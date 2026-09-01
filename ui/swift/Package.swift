@@ -10,8 +10,6 @@ let package = Package(
         .executable(name: "SpireUI", targets: ["SpireUI"]),
     ],
     dependencies: [
-        // FlatBuffers Swift runtime (codegen output will need this)
-        .package(url: "https://github.com/google/flatbuffers.git", from: "25.12.19"),
         // Syntax highlighting for the file viewer
         .package(url: "https://github.com/appstefan/HighlightSwift.git", branch: "main"),
         // Real VT100/xterm terminal emulator (the interactive shell renders
@@ -23,7 +21,6 @@ let package = Package(
         .executableTarget(
             name: "SpireUI",
             dependencies: [
-                .product(name: "FlatBuffers", package: "flatbuffers"),
                 .product(name: "HighlightSwift", package: "HighlightSwift"),
                 .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],

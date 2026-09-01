@@ -59,6 +59,10 @@ impl Actor for MavenBuildModule {
                     build_system: "Maven".to_string(),
                     language: "Java".to_string(),
                     source_extensions: vec!["java".to_string()],
+                supports_clean: false,
+                supports_lint: false,
+                supports_format: false,
+                supports_fix: false,
                 mcp_servers: vec![],
                 });
             }

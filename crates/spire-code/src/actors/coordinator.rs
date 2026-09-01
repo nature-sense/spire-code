@@ -10,16 +10,13 @@ use async_trait::async_trait;
 use regex::Regex;
 use tokio::sync::mpsc;
 
-use crate::subsystems::build::build_orchestrator::BuildOrchestratorMessage;
 use spire_core::subsystems::chat::chat::ChatMessage;
 use crate::subsystems::planning::intent_router::{IntentRouterMessage, RouteResult};
 use spire_core::subsystems::llm::llm::LlmMessage;
 use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use crate::subsystems::planning::plan_orchestrator::PlanOrchestratorMessage;
-use spire_core::actors::progress::ProgressMessage;
 use crate::subsystems::project::project_query::ProjectQueryMessage;
-use spire_core::actors::prompt_handler::PromptHandlerMessage;
 use crate::actors::system::SystemMessage;
 use spire_core::actors::tool_providers::ToolRouterMessage;
 use spire_core::actors::tools::ToolsMessage;
@@ -37,18 +34,9 @@ pub enum CoordinatorMessage {
     },
     /// Shut down the coordinator.
     Shutdown,
-    /// HAL fix proposal: lint one header, send the whole-file rewrite prompt
-    /// to the LLM, and return the proposed corrected content for the user to
-    /// review (accept/reject in the UI). No file is written here.
-    HalFixPropose {
-        root: String,
-        path: String,
-        reply_to: tokio::sync::oneshot::Sender<serde_json::Value>,
-    },
 }
 
 /// The Coordinator actor routes requests to the appropriate sub-actors.
-#[allow(dead_code)]
 pub struct CoordinatorActor {
     /// Sender for the chat actor.
     chat_tx: mpsc::Sender<ChatMessage>,
@@ -58,8 +46,6 @@ pub struct CoordinatorActor {
     mcp_client_tx: mpsc::Sender<McpClientMessage>,
     /// Sender for the LLM actor.
     llm_tx: mpsc::Sender<LlmMessage>,
-    /// Sender for the progress actor.
-    progress_tx: mpsc::Sender<ProgressMessage>,
     /// Sender for the system actor.
     system_tx: mpsc::Sender<SystemMessage>,
     /// Sender for the memory graph actor (knowledge graph + config storage).
@@ -68,10 +54,6 @@ pub struct CoordinatorActor {
     project_query_tx: mpsc::Sender<ProjectQueryMessage>,
     /// Sender for the intent router actor (routes user queries to matched intents).
     intent_router_tx: mpsc::Sender<IntentRouterMessage>,
-    /// Sender for the prompt handler actor (LLM prompt lifecycle with context).
-    prompt_handler_tx: mpsc::Sender<PromptHandlerMessage>,
-    /// Sender for the build orchestrator actor (build-fix loop lifecycle).
-    build_orchestrator_tx: mpsc::Sender<BuildOrchestratorMessage>,
     /// Sender for the tool router actor (routes tool calls to appropriate backend).
     tool_router_tx: mpsc::Sender<ToolRouterMessage>,
     /// Sender for the plan orchestrator actor (creates and executes multi-step plans).
@@ -87,13 +69,10 @@ impl CoordinatorActor {
         tools_tx: mpsc::Sender<ToolsMessage>,
         mcp_client_tx: mpsc::Sender<McpClientMessage>,
         llm_tx: mpsc::Sender<LlmMessage>,
-        progress_tx: mpsc::Sender<ProgressMessage>,
         system_tx: mpsc::Sender<SystemMessage>,
         memory_graph_tx: mpsc::Sender<MemoryGraphMessage>,
         project_query_tx: mpsc::Sender<ProjectQueryMessage>,
         intent_router_tx: mpsc::Sender<IntentRouterMessage>,
-        prompt_handler_tx: mpsc::Sender<PromptHandlerMessage>,
-        build_orchestrator_tx: mpsc::Sender<BuildOrchestratorMessage>,
         tool_router_tx: mpsc::Sender<ToolRouterMessage>,
         plan_orchestrator_tx: mpsc::Sender<PlanOrchestratorMessage>,
         transport_tx: mpsc::Sender<TransportMessage>,
@@ -103,13 +82,10 @@ impl CoordinatorActor {
             tools_tx,
             mcp_client_tx,
             llm_tx,
-            progress_tx,
             system_tx,
             memory_graph_tx,
             project_query_tx,
             intent_router_tx,
-            prompt_handler_tx,
-            build_orchestrator_tx,
             tool_router_tx,
             plan_orchestrator_tx,
             transport_tx,
@@ -224,10 +200,6 @@ impl Actor for CoordinatorActor {
             }
             CoordinatorMessage::Shutdown => {
                 tracing::info!("Coordinator: shutting down");
-            }
-            CoordinatorMessage::HalFixPropose { root, path, reply_to } => {
-                let result = self.propose_hal_fix(&root, &path).await;
-                let _ = reply_to.send(result);
             }
         }
     }
@@ -894,9 +866,6 @@ impl CoordinatorActor {
                             tracing::info!(
                                 "[COORDINATOR] ← INTENT: Chat — proceeding to LLM fall-through"
                             );
-                        }
-                        _ => {
-                            tracing::info!("[COORDINATOR] ← INTENT: unmatched RouteResult variant — falling through to LLM");
                         }
                     }
                 }

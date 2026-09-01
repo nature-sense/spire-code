@@ -37,10 +37,10 @@ use tokio::sync::{mpsc, oneshot};
 pub async fn build_default_registry(
     transport_tx: mpsc::Sender<TransportMessage>,
     project_query_tx: mpsc::Sender<ProjectQueryMessage>,
-    project_build_tx: mpsc::Sender<ProjectBuildMessage>,
-    project_test_tx: mpsc::Sender<ProjectTestMessage>,
-    project_lint_tx: mpsc::Sender<ProjectLintMessage>,
-    project_install_tx: mpsc::Sender<ProjectInstallMessage>,
+    project_build_tx: Option<mpsc::Sender<ProjectBuildMessage>>,
+    project_test_tx: Option<mpsc::Sender<ProjectTestMessage>>,
+    project_lint_tx: Option<mpsc::Sender<ProjectLintMessage>>,
+    project_install_tx: Option<mpsc::Sender<ProjectInstallMessage>>,
     filesystem_tx: mpsc::Sender<FilesystemMessage>,
     git_tx: mpsc::Sender<GitMessage>,
     process_tx: mpsc::Sender<ProcessMessage>,
@@ -68,26 +68,34 @@ pub async fn build_default_registry(
             ProjectQueryMessage::CallTool { tool, args, reply_to: reply }
         })
     })?;
-    register_static(&registry, ProjectBuildActor::tool_definitions(), |name| {
-        actor_tool_handler_result(project_build_tx.clone(), name, |tool, args, reply| {
-            ProjectBuildMessage::CallTool { tool, args, reply_to: reply }
-        })
-    })?;
-    register_static(&registry, ProjectTestActor::tool_definitions(), |name| {
-        actor_tool_handler_result(project_test_tx.clone(), name, |tool, args, reply| {
-            ProjectTestMessage::CallTool { tool, args, reply_to: reply }
-        })
-    })?;
-    register_static(&registry, ProjectLintActor::tool_definitions(), |name| {
-        actor_tool_handler_result(project_lint_tx.clone(), name, |tool, args, reply| {
-            ProjectLintMessage::CallTool { tool, args, reply_to: reply }
-        })
-    })?;
-    register_static(&registry, ProjectInstallActor::tool_definitions(), |name| {
-        actor_tool_handler_result(project_install_tx.clone(), name, |tool, args, reply| {
-            ProjectInstallMessage::CallTool { tool, args, reply_to: reply }
-        })
-    })?;
+    if let Some(tx) = project_build_tx {
+        register_static(&registry, ProjectBuildActor::tool_definitions(), |name| {
+            actor_tool_handler_result(tx.clone(), name, |tool, args, reply| {
+                ProjectBuildMessage::CallTool { tool, args, reply_to: reply }
+            })
+        })?;
+    }
+    if let Some(tx) = project_test_tx {
+        register_static(&registry, ProjectTestActor::tool_definitions(), |name| {
+            actor_tool_handler_result(tx.clone(), name, |tool, args, reply| {
+                ProjectTestMessage::CallTool { tool, args, reply_to: reply }
+            })
+        })?;
+    }
+    if let Some(tx) = project_lint_tx {
+        register_static(&registry, ProjectLintActor::tool_definitions(), |name| {
+            actor_tool_handler_result(tx.clone(), name, |tool, args, reply| {
+                ProjectLintMessage::CallTool { tool, args, reply_to: reply }
+            })
+        })?;
+    }
+    if let Some(tx) = project_install_tx {
+        register_static(&registry, ProjectInstallActor::tool_definitions(), |name| {
+            actor_tool_handler_result(tx.clone(), name, |tool, args, reply| {
+                ProjectInstallMessage::CallTool { tool, args, reply_to: reply }
+            })
+        })?;
+    }
 
     // In-process core modules (dynamic definitions via ListTools).
     register_msg_backend(

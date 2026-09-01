@@ -317,6 +317,18 @@ pub struct ModuleCapability {
     /// aggregates these and provisions them for the McpClientActor.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerDependency>,
+    /// Whether this module implements the `clean` / `lint` / `format` / `fix`
+    /// operations. Modules without an implementation (they return "not
+    /// implemented for this module") declare it here so the BuildManager rejects
+    /// the call up-front instead of after routing to the module.
+    #[serde(default)]
+    pub supports_clean: bool,
+    #[serde(default)]
+    pub supports_lint: bool,
+    #[serde(default)]
+    pub supports_format: bool,
+    #[serde(default)]
+    pub supports_fix: bool,
 }
 
 // ============================================================================
@@ -426,23 +438,3 @@ pub struct BuildOutput {
     pub exit_code: Option<i32>,
 }
 
-// ============================================================================
-// Module Registry (for discovery)
-/// Map a build-config filename to the build-system label of the module that
-/// owns it. Falls back to "Unknown" for unregistered configs.
-pub fn build_system_for_config(filename: &str) -> &'static str {
-    match filename {
-        "Cargo.toml" => "Cargo",
-        "package.json" | "pnpm-workspace.yaml" => "npm",
-        "Package.swift" => "SwiftPM",
-        "pyproject.toml" | "setup.py" | "setup.cfg" => "Python",
-        "go.mod" => "Go",
-        "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts" => "Gradle",
-        "pom.xml" => "Maven",
-        "CMakeLists.txt" => "CMake",
-        "Makefile" | "makefile" => "Make",
-        "meson.build" => "Meson",
-        "Gemfile" | "Rakefile" | "*.gemspec" => "Ruby",
-        _ => "Unknown",
-    }
-}

@@ -942,6 +942,10 @@ impl Actor for CargoBuildModule {
                     build_system: "Cargo".to_string(),
                     language: "Rust".to_string(),
                     source_extensions: vec!["rs".to_string()],
+                    supports_clean: true,
+                    supports_lint: true,
+                    supports_format: true,
+                    supports_fix: true,
                     mcp_servers: vec![McpServerDependency {
                         // In-process tool namespace: the LLM emits
                         // tool_call { server_name: "build/cargo", ... } and

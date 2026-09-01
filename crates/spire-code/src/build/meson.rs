@@ -2728,6 +2728,10 @@ impl Actor for MesonBuildModule {
                         "h".to_string(),
                         "hpp".to_string(),
                     ],
+                    supports_clean: true,
+                    supports_lint: true,
+                    supports_format: true,
+                    supports_fix: true,
                     mcp_servers: vec![],
                 });
             }

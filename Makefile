@@ -1,7 +1,6 @@
 # spire-code monorepo — Rust core (crates/spire-code) + Swift UI (ui/swift).
 #
 # Targets:
-#   make schema   — regenerate FlatBuffers bindings (Rust + Swift)
 #   make rust     — build the Rust crate (libspire_code.dylib + spire-core bin)
 #   make swift    — build the Swift UI executable
 #   make app      — build everything + assemble build/Spire.app (double-clickable)
@@ -9,12 +8,9 @@
 #   make test     — run Rust + Swift tests
 #   make clean    — remove build artifacts
 
-.PHONY: schema rust swift app run test clean
+.PHONY: rust swift app run test clean
 
-schema:
-	@./build/generate-schema.sh
-
-rust: schema
+rust:
 	cargo build --release -p spire-code
 
 swift:

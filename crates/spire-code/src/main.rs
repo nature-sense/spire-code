@@ -30,10 +30,10 @@ use spire_core::actors::tool_providers::ToolRouterActor;
 use spire_code::actors::tool_providers::build_default_registry;
 use spire_core::actors::{
     ActorSystem, ChatActor, LlmActor, LlmConfig, McpClientActor, MemoryGraphActor, ProgressActor,
-    PromptHandlerActor, SystemPromptActor, ToolOrchestrator, ToolsActor,
+    SystemPromptActor, ToolOrchestrator, ToolsActor,
 };
 use spire_code::actors::{
-    BuildOrchestrator, CoordinatorActor, CoordinatorMessage, ErrorAnalyzer, IntentRouterActor,
+    CoordinatorActor, CoordinatorMessage, IntentRouterActor,
     PlanOrchestrator, ProjectAnalyzerActor, ProjectBuildActor, ProjectInstallActor, ProjectLintActor,
     ProjectQueryActor, ProjectSyncActor, ProjectTestActor, SystemActor, SystemMessage,
 };
@@ -288,15 +288,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (intent_router_tx, _intent_router_handle) =
         system.spawn(IntentRouterActor::new(memory_graph_tx.clone()));
 
-    // ── Spawn the build-fix loop actors ──
-    // These actors form the build → detect error → analyze → fix → rebuild cycle.
-    // All graph access goes through MemoryGraphMessage — no direct GraphDb reference.
-    // NOTE: BuildOrchestrator is spawned later (after ToolRouter) because it needs tool_router_tx.
-    // NOTE: ToolOrchestrator is also spawned later (after Transport+TollRouter) for the same reason.
-
-    // Spawn the error analyzer actor (analyzes build errors and returns fix strategies)
-    let (error_analyzer_tx, _error_analyzer_handle) =
-        system.spawn(ErrorAnalyzer::new(memory_graph_tx.clone()));
+    // ── Build-fix loop actors ──
+    // The ErrorAnalyzer / BuildOrchestrator / PromptHandlerActor build-fix loop is NOT
+    // spawned in this binary: it was only reachable through coordinator fields that were
+    // never read. The actor implementations remain (covered by actor_tests.rs) in case the
+    // loop is wired back up later.
+    // NOTE: ToolOrchestrator is spawned later (after Transport + ToolRouter).
 
     // ── Spawn the TransportActor (replaces old Arc<Mutex<Transport>>) ──
     let (transport_tx, _transport_handle) = system.spawn(TransportActor::new());
@@ -441,10 +438,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tool_registry = build_default_registry(
         transport_tx.clone(),
         project_query_tx.clone(),
-        project_build_tx.clone(),
-        project_test_tx.clone(),
-        project_lint_tx.clone(),
-        project_install_tx.clone(),
+        Some(project_build_tx.clone()),
+        Some(project_test_tx.clone()),
+        Some(project_lint_tx.clone()),
+        Some(project_install_tx.clone()),
         // Standalone binary: in-process core modules are unused (MCP catch-all).
         dummy_fs_tx,
         dummy_git_tx,
@@ -463,15 +460,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn the tools actor with the tool router sender
     let (tools_tx, _tools_handle) = system.spawn(ToolsActor::new(tool_router_tx.clone()));
 
-    // Spawn the prompt handler actor (handles LLM prompt lifecycle with context injection)
-    // This must be spawned AFTER the ToolRouterActor since it needs tool_router_tx.
-    let (prompt_handler_tx, _prompt_handler_handle) = system.spawn(PromptHandlerActor::new(
-        memory_graph_tx.clone(),
-        llm_tx.clone(),
-        system_prompt_tx.clone(),
-        tool_router_tx.clone(),
-    ));
-
     // Spawn the tool orchestrator actor (executes tools and tool chains)
     // Must be spawned AFTER TransportActor + ToolRouterActor + MCP client + LLM.
     let (tool_orchestrator_tx, _tool_orchestrator_handle) = system.spawn(ToolOrchestrator::new(
@@ -479,15 +467,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         transport_tx.clone(),
         mcp_client_tx.clone(),
         llm_tx.clone(),
-        tool_router_tx.clone(),
-    ));
-
-    // Spawn the build orchestrator actor (orchestrates the build-fix loop lifecycle)
-    // Must be spawned AFTER ToolRouterActor since it needs tool_router_tx.
-    let (build_orchestrator_tx, _build_orchestrator_handle) = system.spawn(BuildOrchestrator::new(
-        memory_graph_tx.clone(),
-        error_analyzer_tx.clone(),
-        tool_orchestrator_tx.clone(),
         tool_router_tx.clone(),
     ));
 
@@ -557,19 +536,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let system_tx_for_system = system_tx.clone();
 
     // Spawn the coordinator actor with all sub-actor senders
-    let progress_tx_for_coordinator = progress_tx.clone();
     let (coordinator_tx, _coordinator_handle) = system.spawn(CoordinatorActor::new(
         chat_tx,
         tools_tx,
         mcp_client_tx,
         llm_tx,
-        progress_tx_for_coordinator,
         system_tx,
         memory_graph_tx.clone(),
         project_query_tx.clone(),
         intent_router_tx.clone(),
-        prompt_handler_tx.clone(),
-        build_orchestrator_tx.clone(),
         tool_router_tx.clone(),
         plan_orchestrator_tx.clone(),
         transport_tx.clone(),
@@ -708,9 +683,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Received notification: {} (params: {:?})",
                     notification.method, notification.params
                 );
-                // Notifications are logged but not forwarded as requests since
-                // they have no response_tx. If needed in the future, create a
-                // dedicated CoordinatorMessage::HandleNotification variant.
+                // Notifications are intentionally log-only: they carry no
+                // response_tx, so they can't use the HandleRequest flow, and the
+                // coordinator has no notification sink. The shipping app (FFI)
+                // receives file events via the FileWatcherActor + the
+                // `spire_wait_for_event` FFI channel, not transport notifications.
             }
         });
 

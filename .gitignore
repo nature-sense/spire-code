@@ -1,10 +1,6 @@
 # Rust
 /target/
 
-# FlatBuffers generated bindings (regenerated via build.rs / make schema)
-crates/spire-code/src/generated/
-ui/swift/Sources/SpireUI/Generated/
-
 # Swift
 ui/swift/.build/
 ui/swift/.swiftpm/

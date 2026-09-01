@@ -75,6 +75,10 @@ impl Actor for PythonBuildModule {
                     build_system: "Python".to_string(),
                     language: "Python".to_string(),
                     source_extensions: vec!["py".to_string()],
+                supports_clean: false,
+                supports_lint: false,
+                supports_format: false,
+                supports_fix: false,
                 mcp_servers: vec![McpServerDependency {
                         name: "pypi-mcp".to_string(),
                         package: "pypi-mcp-server".to_string(),

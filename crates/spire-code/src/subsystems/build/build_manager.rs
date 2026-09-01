@@ -1065,6 +1065,33 @@ impl BuildManagerActor {
         output.map(|o| (o, events))
     }
 
+    /// Reject an operation the registered module declares unsupported.
+    ///
+    /// Modules set `supports_*` in their `ModuleCapability`; the modules without
+    /// a clean/lint/format/fix implementation leave them false, so the manager
+    /// surfaces a clear error instead of forwarding to a module that would reply
+    /// "not implemented".
+    fn check_capability(
+        &self,
+        config: &str,
+        op: &str,
+        supported: impl Fn(&ModuleCapability) -> bool,
+    ) -> Result<(), String> {
+        if let Some(cap) = self
+            .capabilities
+            .iter()
+            .find(|c| c.config_files.iter().any(|f| f == config))
+        {
+            if !supported(cap) {
+                return Err(format!(
+                    "{} is not supported for build system {}",
+                    op, cap.build_system
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Streaming lint that pushes every line into the shared pollable buffer.
     async fn lint_project_streaming(
         &self,
@@ -1084,6 +1111,7 @@ impl BuildManagerActor {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
+        self.check_capability(&config, "lint", |c| c.supports_lint)?;
         let module_tx = self
             .router
             .get(&config)
@@ -1148,6 +1176,7 @@ impl BuildManagerActor {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
+        self.check_capability(&config, "fix", |c| c.supports_fix)?;
         let module_tx = self
             .router
             .get(&config)
@@ -1245,6 +1274,7 @@ impl BuildManagerActor {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
+        self.check_capability(&config, "clean", |c| c.supports_clean)?;
         let module_tx = self
             .router
             .get(&config)
@@ -1319,6 +1349,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
+        self.check_capability(&config, "format", |c| c.supports_format)?;
         let module_tx = self
             .router
             .get(&config)
@@ -2802,6 +2833,10 @@ mod tests {
                 build_system: "Cargo".to_string(),
                 language: "Rust".to_string(),
                 source_extensions: vec!["rs".to_string()],
+                supports_clean: true,
+                supports_lint: true,
+                supports_format: true,
+                supports_fix: true,
             mcp_servers: vec![],
             },
             mpsc::channel(1).0,
@@ -2874,6 +2909,10 @@ mod tests {
                 build_system: "Cargo".to_string(),
                 language: "Rust".to_string(),
                 source_extensions: vec!["rs".to_string()],
+                supports_clean: true,
+                supports_lint: true,
+                supports_format: true,
+                supports_fix: true,
             mcp_servers: vec![],
             },
             mpsc::channel(1).0,

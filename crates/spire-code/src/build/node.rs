@@ -385,6 +385,10 @@ impl Actor for NodeBuildModule {
                         "ts".to_string(),
                         "tsx".to_string(),
                     ],
+                supports_clean: false,
+                supports_lint: false,
+                supports_format: false,
+                supports_fix: false,
                 mcp_servers: vec![McpServerDependency {
                         name: "npm-mcp".to_string(),
                         package: "npm-mcp-server".to_string(),

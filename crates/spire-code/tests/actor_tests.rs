@@ -482,14 +482,11 @@ async fn test_coordinator_ping() {
     let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
-    let (progress_tx, _) = system.spawn(ProgressActor::new());
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     let memory_graph_tx = mock_memory_graph();
     let project_query_tx = mock_sender();
     let intent_router_tx = mock_sender();
-    let prompt_handler_tx = mock_sender();
-    let build_orchestrator_tx = mock_sender();
     let plan_orchestrator_tx = mock_sender();
     let transport_tx = mock_sender();
     let tool_router_tx: tokio::sync::mpsc::Sender<actors::ToolRouterMessage> = mock_sender();
@@ -498,13 +495,10 @@ async fn test_coordinator_ping() {
         tools_tx,
         mcp_tx,
         llm_tx,
-        progress_tx,
         system_tx,
         memory_graph_tx,
         project_query_tx,
         intent_router_tx,
-        prompt_handler_tx,
-        build_orchestrator_tx,
         tool_router_tx,
         plan_orchestrator_tx,
         transport_tx,
@@ -531,14 +525,11 @@ async fn test_coordinator_chat_get_active_end_to_end() {
     let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
-    let (progress_tx, _) = system.spawn(ProgressActor::new());
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     let memory_graph_tx = mock_memory_graph();
     let project_query_tx = mock_sender();
     let intent_router_tx = mock_sender();
-    let prompt_handler_tx = mock_sender();
-    let build_orchestrator_tx = mock_sender();
     let plan_orchestrator_tx = mock_sender();
     let transport_tx = mock_sender();
     let tool_router_tx: tokio::sync::mpsc::Sender<actors::ToolRouterMessage> = mock_sender();
@@ -547,13 +538,10 @@ async fn test_coordinator_chat_get_active_end_to_end() {
         tools_tx,
         mcp_tx,
         llm_tx,
-        progress_tx,
         system_tx,
         memory_graph_tx,
         project_query_tx,
         intent_router_tx,
-        prompt_handler_tx,
-        build_orchestrator_tx,
         tool_router_tx,
         plan_orchestrator_tx,
         transport_tx,
@@ -581,14 +569,11 @@ async fn test_coordinator_chat_append_and_get_history() {
     let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
-    let (progress_tx, _) = system.spawn(ProgressActor::new());
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     let memory_graph_tx = mock_memory_graph();
     let project_query_tx = mock_sender();
     let intent_router_tx = mock_sender();
-    let prompt_handler_tx = mock_sender();
-    let build_orchestrator_tx = mock_sender();
     let plan_orchestrator_tx = mock_sender();
     let transport_tx = mock_sender();
     let tool_router_tx: tokio::sync::mpsc::Sender<actors::ToolRouterMessage> = mock_sender();
@@ -597,13 +582,10 @@ async fn test_coordinator_chat_append_and_get_history() {
         tools_tx,
         mcp_tx,
         llm_tx,
-        progress_tx,
         system_tx,
         memory_graph_tx,
         project_query_tx,
         intent_router_tx,
-        prompt_handler_tx,
-        build_orchestrator_tx,
         tool_router_tx,
         plan_orchestrator_tx,
         transport_tx,
@@ -654,7 +636,6 @@ async fn spawn_tools_and_coordinator_with_real_router(
     chat_tx: tokio::sync::mpsc::Sender<actors::ChatMessage>,
     mcp_tx: tokio::sync::mpsc::Sender<actors::McpClientMessage>,
     llm_tx: tokio::sync::mpsc::Sender<actors::LlmMessage>,
-    progress_tx: tokio::sync::mpsc::Sender<actors::ProgressMessage>,
     system_tx: tokio::sync::mpsc::Sender<actors::SystemMessage>,
 ) -> tokio::sync::mpsc::Sender<actors::CoordinatorMessage> {
     // Spawn a REAL ToolRouterActor so `tools/list` returns the static VS Code
@@ -670,8 +651,6 @@ async fn spawn_tools_and_coordinator_with_real_router(
     let memory_graph_tx = mock_memory_graph();
     let project_query_tx = mock_sender();
     let intent_router_tx = mock_sender();
-    let prompt_handler_tx = mock_sender();
-    let build_orchestrator_tx = mock_sender();
     let plan_orchestrator_tx = mock_sender();
     let transport_tx = mock_sender();
 
@@ -681,13 +660,10 @@ async fn spawn_tools_and_coordinator_with_real_router(
             tools_tx,
             mcp_tx,
             llm_tx,
-            progress_tx,
             system_tx,
             memory_graph_tx,
             project_query_tx,
             intent_router_tx,
-            prompt_handler_tx,
-            build_orchestrator_tx,
             tool_router_tx,
             plan_orchestrator_tx,
             transport_tx,
@@ -701,7 +677,6 @@ async fn test_coordinator_tools_list() {
     let (chat_tx, _) = system.spawn(ChatActor::new());
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
-    let (progress_tx, _) = system.spawn(ProgressActor::new());
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     let coord_tx = spawn_tools_and_coordinator_with_real_router(
@@ -709,7 +684,6 @@ async fn test_coordinator_tools_list() {
         chat_tx,
         mcp_tx,
         llm_tx,
-        progress_tx,
         system_tx,
     )
     .await;
@@ -740,7 +714,6 @@ async fn test_coordinator_system_status() {
     let (chat_tx, _) = system.spawn(ChatActor::new());
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
-    let (progress_tx, _) = system.spawn(ProgressActor::new());
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     let coord_tx = spawn_tools_and_coordinator_with_real_router(
@@ -748,7 +721,6 @@ async fn test_coordinator_system_status() {
         chat_tx,
         mcp_tx,
         llm_tx,
-        progress_tx,
         system_tx,
     )
     .await;
@@ -777,15 +749,12 @@ async fn test_coordinator_unknown_method() {
     let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
-    let (progress_tx, _) = system.spawn(ProgressActor::new());
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     let memory_graph_tx = mock_memory_graph();
     let project_query_tx = mock_sender();
     let transport_tx = mock_sender();
     let intent_router_tx = mock_sender();
-    let prompt_handler_tx = mock_sender();
-    let build_orchestrator_tx = mock_sender();
     let plan_orchestrator_tx = mock_sender();
     let tool_router_tx: tokio::sync::mpsc::Sender<actors::ToolRouterMessage> = mock_sender();
 
@@ -794,13 +763,10 @@ async fn test_coordinator_unknown_method() {
         tools_tx,
         mcp_tx,
         llm_tx,
-        progress_tx,
         system_tx,
         memory_graph_tx,
         project_query_tx,
         intent_router_tx,
-        prompt_handler_tx,
-        build_orchestrator_tx,
         tool_router_tx,
         plan_orchestrator_tx,
         transport_tx,
@@ -831,15 +797,12 @@ async fn test_coordinator_mcp_servers_empty() {
     let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
-    let (progress_tx, _) = system.spawn(ProgressActor::new());
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     let memory_graph_tx = mock_memory_graph();
     let project_query_tx = mock_sender();
     let transport_tx = mock_sender();
     let intent_router_tx = mock_sender();
-    let prompt_handler_tx = mock_sender();
-    let build_orchestrator_tx = mock_sender();
     let plan_orchestrator_tx = mock_sender();
     let tool_router_tx: tokio::sync::mpsc::Sender<actors::ToolRouterMessage> = mock_sender();
 
@@ -848,13 +811,10 @@ async fn test_coordinator_mcp_servers_empty() {
         tools_tx,
         mcp_tx,
         llm_tx,
-        progress_tx,
         system_tx,
         memory_graph_tx,
         project_query_tx,
         intent_router_tx,
-        prompt_handler_tx,
-        build_orchestrator_tx,
         tool_router_tx,
         plan_orchestrator_tx,
         transport_tx,

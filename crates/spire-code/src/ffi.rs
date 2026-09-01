@@ -1,8 +1,5 @@
 // spire-ffi — C FFI bridge for Swift UI to call the Rust core.
 
-#[path = "generated/mod.rs"]
-mod generated;
-
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,6 +156,10 @@ async fn register_build_module(
                 build_system: cap_name.to_string(),
                 language: "".to_string(),
                 source_extensions: vec![],
+                supports_clean: false,
+                supports_lint: false,
+                supports_format: false,
+                supports_fix: false,
                 mcp_servers: vec![],
             }
         }
@@ -471,13 +472,18 @@ fn init_actor_system() {
         // Routes tool calls: extension tools → transport; project/* → embedded;
         // filesystem_/git_/process_/search_/terminal_ → core modules;
         // build_ → BuildManager; catch-all → MCP client.
+        // Project meta-tools (project/build|test|lint|install) are intentionally NOT
+        // registered here: the FFI drives build/test/lint through the build/* tools
+        // (BuildManager) and FFI-direct methods (project/buildStatus, build/lint, …),
+        // and ProjectBuildActor requires a per-project root that the FFI resolves
+        // dynamically. Registering them against dummy channels made them silently fail.
         let tool_registry = build_default_registry(
-            dummy_tx(),
+            dummy_tx(), // transport_tx — tool events unused in FFI
             project_query_tx.clone(),
-            dummy_tx(),
-            dummy_tx(),
-            dummy_tx(),
-            dummy_tx(),
+            None, // project/build — not wired in FFI
+            None, // project/test — not wired in FFI
+            None, // project/lint — not wired in FFI
+            None, // project/install — not wired in FFI
             fs_tx,
             git_tx,
             process_tx,
@@ -537,9 +543,8 @@ fn init_actor_system() {
 
         // ── PlanOrchestrator (used by plan/create RPC) ──
         // Wire it with real channels so `plan/create` doesn't fall into the
-        // "PlanOrchestrator not available" error branch. Step execution uses a
-        // dummy tool-orchestrator channel (the real one is spawned by the
-        // stand-alone binary, not the FFI).
+        // "PlanOrchestrator not available" error branch. Step execution uses
+        // the real ToolOrchestrator spawned above.
         let (plan_orchestrator_tx, _) = system.spawn(PlanOrchestrator::new(
             memory_graph_tx.clone(),
             llm_tx.clone(),
@@ -554,17 +559,14 @@ fn init_actor_system() {
             chat_tx.clone(),
             tools_tx,
             mcp_client_tx.clone(),
-            dummy_tx(),
-            progress_tx,
+            llm_tx.clone(),
             system_tx,
             memory_graph_tx.clone(),
             project_query_tx.clone(),
             intent_router_tx,
-            dummy_tx(),
-            dummy_tx(),
             tool_router_tx,
-            plan_orchestrator_tx, // 13th arg: real PlanOrchestrator channel
-            dummy_tx(),
+            plan_orchestrator_tx, // real PlanOrchestrator channel
+            dummy_tx(),           // transport_tx — tool events unused in FFI
         ));
 
         // ── Register internal spire tools ──

@@ -150,7 +150,6 @@ impl TransactionStream {
     }
 
     /// Delete a node by UUID.
-    #[allow(dead_code)]
     async fn delete_node(&self, id: String) -> Result<()> {
         let result = self.send_op(StreamOp::DeleteNode(id)).await?;
         match result {
@@ -165,16 +164,6 @@ impl TransactionStream {
         match result {
             StreamOpResult::RelationshipCreated(e) => Ok(e),
             _ => Err(anyhow!("Expected RelationshipCreated, got {:?}", result)),
-        }
-    }
-
-    /// Delete a relationship by UUID.
-    #[allow(dead_code)]
-    async fn delete_relationship(&self, id: String) -> Result<()> {
-        let result = self.send_op(StreamOp::DeleteRelationship(id)).await?;
-        match result {
-            StreamOpResult::RelationshipDeleted => Ok(()),
-            _ => Err(anyhow!("Expected RelationshipDeleted, got {:?}", result)),
         }
     }
 
@@ -196,15 +185,6 @@ impl TransactionStream {
         }
     }
 
-    /// Roll back the transaction and close the stream.
-    #[allow(dead_code)]
-    async fn rollback(self) -> Result<()> {
-        let result = self.send_op(StreamOp::Rollback).await?;
-        match result {
-            StreamOpResult::RawGql(_) => Ok(()),
-            _ => Err(anyhow!("Expected RawGql on rollback, got {:?}", result)),
-        }
-    }
 }
 
 // ============================================================================
@@ -560,33 +540,6 @@ impl ProjectSyncActor {
             reply_to: tx,
         })
         .await
-    }
-
-    /// Get a single node by ID.
-    #[allow(dead_code)]
-    async fn get_node(&self, id: &str) -> Result<Option<AttrNode>> {
-        self.send_to_graph(|tx| MemoryGraphMessage::GetAttrNode {
-            id: id.to_string(),
-            reply_to: tx,
-        })
-        .await
-    }
-
-    /// Get relationships for a node.
-    #[allow(dead_code)]
-    async fn get_relationships(&self, node_id: &str) -> Result<Vec<GraphEdge>> {
-        self.send_to_graph(|tx| MemoryGraphMessage::GetRelationships {
-            node_id: node_id.to_string(),
-            reply_to: tx,
-        })
-        .await
-    }
-
-    /// Delete a relationship.
-    #[allow(dead_code)]
-    async fn delete_relationship(&self, id: String) -> Result<()> {
-        self.send_to_graph(|tx| MemoryGraphMessage::DeleteRelationship { id, reply_to: tx })
-            .await
     }
 
     /// Generate an embedding for text and store it on a node.

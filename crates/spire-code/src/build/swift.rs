@@ -789,6 +789,10 @@ impl Actor for SwiftBuildModule {
                     build_system: "SwiftPM".to_string(),
                     language: "Swift".to_string(),
                     source_extensions: vec!["swift".to_string()],
+                supports_clean: true,
+                supports_lint: true,
+                supports_format: true,
+                supports_fix: true,
                 mcp_servers: vec![McpServerDependency {
                         name: "swiftpm-mcp".to_string(),
                         package: "swiftpm-mcp-server".to_string(),

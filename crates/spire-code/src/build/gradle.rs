@@ -63,6 +63,10 @@ impl Actor for GradleBuildModule {
                         "groovy".to_string(),
                         "kt".to_string(),
                     ],
+                supports_clean: false,
+                supports_lint: false,
+                supports_format: false,
+                supports_fix: false,
                 mcp_servers: vec![],
                 });
             }

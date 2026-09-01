@@ -1,5 +1,4 @@
 import Foundation
-import FlatBuffers
 
 /// Encodes and decodes messages between Swift and Rust.
 /// Uses JSON for the wire format (the C FFI layer speaks JSON strings).

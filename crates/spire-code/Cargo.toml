@@ -50,8 +50,6 @@ tracing-appender = { workspace = true }
 # Home directory (tests + platform registry seeds)
 dirs = "5"
 
-# FlatBuffers message framing (FFI bridge)
-flatbuffers = "24"
 once_cell = "1"
 
 # Utilities

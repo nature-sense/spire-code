@@ -3,13 +3,13 @@ import Foundation
 /// Abstract interface for communication with the Rust core.
 ///
 /// Any UI frontend (SwiftUI, CLI, web) can implement this protocol
-/// to communicate with the core via FlatBuffers messages.
+/// to communicate with the core via JSON messages.
 protocol UIBackend: Sendable {
     /// Whether the Rust core is reachable (e.g. dylib loaded). Defaults to true
     /// for in-process/mock backends; the FFI backend reports whether it could
     /// `dlopen` libspire_code.dylib.
     var isAvailable: Bool { get }
-    /// Send a FlatBuffers-encoded command and await the reply.
+    /// Send a JSON-encoded command and await the reply.
     func send(_ data: Data) async throws -> Data
     /// Block until the next pushed file-change event is available (or timeout).
     /// Returns the event JSON string, or nil on timeout.

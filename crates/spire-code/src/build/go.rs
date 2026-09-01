@@ -59,6 +59,10 @@ impl Actor for GoBuildModule {
                     build_system: "Go".to_string(),
                     language: "Go".to_string(),
                     source_extensions: vec!["go".to_string()],
+                supports_clean: false,
+                supports_lint: false,
+                supports_format: false,
+                supports_fix: false,
                 mcp_servers: vec![McpServerDependency {
                         name: "gomod-mcp".to_string(),
                         package: "gomod-mcp-server".to_string(),

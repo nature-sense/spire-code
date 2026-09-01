@@ -59,6 +59,10 @@ impl Actor for RubyBuildModule {
                     build_system: "Bundler".to_string(),
                     language: "Ruby".to_string(),
                     source_extensions: vec!["rb".to_string()],
+                supports_clean: false,
+                supports_lint: false,
+                supports_format: false,
+                supports_fix: false,
                 mcp_servers: vec![],
                 });
             }

@@ -46,30 +46,6 @@ pub enum RouteResult {
         confidence: f64,
         parameters: HashMap<String, String>,
     },
-    /// Route to the error analyzer for error analysis intents.
-    AnalyzeError {
-        intent_name: String,
-        confidence: f64,
-        error_text: String,
-    },
-    /// Route to the project analyzer for project analysis intents.
-    AnalyzeProject {
-        intent_name: String,
-        confidence: f64,
-    },
-    /// Route to the project query for information retrieval intents.
-    QueryProject {
-        intent_name: String,
-        confidence: f64,
-        query: String,
-    },
-    /// Route to the tool orchestrator for tool execution intents.
-    ExecuteTool {
-        intent_name: String,
-        confidence: f64,
-        tool_name: String,
-        parameters: HashMap<String, String>,
-    },
     /// Intent matched but required states are not met.
     StateBlocked {
         intent_name: String,
@@ -498,10 +474,7 @@ impl IntentRouterActor {
     /// | handler           | RouteResult variant  |
     /// |-------------------|----------------------|
     /// | BuildOrchestrator | Build                |
-    /// | ErrorAnalyzer     | AnalyzeError         |
-    /// | ProjectAnalyzer   | AnalyzeProject       |
-    /// | ProjectQuery      | QueryProject         |
-    /// | ToolOrchestrator  | ExecuteTool          |
+    /// | PlanOrchestrator  | Plan                 |
     /// | (anything else)   | Chat                 |
     fn route_to_handler(
         &self,
@@ -524,26 +497,6 @@ impl IntentRouterActor {
                     parameters,
                 }
             }
-            "ErrorAnalyzer" => RouteResult::AnalyzeError {
-                intent_name: intent_name.to_string(),
-                confidence,
-                error_text: query_lower.to_string(),
-            },
-            "ProjectAnalyzer" => RouteResult::AnalyzeProject {
-                intent_name: intent_name.to_string(),
-                confidence,
-            },
-            "ProjectQuery" => RouteResult::QueryProject {
-                intent_name: intent_name.to_string(),
-                confidence,
-                query: query_lower.to_string(),
-            },
-            "ToolOrchestrator" => RouteResult::ExecuteTool {
-                intent_name: intent_name.to_string(),
-                confidence,
-                tool_name: String::new(),
-                parameters: HashMap::new(),
-            },
             "PlanOrchestrator" => {
                 let mut parameters = HashMap::new();
                 parameters.insert("query".to_string(), query_lower.to_string());
