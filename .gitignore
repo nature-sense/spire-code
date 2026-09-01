@@ -14,8 +14,8 @@ ui/swift/.swiftpm/
 /build/*.framework/
 /build/*.dylib/
 
-# Local runtime data (graph snapshots per project)
-/.spire/
+# Local runtime data (graph snapshots per project) — anywhere in the tree
+**/.spire/
 
 # macOS
 .DS_Store
