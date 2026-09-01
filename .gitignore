@@ -1,0 +1,21 @@
+# Rust
+/target/
+
+# FlatBuffers generated bindings (regenerated via build.rs / make schema)
+crates/spire-code/src/generated/
+ui/swift/Sources/SpireUI/Generated/
+
+# Swift
+ui/swift/.build/
+ui/swift/.swiftpm/
+
+# Bundles / build output
+/build/*.app/
+/build/*.framework/
+/build/*.dylib/
+
+# Local runtime data (graph snapshots per project)
+/.spire/
+
+# macOS
+.DS_Store

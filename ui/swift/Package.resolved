@@ -1,0 +1,42 @@
+{
+  "originHash" : "00d3f16561c28b9a682e6cd51facd22e01621fd5f34d9dcd27cc6e2777f0dc02",
+  "pins" : [
+    {
+      "identity" : "flatbuffers",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/google/flatbuffers.git",
+      "state" : {
+        "revision" : "7e163021e59cca4f8e1e35a7c828b5c6b7915953",
+        "version" : "25.12.19"
+      }
+    },
+    {
+      "identity" : "highlightswift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/appstefan/HighlightSwift.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "99c431b38a1444a5fd6a4978307fbbefe3a7af53"
+      }
+    },
+    {
+      "identity" : "swift-argument-parser",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-argument-parser",
+      "state" : {
+        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+        "version" : "1.8.2"
+      }
+    },
+    {
+      "identity" : "swiftterm",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/migueldeicaza/SwiftTerm.git",
+      "state" : {
+        "revision" : "5d14406844143538cd8f8851d2d8a67c1fe443e5",
+        "version" : "1.20.0"
+      }
+    }
+  ],
+  "version" : 3
+}

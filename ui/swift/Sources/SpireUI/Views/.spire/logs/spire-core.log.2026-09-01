@@ -1,0 +1,109 @@
+2026-09-01T05:33:19.719673Z  INFO spire_core: Spire Core starting...
+2026-09-01T05:33:19.719715Z  INFO spire_core: Logging to: /Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/logs/spire-core.log.2026-09-01
+2026-09-01T05:33:19.719718Z  INFO spire_core: SPIRE_LOG_DIR set to: /Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/logs
+2026-09-01T05:33:19.719740Z  INFO spire_core: Data directory: /Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data
+2026-09-01T05:33:19.741439Z  INFO spire_core::actors::system_prompt: SystemPromptActor: initialized
+2026-09-01T05:33:19.742039Z  INFO spire_core: SystemPromptActor initialized
+2026-09-01T05:33:19.742358Z  INFO spire_core::transport::socket: TransportActor: listening on 127.0.0.1:56913
+2026-09-01T05:33:19.742656Z  INFO spire_core: Spire Core transport bound to port 56913. Extension can connect now.
+2026-09-01T05:33:26.268595Z  INFO spire_core::transport::socket: TransportActor: accepted connection from 127.0.0.1:56916
+2026-09-01T05:33:26.268772Z  INFO spire_core: Spire Core accepted extension connection on port 56913.
+2026-09-01T05:33:26.269000Z  INFO spire_core::embedder::candle_embedder: Using CPU (Metal disabled; set SPIRE_USE_METAL=1 to enable)
+2026-09-01T05:33:26.269233Z  INFO spire_core::embedder::candle_embedder: Found bundled model directory: /Users/steve/.vscode/extensions/naturesense.spire-extension-0.1.0/bin/darwin-arm64/models/all-MiniLM-L6-v2
+2026-09-01T05:33:26.417096Z  INFO spire_core::embedder::candle_embedder: Embedding model loaded from bundled path in 0.15s on Cpu (384 dimensions)
+2026-09-01T05:33:26.417182Z  INFO spire_core: CandleEmbedder created successfully
+2026-09-01T05:33:26.417194Z  INFO spire_core: Notification handler registered for file events
+2026-09-01T05:33:26.417195Z  INFO spire_core: Spire Core is ready. Connected on 127.0.0.1:56913 for JSON-RPC messages.
+2026-09-01T05:33:26.417203Z  INFO spire_core::actors::system: SystemActor: received Initialize, starting phase chain
+2026-09-01T05:33:26.417218Z  INFO spire_core::transport::socket: TransportActor: request handler registered
+2026-09-01T05:33:26.417220Z  INFO spire_core::transport::socket: TransportActor: notification handler registered
+2026-09-01T05:33:26.417222Z  INFO spire_core::actors::system: SystemActor: starting phase chain with phase 'startup'
+2026-09-01T05:33:26.417224Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: starting phase chain with 5 phases
+2026-09-01T05:33:26.417237Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: starting phase 'graph_init' (1/5)
+2026-09-01T05:33:26.417252Z  INFO spire_core::actors::startup_phases: SystemActor: initializing graph database
+2026-09-01T05:33:26.421867Z  WARN spire_core::actors::memory_graph: MemoryGraph: recovery failed (Failed to recover graph: wal snapshot sequence 0 does not match applied snapshot 3), attempting clean start
+2026-09-01T05:33:26.421875Z  WARN spire_core::actors::memory_graph: MemoryGraph: WAL/snapshot sequence mismatch detected — removing stale WAL, keeping snapshots
+2026-09-01T05:33:26.422035Z  INFO spire_core::actors::memory_graph: MemoryGraph: removed stale WAL file: "/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/wal.log"
+2026-09-01T05:33:26.422046Z  INFO spire_core::actors::memory_graph: MemoryGraph: recovering graph from: /Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data (stale WAL removed, snapshots preserved)
+2026-09-01T05:33:26.428319Z  INFO spire_core::actors::startup_phases: SystemActor: graph database initialized
+2026-09-01T05:33:26.428332Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: phase 'graph_init' completed synchronously (1/5)
+2026-09-01T05:33:26.428335Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: starting phase 'parallel_init' (2/5)
+2026-09-01T05:33:26.428400Z  INFO spire_core::actors::startup_phases: PhaseGroup[parallel_init]: starting 5 sub-phases: ["embedder_init", "mcp_bootstrap", "project_sync_init", "project_analyzer_init", "project_query_init"]
+2026-09-01T05:33:26.428411Z  INFO spire_core::actors::startup_phases: SystemActor: initializing embedding model
+2026-09-01T05:33:26.428438Z  INFO spire_core::actors::memory_graph: MemoryGraph: using provided embedder
+2026-09-01T05:33:26.428442Z  INFO spire_core::actors::startup_phases: SystemActor: embedding model initialized
+2026-09-01T05:33:26.428478Z  INFO spire_core::actors::startup_phases: SystemActor: loading MCP configuration
+2026-09-01T05:33:26.428500Z  INFO spire_core::actors::startup_phases: SystemActor: no MCP config path provided or auto-discovered, skipping bootstrap
+2026-09-01T05:33:26.428545Z  INFO spire_core::actors::memory_graph: GetMcpConfig: executing GQL: MATCH (n:SpireMcpConfig) RETURN n.config_value
+2026-09-01T05:33:26.432423Z  INFO spire_core::actors::memory_graph: GetMcpConfig: got table with 0 rows
+2026-09-01T05:33:26.432430Z  INFO spire_core::actors::memory_graph: GetMcpConfig: returning 0 entries
+2026-09-01T05:33:26.432462Z  INFO spire_core::actors::startup_phases: SystemActor: no MCP server configs in graph, skipping client load
+2026-09-01T05:33:26.432464Z  INFO spire_core::actors::startup_phases: SystemActor: initializing project sync actor
+2026-09-01T05:33:26.432644Z  INFO spire_core::actors::startup_phases: SystemActor: project sync actor initialized
+2026-09-01T05:33:26.432649Z  INFO spire_core::actors::startup_phases: SystemActor: initializing project analyzer actor
+2026-09-01T05:33:26.432653Z  INFO spire_core::actors::project_analyzer: ProjectAnalyzerActor: initialized with MCP client channel
+2026-09-01T05:33:26.432670Z  INFO spire_core::actors::startup_phases: SystemActor: project analyzer actor initialized
+2026-09-01T05:33:26.432672Z  INFO spire_core::actors::startup_phases: SystemActor: initializing project query actor
+2026-09-01T05:33:26.432689Z  INFO spire_core::actors::project_query: ProjectQueryActor initialized
+2026-09-01T05:33:26.432694Z  INFO spire_core::actors::startup_phases: SystemActor: project query actor initialized
+2026-09-01T05:33:26.432695Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: phase 'parallel_init' completed synchronously (2/5)
+2026-09-01T05:33:26.432696Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: starting phase 'parallel_connect' (3/5)
+2026-09-01T05:33:26.432697Z  INFO spire_core::actors::startup_phases: PhaseGroup[parallel_connect]: starting 4 sub-phases: ["mcp_connect", "project_sync", "project_analysis", "llm_config"]
+2026-09-01T05:33:26.432701Z  INFO spire_core::actors::startup_phases: SystemActor: connecting to MCP servers (fire-and-forget)
+2026-09-01T05:33:26.432703Z  INFO spire_core::actors::startup_phases: SystemActor: MCP connect dispatched (background)
+2026-09-01T05:33:26.432704Z  INFO spire_core::actors::startup_phases: SystemActor: dispatching project sync to transient actor
+2026-09-01T05:33:26.432707Z  INFO spire_core::actors::startup_phases: SystemActor: dispatching project analysis to transient actor
+2026-09-01T05:33:26.432709Z  INFO spire_core::actors::startup_phases: SystemActor: dispatching LLM config load to transient actor
+2026-09-01T05:33:26.432711Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: phase 'parallel_connect' in progress (3/5)
+2026-09-01T05:33:26.432809Z  INFO spire_core::actors::project_analyzer: ProjectAnalyzer: analyzing project at /Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views
+2026-09-01T05:33:26.434879Z  INFO spire_core::actors::startup_phases: ProjectSyncPhase: project node exists, performing startup sync
+2026-09-01T05:33:26.435027Z  INFO spire_core::actors::project_sync: ProjectSync: startup sync for /Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views
+2026-09-01T05:33:26.436945Z  INFO spire_core::actors::project_sync: ProjectSync: manifest changed (old: Some("3a3058401c0cd264df9c063772c60eaba2d3c4b390f6515f9840a99d175cc902"), new: f14e370c18776a1c2b8eaaa3388b458de07d8108150af64c1363952770967a27), re-syncing
+2026-09-01T05:33:26.437758Z  INFO spire_core::actors::startup_phases: LlmConfigPhase: no persisted DeepSeek config found, using defaults
+2026-09-01T05:33:26.437760Z  INFO spire_core::actors::startup_phases: LlmConfigPhase: LLM config loaded
+2026-09-01T05:33:26.437828Z  INFO spire_core::actors::startup_phases: PhaseGroup[parallel_connect]: sub-phase 'llm_config' completed (2/4)
+2026-09-01T05:33:26.438617Z  INFO spire_core::actors::project_analyzer: ProjectAnalyzer: analysis complete in 5.807625ms — 31 files, 1 dirs, 0 build systems
+2026-09-01T05:33:26.438657Z  INFO spire_core::actors::startup_phases: ProjectAnalysisPhase: analysis complete: 31 files, 1 dirs, 0 build systems
+2026-09-01T05:33:26.446307Z  INFO spire_core::actors::project_sync: ProjectSync: startup sync complete in 11ms
+2026-09-01T05:33:26.446331Z  INFO spire_core::actors::startup_phases: ProjectSyncPhase: startup sync complete: SyncResult { nodes_created: 0, nodes_updated: 0, nodes_deleted: 1, edges_created: 0, edges_deleted: 0, embeddings_generated: 0, duration_ms: 11 }
+2026-09-01T05:33:26.449824Z  INFO spire_core::actors::startup_phases: store_project_analysis: stored project 'Views' with 0 build systems, set config keys
+2026-09-01T05:33:26.449830Z  INFO spire_core::actors::startup_phases: ProjectAnalysisPhase: analysis stored in graph
+2026-09-01T05:33:26.449896Z  INFO spire_core::actors::startup_phases: PhaseGroup[parallel_connect]: sub-phase 'project_analysis' completed (3/4)
+2026-09-01T05:33:26.468398Z  INFO spire_core::actors::memory_graph: MemoryGraph: snapshot written (seq=4, sections=8)
+2026-09-01T05:33:26.468566Z  INFO spire_core::actors::startup_phases: ProjectSyncPhase: snapshot written after project sync
+2026-09-01T05:33:26.468571Z  INFO spire_core::actors::startup_phases: ProjectSyncPhase: project sync complete
+2026-09-01T05:33:26.468583Z  INFO spire_core::actors::startup_phases: PhaseGroup[parallel_connect]: sub-phase 'project_sync' completed (4/4)
+2026-09-01T05:33:26.468585Z  INFO spire_core::actors::startup_phases: PhaseGroup[parallel_connect]: all 4 sub-phases complete
+2026-09-01T05:33:26.468587Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: phase 'parallel_connect' completed (3/5)
+2026-09-01T05:33:26.468587Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: advancing to phase 'intents_bootstrap' (4/5)
+2026-09-01T05:33:26.468589Z  INFO spire_core::actors::startup_phases: PhaseGroup[intents_bootstrap]: starting 2 sub-phases: ["intents_bootstrap_init", "intents_bootstrap"]
+2026-09-01T05:33:26.468592Z  INFO spire_core::actors::startup_phases: SystemActor: initializing intents bootstrap actor
+2026-09-01T05:33:26.468598Z  INFO spire_core::actors::startup_phases: SystemActor: dispatching intents bootstrap to transient actor
+2026-09-01T05:33:26.468601Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: phase 'intents_bootstrap' in progress (4/5)
+2026-09-01T05:33:26.468611Z  INFO spire_core::actors::startup_phases: IntentsBootstrapPhase: no config/intents.json found, skipping static bootstrap
+2026-09-01T05:33:26.468631Z  INFO spire_core::actors::startup_phases: discover_mcp_tools: no connected MCP servers with tools
+2026-09-01T05:33:26.468632Z  INFO spire_core::actors::startup_phases: IntentsBootstrapPhase: stored 0 MCP tool nodes
+2026-09-01T05:33:26.479178Z  INFO spire_core::actors::memory_graph: MemoryGraph: snapshot written (seq=5, sections=8)
+2026-09-01T05:33:26.479747Z  INFO spire_core::actors::startup_phases: IntentsBootstrapPhase: snapshot written after intents bootstrap
+2026-09-01T05:33:26.479755Z  INFO spire_core::actors::startup_phases: IntentsBootstrapPhase: intents bootstrap complete
+2026-09-01T05:33:26.479769Z  INFO spire_core::actors::startup_phases: PhaseGroup[intents_bootstrap]: sub-phase 'intents_bootstrap' completed (2/2)
+2026-09-01T05:33:26.479771Z  INFO spire_core::actors::startup_phases: PhaseGroup[intents_bootstrap]: all 2 sub-phases complete
+2026-09-01T05:33:26.479773Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: phase 'intents_bootstrap' completed (4/5)
+2026-09-01T05:33:26.479774Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: advancing to phase 'register_tools' (5/5)
+2026-09-01T05:33:26.479779Z  INFO spire_core::actors::startup_phases: SystemActor: registering internal tools
+2026-09-01T05:33:26.480359Z  INFO spire_core::actors::startup_phases: SystemActor: internal tools registered
+2026-09-01T05:33:26.480366Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: phase 'register_tools' completed synchronously (5/5)
+2026-09-01T05:33:26.480367Z  INFO spire_core::actors::startup_phases: PhaseChain[startup]: all 5 phases complete
+2026-09-01T05:33:26.480368Z  INFO spire_core::actors::system: SystemActor: phase 'startup' complete
+2026-09-01T05:33:26.480386Z  INFO spire_core::actors::system: SystemActor: system is ready
+2026-09-01T05:33:26.480389Z  INFO spire_core: SystemActor initialization complete
+2026-09-01T05:33:27.012960Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Modified"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/wal.log")})
+2026-09-01T05:33:27.013058Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Created"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/snapshot.4.snap")})
+2026-09-01T05:33:27.013074Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Created"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/snapshot.5.snap")})
+2026-09-01T05:33:27.013078Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Modified"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data")})
+2026-09-01T05:33:27.013081Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Deleted"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/snapshot.4.snap.tmp")})
+2026-09-01T05:33:27.013091Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Deleted"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/snapshot.5.snap.tmp")})
+2026-09-01T05:33:28.463497Z  INFO spire_core::actors::memory_graph: MemoryGraph snapshot task: snapshot written (seq=6, sections=8)
+2026-09-01T05:33:29.048340Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Created"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/snapshot.6.snap")})
+2026-09-01T05:33:29.048398Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Modified"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data")})
+2026-09-01T05:33:29.048408Z  INFO spire_core: Received notification: project/fileEvent (params: Object {"changeType": String("Deleted"), "path": String("/Users/steve/naturesense/tools/spire-app/ui/swift/Sources/SpireUI/Views/.spire/data/snapshot.6.snap.tmp")})
