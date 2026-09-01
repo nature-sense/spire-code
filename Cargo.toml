@@ -39,7 +39,9 @@ tracing-appender = "0.2"
 # MCP protocol
 rust-mcp-sdk = "1.0"
 rust-mcp-transport = "0.9"
-rust-mcp-schema = "0.10"
+# Aligned with rust-mcp-sdk 1.1.x (which re-exports schema 1.0) — keeps a single
+# rust-mcp-schema in the graph so `rust_mcp_schema::*` == `rust_mcp_sdk::schema::*`.
+rust-mcp-schema = "1.0"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }

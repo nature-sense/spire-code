@@ -4565,7 +4565,7 @@ dependencies = [
  "once_cell",
  "regex",
  "reqwest 0.12.28",
- "rust-mcp-schema 0.10.3",
+ "rust-mcp-schema 1.0.0",
  "rust-mcp-sdk",
  "rust-mcp-transport 0.9.1",
  "serde",
