@@ -23,10 +23,10 @@ pub use build::{
 pub mod ffi;
 pub mod subsystems;
 
-/// The generic actor trait + tool metadata come from `spire-actor` (shared
-/// with `spire-core`); the shared build/platform types live in `spire-core`
-/// (`spire_core::build_types`, `spire_core::platform`).
-pub use spire_actor::{Actor, ToolInfo};
+/// The generic actor trait comes from `spire-actor`; tool metadata and the
+/// shared build/platform types live in `spire-core` (`spire_core::actors`,
+/// `spire_core::build_types`, `spire_core::platform`).
+pub use spire_core::actors::{Actor, ToolInfo};
 
 /// Test-only lock serializing in-process tests that read or mutate the
 /// process-global `SPIRE_PLATFORM_DIR` env var (`build_manager` fixtures set
