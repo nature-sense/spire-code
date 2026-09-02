@@ -3,6 +3,8 @@
 
 //! Project subsystem — project lifecycle: sync, analyze, query, create.
 
+pub mod spec;
+
 pub mod project_analyzer;
 pub use project_analyzer::{
     LanguageBreakdown, ProjectAnalysis, ProjectAnalyzerActor, ProjectAnalyzerMessage, RoleBreakdown,
