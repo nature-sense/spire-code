@@ -1,0 +1,260 @@
+{
+  "app": {
+    "name": "spire-gis",
+    "goal": "view, edit and search geospatial layers (buildings, roads, parcels, flood zones) — ingest GeoJSON/Shapefile and run spatial + semantic queries"
+  },
+  "types": [
+    {
+      "kind": "enum",
+      "name": "GeometryType",
+      "variants": ["point", "linestring", "polygon", "multipoint", "multipolygon", "raster"]
+    },
+    {
+      "kind": "record",
+      "name": "BoundingBox",
+      "fields": [
+        { "name": "min_x", "ty": { "kind": "float" } },
+        { "name": "min_y", "ty": { "kind": "float" } },
+        { "name": "max_x", "ty": { "kind": "float" } },
+        { "name": "max_y", "ty": { "kind": "float" } }
+      ]
+    },
+    {
+      "kind": "record",
+      "name": "LayerInfo",
+      "fields": [
+        { "name": "id", "ty": { "kind": "str" } },
+        { "name": "name", "ty": { "kind": "str" } },
+        { "name": "visible", "ty": { "kind": "bool" } }
+      ]
+    },
+    {
+      "kind": "record",
+      "name": "FeatureHit",
+      "fields": [
+        { "name": "id", "ty": { "kind": "str" } },
+        { "name": "label", "ty": { "kind": "str" } },
+        { "name": "score", "ty": { "kind": "option", "of": { "kind": "float" } } }
+      ]
+    },
+    {
+      "kind": "record",
+      "name": "IngestReport",
+      "fields": [
+        { "name": "source_format", "ty": { "kind": "str" } },
+        { "name": "imported", "ty": { "kind": "int" } },
+        { "name": "errors", "ty": { "kind": "int" } }
+      ]
+    }
+  ]
+  ,
+  "graph": {
+    "nodes": [
+      {
+        "name": "feature",
+        "description": "root label inherited by every geospatial feature (SeleneDB Feature hierarchy)",
+        "fields": [
+          { "name": "id", "ty": { "kind": "str" } },
+          { "name": "geometry_wkb", "ty": { "kind": "str" } },
+          { "name": "geometry_type", "ty": { "kind": "named", "name": "GeometryType" } },
+          { "name": "srid", "ty": { "kind": "option", "of": { "kind": "int" } } },
+          { "name": "bbox", "ty": { "kind": "named", "name": "BoundingBox" } },
+          { "name": "source_format", "ty": { "kind": "str" } },
+          { "name": "embedding", "ty": { "kind": "list", "of": { "kind": "float" } } }
+        ]
+      },
+      {
+        "name": "building",
+        "description": "building footprint (extends feature)",
+        "fields": [
+          { "name": "name", "ty": { "kind": "str" } },
+          { "name": "height", "ty": { "kind": "float" } },
+          { "name": "area", "ty": { "kind": "float" } }
+        ]
+      },
+      {
+        "name": "road",
+        "description": "road segment (extends feature)",
+        "fields": [
+          { "name": "name", "ty": { "kind": "str" } },
+          { "name": "length", "ty": { "kind": "float" } }
+        ]
+      },
+      {
+        "name": "parcel",
+        "description": "land parcel (extends feature)",
+        "fields": [
+          { "name": "parcel_no", "ty": { "kind": "str" } }
+        ]
+      },
+      {
+        "name": "flood_zone",
+        "description": "flood hazard zone (extends feature)",
+        "fields": [
+          { "name": "name", "ty": { "kind": "str" } }
+        ]
+      },
+      {
+        "name": "sensor",
+        "description": "IoT/telemetry sensor (extends point)",
+        "fields": [
+          { "name": "kind", "ty": { "kind": "str" } },
+          { "name": "unit", "ty": { "kind": "str" } }
+        ]
+      }
+    ],
+    "edges": [
+      { "name": "CONTAINS", "from": "flood_zone", "to": "building", "description": "parent-child containment" },
+      { "name": "WITHIN", "from": "feature", "to": "feature", "description": "spatial containment" },
+      { "name": "INTERSECTS", "from": "feature", "to": "feature", "description": "spatial intersection" },
+      { "name": "ADJACENT_TO", "from": "parcel", "to": "parcel", "description": "sharing a boundary" },
+      { "name": "CONNECTS", "from": "road", "to": "road", "description": "road connectivity" },
+      { "name": "NEARBY", "from": "feature", "to": "feature", "description": "within a distance threshold" },
+      { "name": "MONITORS", "from": "sensor", "to": "feature", "description": "sensor observes a feature" },
+      { "name": "PART_OF", "from": "building", "to": "parcel", "description": "part-whole relationship" }
+    ]
+  }
+
+  ,
+  "actors": [
+    {
+      "name": "MapActor",
+      "description": "owns layer state + selection",
+      "handlers": ["map/listLayers", "map/addLayer", "map/setLayerVisibility", "map/selectFeature"],
+      "state": [
+        { "name": "layers", "ty": { "kind": "list", "of": { "kind": "named", "name": "LayerInfo" } } },
+        { "name": "selection", "ty": { "kind": "option", "of": { "kind": "named", "name": "FeatureHit" } } }
+      ],
+      "uses": ["build_types"]
+    },
+    {
+      "name": "IngestActor",
+      "description": "ingests GIS formats into the feature graph (SeleneDB WKB + bbox)",
+      "handlers": ["gis/importGeoJson", "gis/importShapefile"],
+      "state": [
+        { "name": "last_report", "ty": { "kind": "option", "of": { "kind": "named", "name": "IngestReport" } } }
+      ],
+      "uses": ["modules", "config"]
+    },
+    {
+      "name": "QueryActor",
+      "description": "spatial + semantic graph queries (SeleneDB HNSW / GQL)",
+      "handlers": ["gis/semanticSearch", "gis/within", "gis/shortestPath", "gis/featuresInBounds"],
+      "state": [],
+      "uses": ["rag", "llm"]
+    }
+  ],
+  "bridge": [
+    { "method": "map/listLayers", "description": "all visible layers", "params": [], "result": { "kind": "list", "of": { "kind": "named", "name": "LayerInfo" } } },
+    { "method": "map/addLayer", "description": "register a layer by name", "params": [ { "name": "name", "ty": { "kind": "str" } } ], "result": { "kind": "named", "name": "LayerInfo" } },
+    { "method": "map/setLayerVisibility", "description": "toggle a layer", "params": [ { "name": "id", "ty": { "kind": "str" } }, { "name": "visible", "ty": { "kind": "bool" } } ], "result": { "kind": "bool" } },
+    { "method": "map/selectFeature", "description": "select a feature for the inspector", "params": [ { "name": "id", "ty": { "kind": "str" } } ], "result": { "kind": "named", "name": "FeatureHit" } },
+    { "method": "gis/importGeoJson", "description": "ingest a GeoJSON file", "params": [ { "name": "path", "ty": { "kind": "str" } } ], "result": { "kind": "named", "name": "IngestReport" } },
+    { "method": "gis/importShapefile", "description": "ingest a .shp/.dbf pair", "params": [ { "name": "path", "ty": { "kind": "str" } } ], "result": { "kind": "named", "name": "IngestReport" } },
+    { "method": "gis/semanticSearch", "description": "meaning-based search over features", "params": [ { "name": "query", "ty": { "kind": "str" } } ], "result": { "kind": "list", "of": { "kind": "named", "name": "FeatureHit" } } },
+    { "method": "gis/within", "description": "features inside a zone", "params": [ { "name": "zoneId", "ty": { "kind": "str" } } ], "result": { "kind": "list", "of": { "kind": "named", "name": "FeatureHit" } } },
+    { "method": "gis/shortestPath", "description": "shortest road path", "params": [ { "name": "from", "ty": { "kind": "str" } }, { "name": "to", "ty": { "kind": "str" } } ], "result": { "kind": "list", "of": { "kind": "named", "name": "FeatureHit" } } },
+    { "method": "gis/featuresInBounds", "description": "features whose bbox intersects a viewport", "params": [ { "name": "bbox", "ty": { "kind": "named", "name": "BoundingBox" } } ], "result": { "kind": "list", "of": { "kind": "named", "name": "FeatureHit" } } }
+  ]
+
+  ,
+  "ui": [
+    {
+      "id": "map",
+      "title": "Map",
+      "layout": {
+        "kind": "vstack",
+        "children": [
+          {
+            "kind": "hstack",
+            "children": [
+              { "kind": "button", "label": "Reload", "action": "reload" },
+              { "kind": "input", "placeholder": "layer name", "bind": "layerName" },
+              { "kind": "button", "label": "Add layer", "action": "add" },
+              { "kind": "button", "label": "Toggle visibility", "action": "visibility" }
+            ]
+          },
+          { "kind": "list", "item": { "kind": "button", "label": "Open", "action": "select" } },
+          { "kind": "spacer" }
+        ]
+      },
+      "actions": [
+        { "id": "reload", "description": "reload layers", "bridge": "map/listLayers" },
+        { "id": "add", "description": "add a layer", "bridge": "map/addLayer" },
+        { "id": "visibility", "description": "toggle visibility", "bridge": "map/setLayerVisibility" },
+        { "id": "select", "description": "inspect a feature", "bridge": "map/selectFeature" }
+      ],
+      "bindings": [
+        { "field": "layers", "method": "map/listLayers" },
+        { "field": "selection", "method": "map/selectFeature" }
+      ],
+      "navigation": [
+        { "action_id": "select", "to": "inspector" }
+      ]
+    },
+    {
+      "id": "inspector",
+      "title": "Inspector",
+      "layout": {
+        "kind": "vstack",
+        "children": [
+          { "kind": "text", "text": "feature.label" },
+          { "kind": "text", "text": "feature.geometry_type" }
+        ]
+      },
+      "actions": [],
+      "bindings": [
+        { "field": "feature", "method": "map/selectFeature" }
+      ],
+      "navigation": []
+    },
+    {
+      "id": "search",
+      "title": "Search",
+      "layout": {
+        "kind": "vstack",
+        "children": [
+          { "kind": "input", "placeholder": "semantic query", "bind": "query" },
+          { "kind": "button", "label": "Search", "action": "search" },
+          { "kind": "button", "label": "Inside flood zone", "action": "within" },
+          { "kind": "button", "label": "Shortest path", "action": "path" },
+          { "kind": "button", "label": "Viewport features", "action": "bounds" }
+        ]
+      },
+      "actions": [
+        { "id": "search", "description": "semantic search", "bridge": "gis/semanticSearch" },
+        { "id": "within", "description": "features in a zone", "bridge": "gis/within" },
+        { "id": "path", "description": "shortest road path", "bridge": "gis/shortestPath" },
+        { "id": "bounds", "description": "viewport query", "bridge": "gis/featuresInBounds" }
+      ],
+      "bindings": [
+        { "field": "results", "method": "gis/semanticSearch" }
+      ],
+      "navigation": [
+        { "action_id": "search", "to": "inspector" },
+        { "action_id": "within", "to": "inspector" },
+        { "action_id": "bounds", "to": "inspector" }
+      ]
+    },
+    {
+      "id": "ingest",
+      "title": "Ingest",
+      "layout": {
+        "kind": "vstack",
+        "children": [
+          { "kind": "button", "label": "Import GeoJSON", "action": "geojson" },
+          { "kind": "button", "label": "Import Shapefile", "action": "shp" }
+        ]
+      },
+      "actions": [
+        { "id": "geojson", "description": "import GeoJSON", "bridge": "gis/importGeoJson" },
+        { "id": "shp", "description": "import Shapefile", "bridge": "gis/importShapefile" }
+      ],
+      "bindings": [
+        { "field": "report", "method": "gis/importGeoJson" }
+      ],
+      "navigation": []
+    }
+  ]
+}
+

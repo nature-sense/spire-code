@@ -671,6 +671,13 @@ fn collect_named_types_in_spec(spec: &AppSpec, out: &mut HashSet<String>) {
             collect_named_types(&f.ty, out);
         }
     }
+    // Graph node fields reference shared domain types too — a type used only
+    // there is NOT unused.
+    for n in &spec.graph.nodes {
+        for f in &n.fields {
+            collect_named_types(&f.ty, out);
+        }
+    }
     for t in &spec.types {
         if let DomainType::Record { fields, .. } = t {
             for f in fields {
@@ -1019,6 +1026,29 @@ mod tests {
                 .iter()
                 .any(|i| i.message.contains("unresolved type reference 'NoSuchType'")),
             "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn type_used_only_in_a_graph_field_is_not_flagged_unused() {
+        let mut spec = gis_spec();
+        // A type referenced ONLY by a graph node field must not produce the
+        // unused-type warning.
+        spec.types.push(DomainType::Enum {
+            name: "GeometryKind".to_string(),
+            variants: vec!["point".to_string(), "polygon".to_string()],
+        });
+        spec.graph.nodes[0]
+            .fields
+            .push(field("kind", named("GeometryKind")));
+        let issues = validate(&spec);
+        assert!(errors(&issues).is_empty(), "unexpected errors: {issues:?}");
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.severity == SpecIssueSeverity::Warning
+                    && i.message.contains("GeometryKind")),
+            "type used in a graph field must not warn: {issues:?}"
         );
     }
 
