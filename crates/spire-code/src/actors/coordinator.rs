@@ -304,6 +304,9 @@ impl CoordinatorActor {
             "createProject/Fill" => {
                 return self.handle_create_project_fill(&params).await;
             }
+            "createProject/GenerateSpec" => {
+                return self.handle_create_project_generate_spec(&params).await;
+            }
             "createProject/ExecutePlan" => {
                 return self.handle_create_project_execute_plan(&params).await;
             }
@@ -2937,6 +2940,51 @@ impl CoordinatorActor {
         .await;
         match result {
             Ok(Ok(plan)) => serde_json::to_value(plan).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
+            Err(e) => serde_json::json!({"error": e}),
+        }
+    }
+
+    /// `createProject/GenerateSpec` — SpireApp requirements pass: derive a
+    /// VALIDATED AppSpec JSON contract from the goal (self-healed against
+    /// `spec::validate`). Writes nothing to disk; the spec drives the later
+    /// fill/codegen phase.
+    async fn handle_create_project_generate_spec(
+        &self,
+        params: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({"error": e}),
+        };
+
+        let project_name = params
+            .get("projectName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let goal = params
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let result: Result<_, String> = async {
+            let (t, r) = tokio::sync::oneshot::channel();
+            let _ = registry
+                .get::<ProjectCreationMessage>("project_creation")
+                .unwrap_or_else(dummy_tx)
+                .send(ProjectCreationMessage::GenerateAppSpec {
+                    project_name,
+                    goal,
+                    reply_to: t,
+                })
+                .await;
+            r.await.map_err(|e| format!("lost: {e}"))
+        }
+        .await;
+        match result {
+            Ok(Ok(spec)) => serde_json::to_value(spec).unwrap_or(serde_json::json!({"error": "serialize"})),
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }

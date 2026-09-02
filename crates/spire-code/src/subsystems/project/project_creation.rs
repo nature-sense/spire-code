@@ -20,6 +20,7 @@ use crate::actors::{
     Actor, BuildManagerMessage, LlmMessage, McpClientMessage, ProjectAnalyzerMessage,
 };
 use crate::build::{BuildOptions, TestOptions};
+use super::spec::AppSpec;
 
 // ── Step types ──────────────────────────────────────────────────────────────
 
@@ -526,6 +527,15 @@ pub enum ProjectCreationMessage {
         spec: crate::subsystems::build::build_manager::ScaffoldSpec,
         reply_to: oneshot::Sender<Result<PlanGenerationResult>>,
     },
+    /// AppSpec requirements pass (SpireApp, LLM): derive a VALIDATED AppSpec
+    /// JSON contract for the goal — the bridge is the single source of truth
+    /// the later fill/codegen phase implements. Nothing is written to disk;
+    /// the spec is self-healed against `validate()` before it is returned.
+    GenerateAppSpec {
+        project_name: String,
+        goal: String,
+        reply_to: oneshot::Sender<Result<AppSpec>>,
+    },
     /// Plan a NEW project WITHOUT writing anything: compute the in-memory
     /// structural contract (ScaffoldSpec) from the build module, have the LLM
     /// propose implementation steps inside it, and return both `{plan, spec}`.
@@ -979,6 +989,47 @@ and NEVER repeat any line or block."
 
     pub fn set_llm(&mut self, tx: mpsc::Sender<LlmMessage>) {
         self.llm_tx = Some(tx);
+    }
+
+    /// AppSpec requirements pass (SpireApp, LLM): derive a VALIDATED AppSpec
+    /// JSON contract from the goal (self-healed against `validate()`). Nothing
+    /// is written to disk — the later fill/codegen phase consumes the spec.
+    async fn generate_app_spec(
+        &self,
+        project_name: &str,
+        goal: &str,
+    ) -> Result<AppSpec, String> {
+        let llm_tx = match &self.llm_tx {
+            Some(tx) => tx.clone(),
+            None => {
+                return Err(
+                    "LLM is not configured — set your DeepSeek API key in Settings before creating a project."
+                        .to_string(),
+                )
+            }
+        };
+        let hints = crate::build::generic_helpers::spire_framework_hints();
+        let call = |prompt: String| {
+            let tx = llm_tx.clone();
+            async move {
+                let (t, r) = tokio::sync::oneshot::channel();
+                let _ = tx
+                    .send(LlmMessage::Complete {
+                        prompt,
+                        role: spire_core::subsystems::llm::llm::LlmModelRole::Planning,
+                        reply_to: t,
+                    })
+                    .await;
+                match r.await {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err(format!("LLM actor error: {e}")),
+                    Err(e) => Err(format!("LLM response lost: {e}")),
+                }
+            }
+        };
+        super::spec_gen::generate_app_spec(project_name, goal, &hints, call)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     // ── Plan generation ───────────────────────────────────────────────────
@@ -2308,6 +2359,19 @@ impl Actor for ProjectCreationActor {
                 let _ = reply_to.send(plan.map_err(anyhow::Error::msg));
             }
 
+            ProjectCreationMessage::GenerateAppSpec {
+                project_name,
+                goal,
+                reply_to,
+            } => {
+                info!(
+                    "[ProjectCreation] GenerateAppSpec: deriving validated AppSpec for '{}' (goal: {})",
+                    project_name, goal
+                );
+                let spec = self.generate_app_spec(&project_name, &goal).await;
+                let _ = reply_to.send(spec.map_err(anyhow::Error::msg));
+            }
+
             ProjectCreationMessage::ExecutePlan {
                 root_dir,
                 steps,
@@ -2363,6 +2427,45 @@ mod tests {
 
     fn dummy_mcp() -> mpsc::Sender<McpClientMessage> {
         mpsc::channel(4).0
+    }
+
+    /// The AppSpec requirements pass drives the real LlmMessage channel: a
+    /// stub responder answers `Complete` with a valid GIS AppSpec JSON.
+    #[test]
+    fn generate_app_spec_roundtrips_a_valid_spec_over_the_llm_channel() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (llm_tx, mut llm_rx) = mpsc::channel::<LlmMessage>(4);
+        let reply = serde_json::json!({
+            "app": { "name": "spire-gis", "goal": "view and edit map layers" },
+            "types": [],
+            "actors": [{
+                "name": "MapActor", "description": "", "handlers": ["map/listLayers"],
+                "state": [], "uses": []
+            }],
+            "bridge": [{
+                "method": "map/listLayers", "description": "", "params": [],
+                "result": { "kind": "list", "of": { "kind": "str" } }
+            }],
+            "ui": [{
+                "id": "map", "title": "Map",
+                "actions": [{ "id": "load", "description": "", "bridge": "map/listLayers" }]
+            }]
+        });
+        rt.spawn(async move {
+            while let Some(msg) = llm_rx.recv().await {
+                if let LlmMessage::Complete { reply_to, .. } = msg {
+                    let _ = reply_to.send(Ok(reply.to_string()));
+                }
+            }
+        });
+        let mut actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
+        actor.set_llm(llm_tx);
+        let spec = rt
+            .block_on(actor.generate_app_spec("spire-gis", "view and edit map layers"))
+            .expect("valid spec must round-trip through the LLM message path");
+        assert_eq!(spec.app.name, "spire-gis");
+        assert_eq!(spec.bridge[0].method, "map/listLayers");
+        assert!(spec.is_valid());
     }
 
     #[test]
