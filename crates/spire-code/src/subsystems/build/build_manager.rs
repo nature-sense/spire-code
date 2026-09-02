@@ -265,6 +265,11 @@ pub enum BuildManagerMessage {
     /// Analyze a project → produce + store BuildMetadata.
     AnalyzeProject {
         path: PathBuf,
+        /// The specific config file to analyze (e.g. "Cargo.toml") when the
+        /// directory holds several build configs (e.g. a Cargo workspace root
+        /// that also carries a Makefile). `None` → the manager detects a single
+        /// config in the directory (see `find_config_file`).
+        config_file: Option<String>,
         reply_to: oneshot::Sender<Result<BuildMetadata, String>>,
     },
     /// Build a project using stored analysis.
@@ -424,12 +429,42 @@ impl BuildManagerActor {
     /// Find which registered config file applies to a path.
     /// For a file path, use its basename. For a directory, look for a known
     /// config file inside it.
+    /// Deterministic config-file priority so a directory holding several
+    /// build configs (e.g. a Cargo workspace root that also carries a
+    /// Makefile wrapper) resolves to the same primary system every time.
+    const CONFIG_PRIORITY: &[&str] = &[
+        "Cargo.toml",
+        "Package.swift",
+        "meson.build",
+        "package.json",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "CMakeLists.txt",
+        "Makefile",
+        "go.mod",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+    ];
+
     fn find_config_file(&self, path: &Path) -> Option<String> {
         if path.is_file() {
             let name = path.file_name()?.to_str()?.to_string();
             return self.router.contains_key(&name).then_some(name);
         }
-        for config in self.router.keys() {
+        // Deterministic priority first…
+        for config in Self::CONFIG_PRIORITY {
+            if self.router.contains_key(*config) && path.join(config).exists() {
+                return Some(config.to_string());
+            }
+        }
+        // …then any remaining registered config in stable sorted order.
+        let mut keys: Vec<&String> = self.router.keys().collect();
+        keys.sort();
+        for config in keys {
             if path.join(config).exists() {
                 return Some(config.clone());
             }
@@ -921,14 +956,23 @@ impl BuildManagerActor {
     }
 
     /// Analyze: route to the matching module, then store result in graph.
-    async fn analyze_project(&self, path: &Path) -> Result<BuildMetadata, String> {
-        let config = self
-            .find_config_file(path)
-            .ok_or_else(|| format!("No known build config found for {}", path.display()))?;
+    async fn analyze_project(
+        &self,
+        path: &Path,
+        config_file: Option<&str>,
+    ) -> Result<BuildMetadata, String> {
+        // Prefer the explicitly requested config file (the discovery already
+        // knows which one it found); fall back to directory detection.
+        let config = match config_file {
+            Some(cf) if self.router.contains_key(cf) => cf.to_string(),
+            _ => self
+                .find_config_file(path)
+                .ok_or_else(|| format!("No known build config found for {}", path.display()))?,
+        };
         let module_tx = self
             .router
             .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+            .ok_or_else(|| format!("No module registered for {config}"))?;
 
         let (tx, rx) = oneshot::channel();
         module_tx
@@ -1604,7 +1648,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                match self.analyze_project(Path::new(path)).await {
+                match self.analyze_project(Path::new(path), None).await {
                     Ok(md) => serde_json::to_value(md)
                         .unwrap_or(serde_json::json!({"error": "serialize"})),
                     Err(e) => serde_json::json!({ "error": e }),
@@ -2058,7 +2102,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         // the new target (the analyzer lists placeholders as
                         // implementations — real ones fill them via Stage 1).
                         let analysis_status;
-                        match self.analyze_project(std::path::Path::new(root)).await {
+                        match self.analyze_project(std::path::Path::new(root), None).await {
                             Ok(_) => analysis_status = "re-analyzed (queued impls ready)".to_string(),
                             Err(e) => analysis_status = format!("re-analyze failed: {e}"),
                         }
@@ -2256,7 +2300,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     // 8. Re-analyze so the new domain/build target + fill queue
                     // reflect the new platform.
                     let analysis_status;
-                    match self.analyze_project(root_path).await {
+                    match self.analyze_project(root_path, None).await {
                         Ok(_) => analysis_status = "re-analyzed (platform added)".to_string(),
                         Err(e) => analysis_status = format!("re-analyze failed: {e}"),
                     }
@@ -2381,7 +2425,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                 } else {
                     let analyze = async {
                         let r = self
-                            .analyze_project(std::path::Path::new(&root))
+                            .analyze_project(std::path::Path::new(&root), None)
                             .await;
                         r.map(|_| ())
                     };
@@ -2672,8 +2716,12 @@ impl Actor for BuildManagerActor {
                 self.add_module(capability, module_tx);
             }
 
-            BuildManagerMessage::AnalyzeProject { path, reply_to } => {
-                let result = self.analyze_project(&path).await;
+            BuildManagerMessage::AnalyzeProject {
+                path,
+                config_file,
+                reply_to,
+            } => {
+                let result = self.analyze_project(&path, config_file.as_deref()).await;
                 let _ = reply_to.send(result);
             }
 
@@ -2849,6 +2897,47 @@ mod tests {
         );
         // Unknown file
         assert!(manager.find_config_file(Path::new("README.md")).is_none());
+    }
+
+    #[test]
+    fn find_config_file_prefers_cargo_over_makefile_deterministically() {
+        let mut manager = BuildManagerActor::new(
+            mpsc::channel(1).0,
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        );
+        let add = |manager: &mut BuildManagerActor, name: &str, config: &str| {
+            manager.add_module(
+                ModuleCapability {
+                    name: name.to_string(),
+                    config_files: vec![config.to_string()],
+                    build_system: name.to_string(),
+                    language: "x".to_string(),
+                    source_extensions: Vec::new(),
+                    supports_clean: false,
+                    supports_lint: false,
+                    supports_format: false,
+                    supports_fix: false,
+                    mcp_servers: vec![],
+                },
+                mpsc::channel(1).0,
+            );
+        };
+        add(&mut manager, "cargo", "Cargo.toml");
+        add(&mut manager, "make", "Makefile");
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A Cargo workspace root that also carries a Makefile wrapper.
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(tmp.path().join("Makefile"), "build:\n").unwrap();
+
+        // Deterministic: the primary build config (Cargo) wins every time.
+        for _ in 0..5 {
+            assert_eq!(
+                manager.find_config_file(tmp.path()),
+                Some("Cargo.toml".to_string())
+            );
+        }
     }
 
     #[tokio::test]

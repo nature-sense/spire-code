@@ -162,6 +162,13 @@ impl ProjectAnalyzerActor {
             if bm_tx
                 .send(BuildManagerMessage::AnalyzeProject {
                     path: target.clone(),
+                    // The discovery already knows WHICH config file was found —
+                    // honor it so a directory holding several build configs
+                    // (e.g. a Cargo workspace root with a Makefile) analyzes
+                    // each one instead of re-detecting a single arbitrary file.
+                    config_file: build_file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string()),
                     reply_to: tx,
                 })
                 .await

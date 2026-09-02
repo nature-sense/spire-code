@@ -2247,6 +2247,7 @@ impl Actor for ProjectCreationActor {
                     self.build_manager_tx
                         .send(BuildManagerMessage::AnalyzeProject {
                             path: root,
+                            config_file: None,
                             reply_to: at,
                         })
                         .await

@@ -1973,6 +1973,7 @@ impl ProjectSyncActor {
             let send_result = bm_tx
                 .send(crate::subsystems::build::build_manager::BuildManagerMessage::AnalyzeProject {
                     path: target.clone(),
+                    config_file: None,
                     reply_to: reply_tx,
                 })
                 .await;
