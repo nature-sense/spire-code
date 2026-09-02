@@ -140,7 +140,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// The canonical GIS spec (also the JSON template embedded in the prompt).
-fn example_gis_spec() -> AppSpec {
+pub(crate) fn example_gis_spec() -> AppSpec {
     AppSpec {
         app: AppMeta {
             name: "spire-gis".to_string(),

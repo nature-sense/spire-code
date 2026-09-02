@@ -538,6 +538,16 @@ pub enum ProjectCreationMessage {
         goal: String,
         reply_to: oneshot::Sender<Result<AppSpec>>,
     },
+    /// AppSpec codegen (deterministic, no LLM): derive `write_source_file`
+    /// skeleton steps from a VALIDATED AppSpec — serde types + actor skeletons
+    /// + FFI dispatch (routing derived from `handlers`) on the Rust side, and
+    /// typed bridge wrappers + screen skeletons on the Swift side. Nothing is
+    /// written here; the caller executes the returned plan.
+    GenerateCode {
+        project_name: String,
+        spec: AppSpec,
+        reply_to: oneshot::Sender<Result<Vec<CreationStep>>>,
+    },
     /// Plan a NEW project WITHOUT writing anything: compute the in-memory
     /// structural contract (ScaffoldSpec) from the build module, have the LLM
     /// propose implementation steps inside it, and return both `{plan, spec}`.
@@ -2437,6 +2447,21 @@ impl Actor for ProjectCreationActor {
                 );
                 let spec = self.generate_app_spec(&project_name, &goal).await;
                 let _ = reply_to.send(spec.map_err(anyhow::Error::msg));
+            }
+
+            ProjectCreationMessage::GenerateCode {
+                project_name,
+                spec,
+                reply_to,
+            } => {
+                let steps =
+                    crate::subsystems::project::spec_codegen::codegen_steps(&spec, &project_name);
+                info!(
+                    "[ProjectCreation] GenerateCode: {} skeleton steps for '{}'",
+                    steps.len(),
+                    project_name
+                );
+                let _ = reply_to.send(Ok(steps));
             }
 
             ProjectCreationMessage::ExecutePlan {

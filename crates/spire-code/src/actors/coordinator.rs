@@ -307,6 +307,9 @@ impl CoordinatorActor {
             "createProject/GenerateSpec" => {
                 return self.handle_create_project_generate_spec(&params).await;
             }
+            "createProject/GenerateCode" => {
+                return self.handle_create_project_generate_code(&params).await;
+            }
             "createProject/ExecutePlan" => {
                 return self.handle_create_project_execute_plan(&params).await;
             }
@@ -2985,6 +2988,53 @@ impl CoordinatorActor {
         .await;
         match result {
             Ok(Ok(spec)) => serde_json::to_value(spec).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
+            Err(e) => serde_json::json!({"error": e}),
+        }
+    }
+
+    /// `createProject/GenerateCode` — deterministic skeleton steps from a
+    /// VALIDATED AppSpec (types/actors/FFI dispatch + Swift wrappers/screens,
+    /// bridge-derived routing). Returns the `write_source_file` steps; the
+    /// caller executes them via `createProject/ExecutePlan`.
+    async fn handle_create_project_generate_code(
+        &self,
+        params: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({"error": e}),
+        };
+
+        let project_name = params
+            .get("projectName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let spec: crate::subsystems::project::spec::AppSpec = match params
+            .get("spec")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            Some(s) => s,
+            None => return serde_json::json!({"error": "missing or invalid 'spec'"}),
+        };
+
+        let result: Result<_, String> = async {
+            let (t, r) = tokio::sync::oneshot::channel();
+            let _ = registry
+                .get::<ProjectCreationMessage>("project_creation")
+                .unwrap_or_else(dummy_tx)
+                .send(ProjectCreationMessage::GenerateCode {
+                    project_name,
+                    spec,
+                    reply_to: t,
+                })
+                .await;
+            r.await.map_err(|e| format!("lost: {e}"))
+        }
+        .await;
+        match result {
+            Ok(Ok(steps)) => serde_json::to_value(steps).unwrap_or(serde_json::json!({"error": "serialize"})),
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
