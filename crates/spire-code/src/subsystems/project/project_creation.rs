@@ -1020,6 +1020,13 @@ and NEVER repeat any line or block."
     /// is already returned to the caller; failures are logged, not fatal).
     /// Returns the stored node id when the upsert succeeded, so codegen can
     /// link generated artifacts to it.
+    /// Persist a validated AppSpec in the memory graph (best-effort — the spec
+    /// is already returned to the caller; failures are logged, not fatal).
+    /// Stage 4: the spec is stored in its graph-native form
+    /// ([`super::spec_persist`]) — an `appspec` anchor (name == project, with
+    /// a rendered `spec_md` review copy) plus one node per decomposed spec
+    /// node and one relationship per spec edge. The whole-JSON `spec` blob
+    /// property is gone; the graph IS the spec.
     async fn store_app_spec_in_graph(
         &self,
         project_name: &str,
@@ -1029,52 +1036,8 @@ and NEVER repeat any line or block."
         let Some(mg_tx) = &self.memory_graph_tx else {
             return None;
         };
-        let now = chrono::Utc::now();
-        let node = AttrNode {
-            id: uuid::Uuid::new_v4().to_string(),
-            node_type: "Unknown".to_string(),
-            subtype: Some("appspec".to_string()),
-            name: project_name.to_string(),
-            description: Some(goal.to_string()),
-            properties: std::collections::HashMap::from([
-                ("goal".to_string(), serde_json::json!(goal)),
-                ("spec".to_string(), serde_json::to_value(spec).unwrap_or(serde_json::Value::Null)),
-                ("version".to_string(), serde_json::json!(1)),
-            ]),
-            embedding_id: None,
-            created_at: now,
-            updated_at: now,
-            version: 1,
-        };
-        let (t, r) = tokio::sync::oneshot::channel();
-        if mg_tx
-            .send(MemoryGraphMessage::MergeAttrNode {
-                node,
-                reply_to: t,
-            })
-            .await
-            .is_err()
-        {
-            warn!("[ProjectCreation] AppSpec graph store: memory graph unavailable");
-            return None;
-        }
-        match r.await {
-            Ok(Ok(stored)) => {
-                info!(
-                    "[ProjectCreation] AppSpec stored in graph: node_type=appspec name={} id={}",
-                    project_name, stored.id
-                );
-                Some(stored.id)
-            }
-            Ok(Err(e)) => {
-                warn!("[ProjectCreation] AppSpec graph store failed: {e}");
-                None
-            }
-            Err(e) => {
-                warn!("[ProjectCreation] AppSpec graph store reply lost: {e}");
-                None
-            }
-        }
+        let g = super::spec_graph::decompose(spec);
+        super::spec_persist::store_spec_graph(mg_tx, project_name, goal, &g).await
     }
 
     /// Find the appspec node id for a project (upserted by the requirements
@@ -2728,17 +2691,33 @@ mod tests {
             .expect("valid spec must be produced");
         assert!(spec.is_valid());
 
+        // Stage 4: the DECOMPOSITION is what lands in the graph — an appspec
+        // anchor (no whole-JSON `spec` blob property) + one AttrNode per spec
+        // node, plus one Custom relationship per spec edge.
+        let g = crate::subsystems::project::spec_graph::decompose(&spec);
         let stored = stored.lock().unwrap();
-        assert_eq!(stored.len(), 1, "exactly one upsert after the full pass");
-        let node = &stored[0];
-        assert_eq!(node.node_type, "Unknown");
-        assert_eq!(node.subtype.as_deref(), Some("appspec"));
-        assert_eq!(node.name, "spire-gis");
-        let spec_back: AppSpec =
-            serde_json::from_value(node.properties.get("spec").unwrap().clone())
-                .expect("graph node must carry the round-trippable spec");
-        assert_eq!(spec_back.app.name, "spire-gis");
-        assert_eq!(spec_back, spec);
+        assert_eq!(
+            stored.len(),
+            g.nodes.len(),
+            "one upsert per decomposed node after the full pass"
+        );
+        let anchor = stored
+            .iter()
+            .find(|n| n.subtype.as_deref() == Some("appspec"))
+            .expect("appspec anchor must be stored");
+        assert_eq!(anchor.node_type, "Unknown");
+        assert_eq!(anchor.name, "spire-gis");
+        assert!(
+            !anchor.properties.contains_key("spec"),
+            "no whole-JSON spec blob property remains"
+        );
+        assert!(anchor.properties.contains_key("spec_md"));
+        for disc in ["spec_actor", "spec_method", "spec_screen"] {
+            assert!(
+                stored.iter().any(|n| n.subtype.as_deref() == Some(disc)),
+                "decomposition must contain {disc} nodes"
+            );
+        }
     }
 
     /// Codegen artifacts are recorded as `generated_file` nodes and linked to
@@ -2863,12 +2842,27 @@ mod tests {
             "every generated skeleton file must be recorded as a node"
         );
         let edges = edges.lock().unwrap();
-        assert_eq!(edges.len(), 5, "one GENERATED_FROM edge per artifact");
-        for e in edges.iter() {
-            assert_eq!(
-                e.edge_type,
-                RelationshipType::Custom("GENERATED_FROM".to_string())
-            );
+        let generated_from: Vec<&GraphEdge> = edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.edge_type,
+                    RelationshipType::Custom(p) if p == "GENERATED_FROM"
+                )
+            })
+            .collect();
+        assert_eq!(
+            generated_from.len(),
+            5,
+            "one GENERATED_FROM edge per artifact (spec edges also present)"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| matches!(&e.edge_type, RelationshipType::Custom(p) if p == "HAS_ACTOR")),
+            "the decomposition's spec edges are stored alongside codegen links"
+        );
+        for e in generated_from {
             assert_eq!(e.to_id, appspec_id, "every artifact points at the spec");
         }
     }
