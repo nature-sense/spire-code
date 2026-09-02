@@ -24,12 +24,41 @@
 //! unit tests run on canned responses (no live actor, no network).
 
 use super::spec::{
-    validate, ActorSpec, AppMeta, AppSpec, BridgeMethod, DomainType, Field, Screen, SpecIssue,
-    SpecIssueSeverity, Type, UiAction,
+    validate, ActorSpec, AppMeta, AppSpec, BridgeMethod, DomainType, Field, GraphEdgeType,
+    GraphNodeType, GraphSchema, LayoutNode, Screen, SpecIssue, SpecIssueSeverity, Type, UiAction,
+    UiBinding, UiNavigation,
 };
 
 /// Total LLM rounds (initial attempt + repairs) before giving up.
 pub const MAX_ATTEMPTS: usize = 3;
+
+/// Total critique + rewrite rounds applied AFTER a spec validates. The
+/// improvement loop is bounded and best-effort (see [`generate_app_spec`]).
+pub const MAX_IMPROVE_ROUNDS: usize = 2;
+
+/// `validate()` plus the requirements-pass guard that `app.name` matches the
+/// project name the prompt fixed.
+fn validate_with_name(spec: &AppSpec, project_name: &str) -> Vec<SpecIssue> {
+    let mut issues = validate(spec);
+    if spec.app.name.trim().to_lowercase() != project_name.trim().to_lowercase() {
+        issues.push(SpecIssue {
+            severity: SpecIssueSeverity::Error,
+            path: "app.name".to_string(),
+            message: format!(
+                "app.name must be '{project_name}' (projectName), got '{}'",
+                spec.app.name
+            ),
+        });
+    }
+    issues
+}
+
+/// Improvement candidates must not regress the core surface area (bridge
+/// methods + screens). Guards against degraded-but-valid rewrites replacing a
+/// real spec.
+fn is_substantive(candidate: &AppSpec, current: &AppSpec) -> bool {
+    candidate.bridge.len() >= current.bridge.len() && candidate.ui.len() >= current.ui.len()
+}
 
 /// Failure of the AppSpec requirements pass.
 #[derive(Debug)]
@@ -117,6 +146,28 @@ fn example_gis_spec() -> AppSpec {
             name: "spire-gis".to_string(),
             goal: "view and edit map layers".to_string(),
         },
+        graph: GraphSchema {
+            nodes: vec![GraphNodeType {
+                name: "map_layer".to_string(),
+                description: "a rendered map layer".to_string(),
+                fields: vec![
+                    Field {
+                        name: "id".to_string(),
+                        ty: Type::Str,
+                    },
+                    Field {
+                        name: "visible".to_string(),
+                        ty: Type::Bool,
+                    },
+                ],
+            }],
+            edges: vec![GraphEdgeType {
+                name: "contains".to_string(),
+                from: "map_layer".to_string(),
+                to: "map_layer".to_string(),
+                description: String::new(),
+            }],
+        },
         types: vec![DomainType::Record {
             name: "LayerInfo".to_string(),
             fields: vec![
@@ -170,22 +221,50 @@ fn example_gis_spec() -> AppSpec {
                 },
             },
         ],
-        ui: vec![Screen {
-            id: "map".to_string(),
-            title: "Map".to_string(),
-            actions: vec![
-                UiAction {
-                    id: "load".to_string(),
-                    description: String::new(),
-                    bridge: "map/listLayers".to_string(),
+        ui: vec![
+            Screen {
+                id: "map".to_string(),
+                title: "Map".to_string(),
+                layout: LayoutNode::VStack {
+                    children: vec![
+                        LayoutNode::Button {
+                            label: "Reload".to_string(),
+                            action: "load".to_string(),
+                        },
+                        LayoutNode::Button {
+                            label: "Add layer".to_string(),
+                            action: "add".to_string(),
+                        },
+                    ],
                 },
-                UiAction {
-                    id: "add".to_string(),
-                    description: String::new(),
-                    bridge: "map/addLayer".to_string(),
-                },
-            ],
-        }],
+                actions: vec![
+                    UiAction {
+                        id: "load".to_string(),
+                        description: String::new(),
+                        bridge: "map/listLayers".to_string(),
+                    },
+                    UiAction {
+                        id: "add".to_string(),
+                        description: String::new(),
+                        bridge: "map/addLayer".to_string(),
+                    },
+                ],
+                bindings: vec![UiBinding {
+                    field: "layers".to_string(),
+                    method: "map/listLayers".to_string(),
+                }],
+                navigation: vec![UiNavigation {
+                    action_id: "add".to_string(),
+                    to: "inspector".to_string(),
+                }],
+            },
+            Screen {
+                id: "inspector".to_string(),
+                title: "Inspector".to_string(),
+                actions: vec![],
+                ..Screen::default()
+            },
+        ],
     }
 }
 
@@ -194,34 +273,48 @@ fn example_gis_spec() -> AppSpec {
 fn schema_guide() -> String {
     let example = serde_json::to_string_pretty(&example_gis_spec())
         .unwrap_or_else(|_| "{\"app\":{}}".to_string());
-    format!(
-        r#"APPSPEC JSON SCHEMA (emit exactly this shape):
-- app: {{"name": "<project name, FIXED — never change it>", "goal": "<one-line goal>"}}
+    // Plain raw string (no format braces) — the GIS example is appended below.
+    let guide = r#"APPSPEC JSON SCHEMA (emit exactly this shape):
+- app: {"name": "<project name, FIXED — never change it>", "goal": "<one-line goal>"}
+- graph: the app's memory-graph schema (what its actors persist/query). Optional
+  but strongly encouraged — describe at least the core nodes:
+    nodes: [{"name":"<type discriminator>","description":"...","fields":[{"name":"...","ty":<ty>}]}]
+    edges: [{"name":"<predicate>","from":"<node type>","to":"<node type>","description":"..."}]
 - types: named data types both sides share. Each is tagged by "kind":
-    record: {{"kind":"record","name":"...","fields":[{{"name":"...","ty":<ty>}}]}}
-    enum:   {{"kind":"enum","name":"...","variants":["..."]}}
+    record: {"kind":"record","name":"...","fields":[{"name":"...","ty":<ty>}]}
+    enum:   {"kind":"enum","name":"...","variants":["..."]}
 - ty (used by every field/param/result): pick exactly one of:
-    {{"kind":"str"}} | {{"kind":"int"}} | {{"kind":"float"}} | {{"kind":"bool"}}
-    {{"kind":"list","of":<ty>}} | {{"kind":"option","of":<ty>}}
-    {{"kind":"named","name":"<a type defined in types>"}}   (no other "named" uses)
-    inline object: {{"kind":"record","fields":[{{"name":"...","ty":<ty>}}]}}
+    {"kind":"str"} | {"kind":"int"} | {"kind":"float"} | {"kind":"bool"}
+    {"kind":"list","of":<ty>} | {"kind":"option","of":<ty>}
+    {"kind":"named","name":"<a type defined in types>"}   (no other "named" uses)
+    inline object: {"kind":"record","fields":[{"name":"...","ty":<ty>}]}
 - actors: one entry per backend actor. "handlers" = the bridge methods it
   implements (routing is derived from this — no separate route list).
 - bridge: the JSON method contract. Each method: name, params, result type.
-- ui: SwiftUI screens. Every screen action binds "bridge" to exactly one
-  defined bridge method.
+- ui: SwiftUI screens WITH a layout sketch and interactions. Each screen has:
+    layout: a structural tree tagged by "kind":
+      {"kind":"vstack","children":[...]} | {"kind":"hstack","children":[...]}
+      {"kind":"list","item":<layout>} | {"kind":"text","text":"..."}
+      {"kind":"button","label":"...","action":"<action id>"}
+      {"kind":"input","placeholder":"...","bind":"<field>"} | {"kind":"spacer"}
+    actions: [{"id":"...","description":"...","bridge":"<bridge method>"}]
+    bindings: [{"field":"...","method":"<bridge method>"}]
+    navigation: [{"action_id":"<an action on this screen>","to":"<a screen id>"}]
 
 HARD RULES (the spec is machine-validated; violations are rejected):
 - Every bridge method is handled by exactly ONE actor.
-- Every UI action references an existing bridge method.
+- Every UI action/binding references an existing bridge method.
+- Layout buttons reference actions on the SAME screen; navigation targets and
+  action ids must exist.
+- Graph edge "from"/"to" must reference node types defined in graph.nodes.
 - Every "named" ty references a type defined in types.
 - There is NO json escape hatch — describe every value precisely.
-- Names are unique across types, actors, bridge methods, screens, actions.
+- Names are unique across types, actors, bridge methods, screens, actions,
+  graph node types and graph edge types.
 - Keep it small and coherent for the goal (typically 1-3 actors).
-
-REFERENCE TEMPLATE (valid GIS example):
-{example}"#
-    )
+- ui layout is a SKETCH: include the screens the goal obviously needs (e.g. a
+  main view, an editor/inspector) — do not over-decompose."#;
+    format!("{guide}\n\nREFERENCE TEMPLATE (valid GIS example):\n{example}")
 }
 
 /// Build the initial requirements prompt for the LLM.
@@ -284,6 +377,52 @@ Previous reply:
     )
 }
 
+/// Build the improvement-pass prompt: ask the model to critique and refine an
+/// already-VALID AppSpec against the goal, without breaking validation.
+pub fn build_improve_prompt(
+    project_name: &str,
+    goal: &str,
+    framework_hints: &str,
+    spec: &AppSpec,
+    warnings: &[SpecIssue],
+) -> String {
+    let current = serde_json::to_string_pretty(spec).unwrap_or_else(|_| "{}".to_string());
+    let warning_lines = if warnings.is_empty() {
+        "none".to_string()
+    } else {
+        warnings
+            .iter()
+            .map(|i| format!("- [{}] {} — {}", spec_severity_label(i), i.path, i.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"{base}
+
+IMPROVEMENT PASS — the AppSpec below is VALID (it passes every machine check).
+Critique it against the goal and return an improved, COMPLETE AppSpec JSON
+object (no markdown fencing, no commentary, no partial diffs). Improve it only
+where it is genuinely thin:
+- graph: does it sketch the real persistent state the app's actors will store
+  and query? (Spire's graph is the single source of truth.)
+- ui: does every screen sketch its layout, bindings and navigation, so the
+  screens and their interactions are concrete?
+- bridge/actors/types: are the method contract and the domain model coherent
+  and complete enough to implement the goal WITHOUT inventing APIs?
+Do NOT add features outside the goal, and NEVER break validation.
+
+Warnings from the last pass (non-blocking — resolve them if easy):
+{warnings}
+
+Current AppSpec:
+{current}
+"#,
+        base = build_app_spec_prompt(project_name, goal, framework_hints),
+        warnings = warning_lines,
+        current = current,
+    )
+}
+
 /// Parse an AppSpec from a raw LLM response. Tolerates markdown code fences
 /// and stray prose before/after the JSON object.
 pub fn parse_app_spec(raw: &str) -> Option<AppSpec> {
@@ -300,16 +439,14 @@ pub fn parse_app_spec(raw: &str) -> Option<AppSpec> {
     serde_json::from_str(span).ok()
 }
 
-/// Run the AppSpec requirements pass to completion (self-healing loop).
-///
-/// `call_llm` is invoked once per round with the full prompt and returns the
-/// model's raw reply (or an error string). Injecting it as a closure keeps the
-/// loop testable without a live LLM actor.
-pub async fn generate_app_spec<F, Fut>(
+/// Emit phase: prompt the LLM for an AppSpec and self-heal against
+/// [`validate`] (repair prompts carry the concrete violations) until it
+/// validates or [`MAX_ATTEMPTS`] rounds are exhausted.
+async fn emit_valid_spec<F, Fut>(
     project_name: &str,
     goal: &str,
     framework_hints: &str,
-    mut call_llm: F,
+    call_llm: &mut F,
 ) -> Result<AppSpec, SpecGenError>
 where
     F: FnMut(String) -> Fut,
@@ -327,19 +464,7 @@ where
         last_raw = raw.clone();
         match parse_app_spec(&raw) {
             Some(spec) => {
-                // Spec-level guard beyond validate(): the requirements pass
-                // promised app.name == project_name; enforce it here.
-                let mut issues = validate(&spec);
-                if spec.app.name.trim().to_lowercase() != project_name.trim().to_lowercase() {
-                    issues.push(SpecIssue {
-                        severity: SpecIssueSeverity::Error,
-                        path: "app.name".to_string(),
-                        message: format!(
-                            "app.name must be '{project_name}' (projectName), got '{}'",
-                            spec.app.name
-                        ),
-                    });
-                }
+                let issues = validate_with_name(&spec, project_name);
                 let errors: Vec<SpecIssue> = issues
                     .iter()
                     .filter(|i| i.severity == SpecIssueSeverity::Error)
@@ -370,6 +495,69 @@ where
             last_raw,
         }),
     }
+}
+
+/// Run the AppSpec requirements pass to completion:
+///
+/// 1. **Emit + self-heal** ([`emit_valid_spec`]) — a VALID spec is required;
+///    errors keep the pass from returning at all.
+/// 2. **Improvement loop** — up to [`MAX_IMPROVE_ROUNDS`] critique + rewrite
+///    rounds against the goal (graph schema + UI interactions + domain model
+///    completeness). Best-effort: an unreachable LLM, unparseable reply,
+///    invalid rewrite, or a rewrite that shrinks the core surface area keeps
+///    the current (already valid) spec instead of failing the whole pass.
+///
+/// `call_llm` is invoked once per round with the full prompt and returns the
+/// model's raw reply (or an error string). Injecting it as a closure keeps the
+/// loop testable without a live LLM actor.
+pub async fn generate_app_spec<F, Fut>(
+    project_name: &str,
+    goal: &str,
+    framework_hints: &str,
+    mut call_llm: F,
+) -> Result<AppSpec, SpecGenError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    // Phase 1 — emit + self-heal to a valid spec.
+    let mut spec = emit_valid_spec(project_name, goal, framework_hints, &mut call_llm).await?;
+
+    // Phase 2 — bounded improvement over the valid spec (never destructive).
+    for round in 1..=MAX_IMPROVE_ROUNDS {
+        let warnings: Vec<SpecIssue> = validate_with_name(&spec, project_name)
+            .into_iter()
+            .filter(|i| i.severity == SpecIssueSeverity::Warning)
+            .collect();
+        let prompt = build_improve_prompt(project_name, goal, framework_hints, &spec, &warnings);
+        // Best-effort: any LLM failure here keeps the current valid spec.
+        let Ok(raw) = call_llm(prompt).await else {
+            break;
+        };
+        let Some(candidate) = parse_app_spec(&raw) else {
+            break;
+        };
+        let candidate_has_errors = validate_with_name(&candidate, project_name)
+            .iter()
+            .any(|i| i.severity == SpecIssueSeverity::Error);
+        // Regression (invalid or shrunk surface) → keep the current spec.
+        if candidate_has_errors || !is_substantive(&candidate, &spec) {
+            break;
+        }
+        // No change → nothing more to gain.
+        let json_cur = serde_json::to_string(&spec).unwrap_or_default();
+        let json_new = serde_json::to_string(&candidate).unwrap_or_default();
+        if json_new == json_cur {
+            break;
+        }
+        tracing::info!(
+            "[SpecGen] improvement round {round}/{} applied (valid rewrite)",
+            MAX_IMPROVE_ROUNDS
+        );
+        spec = candidate;
+    }
+
+    Ok(spec)
 }
 
 #[cfg(test)]
@@ -469,18 +657,25 @@ mod tests {
             HINTS,
             move |prompt: String| {
                 prompts2.lock().unwrap().push(prompt.clone());
-                let reply = replies.remove(0);
+                // Improvement rounds repeat the (now valid) GIS spec.
+                let reply = if replies.is_empty() {
+                    gis_json()
+                } else {
+                    replies.remove(0)
+                };
                 Box::pin(async move { Ok(reply) })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>>>>
             },
         ));
         let spec = result.expect("repair round must fix the dangling action");
         assert_eq!(spec.ui[0].actions.len(), 2);
-        // The repair prompt must have surfaced the exact violation.
+        // The REPAIR prompt (index 1 — initial + repair before improvement)
+        // must have surfaced the exact violation.
         let prompts = prompts.lock().unwrap();
-        let repair = prompts.last().expect("second prompt");
+        let repair = prompts.get(1).expect("second prompt is the repair round");
         assert!(repair.contains("undefined bridge method"));
         assert!(repair.contains("map/doesNotExist"));
+        assert!(prompts.last().unwrap().contains("IMPROVEMENT PASS"));
     }
 
     #[test]
@@ -591,5 +786,101 @@ mod tests {
         assert!(repair.contains("handled by no actor"));
         assert!(repair.contains("APPSPEC JSON SCHEMA"));
         assert!(repair.contains("COMPLETE corrected AppSpec JSON"));
+    }
+    #[test]
+    fn improvement_loop_applies_a_valid_rewrite_and_is_bounded() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // v2 adds a screen binding; v3 adds a graph node. Each round consumes
+        // one reply: emit(gis) → improve(v2, applied) → improve(v3, applied)
+        // → stop (budget exhausted after MAX_IMPROVE_ROUNDS).
+        let mut v2 = example_gis_spec();
+        v2.ui[0].bindings.push(UiBinding {
+            field: "active".to_string(),
+            method: "map/listLayers".to_string(),
+        });
+        let mut v3 = v2.clone();
+        v3.graph.nodes.push(GraphNodeType {
+            name: "viewport".to_string(),
+            description: String::new(),
+            fields: vec![Field {
+                name: "west".to_string(),
+                ty: Type::Int,
+            }],
+        });
+        assert!(v3.is_valid());
+
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts2 = prompts.clone();
+        let mut replies = vec![
+            gis_json(),
+            serde_json::to_string(&v2).unwrap(),
+            serde_json::to_string(&v3).unwrap(),
+        ];
+        let result = rt.block_on(generate_app_spec(
+            "spire-gis",
+            GOAL,
+            HINTS,
+            move |prompt: String| {
+                prompts2.lock().unwrap().push(prompt.clone());
+                let reply = if replies.is_empty() {
+                    gis_json()
+                } else {
+                    replies.remove(0)
+                };
+                Box::pin(async move { Ok(reply) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>>>>
+            },
+        ));
+        let spec = result.expect("requirements pass must succeed");
+        // Emit round + MAX_IMPROVE_ROUNDS improvement rounds.
+        assert_eq!(prompts.lock().unwrap().len(), 1 + MAX_IMPROVE_ROUNDS);
+        // v3 was applied: graph gained the viewport node.
+        assert_eq!(spec.graph.nodes.len(), 2);
+        assert!(spec.graph.nodes.iter().any(|n| n.name == "viewport"));
+        assert!(spec.is_valid());
+        // The improvement prompt embedded the current spec JSON.
+        let prompts = prompts.lock().unwrap();
+        let improve = prompts[1].clone();
+        assert!(improve.contains("IMPROVEMENT PASS"));
+        assert!(improve.contains("\"viewport\"") == false); // round 1 saw v1 (no viewport yet)
+    }
+
+    #[test]
+    fn improvement_loop_rejects_a_shrinking_rewrite() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // The "improved" reply is valid but strips all bridge methods — it
+        // must NOT replace the substantive GIS spec.
+        let empty = serde_json::json!({
+            "app": { "name": "spire-gis", "goal": GOAL },
+            "types": [], "actors": [], "bridge": [], "ui": []
+        });
+        let result = rt.block_on(generate_app_spec(
+            "spire-gis",
+            GOAL,
+            HINTS,
+            canned(vec![gis_json(), empty.to_string()]),
+        ));
+        let spec = result.expect("requirements pass must succeed");
+        assert_eq!(spec.bridge.len(), 2, "shrinking rewrite must be rejected");
+        assert_eq!(spec, example_gis_spec());
+    }
+
+    #[test]
+    fn improvement_loop_keeps_valid_spec_when_rewrite_regresses_to_invalid() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut invalid = example_gis_spec();
+        invalid.ui[0].actions.push(UiAction {
+            id: "boom".to_string(),
+            description: String::new(),
+            bridge: "map/doesNotExist".to_string(),
+        });
+        let result = rt.block_on(generate_app_spec(
+            "spire-gis",
+            GOAL,
+            HINTS,
+            canned(vec![gis_json(), serde_json::to_string(&invalid).unwrap()]),
+        ));
+        let spec = result.expect("requirements pass must succeed");
+        assert_eq!(spec, example_gis_spec(), "invalid rewrite must be rejected");
     }
 }

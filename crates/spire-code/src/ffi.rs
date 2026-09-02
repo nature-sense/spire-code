@@ -438,6 +438,10 @@ fn init_actor_system() {
         if !llm_config.api_key.is_empty() {
             project_creation.set_llm(llm_tx.clone());
         }
+        // The memory graph is the system's single source of truth — always
+        // available, so the AppSpec requirements pass can persist validated
+        // specs as graph nodes (linked to their implementation later).
+        project_creation.set_memory_graph(memory_graph_tx.clone());
         let (project_creation_tx, _pc_handle) = system.spawn(project_creation);
         let _ = registry
             .register::<ProjectCreationMessage>("project_creation", project_creation_tx.clone());

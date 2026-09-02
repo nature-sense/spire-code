@@ -21,6 +21,8 @@ use crate::actors::{
 };
 use crate::build::{BuildOptions, TestOptions};
 use super::spec::AppSpec;
+use spire_core::models::memory_graph::AttrNode;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 
 // ── Step types ──────────────────────────────────────────────────────────────
 
@@ -576,6 +578,10 @@ pub struct ProjectCreationActor {
     mcp_client_tx: mpsc::Sender<McpClientMessage>,
     project_analyzer_tx: Option<mpsc::Sender<ProjectAnalyzerMessage>>,
     llm_tx: Option<mpsc::Sender<LlmMessage>>,
+    /// Memory-graph sender (the graph is the system's single source of truth).
+    /// When wired, the AppSpec requirements pass persists the validated spec
+    /// as an `appspec` node so it can be linked to its implementation later.
+    memory_graph_tx: Option<mpsc::Sender<MemoryGraphMessage>>,
     /// The active fill-phase structural contract (set by FillProject). The
     /// execution guard consults it to deny LLM writes to structural files.
     active_spec: Option<crate::subsystems::build::build_manager::ScaffoldSpec>,
@@ -593,6 +599,7 @@ impl ProjectCreationActor {
             mcp_client_tx,
             project_analyzer_tx: None,
             llm_tx: None,
+            memory_graph_tx: None,
             active_spec: None,
         }
     }
@@ -991,6 +998,62 @@ and NEVER repeat any line or block."
         self.llm_tx = Some(tx);
     }
 
+    /// Wire the memory graph so the AppSpec requirements pass can persist the
+    /// validated spec as a graph node (upsert keeps one stable node per app).
+    pub fn set_memory_graph(&mut self, tx: mpsc::Sender<MemoryGraphMessage>) {
+        self.memory_graph_tx = Some(tx);
+    }
+
+    /// Persist a validated AppSpec in the memory graph (best-effort — the
+    /// spec is already returned to the caller; failures are logged, not fatal).
+    async fn store_app_spec_in_graph(
+        &self,
+        project_name: &str,
+        goal: &str,
+        spec: &AppSpec,
+    ) {
+        let Some(mg_tx) = &self.memory_graph_tx else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let node = AttrNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            node_type: "Unknown".to_string(),
+            subtype: Some("appspec".to_string()),
+            name: project_name.to_string(),
+            description: Some(goal.to_string()),
+            properties: std::collections::HashMap::from([
+                ("goal".to_string(), serde_json::json!(goal)),
+                ("spec".to_string(), serde_json::to_value(spec).unwrap_or(serde_json::Value::Null)),
+                ("version".to_string(), serde_json::json!(1)),
+            ]),
+            embedding_id: None,
+            created_at: now,
+            updated_at: now,
+            version: 1,
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        if mg_tx
+            .send(MemoryGraphMessage::MergeAttrNode {
+                node,
+                reply_to: t,
+            })
+            .await
+            .is_err()
+        {
+            warn!("[ProjectCreation] AppSpec graph store: memory graph unavailable");
+            return;
+        }
+        match r.await {
+            Ok(Ok(stored)) => info!(
+                "[ProjectCreation] AppSpec stored in graph: node_type=appspec name={} id={}",
+                project_name, stored.id
+            ),
+            Ok(Err(e)) => warn!("[ProjectCreation] AppSpec graph store failed: {e}"),
+            Err(e) => warn!("[ProjectCreation] AppSpec graph store reply lost: {e}"),
+        }
+    }
+
     /// AppSpec requirements pass (SpireApp, LLM): derive a VALIDATED AppSpec
     /// JSON contract from the goal (self-healed against `validate()`). Nothing
     /// is written to disk — the later fill/codegen phase consumes the spec.
@@ -1027,9 +1090,13 @@ and NEVER repeat any line or block."
                 }
             }
         };
-        super::spec_gen::generate_app_spec(project_name, goal, &hints, call)
+        let spec = super::spec_gen::generate_app_spec(project_name, goal, &hints, call)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // The graph is Spire's single source of truth: persist the validated
+        // spec (upsert by name) so later codegen can link artifacts to it.
+        self.store_app_spec_in_graph(project_name, goal, &spec).await;
+        Ok(spec)
     }
 
     // ── Plan generation ───────────────────────────────────────────────────
@@ -2466,6 +2533,70 @@ mod tests {
         assert_eq!(spec.app.name, "spire-gis");
         assert_eq!(spec.bridge[0].method, "map/listLayers");
         assert!(spec.is_valid());
+    }
+
+    /// The validated AppSpec is persisted to the memory graph as a
+    /// `MergeAttrNode` upsert (node_type=Unknown, subtype=appspec) — the graph
+    /// is Spire's single source of truth and later codegen links to this node.
+    #[test]
+    fn generate_app_spec_persists_the_spec_into_the_graph() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (llm_tx, mut llm_rx) = mpsc::channel::<LlmMessage>(4);
+        let (mg_tx, mut mg_rx) =
+            mpsc::channel::<spire_core::subsystems::graph::memory_graph::MemoryGraphMessage>(4);
+        let reply = serde_json::json!({
+            "app": { "name": "spire-gis", "goal": "view and edit map layers" },
+            "types": [],
+            "actors": [{
+                "name": "MapActor", "description": "", "handlers": ["map/listLayers"],
+                "state": [], "uses": []
+            }],
+            "bridge": [{
+                "method": "map/listLayers", "description": "", "params": [],
+                "result": { "kind": "list", "of": { "kind": "str" } }
+            }],
+            "ui": [{
+                "id": "map", "title": "Map",
+                "actions": [{ "id": "load", "description": "", "bridge": "map/listLayers" }]
+            }]
+        });
+        let stored: std::sync::Arc<std::sync::Mutex<Vec<AttrNode>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stored2 = stored.clone();
+        rt.spawn(async move {
+            while let Some(msg) = llm_rx.recv().await {
+                if let LlmMessage::Complete { reply_to, .. } = msg {
+                    let _ = reply_to.send(Ok(reply.to_string()));
+                }
+            }
+        });
+        rt.spawn(async move {
+            while let Some(msg) = mg_rx.recv().await {
+                if let MemoryGraphMessage::MergeAttrNode { node, reply_to } = msg {
+                    stored2.lock().unwrap().push(node.clone());
+                    let _ = reply_to.send(Ok(node));
+                }
+            }
+        });
+        let mut actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
+        actor.set_llm(llm_tx);
+        actor.set_memory_graph(mg_tx);
+        let spec = rt
+            .block_on(actor.generate_app_spec("spire-gis", "view and edit map layers"))
+            .expect("valid spec must be produced");
+        assert!(spec.is_valid());
+
+        let stored = stored.lock().unwrap();
+        assert_eq!(stored.len(), 1, "exactly one upsert after the full pass");
+        let node = &stored[0];
+        assert_eq!(node.node_type, "Unknown");
+        assert_eq!(node.subtype.as_deref(), Some("appspec"));
+        assert_eq!(node.name, "spire-gis");
+        let spec_back: AppSpec =
+            serde_json::from_value(node.properties.get("spec").unwrap().clone())
+                .expect("graph node must carry the round-trippable spec");
+        assert_eq!(spec_back.app.name, "spire-gis");
+        assert_eq!(spec_back, spec);
     }
 
     #[test]

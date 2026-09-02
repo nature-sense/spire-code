@@ -29,6 +29,9 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct AppSpec {
     pub app: AppMeta,
+    /// Sketch of the app's memory-graph schema (what its actors persist/query).
+    #[serde(default)]
+    pub graph: GraphSchema,
     /// Shared vocabulary — named types the bridge, actors and UI reference.
     #[serde(default)]
     pub types: Vec<DomainType>,
@@ -38,7 +41,7 @@ pub struct AppSpec {
     /// The JSON bridge contract (method + params + result).
     #[serde(default)]
     pub bridge: Vec<BridgeMethod>,
-    /// SwiftUI screens and their actions.
+    /// SwiftUI screens (layout sketch) and their actions/interactions.
     #[serde(default)]
     pub ui: Vec<Screen>,
 }
@@ -108,6 +111,136 @@ pub enum Type {
     },
 }
 
+/// Sketch of the app's memory-graph schema — the node/edge types the backend
+/// actors read from and write to at runtime. Since the graph is Spire's single
+/// source of truth, any code-generation spec should describe what it persists.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct GraphSchema {
+    /// Node types the app's actors persist/query.
+    #[serde(default)]
+    pub nodes: Vec<GraphNodeType>,
+    /// Edge types linking node types.
+    #[serde(default)]
+    pub edges: Vec<GraphEdgeType>,
+}
+
+/// A typed node the app's actors store in the memory graph.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct GraphNodeType {
+    /// Graph node-type discriminator, e.g. `"map_layer"`.
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Typed fields (against `types` + primitives).
+    #[serde(default)]
+    pub fields: Vec<Field>,
+}
+
+/// A typed relationship between two [`GraphNodeType`]s.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct GraphEdgeType {
+    /// Edge predicate, e.g. `"contains"`.
+    pub name: String,
+    /// Source node type (must exist in `graph.nodes`).
+    pub from: String,
+    /// Target node type (must exist in `graph.nodes`).
+    pub to: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A SwiftUI screen: a structural layout sketch plus the actions, data
+/// bindings and navigation that make up its interactions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Screen {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    /// Structural sketch of the screen's content (VStack/HStack/List/…).
+    #[serde(default)]
+    pub layout: LayoutNode,
+    /// User actions, each invoking one bridge method.
+    #[serde(default)]
+    pub actions: Vec<UiAction>,
+    /// Screen-level data bindings: which bridge result fills which field.
+    #[serde(default)]
+    pub bindings: Vec<UiBinding>,
+    /// Interaction edges: which action navigates to which screen.
+    #[serde(default)]
+    pub navigation: Vec<UiNavigation>,
+}
+
+/// A structural sketch of a screen's content — a small recursive tree, not a
+/// pixel layout. Tagged by `kind`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LayoutNode {
+    /// No defined content yet (empty placeholder).
+    #[default]
+    Empty,
+    /// Children stacked vertically.
+    VStack { children: Vec<LayoutNode> },
+    /// Children stacked horizontally.
+    HStack { children: Vec<LayoutNode> },
+    /// A scrollable list whose rows are the inner element.
+    List { item: Box<LayoutNode> },
+    /// A static text label.
+    Text { text: String },
+    /// A button; `action` must reference one of the screen's actions.
+    Button { label: String, action: String },
+    /// A free-text input; `bind` names the field it fills.
+    Input { placeholder: String, bind: String },
+    /// Vertical whitespace.
+    Spacer,
+}
+
+impl LayoutNode {
+    /// All action ids referenced by buttons anywhere in the tree.
+    pub fn button_actions<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            LayoutNode::Button { action, .. } => out.push(action.as_str()),
+            LayoutNode::VStack { children } | LayoutNode::HStack { children } => {
+                for c in children {
+                    c.button_actions(out);
+                }
+            }
+            LayoutNode::List { item } => item.button_actions(out),
+            LayoutNode::Empty
+            | LayoutNode::Text { .. }
+            | LayoutNode::Input { .. }
+            | LayoutNode::Spacer => {}
+        }
+    }
+}
+
+/// A single user action that invokes a bridge method.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct UiAction {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    /// Bridge method this action calls (must exist in `bridge`).
+    pub bridge: String,
+}
+
+/// A screen-level data binding: the screen shows the result of a bridge method.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct UiBinding {
+    /// The UI field the data lands in (free-form, matches the layout sketch).
+    pub field: String,
+    /// Bridge method supplying the data (must exist in `bridge`).
+    pub method: String,
+}
+
+/// A navigation edge between screens.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct UiNavigation {
+    /// The action that triggers the transition (must exist on this screen).
+    pub action_id: String,
+    /// Destination screen id (must exist in `AppSpec::ui`).
+    pub to: String,
+}
+
 /// A backend actor (the Rust side). All functionality lives in actors.
 ///
 /// Routing is **derived**: each entry of `handlers` is a bridge method name
@@ -140,26 +273,6 @@ pub struct BridgeMethod {
     #[serde(default)]
     pub params: Vec<Field>,
     pub result: Type,
-}
-
-/// A SwiftUI screen and the user actions it exposes.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct Screen {
-    pub id: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub actions: Vec<UiAction>,
-}
-
-/// A single user action that invokes a bridge method.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct UiAction {
-    pub id: String,
-    #[serde(default)]
-    pub description: String,
-    /// Bridge method this action calls (must exist in `bridge`).
-    pub bridge: String,
 }
 
 /// A single validation finding.
@@ -213,7 +326,11 @@ impl AppSpec {
 /// - `app.name` is non-empty.
 /// - No duplicate domain-type, actor, bridge-method, screen or action names.
 /// - Every bridge method is handled by **exactly one** actor (`handlers`).
-/// - Every `UiAction.bridge` resolves to a defined bridge method.
+/// - Every `UiAction.bridge` resolves to a defined bridge method; bindings
+///   resolve too; layout buttons reference real actions; navigation edges
+///   reference real actions and existing destination screens.
+/// - The graph schema is well-formed: unique node/edge type names, every edge
+///   endpoint resolves to a defined node type, and node fields type-check.
 /// - Every `Type::Named` resolves to a defined domain type; `list`/`option`/
 ///   record payloads are well-formed and fields are unique per record.
 /// - Warnings (non-blocking): actor with no handlers, bridge method no UI
@@ -269,6 +386,65 @@ pub fn validate(spec: &AppSpec) -> Vec<SpecIssue> {
         }
     }
 
+    // ── graph schema is well-formed ───────────────────────────────────────
+    let graph_node_names: HashSet<&str> =
+        spec.graph.nodes.iter().map(|n| n.name.as_str()).collect();
+    let mut seen_graph_node: HashSet<&str> = HashSet::new();
+    for n in &spec.graph.nodes {
+        if n.name.trim().is_empty() {
+            issues.push(error("graph.nodes[]", "graph node type name is required"));
+        } else if !seen_graph_node.insert(n.name.as_str()) {
+            issues.push(error(
+                format!("graph.nodes[{}]", n.name),
+                "duplicate graph node type name",
+            ));
+        }
+        let mut seen_field: HashSet<&str> = HashSet::new();
+        for f in &n.fields {
+            if !seen_field.insert(f.name.as_str()) {
+                issues.push(error(
+                    format!("graph.nodes[{}]", n.name),
+                    format!("duplicate field '{}'", f.name),
+                ));
+            }
+            check_type(
+                &format!("graph.nodes[{}].{}", n.name, f.name),
+                &f.ty,
+                &type_names,
+                &mut issues,
+            );
+        }
+    }
+    let mut seen_graph_edge: HashSet<&str> = HashSet::new();
+    for e in &spec.graph.edges {
+        if e.name.trim().is_empty() {
+            issues.push(error("graph.edges[]", "graph edge type name is required"));
+        } else if !seen_graph_edge.insert(e.name.as_str()) {
+            issues.push(error(
+                format!("graph.edges[{}]", e.name),
+                "duplicate graph edge type name",
+            ));
+        }
+        if !graph_node_names.contains(e.from.as_str()) {
+            issues.push(error(
+                format!("graph.edges[{}]", e.name),
+                format!(
+                    "graph edge 'from' references undefined graph node type '{}'",
+                    e.from
+                ),
+            ));
+        }
+        if !graph_node_names.contains(e.to.as_str()) {
+            issues.push(error(
+                format!("graph.edges[{}]", e.name),
+                format!(
+                    "graph edge 'to' references undefined graph node type '{}'",
+                    e.to
+                ),
+            ));
+        }
+    }
+
     // ── bridge is total: every method has exactly one actor handler ───────
     let method_set: HashSet<&str> = spec.bridge.iter().map(|m| m.method.as_str()).collect();
     let mut handler_counts: HashMap<&str, usize> = HashMap::new();
@@ -304,9 +480,11 @@ pub fn validate(spec: &AppSpec) -> Vec<SpecIssue> {
         }
     }
 
-    // ── UI actions reference real bridge methods ──────────────────────────
+    // ── UI actions/interactions reference real bridge methods + screens ────
+    let screen_ids: HashSet<&str> = spec.ui.iter().map(|s| s.id.as_str()).collect();
     let mut action_methods: HashSet<&str> = HashSet::new();
     for s in &spec.ui {
+        let action_ids: HashSet<&str> = s.actions.iter().map(|a| a.id.as_str()).collect();
         let mut seen_action: HashSet<&str> = HashSet::new();
         for act in &s.actions {
             if !seen_action.insert(act.id.as_str()) {
@@ -322,6 +500,42 @@ pub fn validate(spec: &AppSpec) -> Vec<SpecIssue> {
                 ));
             }
             action_methods.insert(act.bridge.as_str());
+        }
+        // Layout buttons must map to actions defined on this screen.
+        let mut refs: Vec<&str> = Vec::new();
+        s.layout.button_actions(&mut refs);
+        for a in refs {
+            if !action_ids.contains(a) {
+                issues.push(error(
+                    format!("ui[{}].layout", s.id),
+                    format!("layout button references undefined action '{a}'"),
+                ));
+            }
+        }
+        // Screen data bindings must reference bridge methods.
+        for b in &s.bindings {
+            if !method_set.contains(b.method.as_str()) {
+                issues.push(error(
+                    format!("ui[{}].bindings[{}]", s.id, b.field),
+                    format!("binding references undefined bridge method '{}'", b.method),
+                ));
+            }
+        }
+        // Navigation edges: the trigger action exists, and the destination
+        // screen is defined somewhere in `ui`.
+        for n in &s.navigation {
+            if !action_ids.contains(n.action_id.as_str()) {
+                issues.push(error(
+                    format!("ui[{}].navigation", s.id),
+                    format!("navigation references undefined action '{}'", n.action_id),
+                ));
+            }
+            if !screen_ids.contains(n.to.as_str()) {
+                issues.push(error(
+                    format!("ui[{}].navigation", s.id),
+                    format!("navigation references undefined screen '{}'", n.to),
+                ));
+            }
         }
     }
 
@@ -502,12 +716,26 @@ mod tests {
         }
     }
 
-    /// The canonical GIS spec from the design doc — fully valid.
+    /// The canonical GIS spec from the design doc — fully valid (now also
+    /// exercising the graph-schema sketch + UI layout/interactions).
     fn gis_spec() -> AppSpec {
         AppSpec {
             app: AppMeta {
                 name: "spire-gis".to_string(),
                 goal: "view and edit map layers".to_string(),
+            },
+            graph: GraphSchema {
+                nodes: vec![GraphNodeType {
+                    name: "map_layer".to_string(),
+                    description: "a rendered map layer".to_string(),
+                    fields: vec![field("id", str_type()), field("visible", bool_type())],
+                }],
+                edges: vec![GraphEdgeType {
+                    name: "contains".to_string(),
+                    from: "map_layer".to_string(),
+                    to: "map_layer".to_string(),
+                    description: String::new(),
+                }],
             },
             types: vec![DomainType::Record {
                 name: "LayerInfo".to_string(),
@@ -543,22 +771,54 @@ mod tests {
                     },
                 },
             ],
-            ui: vec![Screen {
-                id: "map".to_string(),
-                title: "Map".to_string(),
-                actions: vec![
-                    UiAction {
-                        id: "load".to_string(),
-                        description: String::new(),
-                        bridge: "map/listLayers".to_string(),
+            ui: vec![
+                Screen {
+                    id: "map".to_string(),
+                    title: "Map".to_string(),
+                    layout: LayoutNode::VStack {
+                        children: vec![
+                            LayoutNode::Button {
+                                label: "Reload".to_string(),
+                                action: "load".to_string(),
+                            },
+                            LayoutNode::Input {
+                                placeholder: "layer id".to_string(),
+                                bind: "layerId".to_string(),
+                            },
+                            LayoutNode::Button {
+                                label: "Add layer".to_string(),
+                                action: "add".to_string(),
+                            },
+                        ],
                     },
-                    UiAction {
-                        id: "add".to_string(),
-                        description: String::new(),
-                        bridge: "map/addLayer".to_string(),
-                    },
-                ],
-            }],
+                    actions: vec![
+                        UiAction {
+                            id: "load".to_string(),
+                            description: String::new(),
+                            bridge: "map/listLayers".to_string(),
+                        },
+                        UiAction {
+                            id: "add".to_string(),
+                            description: String::new(),
+                            bridge: "map/addLayer".to_string(),
+                        },
+                    ],
+                    bindings: vec![UiBinding {
+                        field: "layers".to_string(),
+                        method: "map/listLayers".to_string(),
+                    }],
+                    navigation: vec![UiNavigation {
+                        action_id: "add".to_string(),
+                        to: "inspector".to_string(),
+                    }],
+                },
+                Screen {
+                    id: "inspector".to_string(),
+                    title: "Inspector".to_string(),
+                    actions: vec![],
+                    ..Screen::default()
+                },
+            ],
         }
     }
 
@@ -700,6 +960,122 @@ mod tests {
             errors(&issues)
                 .iter()
                 .any(|i| i.message.contains("unresolved type reference 'LayerInfo'")),
+            "issues: {issues:?}"
+        );
+    }
+
+    // ── Stage A: graph schema + UI interaction invariants ────────────────
+
+    #[test]
+    fn graph_edge_endpoint_must_reference_a_defined_node_type() {
+        let mut spec = gis_spec();
+        spec.graph.edges[0].to = "ghost_node".to_string();
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues).iter().any(|i| i
+                .message
+                .contains("references undefined graph node type 'ghost_node'")),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_graph_node_type_is_an_error() {
+        let mut spec = gis_spec();
+        spec.graph.nodes.push(spec.graph.nodes[0].clone());
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues)
+                .iter()
+                .any(|i| i.message.contains("duplicate graph node type name")),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_graph_edge_type_is_an_error() {
+        let mut spec = gis_spec();
+        spec.graph.edges.push(spec.graph.edges[0].clone());
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues)
+                .iter()
+                .any(|i| i.message.contains("duplicate graph edge type name")),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn graph_node_fields_type_check_against_domain_types() {
+        let mut spec = gis_spec();
+        spec.graph.nodes[0]
+            .fields
+            .push(field("bad", named("NoSuchType")));
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues)
+                .iter()
+                .any(|i| i.message.contains("unresolved type reference 'NoSuchType'")),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn navigation_to_unknown_screen_is_an_error() {
+        let mut spec = gis_spec();
+        spec.ui[0].navigation[0].to = "ghost_screen".to_string();
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues).iter().any(|i| i
+                .message
+                .contains("navigation references undefined screen 'ghost_screen'")),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn navigation_action_must_exist_on_the_screen() {
+        let mut spec = gis_spec();
+        spec.ui[0].navigation[0].action_id = "noSuchAction".to_string();
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues).iter().any(|i| i
+                .message
+                .contains("navigation references undefined action 'noSuchAction'")),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn layout_button_must_reference_a_screen_action() {
+        let mut spec = gis_spec();
+        spec.ui[0].layout = LayoutNode::VStack {
+            children: vec![LayoutNode::Button {
+                label: "Boom".to_string(),
+                action: "noSuchAction".to_string(),
+            }],
+        };
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues).iter().any(|i| i
+                .message
+                .contains("layout button references undefined action 'noSuchAction'")),
+            "issues: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn screen_binding_must_reference_a_bridge_method() {
+        let mut spec = gis_spec();
+        spec.ui[0].bindings.push(UiBinding {
+            field: "layers".to_string(),
+            method: "map/doesNotExist".to_string(),
+        });
+        let issues = validate(&spec);
+        assert!(
+            errors(&issues).iter().any(|i| i
+                .message
+                .contains("binding references undefined bridge method 'map/doesNotExist'")),
             "issues: {issues:?}"
         );
     }
