@@ -179,8 +179,10 @@ pub enum LayoutNode {
     #[default]
     Empty,
     /// Children stacked vertically.
+    #[serde(rename = "vstack")]
     VStack { children: Vec<LayoutNode> },
     /// Children stacked horizontally.
+    #[serde(rename = "hstack")]
     HStack { children: Vec<LayoutNode> },
     /// A scrollable list whose rows are the inner element.
     List { item: Box<LayoutNode> },
@@ -1078,5 +1080,15 @@ mod tests {
                 .contains("binding references undefined bridge method 'map/doesNotExist'")),
             "issues: {issues:?}"
         );
+    }
+
+    /// The JSON `kind` tags for stacks must match what the requirements-pass
+    /// prompt documents (`vstack`/`hstack`) — the model reads that guide.
+    #[test]
+    fn layout_stack_tags_match_the_prompt_guide() {
+        let v = serde_json::to_value(LayoutNode::VStack { children: vec![] }).unwrap();
+        assert_eq!(v["kind"], "vstack");
+        let h = serde_json::to_value(LayoutNode::HStack { children: vec![] }).unwrap();
+        assert_eq!(h["kind"], "hstack");
     }
 }

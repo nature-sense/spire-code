@@ -490,10 +490,19 @@ where
             spec,
             issues: last_issues,
         }),
-        None => Err(SpecGenError::Unparseable {
-            attempts: MAX_ATTEMPTS,
-            last_raw,
-        }),
+        None => {
+            // DIAGNOSTIC: keep the exact rejected body so non-deterministic
+            // model output can be inspected and covered by a fixture.
+            let _ = std::fs::create_dir_all(std::env::temp_dir().join("spire-specgen"));
+            let _ = std::fs::write(
+                std::env::temp_dir().join("spire-specgen/rejected.json"),
+                &last_raw,
+            );
+            Err(SpecGenError::Unparseable {
+                attempts: MAX_ATTEMPTS,
+                last_raw,
+            })
+        }
     }
 }
 
@@ -882,5 +891,42 @@ mod tests {
         ));
         let spec = result.expect("requirements pass must succeed");
         assert_eq!(spec, example_gis_spec(), "invalid rewrite must be rejected");
+    }
+
+    /// Diagnostic (env-gated, ignored by default): parse a rejected LLM body
+    /// dumped to disk and print the exact serde error.
+    ///
+    ///   REJECTED_PATH=/path/to/rejected.json cargo test --lib \
+    ///       spec_gen::tests::diagnose_rejected_body -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diagnose_rejected_body() {
+        let path = std::env::var("REJECTED_PATH").expect("REJECTED_PATH");
+        let raw = std::fs::read_to_string(&path).expect("read rejected body");
+        match parse_app_spec(&raw) {
+            Some(spec) => {
+                println!(
+                    "parsed OK: {} types, {} actors, {} methods, {} screens",
+                    spec.types.len(),
+                    spec.actors.len(),
+                    spec.bridge.len(),
+                    spec.ui.len()
+                );
+                println!("validate issues: {:#?}", validate(&spec));
+            }
+            None => {
+                let t = raw.trim();
+                let start = t.find('{').expect("{");
+                let end = t.rfind('}').expect("}");
+                let span = &t[start..=end];
+                match serde_json::from_str::<AppSpec>(span) {
+                    Ok(_) => println!("span parses but full response did not"),
+                    Err(e) => {
+                        println!("SERDE ERROR: {e}");
+                        panic!("serde failed: {e}");
+                    }
+                }
+            }
+        }
     }
 }
