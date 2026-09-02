@@ -188,6 +188,14 @@ struct ProjectAnalysisView: View {
                 .font(.title3.weight(.semibold))
                 .lineLimit(1)
                 .truncationMode(.middle)
+            if isSpireAppProject {
+                Text("Spire app")
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(theme.accent.opacity(0.15), in: Capsule())
+                    .foregroundStyle(theme.accent)
+            }
             Spacer(minLength: 0)
         }
         .cardStyle(theme: theme)
@@ -251,6 +259,13 @@ struct ProjectAnalysisView: View {
 
     private var isHalProject: Bool {
         project.subprojects.contains { $0.structure == "hal" }
+    }
+
+    /// A SpireApp project (Rust/SwiftUI monorepo) — any subproject carries the
+    /// `spire_app` structure the Cargo analyzer detects for workspaces that
+    /// depend on spire-actor + spire-core and ship a ui/swift companion.
+    private var isSpireAppProject: Bool {
+        project.subprojects.contains { $0.structure == "spire_app" }
     }
 
     /// The HAL domains from the root Meson subproject (common / rpi5 / …).

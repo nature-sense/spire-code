@@ -51,6 +51,7 @@ pub use ruby::RubyBuildModule;
 pub mod meson;
 pub use meson::MesonBuildModule;
 pub mod hal_migration;
+pub mod spire_app_scaffold;
 
 /// Shared message protocol implemented by every build module.
 #[derive(Debug)]

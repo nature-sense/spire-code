@@ -422,11 +422,68 @@ impl CargoBuildModule {
         dependencies.sort_by(|a, b| a.name.cmp(&b.name));
         dependencies.dedup_by(|a, b| a.name == b.name && a.version == b.version);
 
+        // SpireApp shape: a Cargo workspace that depends on the Spire framework
+        // (spire-actor + spire-core in [workspace.dependencies]) and carries the
+        // host SwiftUI companion app under ui/swift.
+        let structure = if is_workspace
+            && path.join("ui").join("swift").join("Package.swift").exists()
+            && content.contains("spire-actor")
+            && content.contains("spire-core")
+        {
+            spire_core::build_types::ProjectStructure::SpireApp
+        } else {
+            spire_core::build_types::ProjectStructure::default()
+        };
+
+        // Named slices for the SpireApp shape: `core` (the Rust crate) and `ui`
+        // (the SwiftUI app). Sibling domains, not platform×common like HAL.
+        let domains: Vec<spire_core::build_types::ProjectDomain> =
+            if structure == spire_core::build_types::ProjectStructure::SpireApp {
+                vec![
+                    spire_core::build_types::ProjectDomain {
+                        id: "core".to_string(),
+                        name: "Core".to_string(),
+                        kind: "common".to_string(),
+                        files: vec!["crates".to_string()],
+                        dependencies: Vec::new(),
+                        build_spec: Some(spire_core::build_types::BuildSpec {
+                            command: "cargo".to_string(),
+                            arguments: vec!["build".to_string()],
+                            working_dir: String::new(),
+                            env: Vec::new(),
+                        }),
+                        editability: spire_core::build_types::DomainEditability::Fillable,
+                        contracts: Vec::new(),
+                    },
+                    spire_core::build_types::ProjectDomain {
+                        id: "ui".to_string(),
+                        name: "UI".to_string(),
+                        kind: "common".to_string(),
+                        files: vec!["ui/swift".to_string()],
+                        dependencies: Vec::new(),
+                        build_spec: Some(spire_core::build_types::BuildSpec {
+                            command: "swift".to_string(),
+                            arguments: vec!["build".to_string()],
+                            working_dir: "ui/swift".to_string(),
+                            env: Vec::new(),
+                        }),
+                        editability: spire_core::build_types::DomainEditability::Fillable,
+                        contracts: Vec::new(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+
         Ok(BuildMetadata {
             project_name: name,
             description,
             version,
-            project_type: if is_workspace {
+            project_type: if structure
+                == spire_core::build_types::ProjectStructure::SpireApp
+            {
+                "spire_app".to_string()
+            } else if is_workspace {
                 "rust_workspace".to_string()
             } else {
                 "rust_crate".to_string()
@@ -443,6 +500,8 @@ impl CargoBuildModule {
             config_files: vec!["Cargo.toml".to_string()],
             project_path: Some(path.to_string_lossy().to_string()),
             dependencies,
+            structure,
+            domains,
             ..Default::default()
         })
     }
@@ -1220,6 +1279,10 @@ impl CargoBuildModule {
         platforms: &[String],
         structure: spire_core::build_types::ProjectStructure,
     ) -> Result<super::ScaffoldOutput, String> {
+        // SpireApp: Rust/SwiftUI monorepo built on the Spire framework.
+        if structure == spire_core::build_types::ProjectStructure::SpireApp {
+            return Ok(super::spire_app_scaffold::spire_app_scaffold(project_name));
+        }
         let cross: Vec<&String> = platforms.iter().filter(|p| *p != "host").collect();
         if cross.is_empty() {
             // Legacy single-binary scaffold.
@@ -1696,6 +1759,107 @@ mod tests {
         assert!(out.build_content.contains("[package]"));
         assert!(out.source_file.contains("main.rs"));
         assert_eq!(out.platform_targets, vec!["host".to_string()]);
+    }
+
+    #[test]
+    fn scaffold_layout_spire_app_emits_monorepo() {
+        use spire_core::build_types::ProjectStructure;
+        let out = CargoBuildModule::new()
+            .scaffold_layout("spire-quicknotes", "", &[], ProjectStructure::SpireApp)
+            .unwrap();
+        assert_eq!(out.structure, ProjectStructure::SpireApp);
+        let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
+        for expected in [
+            "Cargo.toml",
+            "crates/spire-quicknotes/Cargo.toml",
+            "crates/spire-quicknotes/src/lib.rs",
+            "crates/spire-quicknotes/src/main.rs",
+            "ui/swift/Package.swift",
+            "ui/swift/Sources/SpireUI/App.swift",
+            "ui/swift/Sources/SpireUI/ContentView.swift",
+            "ui/swift/Sources/SpireUI/Bridge/CoreBridge.swift",
+            "build/assemble-app.sh",
+            "Makefile",
+            ".gitignore",
+        ] {
+            assert!(paths.contains(&expected), "missing {expected}");
+        }
+        assert_eq!(
+            out.fill_roots,
+            vec!["crates/spire-quicknotes/src", "ui/swift/Sources"]
+        );
+        assert_eq!(
+            out.dependency_sections,
+            vec!["crates/spire-quicknotes/Cargo.toml"]
+        );
+        assert_eq!(out.platform_targets, vec!["host"]);
+
+        // Workspace manifest: path deps + the strip=none dylib fix + member.
+        let ws = out
+            .files
+            .iter()
+            .find(|f| f.path == "Cargo.toml")
+            .expect("workspace Cargo.toml");
+        assert!(ws.structural);
+        assert!(ws.content.contains("spire-actor = { path = \"../spire-actor\" }"));
+        assert!(ws.content.contains("spire-core = { path = \"../spire-core\" }"));
+        assert!(ws.content.contains("strip = \"none\""));
+        assert!(ws.content.contains("crates/spire-quicknotes"));
+
+        // Crate manifest: cdylib+rlib + workspace deps.
+        let cc = out
+            .files
+            .iter()
+            .find(|f| f.path == "crates/spire-quicknotes/Cargo.toml")
+            .unwrap();
+        assert!(cc.content.contains("crate-type = [\"cdylib\", \"rlib\"]"));
+        assert!(cc.content.contains("spire-actor = { workspace = true }"));
+
+        // Source stubs fillable, build glue structural, FFI symbols present.
+        let lib = out
+            .files
+            .iter()
+            .find(|f| f.path == "crates/spire-quicknotes/src/lib.rs")
+            .unwrap();
+        assert!(!lib.structural);
+        assert!(lib.content.contains("spire_send_json"));
+        let sh = out
+            .files
+            .iter()
+            .find(|f| f.path == "build/assemble-app.sh")
+            .unwrap();
+        assert!(sh.structural);
+    }
+
+    #[test]
+    fn analyze_detects_spire_app_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crates/spire-quicknotes\"]\n\n[workspace.dependencies]\nspire-actor = { path = \"../spire-actor\" }\nspire-core = { path = \"../spire-core\" }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/spire-quicknotes/src")).unwrap();
+        std::fs::write(
+            root.join("crates/spire-quicknotes/Cargo.toml"),
+            "[package]\nname = \"spire-quicknotes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/spire-quicknotes/src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("ui/swift")).unwrap();
+        std::fs::write(root.join("ui/swift/Package.swift"), "// swift-tools-version: 5.10").unwrap();
+
+        let meta = CargoBuildModule::new().analyze(root).unwrap();
+        assert_eq!(
+            meta.structure,
+            spire_core::build_types::ProjectStructure::SpireApp
+        );
+        assert_eq!(meta.project_type, "spire_app");
+        assert_eq!(meta.domains.len(), 2);
+        let ids: Vec<&str> = meta.domains.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&"core"));
+        assert!(ids.contains(&"ui"));
     }
 
     #[test]

@@ -492,6 +492,11 @@ pub enum ProjectCreationMessage {
         /// Optional cross-platform targets (registry ids, e.g. `["rpi5"]`).
         /// Empty/default = `["host"]` (single-target scaffold).
         platforms: Vec<String>,
+        /// Optional structural shape ("spire_app" etc.) chosen in the wizard.
+        /// Defaults to Native.
+        structure: Option<spire_core::build_types::ProjectStructure>,
+        /// True for embedded projects (cross-compiled targets only — no host).
+        embedded: bool,
         reply_to: oneshot::Sender<Result<PlanGenerationResult>>,
     },
     /// Phase 1 of the two-phase creation flow: scaffold the project structure
@@ -504,6 +509,10 @@ pub enum ProjectCreationMessage {
         root_dir: PathBuf,
         language: String,
         platforms: Vec<String>,
+        /// Optional structural shape ("spire_app" etc.) chosen in the wizard.
+        structure: Option<spire_core::build_types::ProjectStructure>,
+        /// True for embedded projects (cross-compiled targets only — no host).
+        embedded: bool,
         reply_to: oneshot::Sender<Result<crate::subsystems::build::build_manager::ScaffoldSpec>>,
     },
     /// Phase 2 of the two-phase creation flow (LLM, constrained): fill the
@@ -528,6 +537,10 @@ pub enum ProjectCreationMessage {
         project_name: String,
         language: String,
         platforms: Vec<String>,
+        /// Optional structural shape ("spire_app" etc.) chosen in the wizard.
+        structure: Option<spire_core::build_types::ProjectStructure>,
+        /// True for embedded projects (cross-compiled targets only — no host).
+        embedded: bool,
         reply_to: oneshot::Sender<Result<PlanScaffoldResult>>,
     },
     /// Execute the entire plan sequentially.
@@ -623,6 +636,15 @@ impl ProjectCreationActor {
             .first()
             .cloned()
             .unwrap_or_else(|| "Cargo.toml".to_string());
+        // SpireApp projects get the curated framework API surface so the LLM
+        // builds on spire-actor/spire-core instead of inventing APIs.
+        let framework_hints = if spec.structure
+            == spire_core::build_types::ProjectStructure::SpireApp
+        {
+            crate::build::generic_helpers::spire_framework_hints()
+        } else {
+            String::new()
+        };
         let prompt = format!(
             r#"You are filling an already-scaffolded {bs} project. The structure is LOCKED.
 Write a JSON object of the form {{"steps": [...]}} where each step is
@@ -631,6 +653,8 @@ to implement the goal INSIDE the existing skeleton.
 
 STRUCTURE CONTRACT:
 {structure}
+
+{framework_hints}
 
 RULES:
 - You may write/modify files ONLY under the fill roots and create subdirectories beneath them.
@@ -647,6 +671,7 @@ Project: name={project_name}, root={root}, goal={goal}
             bs = spec.build_system,
             bs_lower = spec.build_system.to_lowercase(),
             root = root_dir.display(),
+            framework_hints = framework_hints,
         );
         info!(
             "[ProjectCreation] Fill: requesting LLM fill plan for {} (spec bs={}, platforms={:?})",
@@ -893,6 +918,8 @@ and NEVER repeat any line or block."
         _root_dir: &PathBuf,
         language: &str,
         platforms: &[String],
+        structure: Option<spire_core::build_types::ProjectStructure>,
+        embedded: bool,
     ) -> Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> {
         let build_file = match language.to_lowercase().as_str() {
             "swift" => "Package.swift",
@@ -909,8 +936,8 @@ and NEVER repeat any line or block."
                 goal: String::new(),
                 build_file: build_file.to_string(),
                 platforms: platforms.to_vec(),
-                structure: None,
-                embedded: false,
+                structure,
+                embedded,
                 reply_to: t,
             })
             .await
@@ -964,7 +991,16 @@ and NEVER repeat any line or block."
         root_dir: &PathBuf,
         language: &str,
         platforms: &[String],
+        structure: Option<spire_core::build_types::ProjectStructure>,
     ) -> PlanGenerationResult {
+        // SpireApp: deterministic monorepo scaffold — the structure itself is
+        // fixed (Cargo workspace + SwiftUI), so the plan is the scaffold's own
+        // file writes plus a parse+build gate. No LLM needed for this phase.
+        if structure == Some(spire_core::build_types::ProjectStructure::SpireApp) {
+            return self
+                .spire_app_template_plan(goal, root_dir, language, platforms)
+                .await;
+        }
         if let Some(llm_tx) = &self.llm_tx {
             let project_name = root_dir
                 .file_name()
@@ -1207,6 +1243,96 @@ Project:
             }
         }
         self.generate_plan(goal, root_dir, language, platforms)
+    }
+
+    /// Deterministic SpireApp plan: scaffold the monorepo via the build module's
+    /// `scaffold_layout`, then emit one step per file (structural → build-config
+    /// write, fillable → source write) plus a parse+build gate. Never calls the
+    /// LLM — the fill phase (`FillProject`) fills the scaffold from the goal.
+    async fn spire_app_template_plan(
+        &self,
+        goal: &str,
+        root_dir: &PathBuf,
+        language: &str,
+        platforms: &[String],
+    ) -> PlanGenerationResult {
+        let project_name = root_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "spire-app".to_string());
+        let spec = self
+            .scaffold_spec_in_memory(
+                &project_name,
+                root_dir,
+                language,
+                platforms,
+                Some(spire_core::build_types::ProjectStructure::SpireApp),
+                false,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                warn!("[ProjectCreation] SpireApp scaffold spec failed: {e}");
+                crate::subsystems::build::build_manager::ScaffoldSpec {
+                    structural_files: vec!["Cargo.toml".to_string()],
+                    fill_roots: vec!["crates".to_string(), "ui".to_string()],
+                    dependency_sections: vec!["Cargo.toml".to_string()],
+                    platform_targets: vec!["host".to_string()],
+                    build_system: "Cargo".to_string(),
+                    files: vec![],
+                    structure: spire_core::build_types::ProjectStructure::SpireApp,
+                    embedded: false,
+                }
+            });
+
+        let mut steps: Vec<CreationStep> = Vec::new();
+        for (i, f) in spec.files.iter().enumerate() {
+            let step_type = if f.structural {
+                CreationStepType::WriteBuildConfig
+            } else {
+                CreationStepType::WriteSourceFile
+            };
+            steps.push(CreationStep {
+                id: format!("scaffold-{}", i + 1),
+                step_type,
+                description: format!("Write {}", f.path),
+                status: StepStatus::Pending,
+                parameters: serde_json::json!({ "path": f.path, "content": f.content }),
+                result: None,
+            });
+        }
+        let rs_paths: Vec<String> = spec
+            .files
+            .iter()
+            .filter(|f| f.path.ends_with(".rs"))
+            .map(|f| f.path.clone())
+            .collect();
+        steps.push(CreationStep {
+            id: format!("scaffold-{}", steps.len() + 1),
+            step_type: CreationStepType::ParseAndValidate,
+            description: "Parse source files to validate syntax via AST modules".into(),
+            status: StepStatus::Pending,
+            parameters: serde_json::json!({ "paths": rs_paths }),
+            result: None,
+        });
+        steps.push(CreationStep {
+            id: format!("scaffold-{}", steps.len() + 1),
+            step_type: CreationStepType::Build,
+            description: "Build the workspace to verify the scaffold compiles".into(),
+            status: StepStatus::Pending,
+            parameters: serde_json::json!({}),
+            result: None,
+        });
+
+        PlanGenerationResult {
+            goal: goal.to_string(),
+            language: language.to_string(),
+            root_dir: root_dir.to_string_lossy().to_string(),
+            steps,
+            is_template: true,
+            fallback_reason: Some(
+                "SpireApp structure — deterministic monorepo scaffold".to_string(),
+            ),
+        }
     }
 
     /// Generate a plan for a new project. In v1 this is a deterministic
@@ -1994,6 +2120,8 @@ impl Actor for ProjectCreationActor {
                 root_dir,
                 language,
                 platforms,
+                structure,
+                embedded: _embedded,
                 reply_to,
             } => {
                 // Empty platforms => single-target ("host") scaffold.
@@ -2002,7 +2130,9 @@ impl Actor for ProjectCreationActor {
                 } else {
                     platforms
                 };
-                let plan = self.generate_plan_async(&goal, &root_dir, &language, &platforms).await;
+                let plan = self
+                    .generate_plan_async(&goal, &root_dir, &language, &platforms, structure)
+                    .await;
                 info!(
                     "[ProjectCreation] PLAN GENERATED: language={}, root_dir={}, steps={}",
                     plan.language,
@@ -2026,6 +2156,8 @@ impl Actor for ProjectCreationActor {
                 root_dir,
                 language,
                 platforms,
+                structure,
+                embedded,
                 reply_to,
             } => {
                 let platforms = if platforms.is_empty() {
@@ -2049,8 +2181,8 @@ impl Actor for ProjectCreationActor {
                             goal: String::new(),
                             build_file: build_file.to_string(),
                             platforms: platforms.clone(),
-                            structure: None,
-                            embedded: false,
+                            structure,
+                            embedded,
                             reply_to: t,
                         })
                         .await
@@ -2133,6 +2265,8 @@ impl Actor for ProjectCreationActor {
                 project_name,
                 language,
                 platforms,
+                structure,
+                embedded,
                 reply_to,
             } => {
                 let platforms = if platforms.is_empty() {
@@ -2148,6 +2282,8 @@ impl Actor for ProjectCreationActor {
                             &root_dir,
                             &language,
                             &platforms,
+                            structure,
+                            embedded,
                         )
                         .await?;
                     self.active_spec = Some(spec.clone());

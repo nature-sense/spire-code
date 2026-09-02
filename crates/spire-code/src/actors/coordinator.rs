@@ -2688,6 +2688,25 @@ impl CoordinatorActor {
     /// `createProject/Plan` — single-round-trip describe-the-project flow:
     /// compute the in-memory structural contract (no disk writes) + LLM plan,
     /// returning both `{plan, spec}` for UI approval.
+    /// Read the wizard's `structure`/`embedded` params (shared by all
+    /// createProject/* handlers). `structure` defaults to None (→ Native).
+    fn params_structure_embedded(
+        params: &serde_json::Value,
+    ) -> (
+        Option<spire_core::build_types::ProjectStructure>,
+        bool,
+    ) {
+        let structure = params
+            .get("structure")
+            .and_then(|v| v.as_str())
+            .map(spire_core::build_types::ProjectStructure::from_str);
+        let embedded = params
+            .get("embedded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        (structure, embedded)
+    }
+
     async fn handle_create_project_plan(&self, params: &serde_json::Value) -> serde_json::Value {
         let (registry, _ffi_state) = match self.ffi_deps() {
             Ok(d) => d,
@@ -2724,6 +2743,8 @@ impl CoordinatorActor {
             })
             .unwrap_or_default();
 
+        let (structure, embedded) = Self::params_structure_embedded(params);
+
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
             let _ = registry
@@ -2735,6 +2756,8 @@ impl CoordinatorActor {
                     project_name,
                     language,
                     platforms,
+                    structure,
+                    embedded,
                     reply_to: t,
                 })
                 .await;
@@ -2786,6 +2809,8 @@ impl CoordinatorActor {
             })
             .unwrap_or_default();
 
+        let (structure, embedded) = Self::params_structure_embedded(params);
+
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
             let _ = registry
@@ -2796,6 +2821,8 @@ impl CoordinatorActor {
                     root_dir: PathBuf::from(root_dir),
                     language,
                     platforms,
+                    structure,
+                    embedded,
                     reply_to: t,
                 })
                 .await;
@@ -2844,6 +2871,8 @@ impl CoordinatorActor {
             })
             .unwrap_or_default();
 
+        let (structure, embedded) = Self::params_structure_embedded(params);
+
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
             let _ = registry
@@ -2854,6 +2883,8 @@ impl CoordinatorActor {
                     root_dir: PathBuf::from(root_dir),
                     language,
                     platforms,
+                    structure,
+                    embedded,
                     reply_to: t,
                 })
                 .await;

@@ -15,3 +15,6 @@ ui/swift/.swiftpm/
 
 # macOS
 .DS_Store
+
+# Editor config (local)
+.vscode/

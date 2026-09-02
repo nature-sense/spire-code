@@ -1063,6 +1063,40 @@ pub fn hal_meson_var_section(platform: &str, interface_stems: &[String]) -> Stri
     )
 }
 
+/// Curated `spire-actor` + `spire-core` API surface injected into the fill
+/// prompt for **SpireApp** projects, so the LLM builds on the actual framework
+/// instead of inventing APIs. Analogue to [`hal_platform_library_hints`].
+pub fn spire_framework_hints() -> String {
+    r#"SPIRE FRAMEWORK (spire-actor + spire-core) — build the app on these:
+
+Spire-core API surface:
+- build_types: BuildMetadata, BuildSpec, ProjectStructure, ProjectDomain,
+  Dependency, BuildTarget, Platform (registry via Platform::from_registry)
+- embedder::candle_embedder: CandleEmbedder — embed() -> embeddings; defaults
+  to 384 dims; set SPIRE_USE_METAL=1 at runtime for the Metal/GPU backend
+- rag: ingest + query over the ~/.spire/knowledge manifests (see docs/rag.md)
+- subsystems::llm: LlmMessage::Complete { prompt, role, reply_to } with
+  LlmModelRole::{Planning, Coding, ...}
+- modules::FilesystemMessage: CreateDirectory / WriteFile / ReadFile
+- config: config_dir(), Settings (API keys, model selection)
+- actors: ToolInfo and the actor message protocol
+
+Spire-actor API surface:
+- Actor trait: `Actor` with an associated Message type + async handle(msg)
+- Long-lived child actors spawned once at startup (the pattern spire-code uses
+  for its build/planning/rag actors); wire them with mpsc channels + oneshot
+  reply_to, then route JSON requests to them.
+
+Conventions:
+- Keep `spire_send_json` (#[no_mangle] extern "C", JSON in -> JSON out) and
+  `spire_free_string` exported from the crate: the SwiftUI app dlopens the
+  dylib and talks JSON over these two symbols.
+- App logic lives under crates/<crate>/src and the SwiftUI views under
+  ui/swift/Sources (the fill roots). Build configs, the FFI bridge and
+  assemble-app.sh are structural — never rewrite them.
+- Deps are declared ONCE via declare_dependencies against the crate manifest."#
+        .to_string()
+}
 /// The structural difference between two approved HAL contract versions
 /// (Stage 3 — contract change). Used to emit per-target `hal_interface_change`
 /// reconcile steps: adapt every stale implementation to the new signature.
@@ -4208,5 +4242,15 @@ struct ICameraHAL : hal::HalModule {
         assert_eq!(strip_code_fences("```cpp\nint main() {}\n```"), "int main() {}");
         assert_eq!(strip_code_fences("```\nint main() {}\n```"), "int main() {}");
         assert_eq!(strip_code_fences("int main() {}"), "int main() {}");
+    }
+
+    #[test]
+    fn spire_framework_hints_cover_the_framework() {
+        let hints = spire_framework_hints();
+        assert!(hints.contains("spire-actor"), "hints: {hints}");
+        assert!(hints.contains("spire-core"), "hints: {hints}");
+        assert!(hints.contains("spire_send_json"), "hints: {hints}");
+        assert!(hints.contains("CandleEmbedder"), "hints: {hints}");
+        assert!(hints.contains("declare_dependencies"), "hints: {hints}");
     }
 }

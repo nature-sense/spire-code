@@ -37,6 +37,7 @@ struct NewProjectView: View {
     @State private var selectedTargets: Set<String> = []
     @State private var isRust: Bool = false           // false = C++ / Meson
     @State private var useHal: Bool = true            // Meson structure: HAL vs single-source
+    @State private var useSpireApp: Bool = false      // Rust structure: Spire app (Rust core + SwiftUI)
 
     @State private var goal: String = ""
     @State private var projectName: String = ""
@@ -71,12 +72,16 @@ struct NewProjectView: View {
     }
 
     private var structureLabel: String {
-        if isRust { return "Multi-target build (one source set, cross-compiled per target)" }
+        if isRust {
+            return useSpireApp
+                ? "Spire app (Rust core + SwiftUI)"
+                : "Multi-target build (one source set, cross-compiled per target)"
+        }
         return useHal ? "Hardware abstraction (recommended)" : "Single source base (no hardware-specific layer)"
     }
 
     private var structureKey: String {
-        if isRust { return "native" }
+        if isRust { return useSpireApp ? "spire_app" : "native" }
         return useHal ? "hal" : "single_source"
     }
 
@@ -298,9 +303,30 @@ struct NewProjectView: View {
             Text("Project structure")
                 .font(.headline)
             if isRust {
-                Label("Cargo uses a single source set, cross-compiled for every selected target (via .cargo/config.toml).", systemImage: "gearshape")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    choiceCard(
+                        title: "Spire app",
+                        subtitle: "Rust core + SwiftUI, built on spire-actor & spire-core",
+                        systemImage: "sparkles",
+                        selected: useSpireApp,
+                        select: { useSpireApp = true }
+                    )
+                    choiceCard(
+                        title: "Plain Cargo crate",
+                        subtitle: "Single source set, cross-compiled per target",
+                        systemImage: "gear",
+                        selected: !useSpireApp,
+                        select: { useSpireApp = false }
+                    )
+                }
+                Label(
+                    useSpireApp
+                        ? "Spire app: Cargo workspace crate + SwiftUI app (ui/swift) that embeds the Rust core as a dylib. Host-only (macOS)."
+                        : "Cargo uses a single source set, cross-compiled for every selected target (via .cargo/config.toml).",
+                    systemImage: useSpireApp ? "sparkles" : "gearshape"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
             } else {
                 HStack(spacing: 12) {
                     choiceCard(
@@ -539,9 +565,9 @@ struct NewProjectView: View {
                 goal: goal,
                 rootDir: resolvedProjectDirectory,
                 language: language,
-                platforms: isNative ? [] : selectedTargets.sorted(),
+                platforms: (isNative || useSpireApp) ? [] : selectedTargets.sorted(),
                 structure: structureKey,
-                embedded: isEmbedded
+                embedded: isEmbedded && !useSpireApp
             )
             await MainActor.run {
                 if let plan {

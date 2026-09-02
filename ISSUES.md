@@ -100,3 +100,35 @@ carry the same chained-fixup export layout.) Re-verified with a `strip=none`
 build of the cdylib and a fresh `make app` + launch. A `tools/check_dylib.py`
 helper dlopens the dylib to catch regressions.
 
+## 6. SpireApp project shape (Rust + SwiftUI monorepo)
+
+Done (2026-09-02): generalized the project-shape concept beyond HAL with a new
+`ProjectStructure::SpireApp`. The wizard (Rust toolchain → "Spire app") now
+scaffolds a complete `spire-<name>` monorepo: a Cargo workspace with a
+`crates/spire-<name>` crate (rlib + cdylib) on `spire-actor`/`spire-core`
+(sibling path deps), a minimum-launchable SwiftUI app in `ui/swift` embedding
+the dylib over the JSON FFI, and `build/assemble-app.sh`/`Makefile` glue.
+
+- `ProjectStructure::SpireApp` + `as_str`/`from_str` keys in `spire-core`
+  `build_types` (serde "spire_app").
+- `build/spire_app_scaffold.rs` — the monorepo scaffold (structural vs fill
+  roots; workspace `Cargo.toml` bakes in `[profile.release] strip = "none"`).
+- Structure/embedded now thread through the wizard → coordinator
+  (`createProject/Plan|GeneratePlan|Scaffold`) → `PlanScaffold`/`GeneratePlan`/
+  `ScaffoldProject` messages → `scaffold_spec_in_memory` → `ScaffoldBuildConfig`
+  (previously hardcoded `structure: None`).
+- The legacy `GeneratePlan` path emits a deterministic scaffold plan for
+  SpireApp (no LLM needed to propose the structure).
+- Fill: `generic_helpers::spire_framework_hints()` (curated spire-actor/
+  spire-core API surface) is injected into the `FillProject` prompt.
+- Analysis: `cargo::analyze` detects the shape (workspace + `ui/swift/`
+  + spire deps) → `structure = spire_app`, `project_type = "spire_app"`, and
+  `core`/`ui` `ProjectDomain`s.
+- UI: New Project wizard gains the Spire app choice; project analysis shows a
+  "Spire app" badge.
+- Templates: `templates/spire-app/` (best practices + minimal example).
+- Tests: scaffold emits the monorepo, analyze detects the shape, structure
+  keys roundtrip, framework hints cover the API. E2E: materialized a
+  `spire-quicknotes` scaffold, `cargo build --release` + `swift build` +
+  dlopen + `assemble-app.sh` + app launch all succeeded.
+
