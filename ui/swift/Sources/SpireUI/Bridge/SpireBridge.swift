@@ -1566,6 +1566,55 @@ final class SpireBridge {
         }
     }
 
+    /// SpireApp requirements pass: derive a VALIDATED AppSpec JSON contract
+    /// from the goal (`createProject/GenerateSpec`). The spec is self-healed
+    /// against `spec::validate` and persisted to the memory graph. Nothing is
+    /// written to disk — it drives deterministic codegen.
+    func generateAppSpec(projectName: String, goal: String) async -> (spec: [String: Any]?, error: String?) {
+        Self.logScaffold("createProject/GenerateSpec CALLED (project='\(projectName)' goal='\(goal)')")
+        let body: [String: Any] = [
+            "method": "createProject/GenerateSpec",
+            "params": ["projectName": projectName, "goal": goal]
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            guard let object = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
+                return (nil, "unreadable reply")
+            }
+            if let err = object["error"] as? String {
+                return (nil, err)
+            }
+            Self.logScaffold("createProject/GenerateSpec OK: \(object["app"] ?? [:])")
+            return (object, nil)
+        } catch {
+            Self.logScaffold("createProject/GenerateSpec FAILED: \(error)")
+            return (nil, error.localizedDescription)
+        }
+    }
+
+    /// Deterministic codegen from a validated AppSpec JSON (`createProject/
+    /// GenerateCode`): returns the `write_source_file` skeleton steps
+    /// (types/actors/FFI dispatch + Swift wrappers/screens). Execute them with
+    /// `executeCreationPlan`.
+    func generateCodeSteps(projectName: String, spec: [String: Any]) async -> [CreationStep]? {
+        Self.logScaffold("createProject/GenerateCode CALLED (project='\(projectName)')")
+        let body: [String: Any] = [
+            "method": "createProject/GenerateCode",
+            "params": ["projectName": projectName, "spec": spec]
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let steps: [CreationStep] = try MessageSerializer.decode(reply)
+            Self.logScaffold("createProject/GenerateCode OK: \(steps.count) skeleton steps")
+            return steps
+        } catch {
+            Self.logScaffold("createProject/GenerateCode FAILED: \(error)")
+            return nil
+        }
+    }
+
     /// Legacy single-file scaffold helper (superseded by the spec-based
     /// `scaffoldProject` above). Called tools/call build_scaffold and wrote
     /// only build_content + one source stub; the two-phase flow replaces it.

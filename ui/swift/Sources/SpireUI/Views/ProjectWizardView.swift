@@ -36,7 +36,17 @@ struct ProjectWizardView: View {
     @State private var isExecuting = false
     @State private var executedSteps: [String: StepExecutionResult] = [:]
 
+    // AppSpec requirements pass (SpireApp only, optional)
+    @State private var appSpec: [String: Any]?
+    @State private var isDerivingSpec = false
+    @State private var specError: String?
+
     private let buildSystems = ["Cargo", "Meson"]
+
+    /// The wizard chose the Spire app structure.
+    private var isSpireApp: Bool {
+        structure == "spire_app"
+    }
 
     /// Structure options shown for the selected build system.
     private var structureOptions: [(key: String, title: String, subtitle: String)] {
@@ -247,6 +257,10 @@ struct ProjectWizardView: View {
                         }
                     }
 
+                    if isSpireApp {
+                        specSection
+                    }
+
                     if let err = errorMessage {
                         Text(err).font(.caption).foregroundStyle(.red)
                     }
@@ -278,6 +292,69 @@ struct ProjectWizardView: View {
                 }
             }
             .padding(.vertical, 1)
+        }
+    }
+
+    // MARK: - AppSpec (Spire app only)
+
+    /// Optional AppSpec requirements pass: derive a VALIDATED spec from the
+    /// goal, review its summary, then let OK run the deterministic skeleton
+    /// codegen (types/actors/FFI dispatch + Swift wrappers/screens) instead of
+    /// the generic LLM fill plan.
+    @ViewBuilder
+    private var specSection: some View {
+        Divider()
+        HStack(spacing: 6) {
+            Text("AppSpec").font(.headline)
+            Text("spec-driven codegen").font(.caption).foregroundStyle(.secondary)
+        }
+        if let spec = appSpec, let summary = AppSpecSummary(json: spec) {
+            Label(summary.headline, systemImage: "doc.text.magnifyingglass")
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 3), spacing: 6) {
+                ForEach(summary.rows, id: \.label) { row in
+                    VStack(spacing: 2) {
+                        Text(row.value).font(.headline)
+                        Text(row.label).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary))
+                }
+            }
+            DisclosureGroup("AppSpec JSON") {
+                Text(summary.prettyJSON)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .font(.caption)
+            Text("OK below will scaffold the monorepo, then write the generated skeleton steps (no LLM fill).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            Button {
+                Task { await deriveSpec() }
+            } label: {
+                if isDerivingSpec {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Deriving AppSpec…")
+                    }
+                } else {
+                    Label("Derive AppSpec from goal (requirements pass)", systemImage: "doc.badge.gearshape")
+                }
+            }
+            .buttonStyle(.bordered)
+            .disabled(isDerivingSpec || isExecuting)
+            if let specError {
+                Text(specError).font(.caption).foregroundStyle(.red)
+            }
+            Text("Optional: skip to keep the generic LLM fill plan.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -316,6 +393,25 @@ struct ProjectWizardView: View {
         planResult = nil
         errorMessage = nil
         executedSteps = [:]
+        appSpec = nil
+        specError = nil
+    }
+
+    /// Derive a VALIDATED AppSpec from the goal (SpireApp requirements pass).
+    @MainActor
+    private func deriveSpec() async {
+        isDerivingSpec = true
+        specError = nil
+        defer { isDerivingSpec = false }
+        let name = projectName.trimmingCharacters(in: .whitespaces)
+        let cleanGoal = goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        let (spec, err) = await bridge.generateAppSpec(projectName: name, goal: cleanGoal)
+        if let spec {
+            appSpec = spec
+            SpireBridge.logScaffold("ProjectWizardView: AppSpec derived for '\(name)'")
+        } else {
+            specError = err ?? "Failed to derive the AppSpec — check ~/.spire/logs/spire-scaffold.log."
+        }
     }
 
     /// OK: scaffold (materialize), execute the plan step-by-step, then open +
@@ -344,7 +440,20 @@ struct ProjectWizardView: View {
         }
 
         SpireBridge.logScaffold("ProjectWizardView: executing \(result.plan.steps.count) steps")
-        let results = await bridge.executeCreationPlan(rootDir: targetDir, steps: result.plan.steps)
+        // When the user derived an AppSpec, run the deterministic codegen
+        // skeleton instead of the generic LLM fill plan (fall back if codegen
+        // is unavailable so the flow never dead-ends).
+        var stepsToRun = result.plan.steps
+        if isSpireApp, let spec = appSpec {
+            if let codegen = await bridge.generateCodeSteps(projectName: name, spec: spec),
+               !codegen.isEmpty {
+                stepsToRun = codegen
+                SpireBridge.logScaffold("ProjectWizardView: using \(codegen.count) AppSpec codegen steps")
+            } else {
+                SpireBridge.logScaffold("ProjectWizardView: codegen unavailable — falling back to plan steps")
+            }
+        }
+        let results = await bridge.executeCreationPlan(rootDir: targetDir, steps: stepsToRun)
         for stepResult in results {
             executedSteps[stepResult.stepId] = stepResult
         }
