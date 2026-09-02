@@ -1016,14 +1016,18 @@ and NEVER repeat any line or block."
 
     /// Persist a validated AppSpec in the memory graph (best-effort — the
     /// spec is already returned to the caller; failures are logged, not fatal).
+    /// Persist a validated AppSpec in the memory graph (best-effort — the spec
+    /// is already returned to the caller; failures are logged, not fatal).
+    /// Returns the stored node id when the upsert succeeded, so codegen can
+    /// link generated artifacts to it.
     async fn store_app_spec_in_graph(
         &self,
         project_name: &str,
         goal: &str,
         spec: &AppSpec,
-    ) {
+    ) -> Option<String> {
         let Some(mg_tx) = &self.memory_graph_tx else {
-            return;
+            return None;
         };
         let now = chrono::Utc::now();
         let node = AttrNode {
@@ -1052,15 +1056,125 @@ and NEVER repeat any line or block."
             .is_err()
         {
             warn!("[ProjectCreation] AppSpec graph store: memory graph unavailable");
-            return;
+            return None;
         }
         match r.await {
-            Ok(Ok(stored)) => info!(
-                "[ProjectCreation] AppSpec stored in graph: node_type=appspec name={} id={}",
-                project_name, stored.id
-            ),
-            Ok(Err(e)) => warn!("[ProjectCreation] AppSpec graph store failed: {e}"),
-            Err(e) => warn!("[ProjectCreation] AppSpec graph store reply lost: {e}"),
+            Ok(Ok(stored)) => {
+                info!(
+                    "[ProjectCreation] AppSpec stored in graph: node_type=appspec name={} id={}",
+                    project_name, stored.id
+                );
+                Some(stored.id)
+            }
+            Ok(Err(e)) => {
+                warn!("[ProjectCreation] AppSpec graph store failed: {e}");
+                None
+            }
+            Err(e) => {
+                warn!("[ProjectCreation] AppSpec graph store reply lost: {e}");
+                None
+            }
+        }
+    }
+
+    /// Find the appspec node id for a project (upserted by the requirements
+    /// pass; one stable node per (appspec, name)).
+    async fn appspec_node_id(&self, project_name: &str) -> Option<String> {
+        let Some(mg_tx) = &self.memory_graph_tx else {
+            return None;
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        if mg_tx
+            .send(MemoryGraphMessage::QueryAttrNodes {
+                node_type: Some("Unknown".to_string()),
+                subtype: Some("appspec".to_string()),
+                name: Some(project_name.to_string()),
+                limit: Some(1),
+                reply_to: t,
+            })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        match r.await {
+            Ok(Ok(mut nodes)) => nodes.pop().map(|n| n.id),
+            _ => None,
+        }
+    }
+
+    /// Record codegen artifacts in the graph and link each to the project's
+    /// appspec node (`GENERATED_FROM`), so the spec ↔ implementation trace is
+    /// queryable. Best-effort: when the appspec node is missing (codegen ran
+    /// before the requirements pass) or the graph is unwired, this is skipped.
+    async fn store_generated_artifacts(&self, project_name: &str, spec: &AppSpec) {
+        let Some(mg_tx) = &self.memory_graph_tx else {
+            return;
+        };
+        let Some(appspec_id) = self.appspec_node_id(project_name).await else {
+            warn!(
+                "[ProjectCreation] Codegen artifacts NOT linked: no appspec node for '{}' \
+                 (run createProject/GenerateSpec first)",
+                project_name
+            );
+            return;
+        };
+
+        let files = crate::subsystems::project::spec_codegen::generated_files(spec, project_name);
+        for f in &files {
+            let now = chrono::Utc::now();
+            let node = AttrNode {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_type: "Unknown".to_string(),
+                subtype: Some("generated_file".to_string()),
+                name: f.path.clone(),
+                description: Some(format!("codegen artifact for {project_name}")),
+                properties: std::collections::HashMap::from([
+                    ("path".to_string(), serde_json::json!(f.path)),
+                    ("spec".to_string(), serde_json::json!(project_name)),
+                ]),
+                embedding_id: None,
+                created_at: now,
+                updated_at: now,
+                version: 1,
+            };
+            let (t, r) = tokio::sync::oneshot::channel();
+            if mg_tx
+                .send(MemoryGraphMessage::MergeAttrNode { node, reply_to: t })
+                .await
+                .is_err()
+            {
+                warn!("[ProjectCreation] codegen artifact store: graph unavailable");
+                return;
+            }
+            match r.await {
+                Ok(Ok(stored)) => {
+                    let edge_from = stored.id;
+                    let (et, er) = tokio::sync::oneshot::channel();
+                    let _ = mg_tx
+                        .send(MemoryGraphMessage::CreateRelationship {
+                            rel: spire_core::models::memory_graph::RelationshipInput {
+                                edge_type:
+                                    spire_core::models::memory_graph::RelationshipType::Custom(
+                                        "GENERATED_FROM".to_string(),
+                                    ),
+                                from_id: edge_from,
+                                to_id: appspec_id.clone(),
+                                properties: None,
+                                weight: None,
+                            },
+                            reply_to: et,
+                        })
+                        .await;
+                    match er.await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => warn!("[ProjectCreation] codegen link failed: {e}"),
+                        Err(_) => {}
+                    }
+                }
+                Ok(Err(e)) => warn!("[ProjectCreation] codegen artifact store failed: {e}"),
+                Err(e) => warn!("[ProjectCreation] codegen artifact reply lost: {e}"),
+            }
         }
     }
 
@@ -2454,6 +2568,9 @@ impl Actor for ProjectCreationActor {
                 spec,
                 reply_to,
             } => {
+                // Record + link the codegen artifacts to the project's appspec
+                // node first (best-effort), then return the executable steps.
+                self.store_generated_artifacts(&project_name, &spec).await;
                 let steps =
                     crate::subsystems::project::spec_codegen::codegen_steps(&spec, &project_name);
                 info!(
@@ -2622,6 +2739,138 @@ mod tests {
                 .expect("graph node must carry the round-trippable spec");
         assert_eq!(spec_back.app.name, "spire-gis");
         assert_eq!(spec_back, spec);
+    }
+
+    /// Codegen artifacts are recorded as `generated_file` nodes and linked to
+    /// the project's appspec node with a GENERATED_FROM edge — the graph keeps
+    /// the spec ↔ implementation trace (single source of truth).
+    #[test]
+    fn generate_code_links_artifacts_to_the_appspec_node() {
+        use spire_core::models::memory_graph::{GraphEdge, RelationshipType};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (llm_tx, mut llm_rx) = mpsc::channel::<LlmMessage>(4);
+        let (mg_tx, mut mg_rx) = mpsc::channel::<MemoryGraphMessage>(4);
+        let reply = serde_json::json!({
+            "app": { "name": "spire-gis", "goal": "view and edit map layers" },
+            "types": [],
+            "actors": [{
+                "name": "MapActor", "description": "", "handlers": ["map/listLayers"],
+                "state": [], "uses": []
+            }],
+            "bridge": [{
+                "method": "map/listLayers", "description": "", "params": [],
+                "result": { "kind": "list", "of": { "kind": "str" } }
+            }],
+            "ui": [{
+                "id": "map", "title": "Map",
+                "actions": [{ "id": "load", "description": "", "bridge": "map/listLayers" }]
+            }]
+        });
+        let nodes: std::sync::Arc<std::sync::Mutex<Vec<AttrNode>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let edges: std::sync::Arc<std::sync::Mutex<Vec<GraphEdge>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let nodes2 = nodes.clone();
+        let edges2 = edges.clone();
+        rt.spawn(async move {
+            while let Some(msg) = llm_rx.recv().await {
+                if let LlmMessage::Complete { reply_to, .. } = msg {
+                    let _ = reply_to.send(Ok(reply.to_string()));
+                }
+            }
+        });
+        rt.spawn(async move {
+            while let Some(msg) = mg_rx.recv().await {
+                match msg {
+                    MemoryGraphMessage::MergeAttrNode { node, reply_to } => {
+                        nodes2.lock().unwrap().push(node.clone());
+                        let _ = reply_to.send(Ok(node));
+                    }
+                    MemoryGraphMessage::QueryAttrNodes {
+                        node_type,
+                        subtype,
+                        name,
+                        limit,
+                        reply_to,
+                    } => {
+                        let out: Vec<AttrNode> = nodes2
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|n| match &node_type {
+                                Some(t) => n.node_type == *t,
+                                None => true,
+                            })
+                            .filter(|n| match &subtype {
+                                Some(s) => n.subtype.as_deref() == Some(s.as_str()),
+                                None => true,
+                            })
+                            .filter(|n| match &name {
+                                Some(x) => n.name == *x,
+                                None => true,
+                            })
+                            .cloned()
+                            .collect();
+                        let out = match limit {
+                            Some(l) => out.into_iter().take(l as usize).collect(),
+                            None => out,
+                        };
+                        let _ = reply_to.send(Ok(out));
+                    }
+                    MemoryGraphMessage::CreateRelationship { rel, reply_to } => {
+                        let edge = GraphEdge {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            edge_type: rel.edge_type.clone(),
+                            from_id: rel.from_id.clone(),
+                            to_id: rel.to_id.clone(),
+                            properties: rel.properties.clone().unwrap_or_default(),
+                            created_at: chrono::Utc::now(),
+                            weight: rel.weight,
+                        };
+                        edges2.lock().unwrap().push(edge.clone());
+                        let _ = reply_to.send(Ok(edge));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let mut actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
+        actor.set_llm(llm_tx);
+        actor.set_memory_graph(mg_tx);
+        let spec = rt
+            .block_on(actor.generate_app_spec("spire-gis", "view and edit map layers"))
+            .expect("requirements pass must produce a spec");
+
+        // Codegen for that spec records + links the skeleton artifacts.
+        rt.block_on(actor.store_generated_artifacts("spire-gis", &spec));
+
+        let appspec_id = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.subtype.as_deref() == Some("appspec"))
+            .expect("appspec node must exist")
+            .id
+            .clone();
+        let file_nodes = nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.subtype.as_deref() == Some("generated_file"))
+            .count();
+        assert_eq!(
+            file_nodes, 5,
+            "every generated skeleton file must be recorded as a node"
+        );
+        let edges = edges.lock().unwrap();
+        assert_eq!(edges.len(), 5, "one GENERATED_FROM edge per artifact");
+        for e in edges.iter() {
+            assert_eq!(
+                e.edge_type,
+                RelationshipType::Custom("GENERATED_FROM".to_string())
+            );
+            assert_eq!(e.to_id, appspec_id, "every artifact points at the spec");
+        }
     }
 
     #[test]
