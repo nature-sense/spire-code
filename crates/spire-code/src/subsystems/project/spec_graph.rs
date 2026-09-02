@@ -231,11 +231,11 @@ pub struct SpecGraph {
     pub edges: Vec<SpecEdge>,
 }
 
-fn prop<'a>(n: &'a SpecNode, key: &str) -> Option<&'a serde_json::Value> {
+pub(crate) fn prop<'a>(n: &'a SpecNode, key: &str) -> Option<&'a serde_json::Value> {
     n.properties.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
-fn prop_str(n: &SpecNode, key: &str) -> Option<String> {
+pub(crate) fn prop_str(n: &SpecNode, key: &str) -> Option<String> {
     prop(n, key).and_then(|v| v.as_str().map(String::from))
 }
 
@@ -538,7 +538,7 @@ fn order_of(n: &SpecNode) -> usize {
 }
 
 /// Child nodes of `parent` via `predicate`, ordered by their `order` property.
-fn children<'a>(g: &'a SpecGraph, parent: &str, predicate: &str) -> Vec<&'a SpecNode> {
+pub(crate) fn children<'a>(g: &'a SpecGraph, parent: &str, predicate: &str) -> Vec<&'a SpecNode> {
     let mut out: Vec<&SpecNode> = g
         .edges
         .iter()
@@ -549,7 +549,7 @@ fn children<'a>(g: &'a SpecGraph, parent: &str, predicate: &str) -> Vec<&'a Spec
     out
 }
 
-fn fields_of<'a>(g: &'a SpecGraph, parent: &str) -> Result<Vec<Field>, String> {
+pub(crate) fn fields_of<'a>(g: &'a SpecGraph, parent: &str) -> Result<Vec<Field>, String> {
     children(g, parent, edge::HAS_FIELD)
         .into_iter()
         .map(|n| {
@@ -563,7 +563,7 @@ fn fields_of<'a>(g: &'a SpecGraph, parent: &str) -> Result<Vec<Field>, String> {
         .collect()
 }
 
-fn rebuild_layout(g: &SpecGraph, node_name: &str) -> Result<LayoutNode, String> {
+pub(crate) fn rebuild_layout(g: &SpecGraph, node_name: &str) -> Result<LayoutNode, String> {
     let n = g
         .nodes
         .iter()

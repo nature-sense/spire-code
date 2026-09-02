@@ -2,17 +2,17 @@
 // Copyright (c) 2026 NatureSense
 
 //! **AppSpec codegen** — deterministic skeleton generation from a VALIDATED
-//! [`AppSpec`].
+//! [`AppSpec`], read piece-wise straight off its graph-native form
+//! ([`spec_graph::decompose`]). Nothing is invented on either side:
 //!
-//! The bridge contract is the single source of truth, so everything below is a
-//! *projection* of the spec — nothing is invented on either side:
-//!
-//! - `graph`  → typed graph accessors (sketched; bodies are filled later).
-//! - `types`  → serde structs/enums (`types.rs`).
-//! - `actors` → one skeleton per actor listing the bridge methods it handles.
-//! - `bridge` → the FFI dispatch in `lib.rs` (routing DERIVED from the actors'
-//!   `handlers`, never a separate route table) + typed Swift bridge wrappers.
-//! - `ui`     → one SwiftUI screen skeleton per screen (layout + action hooks).
+//! - `types.rs`      walks `spec_type` nodes (fields/variants via `HAS_FIELD`/
+//!   `HAS_VARIANT`).
+//! - `actors.rs`     walks `spec_actor` nodes and their `HAS_HANDLER` children.
+//! - `lib.rs`        dispatch arms are derived per actor from `HANDLED_BY`
+//!   routing edges — never a separate route table.
+//! - `AppBridge.swift` walks `spec_method` nodes (the bridge contract).
+//! - `Screens.swift` walks `spec_screen` nodes + `HAS_ACTION` children and the
+//!   screen's layout subgraph.
 //!
 //! Output is a flat list of [`GeneratedFile`]s written under the SpireApp
 //! fill roots (`crates/<crate>/src`, `ui/swift/Sources`) — i.e. normal
@@ -20,7 +20,11 @@
 //! carry `TODO` markers: the next stage's LLM fill writes the real logic
 //! inside the generated, validated contract.
 
-use super::spec::{AppSpec, DomainType, LayoutNode, Type};
+use super::spec::{
+    ActorSpec, AppSpec, BridgeMethod, DomainType, LayoutNode, Screen, Type, UiAction, UiBinding,
+    UiNavigation,
+};
+use super::spec_graph::{self, edge, node, SpecGraph};
 
 /// One generated file: fill-root-relative path + full content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,15 +86,155 @@ fn rust_type(ty: &Type) -> String {
     }
 }
 
+// ── Graph readers: piece-wise reads for the generators ────────────────────
+// Each generator below consumes ONLY its slice of the spec graph (as the
+// actors will persist it in Stage 4), never the serialized AppSpec. Because
+// decompose is order-preserving, graph reads reproduce the spec's order.
+
+/// `spec_type` nodes → the domain types they describe.
+fn read_graph_types(g: &SpecGraph) -> Vec<DomainType> {
+    let mut out = Vec::new();
+    for n in g.nodes.iter().filter(|n| n.node_type == node::TYPE) {
+        let name = n.name.clone();
+        if spec_graph::prop_str(n, "kind").as_deref() == Some("record") {
+            let fields = spec_graph::fields_of(g, &name)
+                .expect("record fields present on a decomposed graph");
+            out.push(DomainType::Record { name, fields });
+        } else {
+            let variants = spec_graph::children(g, &name, edge::HAS_VARIANT)
+                .into_iter()
+                .map(|v| spec_graph::prop_str(v, "variant").unwrap_or_default())
+                .collect();
+            out.push(DomainType::Enum { name, variants });
+        }
+    }
+    out
+}
+
+/// `spec_actor` nodes → actor skeletons (handlers from their `HAS_HANDLER`
+/// children; state/uses are not part of the skeleton output).
+fn read_graph_actors(g: &SpecGraph) -> Vec<ActorSpec> {
+    g.nodes
+        .iter()
+        .filter(|n| n.node_type == node::ACTOR)
+        .map(|n| {
+            let handlers = spec_graph::children(g, &n.name, edge::HAS_HANDLER)
+                .into_iter()
+                .map(|h| spec_graph::prop_str(h, "method").unwrap_or_default())
+                .collect();
+            ActorSpec {
+                name: n.name.clone(),
+                description: n.description.clone().unwrap_or_default(),
+                handlers,
+                state: Vec::new(),
+                uses: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+/// The dispatch routing, derived from `HANDLED_BY`: every `spec_method` node
+/// lists the actor that owns it. Grouped per actor, methods in graph order.
+fn read_graph_dispatch(g: &SpecGraph) -> Vec<(String, Vec<String>)> {
+    let owned = |actor: &str| -> Vec<String> {
+        g.nodes
+            .iter()
+            .filter(|n| n.node_type == node::METHOD)
+            .filter(|m| {
+                g.edges.iter().any(|e| {
+                    e.predicate == edge::HANDLED_BY && e.from_name == m.name && e.to_name == actor
+                })
+            })
+            .map(|m| m.name.clone())
+            .collect()
+    };
+    g.nodes
+        .iter()
+        .filter(|n| n.node_type == node::ACTOR)
+        .map(|n| (n.name.clone(), owned(&n.name)))
+        .filter(|(_, methods)| !methods.is_empty())
+        .collect()
+}
+
+/// `spec_method` nodes → the bridge contract (name, description, params,
+/// result). Result/param types are re-parsed from the graph's canonical
+/// type-expression properties.
+fn read_graph_bridge(g: &SpecGraph) -> Vec<BridgeMethod> {
+    g.nodes
+        .iter()
+        .filter(|n| n.node_type == node::METHOD)
+        .map(|n| {
+            let ty = spec_graph::prop_str(n, "result")
+                .expect("method nodes always carry a 'result' on a decomposed graph");
+            BridgeMethod {
+                method: n.name.clone(),
+                description: n.description.clone().unwrap_or_default(),
+                params: spec_graph::fields_of(g, &n.name)
+                    .expect("method params present on a decomposed graph"),
+                result: spec_graph::type_from_string(&ty)
+                    .expect("decomposed 'result' is always a valid type expression"),
+            }
+        })
+        .collect()
+}
+
+/// `spec_screen` nodes → screens (id/title), their `HAS_ACTION` actions, and
+/// the layout tree hanging off the screen via its `HAS_LAYOUT` root.
+fn read_graph_screens(g: &SpecGraph) -> Result<Vec<Screen>, String> {
+    let mut ui = Vec::new();
+    for n in g.nodes.iter().filter(|n| n.node_type == node::SCREEN) {
+        let id = n.name.clone();
+        let layout_root = g
+            .edges
+            .iter()
+            .find(|e| e.predicate == edge::HAS_LAYOUT && e.from_name == id)
+            .map(|e| e.to_name.clone())
+            .ok_or_else(|| format!("screen '{id}' has no HAS_LAYOUT root"))?;
+        let layout = spec_graph::rebuild_layout(g, &layout_root)?;
+        let actions = spec_graph::children(g, &id, edge::HAS_ACTION)
+            .into_iter()
+            .map(|a| UiAction {
+                id: spec_graph::prop_str(a, "id").unwrap_or_default(),
+                description: a.description.clone().unwrap_or_default(),
+                bridge: spec_graph::prop_str(a, "bridge").unwrap_or_default(),
+            })
+            .collect();
+        let bindings = spec_graph::children(g, &id, edge::HAS_BINDING)
+            .into_iter()
+            .map(|b| UiBinding {
+                field: spec_graph::prop_str(b, "field").unwrap_or_default(),
+                method: spec_graph::prop_str(b, "method").unwrap_or_default(),
+            })
+            .collect();
+        let navigation = spec_graph::children(g, &id, edge::HAS_NAVIGATION)
+            .into_iter()
+            .map(|x| UiNavigation {
+                action_id: spec_graph::prop_str(x, "action_id").unwrap_or_default(),
+                to: spec_graph::prop_str(x, "to").unwrap_or_default(),
+            })
+            .collect();
+        ui.push(Screen {
+            id,
+            title: spec_graph::prop_str(n, "title").unwrap_or_default(),
+            layout,
+            actions,
+            bindings,
+            navigation,
+        });
+    }
+    Ok(ui)
+}
+
 // ── Rust: domain types (types.rs) ────────────────────────────────────────
 
-fn render_types_rs(spec: &AppSpec) -> String {
+fn render_types_rs(g: &SpecGraph) -> String {
+    let types = read_graph_types(g);
     let mut out = String::from(
         "// Code-generated by spec_codegen.rs — bridge-derived domain types.\n\
          #![allow(dead_code)]\n\
          use serde::{Deserialize, Serialize};\n\n",
     );
-    for t in &spec.types {
+    for t in &types {
         match t {
             DomainType::Record { name, fields } => {
                 out.push_str(&format!(
@@ -117,14 +261,15 @@ fn render_types_rs(spec: &AppSpec) -> String {
 
 // ── Rust: actor skeletons (actors.rs) ────────────────────────────────────
 
-fn render_actors_rs(spec: &AppSpec) -> String {
+fn render_actors_rs(g: &SpecGraph) -> String {
+    let actors = read_graph_actors(g);
     let mut out = String::from(
         "// Code-generated by spec_codegen.rs — one skeleton per AppSpec actor.\n\
          // Routing is derived: each actor lists the bridge methods it handles.\n\
          #![allow(dead_code)]\n\
          use serde_json::Value;\n\n",
     );
-    for a in &spec.actors {
+    for a in &actors {
         let handlers = a.handlers.join("\", \"");
         out.push_str(&format!(
             "pub struct {};\n\nimpl {} {{\n    pub fn new() -> Self {{\n        Self\n    }}\n\n    /// Skeleton handler for the bridge methods this actor owns.\n    pub fn handle(&self, method: &str, params: &Value) -> String {{\n        let _ = (method, params);\n        // TODO({}): implement bodies for \"{}\".\n        serde_json::json!({{\"ok\": true, \"result\": null}}).to_string()\n    }}\n}}\n\n",
@@ -139,19 +284,16 @@ fn render_actors_rs(spec: &AppSpec) -> String {
 
 /// The `match` arms of the FFI dispatch — every bridge method routed to the
 /// actor whose `handlers` lists it (exactly-one-actor is validated upstream).
-fn render_dispatch_arms(spec: &AppSpec) -> String {
+fn render_dispatch_arms(g: &SpecGraph) -> String {
+    let routing = read_graph_dispatch(g);
     let mut out = String::new();
-    for a in &spec.actors {
-        if a.handlers.is_empty() {
-            continue;
-        }
-        let arms: Vec<String> = a
-            .handlers
+    for (a, methods) in &routing {
+        let arms: Vec<String> = methods
             .iter()
             .map(|h| {
                 format!(
                     "        \"{h}\" => actors::{}::new().handle(\"{h}\", &params),",
-                    pascal(&a.name)
+                    pascal(a)
                 )
             })
             .collect();
@@ -164,8 +306,8 @@ fn render_dispatch_arms(spec: &AppSpec) -> String {
     out
 }
 
-fn render_lib_rs(spec: &AppSpec, crate_name: &str) -> String {
-    let dispatch = render_dispatch_arms(spec);
+fn render_lib_rs(g: &SpecGraph, crate_name: &str) -> String {
+    let dispatch = render_dispatch_arms(g);
     format!(
         "//! {crate_name} — Rust core generated from a validated AppSpec.\n\
          //! FFI entry + dispatch are DERIVED from the AppSpec bridge contract\n\
@@ -212,14 +354,15 @@ fn render_lib_rs(spec: &AppSpec, crate_name: &str) -> String {
 
 // ── Swift: typed bridge wrappers (AppBridge.swift) ───────────────────────
 
-fn render_app_bridge_swift(spec: &AppSpec) -> String {
+fn render_app_bridge_swift(g: &SpecGraph) -> String {
+    let bridge = read_graph_bridge(g);
     let mut out = String::from(
         "import Foundation\n\n\
          // Code-generated by spec_codegen.rs — one typed wrapper per AppSpec\n\
          // bridge method. All calls flow through CoreBridge.send (JSON FFI).\n\
          extension CoreBridge {\n",
     );
-    for m in &spec.bridge {
+    for m in &bridge {
         let id = swift_method_id(&m.method);
         out.push_str(&format!(
             "    /// {method}: {desc}\n    func {id}(params: [String: Any] = [:]) -> String? {{\n\
@@ -251,14 +394,15 @@ fn layout_button_label(layout: &LayoutNode, action: &str) -> Option<String> {
 
 // ── Swift: screen skeletons (Screens.swift) ──────────────────────────────
 
-fn render_screens_swift(spec: &AppSpec) -> String {
+fn render_screens_swift(g: &SpecGraph) -> Result<String, String> {
+    let ui = read_graph_screens(g)?;
     let mut out = String::from(
         "import SwiftUI\n\n\
          // Code-generated by spec_codegen.rs — one screen skeleton per AppSpec\n\
          // ui screen. Buttons mirror the layout sketch's actions; bodies are\n\
          // TODO hooks for the fill stage.\n",
     );
-    for s in &spec.ui {
+    for s in &ui {
         let struct_name = pascal(&s.id);
         out.push_str(&format!(
             "struct {struct_name}Screen: View {{\n    @Environment(CoreBridge.self) private var core\n\n    var body: some View {{\n",
@@ -284,37 +428,50 @@ fn render_screens_swift(spec: &AppSpec) -> String {
         }
         out.push_str("    }\n}\n\n");
     }
-    out
+    Ok(out)
 }
 
 // ── Orchestration ────────────────────────────────────────────────────────
 
-/// Deterministic skeleton files for a validated spec, written under the
-/// SpireApp fill roots.
-pub fn generated_files(spec: &AppSpec, project_name: &str) -> Vec<GeneratedFile> {
+/// Deterministic skeleton files generated from a spec **graph**, written under
+/// the SpireApp fill roots. Every generator reads only its slice of the graph
+/// (types, actors/handlers, HANDLED_BY routing, methods, screens+layout) —
+/// the same shape the actor layer will persist in Stage 4.
+pub fn generated_files_from_graph(
+    g: &SpecGraph,
+    project_name: &str,
+) -> Result<Vec<GeneratedFile>, String> {
     let crate_name = crate_id(project_name);
-    vec![
+    Ok(vec![
         GeneratedFile {
             path: format!("crates/{crate_name}/src/types.rs"),
-            content: render_types_rs(spec),
+            content: render_types_rs(g),
         },
         GeneratedFile {
             path: format!("crates/{crate_name}/src/actors.rs"),
-            content: render_actors_rs(spec),
+            content: render_actors_rs(g),
         },
         GeneratedFile {
             path: format!("crates/{crate_name}/src/lib.rs"),
-            content: render_lib_rs(spec, &crate_name),
+            content: render_lib_rs(g, &crate_name),
         },
         GeneratedFile {
             path: "ui/swift/Sources/SpireUI/AppBridge.swift".to_string(),
-            content: render_app_bridge_swift(spec),
+            content: render_app_bridge_swift(g),
         },
         GeneratedFile {
             path: "ui/swift/Sources/SpireUI/Screens.swift".to_string(),
-            content: render_screens_swift(spec),
+            content: render_screens_swift(g)?,
         },
-    ]
+    ])
+}
+
+/// Deterministic skeleton files for a validated spec, written under the
+/// SpireApp fill roots. Convenience wrapper over the graph entry: the spec is
+/// decomposed and every generator reads the graph piece-wise.
+pub fn generated_files(spec: &AppSpec, project_name: &str) -> Vec<GeneratedFile> {
+    generated_files_from_graph(&spec_graph::decompose(spec), project_name)
+        .expect("a validated AppSpec always decomposes to a codegennable graph")
 }
 
 /// Map the generated skeleton files to `write_source_file` creation steps the
@@ -470,5 +627,100 @@ mod tests {
             Some("Open")
         );
         assert_eq!(layout_button_label(&layout, "missing"), None);
+    }
+
+    #[test]
+    fn graph_driven_codegen_matches_the_spec_driven_entry_on_the_reference() {
+        let raw = include_str!("../../../../../docs/spire-gis.appspec.json");
+        let spec: AppSpec = serde_json::from_str(raw).expect("reference spec parses");
+        let g = spec_graph::decompose(&spec);
+        let from_graph =
+            generated_files_from_graph(&g, "spire-gis").expect("graph codegen succeeds");
+        let from_spec = generated_files(&spec, "spire-gis");
+        assert_eq!(
+            from_spec, from_graph,
+            "both entries must produce identical files"
+        );
+        assert_eq!(from_spec.len(), 5);
+    }
+
+    #[test]
+    fn graph_driven_codegen_reads_the_reference_graph_piecewise() {
+        let raw = include_str!("../../../../../docs/spire-gis.appspec.json");
+        let spec: AppSpec = serde_json::from_str(raw).expect("reference spec parses");
+        let g = spec_graph::decompose(&spec);
+        let fs = generated_files_from_graph(&g, "spire-gis").expect("graph codegen succeeds");
+        let types_rs = content(&fs, "crates/spire-gis/src/types.rs");
+        // spec_type nodes → records/enums.
+        assert!(types_rs.contains("pub struct LayerInfo"));
+        assert!(types_rs.contains("pub struct IngestReport"));
+        assert!(types_rs.contains("pub enum GeometryType"));
+        // spec_actor + HAS_HANDLER nodes → skeletons.
+        let actors_rs = content(&fs, "crates/spire-gis/src/actors.rs");
+        assert!(actors_rs.contains("pub struct MapActor"));
+        assert!(actors_rs.contains("pub struct QueryActor"));
+        // HANDLED_BY routing → dispatch, and spec_method nodes → Swift wrappers.
+        let lib_rs = content(&fs, "crates/spire-gis/src/lib.rs");
+        for m in &spec.bridge {
+            let owner = spec
+                .actors
+                .iter()
+                .find(|a| a.handlers.iter().any(|h| h == &m.method))
+                .expect("each method has an owning actor");
+            let ty = owner.name.split(['_', '-']).collect::<Vec<_>>().join("");
+            let actor_ty = ty[..1].to_uppercase() + &ty[1..];
+            assert!(
+                lib_rs.contains(&format!("\"{}\" => actors::{actor_ty}::new()", m.method)),
+                "dispatch must route '{}' to {}
+{}",
+                m.method,
+                owner.name,
+                lib_rs
+            );
+        }
+        // spec_screen nodes + layout/action subgraphs → screen skeletons.
+        let screens_swift = content(&fs, "ui/swift/Sources/SpireUI/Screens.swift");
+        assert!(screens_swift.contains("struct MapScreen: View"));
+        assert!(screens_swift.contains("struct InspectorScreen: View"));
+        assert!(screens_swift.contains("Button(\"Reload\")"));
+        assert!(screens_swift.contains("struct SearchScreen: View"));
+    }
+
+    #[test]
+    fn graph_readers_see_the_whole_reference_decomposition() {
+        let raw = include_str!("../../../../../docs/spire-gis.appspec.json");
+        let spec: AppSpec = serde_json::from_str(raw).expect("reference spec parses");
+        let g = spec_graph::decompose(&spec);
+        let types = read_graph_types(&g);
+        assert_eq!(types.len(), spec.types.len());
+        let actors = read_graph_actors(&g);
+        assert_eq!(actors.len(), spec.actors.len());
+        let dispatch = read_graph_dispatch(&g);
+        let handled: usize = dispatch.iter().map(|(_, ms)| ms.len()).sum();
+        assert_eq!(handled, spec.bridge.len());
+        let bridge = read_graph_bridge(&g);
+        assert_eq!(bridge.len(), spec.bridge.len());
+        for m in &bridge {
+            assert_eq!(
+                m.result,
+                spec.bridge
+                    .iter()
+                    .find(|b| b.method == m.method)
+                    .unwrap()
+                    .result
+            );
+        }
+        let ui = read_graph_screens(&g).expect("screens read");
+        assert_eq!(ui.len(), spec.ui.len());
+        for s in &ui {
+            assert_eq!(
+                s.layout,
+                spec.ui.iter().find(|x| x.id == s.id).unwrap().layout
+            );
+            assert_eq!(
+                s.actions,
+                spec.ui.iter().find(|x| x.id == s.id).unwrap().actions
+            );
+        }
     }
 }
