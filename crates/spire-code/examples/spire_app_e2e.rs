@@ -2,15 +2,17 @@
 // Copyright (c) 2026 NatureSense
 
 //! Dev E2E harness: write the deterministic AppSpec-codegen skeleton files
-//! into a REAL SpireApp monorepo (the canonical GIS spec) so the generated
-//! Rust + Swift code can be compiled by the real toolchains.
+//! into a REAL SpireApp monorepo so the generated Rust + Swift code can be
+//! compiled by the real toolchains.
 //!
 //! Usage:
-//!   cargo run -p spire-code --example spire_app_e2e [repo-root]
+//!   cargo run -p spire-code --example spire_app_e2e [repo-root] [spec.json]
 //!
-//! Defaults to `~/naturesense/spire/spire-gis`. Only writes the five skeleton
-//! files under the repo's fill roots (types.rs, actors.rs, lib.rs,
-//! AppBridge.swift, Screens.swift) plus `<root>/.spire/appspec.json`.
+//! Defaults to `~/naturesense/spire/spire-gis`. When `spec.json` is given it is
+//! parsed (and must validate) as the AppSpec to generate from; otherwise the
+//! canonical GIS spec is used. Only writes the five skeleton files under the
+//! repo's fill roots (types.rs, actors.rs, lib.rs, AppBridge.swift,
+//! Screens.swift) plus `<root>/.spire/appspec.json`.
 
 use std::path::PathBuf;
 
@@ -161,11 +163,32 @@ fn main() {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "spire-gis".to_string());
 
-    let spec = gis_spec();
-    assert!(
-        spec.is_valid(),
-        "the GIS reference spec must validate before codegen"
-    );
+    // Optional external spec JSON (from a live createProject/GenerateSpec);
+    // otherwise the canonical embedded GIS spec is used.
+    let spec = match std::env::args().nth(2) {
+        Some(path) => {
+            let raw = std::fs::read_to_string(&path).expect("read spec.json");
+            let spec: AppSpec = serde_json::from_str(&raw)
+                .expect("spec.json must deserialize as an AppSpec");
+            assert!(spec.is_valid(), "spec.json must validate");
+            println!(
+                "spire_app_e2e: loaded external spec from {path} ({} types, {} actors, {} methods, {} screens)",
+                spec.types.len(),
+                spec.actors.len(),
+                spec.bridge.len(),
+                spec.ui.len()
+            );
+            spec
+        }
+        None => {
+            let spec = gis_spec();
+            assert!(
+                spec.is_valid(),
+                "the GIS reference spec must validate before codegen"
+            );
+            spec
+        }
+    };
 
     let files =
         spire_code::subsystems::project::spec_codegen::generated_files(&spec, &project_name);
