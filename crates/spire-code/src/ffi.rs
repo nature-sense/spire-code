@@ -1064,32 +1064,61 @@ pub(crate) fn serialize_analysis(analysis: &crate::subsystems::project::project_
                 .unwrap_or("")
                 .trim_matches('/')
                 .to_string();
-            if bs.is_workspace && !bs.workspace_members.is_empty() && rel_path0.is_empty() {
+            // A SpireApp root workspace is the project itself (its single
+            // member crate is the app the root describes), so it stays as a
+            // first-class subproject. Only the LEGACY multi-platform workspace
+            // (core/rpi5/rock3c members) is an aggregate whose members are
+            // expanded below instead.
+            let is_spire_app =
+                bs.structure == spire_core::build_types::ProjectStructure::SpireApp;
+            if bs.is_workspace
+                && !bs.workspace_members.is_empty()
+                && rel_path0.is_empty()
+                && !is_spire_app
+            {
                 return None;
             }
             // Use project_name or derive from project_path. For nested
             // configs (e.g. `rpi/hal/meson.build`) the top-level directory
             // name ("rpi") is the subproject's identity — not the leaf
             // ("hal") — so it matches what the user sees in the graph.
-            let name = bs
-                .project_name
-                .clone()
-                .or_else(|| {
-                    bs.project_path.as_ref().and_then(|p| {
-                        let p = p.trim_matches('/');
-                        if p.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                p.split('/')
-                                    .next()
-                                    .map(str::to_string)
-                                    .unwrap_or_else(|| p.to_string()),
-                            )
+            let name = if is_spire_app && rel_path0.is_empty() {
+                // The SpireApp subproject is the project: name it after it.
+                if analysis.project_name.is_empty() {
+                    "cargo".to_string()
+                } else {
+                    analysis.project_name.clone()
+                }
+            } else {
+                bs.project_name
+                    .clone()
+                    .or_else(|| {
+                        bs.project_path.as_ref().and_then(|p| {
+                            let p = p.trim_matches('/');
+                            if p.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    p.split('/')
+                                        .next()
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| p.to_string()),
+                                )
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        // Root configs without a name (e.g. a bare Makefile
+                        // wrapper next to a Cargo workspace) get a label from
+                        // their build system instead of the opaque "unknown".
+                        match bs.build_system.as_str() {
+                            "Cargo" => "cargo".to_string(),
+                            "SwiftPM" | "Xcode" => "swift".to_string(),
+                            "Make" => "make".to_string(),
+                            other => other.to_lowercase(),
                         }
                     })
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+            };
             let lang = match bs.build_system.as_str() {
                 "Cargo" => "Rust",
                 "SwiftPM" | "Xcode" => "Swift",
@@ -1163,7 +1192,12 @@ pub(crate) fn serialize_analysis(analysis: &crate::subsystems::project::project_
     // directories as "covered", so the directory fallback skips them.
     let mut member_subprojects: Vec<serde_json::Value> = Vec::new();
     for bs in &analysis.build_systems {
-        if !bs.is_workspace || bs.workspace_members.is_empty() {
+        // SpireApp roots are emitted directly above (they are the project), so
+        // never re-expand their members into duplicate subprojects.
+        if !bs.is_workspace
+            || bs.workspace_members.is_empty()
+            || bs.structure == spire_core::build_types::ProjectStructure::SpireApp
+        {
             continue;
         }
         for member in &bs.workspace_members {
@@ -1561,3 +1595,193 @@ pub unsafe extern "C" fn spire_free_string(ptr: *mut std::ffi::c_char) {
         }
     }
 }
+
+#[cfg(test)]
+mod serialize_analysis_tests {
+    use super::serialize_analysis;
+    use crate::subsystems::project::project_analyzer::{
+        LanguageBreakdown, ProjectAnalysis, RoleBreakdown,
+    };
+    use spire_core::analyzer::models::DirectoryNode;
+    use spire_core::build_types::{
+        BuildMetadata, DomainEditability, ProjectDomain, ProjectStructure, WorkspaceMember,
+    };
+
+    fn meta(
+        build_system: &str,
+        name: Option<&str>,
+        path: &str,
+        is_workspace: bool,
+        members: Vec<WorkspaceMember>,
+        structure: ProjectStructure,
+    ) -> BuildMetadata {
+        BuildMetadata {
+            project_name: name.map(str::to_string),
+            build_system: build_system.to_string(),
+            project_path: Some(path.to_string()),
+            is_workspace,
+            workspace_members: members,
+            structure,
+            ..Default::default()
+        }
+    }
+
+    fn domain(id: &str) -> ProjectDomain {
+        ProjectDomain {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: "common".to_string(),
+            files: Vec::new(),
+            dependencies: Vec::new(),
+            build_spec: None,
+            editability: DomainEditability::Fillable,
+            contracts: Vec::new(),
+        }
+    }
+
+    fn spire_gis_analysis() -> ProjectAnalysis {
+        let mut cargo = meta(
+            "Cargo",
+            None,
+            "",
+            true,
+            vec![WorkspaceMember {
+                name: "spire-gis".to_string(),
+                path: "crates/spire-gis".to_string(),
+                version: None,
+            }],
+            ProjectStructure::SpireApp,
+        );
+        cargo.domains = vec![domain("core"), domain("ui")];
+        ProjectAnalysis {
+            project_root: "/tmp/spire-gis".to_string(),
+            project_name: "spire-gis".to_string(),
+            file_tree: DirectoryNode::default(),
+            build_systems: vec![
+                cargo,
+                meta("Make", None, "", false, vec![], ProjectStructure::Native),
+                meta(
+                    "SwiftPM",
+                    Some("swift"),
+                    "ui/swift",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+            ],
+            languages: vec![LanguageBreakdown {
+                language: "Rust".to_string(),
+                file_count: 1,
+                line_estimate: 1,
+            }],
+            directory_roles: vec![],
+            file_roles: vec![RoleBreakdown {
+                role: "entry".to_string(),
+                count: 1,
+            }],
+            entry_points: vec![],
+            architecture_summary: String::new(),
+            total_files: 1,
+            total_dirs: 0,
+            total_lines: 1,
+        }
+    }
+
+    /// The SpireApp root is the project itself: it must appear as ONE Cargo
+    /// subproject (named after the project, with its structure + domains),
+    /// alongside the Swift and Make subprojects — never dropped, never
+    /// duplicated by the workspace-member expansion.
+    #[test]
+    fn spire_app_root_is_one_cargo_subproject_not_unknown() {
+        let json = serialize_analysis(&spire_gis_analysis());
+        let sp = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        let labels: Vec<String> = sp
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}[{}]",
+                    s.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    s.get("buildSystem").and_then(|v| v.as_str()).unwrap_or("")
+                )
+            })
+            .collect();
+        eprintln!("subprojects = {labels:?}");
+
+        assert_eq!(sp.len(), 3, "expected 3 subprojects: {labels:?}");
+
+        // The Cargo subproject is the project root, named after the project,
+        // carrying the SpireApp structure + core/ui domains.
+        let cargo = sp
+            .iter()
+            .find(|s| s.get("buildSystem").and_then(|v| v.as_str()) == Some("Cargo"))
+            .expect("Cargo subproject present");
+        assert_eq!(
+            cargo.get("name").and_then(|v| v.as_str()),
+            Some("spire-gis")
+        );
+        assert_eq!(
+            cargo.get("structure").and_then(|v| v.as_str()),
+            Some("spire_app")
+        );
+        let domains = cargo.get("domains").and_then(|v| v.as_array()).unwrap();
+        let domain_ids: Vec<&str> = domains
+            .iter()
+            .filter_map(|d| d.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(domain_ids.contains(&"core"));
+        assert!(domain_ids.contains(&"ui"));
+
+        // Swift and Make subprojects, neither labelled "unknown".
+        let names: Vec<&str> = sp
+            .iter()
+            .filter_map(|s| s.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"swift"), "swift missing: {names:?}");
+        assert!(names.contains(&"make"), "make missing: {names:?}");
+        assert!(!names.contains(&"unknown"), "no unknown label: {names:?}");
+    }
+
+    /// A legacy multi-platform Cargo workspace (platform member crates) must
+    /// still expand its members and NOT emit the root — unchanged behaviour.
+    #[test]
+    fn legacy_cargo_workspace_expands_members() {
+        let analysis = ProjectAnalysis {
+            project_name: "embedded".to_string(),
+            build_systems: vec![meta(
+                "Cargo",
+                None,
+                "",
+                true,
+                vec![
+                    WorkspaceMember {
+                        name: "core".to_string(),
+                        path: "core".to_string(),
+                        version: None,
+                    },
+                    WorkspaceMember {
+                        name: "rpi5".to_string(),
+                        path: "rpi5".to_string(),
+                        version: None,
+                    },
+                ],
+                ProjectStructure::Native,
+            )],
+            ..spire_gis_analysis()
+        };
+        let json = serialize_analysis(&analysis);
+        let sp = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        let names: Vec<&str> = sp
+            .iter()
+            .filter_map(|s| s.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"core"), "member core missing: {names:?}");
+        assert!(names.contains(&"rpi5"), "member rpi5 missing: {names:?}");
+    }
+}
+
