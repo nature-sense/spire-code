@@ -24,6 +24,7 @@ struct ProjectWizardView: View {
     @State private var projectName = ""
     @State private var selectedPlatforms: Set<String> = []
     @State private var availablePlatforms: [Platform] = []
+    @State private var structure = "native"   // native | spire_app (Cargo), single_source | hal (Meson)
 
     // Describe / plan
     @State private var goal = ""
@@ -36,6 +37,20 @@ struct ProjectWizardView: View {
     @State private var executedSteps: [String: StepExecutionResult] = [:]
 
     private let buildSystems = ["Cargo", "Meson"]
+
+    /// Structure options shown for the selected build system.
+    private var structureOptions: [(key: String, title: String, subtitle: String)] {
+        if buildSystem == "Cargo" {
+            return [
+                ("native", "Plain Cargo crate", "Single source set, cross-compiled per target"),
+                ("spire_app", "Spire app", "Rust core + SwiftUI, built on spire-actor & spire-core"),
+            ]
+        }
+        return [
+            ("single_source", "Single source base", "Portable — no hardware-specific layer"),
+            ("hal", "Hardware abstraction", "Common core + hal/api contract + per-target implementations"),
+        ]
+    }
 
     private var hasDescription: Bool {
         !goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -83,6 +98,9 @@ struct ProjectWizardView: View {
                 projectName = (root as NSString).lastPathComponent
             }
         }
+        .onChange(of: buildSystem) { _, _ in
+            structure = structureOptions.first?.key ?? "native"
+        }
     }
 
     private var header: some View {
@@ -109,6 +127,20 @@ struct ProjectWizardView: View {
                 }
             }
             .pickerStyle(.segmented)
+
+            Text("Project structure")
+                .font(.headline)
+            Picker("Project structure", selection: $structure) {
+                ForEach(structureOptions, id: \.key) { opt in
+                    Text(opt.title).tag(opt.key)
+                }
+            }
+            .pickerStyle(.segmented)
+            if let selected = structureOptions.first(where: { $0.key == structure }) {
+                Label(selected.subtitle, systemImage: "square.grid.3x3")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
 
             Text("Project name")
                 .font(.headline)
@@ -265,7 +297,8 @@ struct ProjectWizardView: View {
             rootDir: targetDir,
             projectName: projectName.trimmingCharacters(in: .whitespaces),
             language: buildSystem,
-            platforms: platforms
+            platforms: platforms,
+            structure: structure
         ) {
             SpireBridge.logScaffold("ProjectWizardView: Plan OK — \(result.plan.steps.count) steps")
             planResult = result
@@ -303,7 +336,8 @@ struct ProjectWizardView: View {
             buildSystem: buildSystem,
             projectName: name,
             root: targetDir,
-            platforms: platforms
+            platforms: platforms,
+            structure: structure
         ) {
             errorMessage = err
             return

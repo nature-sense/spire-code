@@ -401,18 +401,23 @@ final class SpireBridge {
     /// the LLM for an implementation plan inside it. Returns both so the wizard
     /// can show the plan for OK/Reject. On OK the UI scaffolds (materializes
     /// the spec) then executes the plan.
-    /// Calls FFI: createProject/Plan { goal, rootDir, projectName, language, platforms }
+    /// Calls FFI: createProject/Plan { goal, rootDir, projectName, language, platforms, structure, embedded }
     func planScaffold(goal: String, rootDir: String, projectName: String,
-                      language: String = "Rust", platforms: [String] = []) async -> PlanScaffoldResult? {
+                      language: String = "Rust", platforms: [String] = [],
+                      structure: String = "native", embedded: Bool = false) async -> PlanScaffoldResult? {
         do {
             var params: [String: Any] = [
                 "goal": goal,
                 "rootDir": rootDir,
                 "projectName": projectName,
-                "language": language
+                "language": language,
+                "structure": structure
             ]
             if !platforms.isEmpty {
                 params["platforms"] = platforms
+            }
+            if embedded {
+                params["embedded"] = true
             }
             let body: [String: Any] = [
                 "method": "createProject/Plan",
@@ -1457,7 +1462,8 @@ final class SpireBridge {
     /// returns the ScaffoldSpec (locked files, fill roots, platforms, layout).
     /// Returns nil on success, error string on failure.
     func scaffoldProject(buildSystem: String, projectName: String, root: String,
-                         platforms: [String] = []) async -> String? {
+                         platforms: [String] = [], structure: String = "native",
+                         embedded: Bool = false) async -> String? {
         do {
             let body: [String: Any] = [
                 "method": "createProject/Scaffold",
@@ -1465,7 +1471,9 @@ final class SpireBridge {
                     "projectName": projectName,
                     "rootDir": root,
                     "language": buildSystem,
-                    "platforms": platforms
+                    "platforms": platforms,
+                    "structure": structure,
+                    "embedded": embedded
                 ]
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
