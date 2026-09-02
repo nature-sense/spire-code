@@ -37,6 +37,11 @@ impl CmakeBuildModule {
     async fn test(&self, path: &Path, _opts: &TestOptions) -> Result<BuildOutput, String> {
         run_cmd(path, "ctest", &["--test-dir", "build"]).await
     }
+
+    /// Run `cmake --build build --target clean`.
+    async fn clean(&self, path: &Path, _metadata: &BuildMetadata) -> Result<BuildOutput, String> {
+        run_cmd(path, "cmake", &["--build", "build", "--target", "clean"]).await
+    }
 }
 
 impl Default for CmakeBuildModule {
@@ -65,7 +70,7 @@ impl Actor for CmakeBuildModule {
                         "hpp".to_string(),
                         "cmake".to_string(),
                     ],
-                supports_clean: false,
+                supports_clean: true,
                 supports_lint: false,
                 supports_format: false,
                 supports_fix: false,
@@ -115,26 +120,31 @@ impl Actor for CmakeBuildModule {
                 let _ = reply_to.send(self.test(&path, &opts).await);
             }
 
-            BuildModuleMessage::Clean { reply_to, .. } => {
-                let _ = reply_to.send(Err("clean not implemented for this module".to_string()));
+            BuildModuleMessage::Clean {
+                path,
+                metadata,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.clean(&path, &metadata).await);
             }
 
             BuildModuleMessage::Lint { reply_to, .. } => {
-                let _ = reply_to.send(Err("lint not implemented for this module".to_string()));
+                let _ = reply_to.send(Err("lint not supported for this module".to_string()));
             }
 
             BuildModuleMessage::Format { reply_to, .. } => {
-                let _ = reply_to.send(Err("format not implemented for this module".to_string()));
+                let _ = reply_to.send(Err("format not supported for this module".to_string()));
             }
             BuildModuleMessage::Fix { reply_to, .. } => {
-                let _ = reply_to.send(Err("fix not implemented for this module".to_string()));
+                let _ = reply_to.send(Err("fix not supported for this module".to_string()));
             }
             BuildModuleMessage::LintStreaming { reply_to, .. } => {
-                let _ = reply_to.send(Err("lint streaming not implemented for this module".to_string()));
+                let _ = reply_to.send(Err("lint not supported for this module".to_string()));
             }
 
             BuildModuleMessage::FixStreaming { reply_to, .. } => {
-                let _ = reply_to.send(Err("fix streaming not implemented for this module".to_string()));
+                let _ = reply_to.send(Err("fix not supported for this module".to_string()));
             }
 
 

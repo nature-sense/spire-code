@@ -1,9 +1,7 @@
 // spire-ffi — C FFI bridge for Swift UI to call the Rust core.
 
 use std::ffi::{CStr, CString};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
@@ -21,6 +19,10 @@ use spire_core::modules::{
 use spire_core::actors::tool_providers::ToolRouterActor;
 use crate::actors::tool_providers::build_default_registry;
 use crate::subsystems::project::project_creation::{ProjectCreationActor, ProjectCreationMessage};
+use crate::subsystems::project::project_build::{ProjectBuildActor, ProjectBuildMessage};
+use crate::subsystems::project::project_install::{ProjectInstallActor, ProjectInstallMessage};
+use crate::subsystems::project::project_lint::{ProjectLintActor, ProjectLintMessage};
+use crate::subsystems::project::project_test::{ProjectTestActor, ProjectTestMessage};
 use crate::subsystems::planning::plan_orchestrator::PlanOrchestrator;
 use crate::subsystems::planning::plan_orchestrator::PlanOrchestratorMessage;
 use spire_core::actors::rag::{RagActor, RagMessage};
@@ -31,15 +33,15 @@ use spire_core::actors::{
     SystemPromptActor, SystemPromptMessage, ToolsActor,
 };
 use crate::actors::{
-    CoordinatorActor, CoordinatorMessage, IntentRouterActor, IntentRouterMessage,
-    ProjectAnalyzerActor, ProjectAnalyzerMessage, ProjectQueryActor, ProjectQueryMessage,
-    ProjectSyncActor, ProjectSyncMessage, SystemActor, SystemMessage,
+    CoordinatorActor, CoordinatorMessage, FfiSharedState, IntentRouterActor,
+    IntentRouterMessage, ProjectAnalyzerActor, ProjectAnalyzerMessage, ProjectQueryActor,
+    ProjectQueryMessage, ProjectSyncActor, ProjectSyncMessage, SystemActor, SystemMessage,
 };
 use spire_core::models::embedding::Embedder;
 
 use spire_actor::registry::ServiceRegistry;
 
-fn dummy_tx<T: Send + 'static>() -> tokio::sync::mpsc::Sender<T> {
+pub(crate) fn dummy_tx<T: Send + 'static>() -> tokio::sync::mpsc::Sender<T> {
     tokio::sync::mpsc::channel::<T>(64).0
 }
 
@@ -74,19 +76,11 @@ fn spawn_module<A: spire_actor::Actor>(actor: A) -> tokio::sync::mpsc::Sender<A:
 
 struct AppState {
     coordinator_tx: tokio::sync::mpsc::Sender<CoordinatorMessage>,
-    watcher_out_tx: tokio::sync::mpsc::Sender<spire_core::subsystems::tools::file_watcher::FileChangeNotification>,
     event_rx: std::sync::Mutex<Option<tokio::sync::broadcast::Receiver<String>>>,
-    /// Authoritative wiring map (all subsystem + core keys registered at init).
-    registry: Arc<ServiceRegistry>,
     runtime: tokio::runtime::Runtime,
-    analysis: Option<crate::subsystems::project::project_analyzer::ProjectAnalysis>,
-    project_root: Option<PathBuf>,
     /// Shared buffer of streaming build events, drained directly by the FFI
     /// (bypasses the actor message loop so output can be read during a build).
     build_event_buffer: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    /// Shared default RAG domain used when `rag/search` / `rag/find-interfaces`
-    /// are called without an explicit `domain` (set via `rag/set-domain`).
-    default_rag_domain: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 unsafe impl Send for AppState {}
@@ -198,15 +192,7 @@ fn init_actor_system() {
 
     let default_rag_domain: std::sync::Arc<std::sync::Mutex<Option<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
-    let default_rag_domain_state = default_rag_domain.clone();
-    let (
-        registry,
-        coord_tx,
-        watcher_out_tx,
-        event_rx,
-        analysis,
-        default_rag_domain_state,
-    ) = runtime.block_on(async {
+    let (coord_tx, event_rx) = runtime.block_on(async {
         // Event broadcast channel: the file-watcher forwarder publishes
         // file-change events here; the UI consumes them via spire_wait_for_event.
         let (event_tx, event_rx) = tokio::sync::broadcast::channel::<String>(256);
@@ -468,22 +454,55 @@ fn init_actor_system() {
         let terminal_tx = spawn_module(TerminalModule::new());
         let _ = registry.register::<TerminalMessage>("terminal", terminal_tx.clone());
 
+        // ── Project meta-tool actors (project/build|test|lint|install) ──
+        // Spawned once at startup. ProjectBuildActor's root is re-pointed on
+        // every project/open via SetProjectRoot (the FFI opens projects
+        // dynamically); the others route through ProjectQuery + BuildManager,
+        // which are already initialized per-project. Registered in the registry
+        // so the coordinator can update them and `tools/call` can dispatch.
+        let (project_build_tx, _) = system.spawn(ProjectBuildActor::new(
+            project_query_tx.clone(),
+            mcp_client_tx.clone(),
+            progress_tx.clone(),
+            chat_tx.clone(),
+            dummy_tx(), // transport_tx — tool events unused in FFI
+            memory_graph_tx.clone(),
+            bm_tx.clone(),
+            std::path::PathBuf::new(), // root set per-project via SetProjectRoot
+        ));
+        let _ = registry.register::<ProjectBuildMessage>("project.build", project_build_tx.clone());
+        let (project_test_tx, _) = system.spawn(ProjectTestActor::new(
+            project_query_tx.clone(),
+            mcp_client_tx.clone(),
+            bm_tx.clone(),
+        ));
+        let _ = registry.register::<ProjectTestMessage>("project.test", project_test_tx.clone());
+        let (project_lint_tx, _) = system.spawn(ProjectLintActor::new(
+            project_query_tx.clone(),
+            mcp_client_tx.clone(),
+            bm_tx.clone(),
+        ));
+        let _ = registry.register::<ProjectLintMessage>("project.lint", project_lint_tx.clone());
+        let (project_install_tx, _) = system.spawn(ProjectInstallActor::new(
+            project_query_tx.clone(),
+            mcp_client_tx.clone(),
+            bm_tx.clone(),
+        ));
+        let _ = registry.register::<ProjectInstallMessage>("project.install", project_install_tx.clone());
+
         // ── Tool router + Tools ──
         // Routes tool calls: extension tools → transport; project/* → embedded;
         // filesystem_/git_/process_/search_/terminal_ → core modules;
         // build_ → BuildManager; catch-all → MCP client.
-        // Project meta-tools (project/build|test|lint|install) are intentionally NOT
-        // registered here: the FFI drives build/test/lint through the build/* tools
-        // (BuildManager) and FFI-direct methods (project/buildStatus, build/lint, …),
-        // and ProjectBuildActor requires a per-project root that the FFI resolves
-        // dynamically. Registering them against dummy channels made them silently fail.
+        // The project meta-tools (project/build|test|lint|install) are wired
+        // with REAL actor channels above, so tools/call reaches them.
         let tool_registry = build_default_registry(
             dummy_tx(), // transport_tx — tool events unused in FFI
             project_query_tx.clone(),
-            None, // project/build — not wired in FFI
-            None, // project/test — not wired in FFI
-            None, // project/lint — not wired in FFI
-            None, // project/install — not wired in FFI
+            Some(project_build_tx.clone()),
+            Some(project_test_tx.clone()),
+            Some(project_lint_tx.clone()),
+            Some(project_install_tx.clone()),
             fs_tx,
             git_tx,
             process_tx,
@@ -717,33 +736,34 @@ fn init_actor_system() {
             file_watcher_tx.clone(),
         );
 
-        // No analysis at startup — `project/open` analyzes the chosen project.
-        let analysis: Option<crate::subsystems::project::project_analyzer::ProjectAnalysis> = None;
+        // ── App-only dispatch deps for the coordinator ──
+        // The FFI-inline RPC handlers (project/open, createProject/*, rag/*, …)
+        // now live in the single CoordinatorActor router. Attach the shared
+        // registry + state so those handlers can resolve actors and remember
+        // the opened project / analysis / RAG domain. The standalone binary
+        // never sends this — its extension flow uses the tools/ methods.
+        let ffi_state = std::sync::Arc::new(FfiSharedState {
+            project_root: std::sync::Mutex::new(None),
+            analysis: std::sync::Mutex::new(None),
+            default_rag_domain: default_rag_domain.clone(),
+            watcher_out_tx: watcher_out_tx.clone(),
+        });
+        let _ = coord_tx
+            .send(CoordinatorMessage::SetFfiDeps {
+                registry: registry.clone(),
+                state: ffi_state.clone(),
+            })
+            .await;
 
-        (
-            registry,
-            coord_tx,
-
-            watcher_out_tx,
-
-            event_rx,
-
-            analysis,
-            default_rag_domain_state,
-        )
+        (coord_tx, event_rx)
     });
 
-    tracing::info!("Spire FFI: ready (analysis={})", analysis.is_some());
+    tracing::info!("Spire FFI: ready (analysis=unopened)");
     *guard = Some(AppState {
-        registry,
         coordinator_tx: coord_tx,
-        watcher_out_tx,
         event_rx: std::sync::Mutex::new(Some(event_rx)),
         runtime,
-        analysis,
-        project_root: None,
         build_event_buffer: BUILD_EVENT_BUFFER.clone(),
-        default_rag_domain: default_rag_domain_state,
     });
     INITIALIZED.store(true, Ordering::Release);
 }
@@ -761,13 +781,13 @@ fn init_actor_system() {
 ///   BuildTarget  — subtype "BuildTarget", BelongsTo → BuildSystem
 ///   Dependency   — subtype "Dependency", BelongsTo → BuildSystem, DEPENDS_ON ← target
 ///   Platform     — subtype "Platform", BelongsTo → BuildSystem
-async fn populate_target_graph(
-    state: &AppState,
+pub(crate) async fn populate_target_graph(
+    registry: &ServiceRegistry,
     build_systems: &[spire_core::analyzer::models::BuildMetadata],
 ) -> anyhow::Result<()> {
     use spire_core::models::memory_graph::{RelationshipInput, RelationshipType};
 
-    let mg_tx = state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx).clone();
+    let mg_tx = registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx).clone();
 
     // Map config_file → BuildSystem node id (from the bootstrap).
     let (t, r) = tokio::sync::oneshot::channel();
@@ -942,7 +962,7 @@ async fn populate_target_graph(
 /// scaffolding `<name>` into a folder already named `<name>` (e.g.
 /// `ai-traps-mcp/ai-traps-mcp`) and made every relative file path resolve to
 /// a non-existent file ("Unable to read file").
-fn resolve_project_root(root: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn resolve_project_root(root: &std::path::Path) -> std::path::PathBuf {
     let mut candidate = root.to_path_buf();
     loop {
         // If the candidate already contains a Cargo.toml at its own root,
@@ -986,7 +1006,7 @@ fn resolve_project_root(root: &std::path::Path) -> std::path::PathBuf {
     candidate
 }
 
-fn find_tree_dir<'a>(
+pub(crate) fn find_tree_dir<'a>(
     root: &'a spire_core::analyzer::models::DirectoryNode,
     path: &str,
 ) -> Option<&'a spire_core::analyzer::models::DirectoryNode> {
@@ -1002,7 +1022,7 @@ fn find_tree_dir<'a>(
 }
 
 /// Recursively collect all files under a directory as Swift `FileEntry` JSON.
-fn collect_tree_files(dir: &spire_core::analyzer::models::DirectoryNode, out: &mut Vec<serde_json::Value>) {
+pub(crate) fn collect_tree_files(dir: &spire_core::analyzer::models::DirectoryNode, out: &mut Vec<serde_json::Value>) {
     for f in &dir.files {
         out.push(serde_json::json!({
             "path": f.path,
@@ -1016,7 +1036,7 @@ fn collect_tree_files(dir: &spire_core::analyzer::models::DirectoryNode, out: &m
     }
 }
 
-fn serialize_analysis(analysis: &crate::subsystems::project::project_analyzer::ProjectAnalysis) -> String {
+pub(crate) fn serialize_analysis(analysis: &crate::subsystems::project::project_analyzer::ProjectAnalysis) -> serde_json::Value {
     let build_systems: Vec<String> = analysis
         .build_systems
         .iter()
@@ -1297,7 +1317,7 @@ fn serialize_analysis(analysis: &crate::subsystems::project::project_analyzer::P
     // Serialize file tree as a JSON value
     let file_tree_json = serde_json::to_value(&analysis.file_tree).unwrap_or(serde_json::json!({}));
 
-    serde_json::to_string(&serde_json::json!({
+    serde_json::json!({
         "name": analysis.project_name,
         "root": analysis.project_root,
         "languages": languages_json,
@@ -1305,16 +1325,19 @@ fn serialize_analysis(analysis: &crate::subsystems::project::project_analyzer::P
         "architecture": analysis.architecture_summary,
         "subprojects": subprojects,
         "fileTree": file_tree_json
-    }))
-    .unwrap_or_default()
+    })
 }
 
+/// Parse a JSON-RPC request and dispatch it to the single CoordinatorActor
+/// router. All method routing lives in `coordinator.rs` (including the app-only
+/// `project/open`, `createProject/*`, `rag/*`, … handlers, which use the
+/// dispatch deps attached via `CoordinatorMessage::SetFfiDeps`). This wrapper
+/// only parses, instruments, and forwards — it never branches on the method.
 fn process_json_request(request_json: &str) -> String {
-    let mut guard = lock_state();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return r#"{"error":"Not initialized"}"#.to_string(),
-    };
+    let guard = lock_state();
+    if guard.is_none() {
+        return r#"{"error":"Not initialized"}"#.to_string();
+    }
 
     let parsed: serde_json::Value = match serde_json::from_str(request_json) {
         Ok(v) => v,
@@ -1360,900 +1383,10 @@ fn process_json_request(request_json: &str) -> String {
         start: std::time::Instant::now(),
     };
 
-            if method == "project/open" {
-                let root = parsed
-                    .get("params")
-                    .and_then(|p| p.get("root"))
-                    .and_then(|v| v.as_str())
-                    .map(PathBuf::from);
-                let root = match root {
-                    Some(r) if !r.as_os_str().is_empty() => r,
-                    _ => return r#"{"error":"Missing root"}"#.to_string(),
-                };
-                // Guard against opening the user's home directory (or the
-                // filesystem root) — scanning them hangs for minutes. Opening
-                // a project requires a real project folder, not a broad parent.
-                let root_canon = root.canonicalize().unwrap_or_else(|_| root.clone());
-                let is_root_dir = root_canon.as_os_str() == std::ffi::OsStr::new("/");
-                let is_home = std::env::var("HOME")
-                    .ok()
-                    .map(|h| {
-                        let hp = PathBuf::from(h);
-                        let hc = hp.canonicalize().unwrap_or(hp);
-                        root_canon == hc
-                    })
-                    .unwrap_or(false);
-                if is_root_dir || is_home {
-                    return serde_json::to_string(&serde_json::json!({
-                        "error": "Please choose a project directory, not your home directory"
-                    })).unwrap_or_default();
-                }
-                if !root.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&root) {
-                        return serde_json::to_string(&serde_json::json!({
-                            "error": format!("Failed to create project dir {}: {}", root.display(), e)
-                        })).unwrap_or_default();
-                    }
-                    tracing::info!("project/open: created {}", root.display());
-                }
-                // ── Auto-descend wrapper directories ──
-                // When the user opens a folder that merely CONTAINS the real
-                // project (e.g. `ai-traps-mcp/` whose only child is
-                // `ai-traps-mcp/` with the Cargo.toml), resolve to the nested
-                // project root. This is the classic double-nesting artifact
-                // from scaffolding <name> into a folder already named <name>,
-                // and it made every relative file path resolve to a
-                // non-existent file ("Unable to read file").
-                let root = resolve_project_root(&root);
-                let data_dir = root.join(".spire").join("data");
-                if let Err(e) = std::fs::create_dir_all(&data_dir) {
-                    return serde_json::to_string(&serde_json::json!({
-                        "error": format!("Failed to create data dir: {}", e)
-                    })).unwrap_or_default();
-                }
-                let result = state.runtime.block_on(async {
-                    let (t, r) = tokio::sync::oneshot::channel();
-                    let _ = state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx).send(MemoryGraphMessage::Initialize {
-                        data_dir: data_dir.clone(),
-                        reply_to: t,
-                    }).await;
-                    if let Err(e) = r.await { return Err(format!("MemoryGraph init lost: {}", e)); }
-                    let (t, r) = tokio::sync::oneshot::channel();
-                    let _ = state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx).send(MemoryGraphMessage::InitializeEmbedder {
-                        model_path: None,
-                        embedder: Some(Arc::new(spire_core::embedder::NoopEmbedder) as Arc<dyn Embedder>),
-                        reply_to: t,
-                    }).await;
-                    if let Err(e) = r.await { return Err(format!("Embedder init lost: {}", e)); }
-                    // ── Bootstrap MCP config into the project graph ──
-                    // Reads config/mcp-config.json, stores each server as a
-                    // SpireMcpConfig node, then loads them into the client and
-                    // connects. This is what seeds cratesio-mcp etc. per project.
-                    // Prefer the project's own config/mcp-config.json; fall back
-                    // to the bundled global config so fresh/empty projects still
-                    // get their language MCP servers seeded into the graph.
-                    let mut config_path = root.join("config").join("mcp-config.json");
-                    if !config_path.exists() {
-                        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                            .parent()
-                            .map(|p| p.join("config").join("mcp-config.json"))
-                            .unwrap_or_default();
-                        if bundled.exists() {
-                            config_path = bundled;
-                        }
-                    }
-                    if config_path.exists() {
-                        let (t, r) = tokio::sync::oneshot::channel();
-                        let _ = state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx)
-                            .send(MemoryGraphMessage::BootstrapMcpConfig {
-                                config_path: config_path.clone(),
-                                reply_to: t,
-                            })
-                            .await;
-                        let _ = r.await;
-                    }
-                    let (t, r) = tokio::sync::oneshot::channel();
-                    let _ = state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx)
-                        .send(MemoryGraphMessage::GetMcpConfig { reply_to: t })
-                        .await;
-                    if let Ok(Ok(servers)) = r.await {
-                        if !servers.is_empty() {
-                            use spire_core::mcp::client::{McpServerConfig, TransportConfig};
-                            let configs: Vec<McpServerConfig> = servers
-                                .into_iter()
-                                .filter_map(|entry| {
-                                    let transport = if let Some(url) = entry.url {
-                                        TransportConfig::Http { url, headers: entry.headers.unwrap_or_default() }
-                                    } else if let Some(cmd) = entry.command {
-                                        TransportConfig::Stdio { command: cmd, args: entry.args, env: entry.env.unwrap_or_default() }
-                                    } else {
-                                        return None;
-                                    };
-                                    Some(McpServerConfig { name: entry.name, transport, autostart: entry.autostart, build_type: None })
-                                })
-                                .collect();
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = state.registry.get::<McpClientMessage>("mcp_client").unwrap_or_else(dummy_tx)
-                                .send(McpClientMessage::LoadConfigFromGraph { servers: configs, reply_to: t })
-                                .await;
-                            let _ = r.await;
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = state.registry.get::<McpClientMessage>("mcp_client").unwrap_or_else(dummy_tx)
-                                .send(McpClientMessage::ConnectAll { reply_to: t })
-                                .await;
-                            // Wait for the servers to actually connect before
-                            // continuing — avoids a race where plan generation
-                            // starts before MCP tools are available.
-                            let _ = r.await;
-                        }
-                    }
-                    let (t, r) = tokio::sync::oneshot::channel();
-                    let _ = state.registry.get::<ProjectQueryMessage>("project.query").unwrap_or_else(dummy_tx).send(ProjectQueryMessage::Initialize {
-                        memory_graph_tx: state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx).clone(),
-                        project_root: root.clone(),
-                        reply_to: t,
-                    }).await;
-                    let _ = r.await;
-                    let (t, r) = tokio::sync::oneshot::channel();
-                    let _ = state.registry.get::<ProjectSyncMessage>("project.sync").unwrap_or_else(dummy_tx).send(ProjectSyncMessage::Bootstrap {
-                        project_root: root.clone(),
-                        reply_to: t,
-                    }).await;
-                    let _ = r.await;
-                    let _ = state.registry.get::<spire_core::subsystems::tools::file_watcher::FileWatcherMessage>("tools.watcher").unwrap_or_else(dummy_tx)
-                        .send(spire_core::subsystems::tools::file_watcher::FileWatcherMessage::StopWatching)
-                        .await;
-                    let (t, r) = tokio::sync::oneshot::channel();
-                    let _ = state.registry.get::<spire_core::subsystems::tools::file_watcher::FileWatcherMessage>("tools.watcher").unwrap_or_else(dummy_tx)
-                        .send(spire_core::subsystems::tools::file_watcher::FileWatcherMessage::StartWatching {
-                            root: root.clone(),
-                            output: state.watcher_out_tx.clone(),
-                            reply_to: t,
-                        }).await;
-                    let _ = r.await;
-                    let (t, r) = tokio::sync::oneshot::channel();
-                    let _ = state.registry.get::<ProjectAnalyzerMessage>("project.analyzer").unwrap_or_else(dummy_tx).send(ProjectAnalyzerMessage::Analyze {
-                        project_root: root.clone(),
-                        reply_to: t,
-                    }).await;
-                    match r.await {
-                        Ok(Ok(a)) => Ok(a),
-                        Ok(Err(e)) => Err(format!("Analysis: {}", e)),
-                        Err(e) => Err(format!("Analysis lost: {}", e)),
-                    }
-                });
-                return match result {
-                    Ok(analysis) => {
-                        state.analysis = Some(analysis.clone());
-                        state.project_root = Some(root.clone());
-                        // Populate first-class target nodes so the graph can be
-                        // queried via project/getBuildTarget (deps/platform/files).
-                        let _ = state.runtime.block_on(async {
-                            let _ = populate_target_graph(&*state, &analysis.build_systems).await;
-                        });
-                        serialize_analysis(&analysis)
-                    }
-                    Err(e) => serde_json::to_string(&serde_json::json!({"error": e})).unwrap_or_default(),
-                }
-            }
-            
-    // project/getBuildTarget is invoked via the `tools/call` JSON-RPC envelope
-    // from Swift: {"method":"tools/call","params":{"tool":"project/getBuildTarget","args":{"name":...}}}.
-    // Answer directly from the in-memory analysis (authoritative BuildManager
-    // result). This bypasses the graph/routing entirely so target-scoped data
-    // is always available the moment analysis completes — no graph
-    // population, no actor round-trip. Both the bare method and the envelope
-    // form are handled here.
-    let is_build_target_call = method == "project/getBuildTarget"
-        || (method == "tools/call"
-            && parsed
-                .get("params")
-                .and_then(|p| p.get("tool"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                == "project/getBuildTarget");
-    if is_build_target_call {
-        let (target_name, is_envelope) = if method == "tools/call" {
-            let name = parsed
-                .get("params")
-                .and_then(|p| p.get("args"))
-                .and_then(|a| a.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            (name, true)
-        } else {
-            let name = parsed
-                .get("params")
-                .and_then(|p| p.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            (name, false)
-        };
-        let _ = is_envelope;
-
-        let Some(analysis) = state.analysis.as_ref() else {
-            return r#"{"error":"No project analyzed yet"}"#.to_string();
-        };
-
-        // Find the BuildMetadata whose targets contain the requested name.
-        let meta = analysis
-            .build_systems
-            .iter()
-            .find(|bs| bs.targets.iter().any(|t| t.name == target_name));
-
-        let Some(meta) = meta else {
-            return serde_json::to_string(&serde_json::json!({
-                "error": format!("Build target not found: {}", target_name)
-            })).unwrap_or_default();
-        };
-
-        // The analyzer parses the actual source files declared in the
-        // executable() definition (app_sources + hal_sources + toolkit_sources)
-        // into `BuildTarget.source_files`. Use those — the exact set compiled
-        // for this target — instead of guessing directories.
-        let target = meta.targets.iter().find(|t| t.name == target_name);
-        let declared_sources: Vec<String> = target
-            .map(|t| t.source_files.iter().cloned().collect())
-            .unwrap_or_default();
-
-        let mut files: Vec<serde_json::Value> = Vec::new();
-        if !declared_sources.is_empty() {
-            // The analyzer stores source files exactly as written in meson
-            // .build: platform files (main.cpp, hal/…) are relative to the
-            // platform subdir (e.g. rock3c/), toolkit files (src/, include/)
-            // are relative to toolkit/. Resolve both to project-relative paths.
-            let scope_dir = target_name
-                .strip_prefix("ai-trap-")
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            for s in &declared_sources {
-                let path = if s.starts_with("src/") || s.starts_with("include/") {
-                    format!("toolkit/{s}")
-                } else if !scope_dir.is_empty() {
-                    format!("{scope_dir}/{s}")
-                } else {
-                    s.clone()
-                };
-                files.push(serde_json::json!({
-                    "path": path,
-                    "role": "source",
-                    "language": "C++",
-                }));
-            }
-        } else {
-            // Fallback when source_files weren't parsed — scope to the platform dir.
-            let scope_dir = target_name
-                .strip_prefix("ai-trap-")
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            if scope_dir.is_empty() {
-                collect_tree_files(&analysis.file_tree, &mut files);
-            } else if let Some(dir_node) = find_tree_dir(&analysis.file_tree, &scope_dir) {
-                collect_tree_files(dir_node, &mut files);
-            }
-        }
-
-        // Dependencies are PER-TARGET (rock3c links rknnrt/mpp/rga, rpi5 links
-        // libcamera/tflite/edgetpu). Serve the target's own dependency list
-        // parsed from the meson.build — not the flat metadata-level list.
-        let target_deps = meta
-            .targets
-            .iter()
-            .find(|t| t.name == target_name)
-            .map(|t| t.dependencies.clone())
-            .unwrap_or_default();
-        let deps: Vec<serde_json::Value> = if !target_deps.is_empty() {
-            target_deps
-                .iter()
-                .map(|d| serde_json::json!({
-                    "name": d.name,
-                    "version": d.version_req,
-                }))
-                .collect()
-        } else {
-            meta.dependencies
-                .iter()
-                .map(|d| serde_json::json!({
-                    "name": d.name,
-                    "version": d.version_req,
-                }))
-                .collect()
-        };
-
-        let response = serde_json::json!({
-            "name": target_name,
-            "kind": meta.targets.iter().find(|t| t.name == target_name)
-                .and_then(|t| t.kind.first()).cloned().unwrap_or_default(),
-            "configFile": meta.config_files.first().cloned().unwrap_or_default(),
-            "platform": meta.platform_targets,
-            "dependencies": deps,
-            "files": files,
-        });
-        return serde_json::to_string(&response).unwrap_or_default();
-    }
-
-    if method == "project/buildStatus" {
-        // Fetch the last persisted build status for a directory from the graph
-        // config key `build.last.<path>` or `build.last.<path>.<target>`
-        // (written by BuildManager's store_build_status). Builds run per
-        // platform, so the target name (e.g. ai-trap-rock3c) selects the
-        // per-platform result — rock3c and rpi5 never overwrite each other.
-        let status_path = parsed
-            .get("params")
-            .and_then(|p| p.get("path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let status_target = parsed
-            .get("params")
-            .and_then(|p| p.get("target"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let key = if status_target.trim().is_empty() {
-            format!("build.last.{}", status_path)
-        } else {
-            format!("build.last.{}.{}", status_path, status_target)
-        };
-
-        let result: serde_json::Value = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx)
-                .send(MemoryGraphMessage::GetConfig {
-                    key,
-                    reply_to: t,
-                })
-                .await;
-            match r.await {
-                Ok(Ok(Some(value))) => value,
-                _ => serde_json::Value::Null,
-            }
-        });
-        return serde_json::to_string(&result).unwrap_or("null".to_string());
-    }
-
-    if method == "project/diagnostics" {
-        // Query the knowledge graph for Diagnostic nodes (errors/warnings/lint
-        // findings stored after each build/lint/fix run) and return them as a
-        // JSON array. Optionally filter by subproject directory path.
-
-        let filter_path = parsed
-            .get("params")
-            .and_then(|p| p.get("path"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim_end_matches('/').to_string())
-            .unwrap_or_default();
-
-        let result: Vec<serde_json::Value> = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx)
-                .send(MemoryGraphMessage::QueryAttrNodes {
-                    node_type: Some("Diagnostic".to_string()),
-                    subtype: None,
-                    name: None,
-                    limit: Some(2000),
-                    reply_to: t,
-                })
-                .await;
-            match r.await {
-                Ok(Ok(nodes)) => {
-                    // Collect both the prefix-filtered diagnostics and, when
-                    // the subproject has none of its own, the project-wide
-                    // build diagnostics — a subproject build (e.g. rpi) runs
-                    // the shared build-native dir, so its warnings may reference
-                    // other subproject files (e.g. toolkit/...). The user's
-                    // build still produced those warnings.
-                    let mut filtered: Vec<serde_json::Value> = Vec::new();
-                    let mut all_build: Vec<serde_json::Value> = Vec::new();
-                    for node in nodes {
-                        let message = node
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let file = node.get("file").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let line = node.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
-                        let column = node.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
-                        let severity = node
-                            .get("severity")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let build_type = node
-                            .get("build_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let build_run_id = node
-                            .get("build_run_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                        if severity != "warning" && severity != "error" { continue; }
-                        if message.trim().is_empty() { continue; }
-                        let f = file.clone().unwrap_or_default();
-                        let entry = serde_json::json!({
-                            "severity": severity,
-                            "file": file,
-                            "line": line,
-                            "column": column,
-                            "message": message,
-                            "buildType": build_type,
-                            "buildRunId": build_run_id,
-                        });
-                        if build_type == "build" {
-                            all_build.push(entry);
-                            continue;
-                        }
-                        if filter_path.is_empty() || f.is_empty() || f.starts_with(&filter_path) {
-                            filtered.push(entry);
-                        }
-                    }
-                    if filtered.is_empty() && !all_build.is_empty() && !filter_path.is_empty() {
-                        // Subproject has no diagnostics of its own yet — show the
-                        // shared build's warnings so the pane isn't misleading.
-                        filtered = all_build;
-                    }
-                    filtered
-                }
-                _ => Vec::new(),
-            }
-        });
-        return serde_json::to_string(&result).unwrap_or_default();
-    }
-
-    if method == "AnalyzeProject" {
-        // Check if a custom project root was supplied (from the welcome screen).
-        let custom_root = parsed
-            .get("params")
-            .and_then(|p| p.get("root"))
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-
-        if let Some(root) = custom_root {
-            // Resolve wrapper folders (same auto-descend as project/open) so a
-            // refresh/analyze on the OUTER path never re-points the project
-            // root at a non-project wrapper — that overwrote project_root and
-            // broke relative file paths ("Unable to read file").
-            let resolved = resolve_project_root(&root);
-            // Run a fresh analysis on the user-selected directory.
-            let analysis = state.runtime.block_on(async {
-                let (t, r) = tokio::sync::oneshot::channel();
-                let _ = state.registry.get::<ProjectAnalyzerMessage>("project.analyzer").unwrap_or_else(dummy_tx)
-                    .send(ProjectAnalyzerMessage::Analyze {
-                        project_root: resolved.clone(),
-                        reply_to: t,
-                    })
-                    .await;
-                r.await.ok().and_then(|r| r.ok())
-            });
-            match analysis {
-                Some(a) => {
-                    // Keep state.project_root in sync so subsequent relative
-                    // file reads resolve against the REAL project root.
-                    state.project_root = Some(resolved.clone());
-                    return serialize_analysis(&a)
-                }
-                None => {
-                    return serde_json::to_string(&serde_json::json!({
-                        "error": format!("Failed to analyze project at {}", resolved.display())
-                    }))
-                    .unwrap_or_default();
-                }
-            }
-        }
-
-        // Return real analysis if available, otherwise fallback stub
-        if let Some(ref analysis) = state.analysis {
-            return serialize_analysis(analysis);
-        }
-
-                // No project open - project/open must be called with a root first.
-        return serde_json::to_string(&serde_json::json!({
-            "error": "No project opened; call project/open with a root directory"
-        })).unwrap_or_default();
-    }
-
-    // Project creation / planning commands
-    //
-    // Single-round-trip "describe the project" flow: compute the in-memory
-    // structural contract (ScaffoldSpec, NO disk writes) + ask the LLM for an
-    // implementation plan inside it, returning both so the UI can show the plan
-    // for approval. On confirm the UI calls createProject/Scaffold + ExecutePlan.
-    if method == "createProject/Plan" {
-        let goal = parsed
-            .get("params")
-            .and_then(|p| p.get("goal"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let root_dir = parsed
-            .get("params")
-            .and_then(|p| p.get("rootDir"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let project_name = parsed
-            .get("params")
-            .and_then(|p| p.get("projectName"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let language = parsed
-            .get("params")
-            .and_then(|p| p.get("language"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Rust")
-            .to_string();
-        let platforms: Vec<String> = parsed
-            .get("params")
-            .and_then(|p| p.get("platforms"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| p.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let result = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry.get::<ProjectCreationMessage>("project_creation").unwrap_or_else(dummy_tx)
-                .send(crate::subsystems::project::project_creation::ProjectCreationMessage::PlanScaffold {
-                    goal,
-                    root_dir: PathBuf::from(root_dir),
-                    project_name,
-                    language,
-                    platforms,
-                    reply_to: t,
-                })
-                .await;
-            r.await
-        });
-        return match result {
-            Ok(Ok(res)) => {
-                // { plan, spec } — both Serialize; spec's snake_case keys match
-                // the Swift ScaffoldSpec CodingKeys.
-                serde_json::to_string(&serde_json::json!({
-                    "plan": res.plan,
-                    "spec": res.spec,
-                })).unwrap_or(r#"{"error":"serialize"}"#.to_string())
-            }
-            Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, e),
-            Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-        };
-    }
-
-    if method == "createProject/GeneratePlan" {
-        let goal = parsed
-            .get("params")
-            .and_then(|p| p.get("goal"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let root_dir = parsed
-            .get("params")
-            .and_then(|p| p.get("rootDir"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let language = parsed
-            .get("params")
-            .and_then(|p| p.get("language"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Rust")
-            .to_string();
-        // Optional cross-platform targets (registry ids, e.g. ["rpi5"]).
-        let platforms: Vec<String> = parsed
-            .get("params")
-            .and_then(|p| p.get("platforms"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| p.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let result = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry.get::<ProjectCreationMessage>("project_creation").unwrap_or_else(dummy_tx)
-                .send(crate::subsystems::project::project_creation::ProjectCreationMessage::GeneratePlan {
-                    goal,
-                    root_dir: PathBuf::from(root_dir),
-                    language,
-                    platforms,
-                    reply_to: t,
-                })
-                .await;
-            r.await
-        });
-        return match result {
-            Ok(Ok(plan)) => {
-                serde_json::to_string(&plan).unwrap_or(r#"{"error":"serialize"}"#.to_string())
-            }
-            Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, e),
-            Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-        };
-    }
-
-    // Two-phase creation flow (structure-locked → LLM fill).
-    if method == "createProject/Scaffold" {
-        let project_name = parsed
-            .get("params")
-            .and_then(|p| p.get("projectName"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let root_dir = parsed
-            .get("params")
-            .and_then(|p| p.get("rootDir"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let language = parsed
-            .get("params")
-            .and_then(|p| p.get("language"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Rust")
-            .to_string();
-        let platforms: Vec<String> = parsed
-            .get("params")
-            .and_then(|p| p.get("platforms"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| p.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let result = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry
-                .get::<ProjectCreationMessage>("project_creation")
-                .unwrap_or_else(dummy_tx)
-                .send(crate::subsystems::project::project_creation::ProjectCreationMessage::ScaffoldProject {
-                    project_name,
-                    root_dir: PathBuf::from(root_dir),
-                    language,
-                    platforms,
-                    reply_to: t,
-                })
-                .await;
-            r.await
-        });
-        return match result {
-            Ok(Ok(spec)) => {
-                serde_json::to_string(&spec).unwrap_or(r#"{"error":"serialize"}"#.to_string())
-            }
-            Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, e),
-            Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-        };
-    }
-
-    if method == "createProject/Fill" {
-        let goal = parsed
-            .get("params")
-            .and_then(|p| p.get("goal"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let root_dir = parsed
-            .get("params")
-            .and_then(|p| p.get("rootDir"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let spec: crate::subsystems::build::build_manager::ScaffoldSpec = parsed
-            .get("params")
-            .and_then(|p| p.get("spec"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let result = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry
-                .get::<ProjectCreationMessage>("project_creation")
-                .unwrap_or_else(dummy_tx)
-                .send(crate::subsystems::project::project_creation::ProjectCreationMessage::FillProject {
-                    goal,
-                    root_dir: PathBuf::from(root_dir),
-                    spec,
-                    reply_to: t,
-                })
-                .await;
-            r.await
-        });
-        return match result {
-            Ok(Ok(plan)) => {
-                serde_json::to_string(&plan).unwrap_or(r#"{"error":"serialize"}"#.to_string())
-            }
-            Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, e),
-            Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-        };
-    }
-
-    if method == "createProject/ExecutePlan" {
-        let root_dir = parsed
-            .get("params")
-            .and_then(|p| p.get("rootDir"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let steps: Vec<crate::subsystems::project::project_creation::CreationStep> = parsed
-            .get("params")
-            .and_then(|p| p.get("steps"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        let result = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry.get::<ProjectCreationMessage>("project_creation").unwrap_or_else(dummy_tx)
-                .send(crate::subsystems::project::project_creation::ProjectCreationMessage::ExecutePlan {
-                    root_dir: PathBuf::from(root_dir),
-                    steps,
-                    reply_to: t,
-                })
-                .await;
-            r.await
-        });
-        return match result {
-            Ok(Ok(results)) => {
-                serde_json::to_string(&results).unwrap_or(r#"{"error":"serialize"}"#.to_string())
-            }
-            Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, e),
-            Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-        };
-    }
-
-    if method == "createProject/ExecuteStep" {
-        let root_dir = parsed
-            .get("params")
-            .and_then(|p| p.get("rootDir"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let step: crate::subsystems::project::project_creation::CreationStep = parsed
-            .get("params")
-            .and_then(|p| p.get("step"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or(crate::subsystems::project::project_creation::CreationStep {
-                id: String::new(),
-                step_type: crate::subsystems::project::project_creation::CreationStepType::Build,
-                description: String::new(),
-                status: crate::subsystems::project::project_creation::StepStatus::Pending,
-                parameters: serde_json::json!({}),
-                result: None,
-            });
-
-        let result = state.runtime.block_on(async {
-            let (t, r) = tokio::sync::oneshot::channel();
-            let _ = state.registry.get::<ProjectCreationMessage>("project_creation").unwrap_or_else(dummy_tx)
-                .send(crate::subsystems::project::project_creation::ProjectCreationMessage::ExecuteStep {
-                    root_dir: PathBuf::from(root_dir),
-                    step,
-                    reply_to: t,
-                })
-                .await;
-            r.await
-        });
-        return match result {
-            Ok(Ok(res)) => serde_json::to_string(&res).unwrap_or(r#"{"error":"serialize"}"#.to_string()),
-            Ok(Err(e)) => format!(r#"{{"error":"{}"}}"#, e),
-            Err(e) => format!(r#"{{"error":"{}"}}"#, e),
-        };
-    }
-
-    // ── RAG RPCs: rag/search, rag/find-interfaces, rag/list-domains,
-    // ── rag/list-manifests, rag/ingest-manifest ──
-    if method.starts_with("rag/") {
-        let rag_tx = state.registry.get::<RagMessage>("rag");
-        let runtime = state.runtime.handle().clone();
-        return match rag_tx {
-            Some(tx) => {
-                let out = runtime.block_on(async {
-                    match method.as_str() {
-                        "rag/search" => {
-                            let domain = parsed.get("params").and_then(|p| p.get("domain")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let query = parsed.get("params").and_then(|p| p.get("query")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let top_k = parsed.get("params").and_then(|p| p.get("top_k")).and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = tx.send(RagMessage::Query { domain, query, top_k, reply_to: t }).await;
-                            match r.await {
-                                Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
-                                Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
-                                Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
-                            }
-                        }
-                        "rag/find-interfaces" => {
-                            let domain = parsed.get("params").and_then(|p| p.get("domain")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let query = parsed.get("params").and_then(|p| p.get("query")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let top_k = parsed.get("params").and_then(|p| p.get("top_k")).and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = tx.send(RagMessage::FindInterfaces { domain, query, top_k, reply_to: t }).await;
-                            match r.await {
-                                Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
-                                Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
-                                Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
-                            }
-                        }
-                        "rag/list-domains" => {
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = tx.send(RagMessage::ListDomains { reply_to: t }).await;
-                            match r.await {
-                                Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
-                                Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
-                                Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
-                            }
-                        }
-                        "rag/list-manifests" => {
-                            let project_root = parsed.get("params").and_then(|p| p.get("project_root")).and_then(|v| v.as_str()).map(PathBuf::from).unwrap_or_default();
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = tx.send(RagMessage::ListManifests { project_root, reply_to: t }).await;
-                            match r.await {
-                                Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
-                                Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
-                                Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
-                            }
-                        }
-                        "rag/set-domain" => {
-                            let domain = parsed
-                                .get("params")
-                                .and_then(|p| p.get("domain"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if let Ok(mut guard) = state.default_rag_domain.lock() {
-                                *guard = if domain.is_empty() { None } else { Some(domain) };
-                            }
-                            serde_json::json!({"ok": true})
-                        }
-                        "rag/list-sources" => {
-                            let domain = parsed.get("params").and_then(|p| p.get("domain")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = tx.send(RagMessage::ListSources { domain, reply_to: t }).await;
-                            match r.await {
-                                Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
-                                Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
-                                Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
-                            }
-                        }
-                        "rag/ingest-graph-config" => {
-                            let manifest_path = parsed.get("params").and_then(|p| p.get("manifest_path")).and_then(|v| v.as_str()).map(PathBuf::from).unwrap_or_default();
-                            let project_root = parsed.get("params").and_then(|p| p.get("project_root")).and_then(|v| v.as_str()).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            let _ = tx.send(RagMessage::IngestGraphConfig { manifest_path, project_root, reply_to: t }).await;
-                            match r.await {
-                                Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
-                                Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
-                                Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
-                            }
-                        }
-                        _ => serde_json::json!({"error": "unknown rag method"}),
-                    }
-                });
-                serde_json::to_string(&out).unwrap_or_default()
-            }
-            None => r#"{"error":"RAG subsystem not available"}"#.to_string(),
-        };
-    }
-
-    let mut params = parsed
+    let params = parsed
         .get("params")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-
-    // Inject the opened project root into plan/create so the PlanOrchestrator
-    // can tell the LLM where files must be written (and resolve relative
-    // arg_template paths against the real project root, not the process CWD).
-    if method == "plan/create" {
-        if let (Some(obj), Some(root)) = (params.as_object_mut(), state.project_root.as_ref()) {
-            obj.insert(
-                "workspace_root".to_string(),
-                serde_json::json!(root.to_string_lossy().to_string()),
-            );
-        }
-    }
 
     // Release the STATE lock (acquired at the top of this function) before
     // blocking on the coordinator RPC. The build-event waiter

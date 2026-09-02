@@ -38,9 +38,10 @@ tracing-appender = "0.2"
 
 # MCP protocol
 rust-mcp-sdk = "1.0"
-rust-mcp-transport = "0.9"
+rust-mcp-transport = "1.0"
 # Aligned with rust-mcp-sdk 1.1.x (which re-exports schema 1.0) — keeps a single
 # rust-mcp-schema in the graph so `rust_mcp_schema::*` == `rust_mcp_sdk::schema::*`.
+# (`rust-mcp-transport` 0.9 pulled in `rust-mcp-schema` 0.10, splitting the graph.)
 rust-mcp-schema = "1.0"
 
 # UUID
@@ -52,3 +53,19 @@ chrono = { version = "0.4", features = ["serde"] }
 # Spire — sibling repos, resolved by path (must exist next to this repo)
 spire-actor = { path = "../spire-actor" }
 spire-core = { path = "../spire-core" }
+
+# Do NOT strip in release builds.
+#
+# rustc's `-C strip=debuginfo` post-link strip step (a Cargo default in
+# release) rewrites __LINKEDIT and lands the symbol string table on a
+# 4-byte (not 8-byte) boundary for cdylibs that use chained fixups. dyld
+# then rejects the dylib at load time:
+#
+#   dlopen(...) (mis-aligned LINKEDIT string pool, fileOffset=0x...)
+#
+# That made the Metal-enabled libspire_code.dylib unloadable in the app
+# ("Rust core not available"). See rust-lang/rust#157750. `strip = "none"`
+# skips the buggy step; the Metal dylib then loads fine with the default
+# linker. (Release already has debug = false, so no debug info is lost.)
+[profile.release]
+strip = "none"

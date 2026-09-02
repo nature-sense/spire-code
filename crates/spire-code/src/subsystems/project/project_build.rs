@@ -72,6 +72,11 @@ pub enum ProjectBuildMessage {
         args: Value,
         reply_to: oneshot::Sender<Result<Value, String>>,
     },
+    /// Set the project root (the FFI opens projects dynamically; the root is
+    /// re-pointed on every `project/open` / `AnalyzeProject`).
+    SetProjectRoot {
+        root: PathBuf,
+    },
 }
 
 // ============================================================================
@@ -100,8 +105,9 @@ pub struct ProjectBuildActor {
     /// registered build modules (no hardcoded per-build-system branches).
     build_manager_tx: mpsc::Sender<BuildManagerMessage>,
     /// Absolute path to the project root. Used to resolve relative build paths
-    /// to absolute paths before dispatching to build tools.
-    project_root: PathBuf,
+    /// to absolute paths before dispatching to build tools. `None` until a
+    /// project is opened (set via `SetProjectRoot`).
+    project_root: Option<PathBuf>,
 }
 
 impl ProjectBuildActor {
@@ -123,7 +129,7 @@ impl ProjectBuildActor {
             transport_tx,
             memory_graph_tx,
             build_manager_tx,
-            project_root,
+            project_root: Some(project_root),
         }
     }
 
@@ -252,6 +258,16 @@ impl ProjectBuildActor {
 
     /// Handle the `project/build` tool call.
     async fn handle_build(&self, args: &Value) -> Result<Value, String> {
+        // The FFI spawns this actor with an empty root and re-points it on every
+        // project/open via SetProjectRoot — an empty/unset root is not buildable.
+        let root_set = self
+            .project_root
+            .as_ref()
+            .map(|p| !p.as_os_str().is_empty())
+            .unwrap_or(false);
+        if !root_set {
+            return Err("No project root set — open a project before building".to_string());
+        }
         let start = Instant::now();
         let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("debug");
         let scope = args.get("scope").and_then(|v| v.as_str());
@@ -1175,7 +1191,11 @@ impl ProjectBuildActor {
         if p.is_absolute() {
             path.to_string()
         } else {
-            self.project_root.join(p).to_string_lossy().to_string()
+            match self.project_root.as_ref() {
+                Some(root) => root.join(p).to_string_lossy().to_string(),
+                // No project open yet — leave relative; `handle_build` guards.
+                None => path.to_string(),
+            }
         }
     }
 }
@@ -1204,6 +1224,10 @@ impl Actor for ProjectBuildActor {
                     _ => Err(format!("ProjectBuildActor: unknown tool '{}'", tool)),
                 };
                 let _ = reply_to.send(result);
+            }
+
+            ProjectBuildMessage::SetProjectRoot { root } => {
+                self.project_root = Some(root);
             }
         }
     }

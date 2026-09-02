@@ -45,10 +45,13 @@ use spire_core::transport::socket::{
 
 /// Determine the log directory.
 /// Priority: SPIRE_LOG_DIR env var, then {project_root}/.spire/logs,
-/// then a temp dir.
+/// then a temp dir. The directory is created in every branch so the caller
+/// can `File::create` a log file without an extra mkdir.
 fn log_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("SPIRE_LOG_DIR") {
-        return PathBuf::from(dir);
+        let dir = PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        return dir;
     }
     // Prefer project-local .spire/logs directory
     if let Ok(project_root) = std::env::var("SPIRE_PROJECT_ROOT") {

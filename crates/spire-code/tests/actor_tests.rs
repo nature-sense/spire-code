@@ -9,13 +9,18 @@
 
 use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use spire_code::actors::{
-    self, BuildOrchestrator, BuildOrchestratorMessage, ChatActor, ChatMessage, CoordinatorActor,
-    CoordinatorMessage, ErrorAnalyzer, ErrorAnalyzerMessage, LlmActor, LlmConfig,
-    McpClientActor, ProgressActor, ProgressMessage,
-    ProgressStatus, ProgressUpdate, SystemActor, SystemMessage, ToolInfo,
+    self, build_default_registry, BuildOrchestrator, BuildOrchestratorMessage, ChatActor,
+    ChatMessage, CoordinatorActor, CoordinatorMessage, ErrorAnalyzer, ErrorAnalyzerMessage,
+    FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProgressActor, ProgressMessage,
+    ProgressStatus, ProgressUpdate, ProjectBuildActor, SystemActor, SystemMessage, ToolInfo,
     ToolOrchestratorMessage, ToolRouterActor, ToolsActor, ToolsMessage,
 };
+use spire_actor::registry::ServiceRegistry;
 use spire_actor::ActorSystem;
+use spire_code::build::{
+    BuildModuleMessage, CmakeBuildModule, GoBuildModule, GradleBuildModule, MakeBuildModule,
+    MavenBuildModule, ModuleCapability, NodeBuildModule, PythonBuildModule, RubyBuildModule,
+};
 use spire_core::models::embedding::{Embedder, Embedding};
 use spire_core::models::memory_graph::{
     BuildContext, BuildError, NodeUpdate, AttrNode,
@@ -2745,5 +2750,251 @@ async fn test_query_attr_nodes_filters_by_discriminator() {
     .unwrap();
     let nodes = resp_rx.await.unwrap().expect("QueryAttrNodes failed");
     assert_eq!(nodes.len(), 2);
+}
+
+// ── Consolidated dispatch: FFI-inline RPC methods now route through the
+// ── CoordinatorActor once `SetFfiDeps` attaches the app-only deps ──
+
+/// Build a coordinator with mock backends and (optionally) attached FFI deps.
+async fn spawn_coordinator(
+    system: &ActorSystem,
+    with_ffi_deps: bool,
+) -> tokio::sync::mpsc::Sender<CoordinatorMessage> {
+    let (chat_tx, _) = system.spawn(ChatActor::new());
+    let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
+    let (mcp_tx, _) = system.spawn(McpClientActor::new());
+    let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
+    let (system_tx, _) = system.spawn(SystemActor::new());
+    let memory_graph_tx = mock_memory_graph();
+    let project_query_tx = mock_sender();
+    let intent_router_tx = mock_sender();
+    let plan_orchestrator_tx = mock_sender();
+    let transport_tx = mock_sender();
+    let tool_router_tx: tokio::sync::mpsc::Sender<actors::ToolRouterMessage> = mock_sender();
+    let (coord_tx, _handle) = system.spawn(CoordinatorActor::new(
+        chat_tx,
+        tools_tx,
+        mcp_tx,
+        llm_tx,
+        system_tx,
+        memory_graph_tx,
+        project_query_tx,
+        intent_router_tx,
+        tool_router_tx,
+        plan_orchestrator_tx,
+        transport_tx,
+    ));
+
+    if with_ffi_deps {
+        let (watcher_tx, _watcher_rx) = mpsc::channel::<actors::FileChangeNotification>(8);
+        let ffi_state = std::sync::Arc::new(FfiSharedState {
+            project_root: std::sync::Mutex::new(None),
+            analysis: std::sync::Mutex::new(None),
+            default_rag_domain: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            watcher_out_tx: watcher_tx,
+        });
+        coord_tx
+            .send(CoordinatorMessage::SetFfiDeps {
+                registry: std::sync::Arc::new(ServiceRegistry::new()),
+                state: ffi_state,
+            })
+            .await
+            .unwrap();
+    }
+    coord_tx
+}
+
+/// Send a HandleRequest and await the routed response.
+async fn route(sender: &tokio::sync::mpsc::Sender<CoordinatorMessage>, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(CoordinatorMessage::HandleRequest {
+            method: method.to_string(),
+            params,
+            response_tx: resp_tx,
+        })
+        .await
+        .unwrap();
+    resp_rx.await.unwrap()
+}
+
+/// FFI-inline methods route through the coordinator once deps are attached.
+#[tokio::test]
+async fn test_coordinator_routes_ffi_methods_with_deps() {
+    let system = ActorSystem::new();
+    let coord_tx = spawn_coordinator(&system, true).await;
+
+    // project/open with a missing root → structured error (not "Method not found").
+    let resp = route(&coord_tx, "project/open", serde_json::json!({})).await;
+    assert_eq!(resp["error"], "Missing root");
+
+    // rag/* with no RAG actor registered → clear unavailable error.
+    let resp = route(&coord_tx, "rag/list-domains", serde_json::json!({})).await;
+    assert_eq!(resp["error"], "RAG subsystem not available");
+
+    // project/getBuildTarget via the tools/call envelope, no analysis yet.
+    let resp = route(
+        &coord_tx,
+        "tools/call",
+        serde_json::json!({"tool": "project/getBuildTarget", "args": {"name": "x"}}),
+    )
+    .await;
+    assert_eq!(resp["error"], "No project analyzed yet");
+
+    // project/buildStatus with a mock graph → null (no persisted status).
+    let resp = route(&coord_tx, "project/buildStatus", serde_json::json!({"path": "x"})).await;
+    assert!(resp.is_null());
+
+    // A regular coordinator method still works after SetFfiDeps.
+    let resp = route(&coord_tx, "ping", serde_json::json!({})).await;
+    assert_eq!(resp, serde_json::json!({"pong": true}));
+}
+
+/// Without SetFfiDeps (the standalone binary), FFI-inline methods return a
+/// clear error instead of being dispatched.
+#[tokio::test]
+async fn test_coordinator_ffi_methods_error_without_deps() {
+    let system = ActorSystem::new();
+    let coord_tx = spawn_coordinator(&system, false).await;
+
+    for method in ["project/open", "AnalyzeProject", "rag/search", "createProject/Plan"] {
+        let resp = route(&coord_tx, method, serde_json::json!({})).await;
+        assert_eq!(
+            resp["error"],
+            "FFI dispatch deps not attached (standalone binary)",
+            "method {method} should require FFI deps"
+        );
+    }
+}
+
+// ── Build module operation capabilities (clean/lint/format/fix) ──
+
+/// Query a build module's declared capability via DescribeCapabilities.
+async fn describe_module<A: spire_actor::Actor<Message = BuildModuleMessage>>(
+    system: &ActorSystem,
+    module: A,
+) -> ModuleCapability {
+    let (tx, _handle) = system.spawn(module);
+    let (r_tx, r_rx) = tokio::sync::oneshot::channel();
+    tx.send(BuildModuleMessage::DescribeCapabilities { reply_to: r_tx })
+        .await
+        .unwrap();
+    r_rx.await.unwrap()
+}
+
+/// `clean` is supported by every build module; `lint`/`format`/`fix` only where
+/// a canonical ecosystem tool exists (no universal formatter for Ruby).
+#[tokio::test]
+async fn test_build_module_operation_capabilities() {
+    let system = ActorSystem::new();
+
+    // (capability, supports_lint, supports_format, supports_fix)
+    let cases: Vec<(ModuleCapability, bool, bool, bool)> = vec![
+        (describe_module(&system, CmakeBuildModule::new()).await, false, false, false),
+        (describe_module(&system, MakeBuildModule::new()).await, false, false, false),
+        (describe_module(&system, MavenBuildModule::new()).await, false, false, false),
+        (describe_module(&system, GradleBuildModule::new()).await, false, false, false),
+        (describe_module(&system, GoBuildModule::new()).await, true, true, true),
+        (describe_module(&system, NodeBuildModule::new()).await, true, true, true),
+        (describe_module(&system, PythonBuildModule::new()).await, true, true, true),
+        (describe_module(&system, RubyBuildModule::new()).await, true, false, true),
+    ];
+
+    for (cap, lint, format, fix) in cases {
+        assert!(cap.supports_clean, "{} should support clean", cap.build_system);
+        assert_eq!(cap.supports_lint, lint, "{} lint", cap.build_system);
+        assert_eq!(cap.supports_format, format, "{} format", cap.build_system);
+        assert_eq!(cap.supports_fix, fix, "{} fix", cap.build_system);
+    }
+}
+
+// ── Project meta-tools wired into the tool registry (project/build|test|lint|install) ──
+
+/// `build_default_registry` exposes the four project meta-tools when real actor
+/// channels are supplied (the FFI now wires them instead of `None`).
+#[tokio::test]
+async fn test_build_default_registry_registers_project_meta_tools() {
+    let registry = build_default_registry(
+        mock_sender(), // transport
+        mock_sender(), // project_query
+        Some(mock_sender()), // project/build
+        Some(mock_sender()), // project/test
+        Some(mock_sender()), // project/lint
+        Some(mock_sender()), // project/install
+        mock_sender(), // filesystem
+        mock_sender(), // git
+        mock_sender(), // process
+        mock_sender(), // search
+        mock_sender(), // terminal
+        mock_sender(), // build_manager
+        mock_sender(), // rag
+        std::sync::Arc::new(std::sync::Mutex::new(None)), // default rag domain
+    )
+    .await
+    .expect("build tool registry");
+
+    let names: Vec<String> = registry.list().iter().map(|t| t.name.clone()).collect();
+    for tool in [
+        "project/build",
+        "project/test",
+        "project/lint",
+        "project/install",
+    ] {
+        assert!(
+            names.iter().any(|n| n == tool),
+            "default registry missing {tool}"
+        );
+    }
+}
+
+/// `ProjectBuildActor` rejects builds before a root is set and honors
+/// `SetProjectRoot` (the FFI opens projects dynamically).
+#[tokio::test]
+async fn test_project_build_root_gating_and_set() {
+    let system = ActorSystem::new();
+    let actor = ProjectBuildActor::new(
+        mock_sender(), // project_query
+        mock_sender(), // mcp_client
+        mock_sender(), // progress
+        mock_sender(), // chat
+        mock_sender(), // transport
+        mock_sender(), // memory_graph
+        mock_sender(), // build_manager
+        std::path::PathBuf::new(),
+    );
+    let (tx, _handle) = system.spawn(actor);
+
+    async fn call_build(
+        tx: &tokio::sync::mpsc::Sender<actors::ProjectBuildMessage>,
+    ) -> Result<serde_json::Value, String> {
+        let (r_tx, r_rx) = tokio::sync::oneshot::channel();
+        tx.send(actors::ProjectBuildMessage::CallTool {
+            tool: "project/build".to_string(),
+            args: serde_json::json!({}),
+            reply_to: r_tx,
+        })
+        .await
+        .unwrap();
+        r_rx.await.unwrap()
+    }
+
+    // No root set → clear guard error.
+    let before = call_build(&tx).await;
+    assert!(
+        matches!(&before, Err(e) if e.contains("No project root set")),
+        "expected root guard before SetProjectRoot, got {before:?}"
+    );
+
+    // Set the root → the guard must NOT fire (fails later on the mock query).
+    tx.send(actors::ProjectBuildMessage::SetProjectRoot {
+        root: std::path::PathBuf::from("/tmp/some-project"),
+    })
+    .await
+    .unwrap();
+    let after = call_build(&tx).await;
+    assert!(
+        matches!(&after, Err(e) if !e.contains("No project root set")),
+        "root guard must clear after SetProjectRoot, got {after:?}"
+    );
 }
 

@@ -67,6 +67,11 @@ struct CoreProcess {
     reader: BufReader<TcpStream>,
     /// Write half: JSON-RPC requests sent to core.
     writer: TcpStream,
+    /// Keeps the per-test temp dir (graph data, project root, logs) alive for
+    /// the lifetime of the child process. Dropped with the harness, AFTER the
+    /// child is killed by `Drop`, so the dir is never removed under a running
+    /// core.
+    _tmp: tempfile::TempDir,
 }
 
 impl CoreProcess {
@@ -74,7 +79,26 @@ impl CoreProcess {
     fn spawn() -> Self {
         let binary_path = build_binary();
 
+        // Hermetic per-test environment. `spire-core` resolves its data dir
+        // and project root from `SPIRE_DATA_DIR` / `SPIRE_PROJECT_ROOT`,
+        // falling back to SHARED locations (`temp_dir()/spire-core-data` and
+        // the process cwd) that persist across runs. A stale/truncated WAL
+        // there makes `system/status` report `failed: Graph init failed …` and
+        // a non-empty cwd makes startup scan whatever directory the tests run
+        // from. Point every test at its own temp dir so it can never read or
+        // write ambient state.
+        let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+        let data_dir = tmp.path().join("data");
+        let project_root = tmp.path().join("project");
+        let log_dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        std::fs::create_dir_all(&project_root).expect("Failed to create project root");
+        std::fs::create_dir_all(&log_dir).expect("Failed to create log dir");
+
         let mut child = Command::new(&binary_path)
+            .env("SPIRE_DATA_DIR", &data_dir)
+            .env("SPIRE_PROJECT_ROOT", &project_root)
+            .env("SPIRE_LOG_DIR", &log_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()) // Suppress stderr in tests
@@ -111,6 +135,7 @@ impl CoreProcess {
             child,
             reader: BufReader::new(stream),
             writer,
+            _tmp: tmp,
         };
 
         // Wait until the backend is ready: core prints SPIRE_PORT before its
@@ -158,16 +183,6 @@ impl CoreProcess {
     /// Send a JSON-RPC request and read the matching response (by id).
     fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         self.request_with_id(1, method, params)
-    }
-
-    /// Send a raw line to core (for malformed JSON tests).
-    fn send_raw(&mut self, line: &str) -> String {
-        writeln!(self.writer, "{}", line).unwrap();
-        self.writer.flush().unwrap();
-
-        let mut response_line = String::new();
-        self.reader.read_line(&mut response_line).unwrap();
-        response_line.trim().to_string()
     }
 
     /// Send a JSON-RPC request with a specific ID and read the matching response.

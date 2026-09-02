@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command;
 
-use super::generic_helpers::sha256_hex;
+use super::generic_helpers::{run_cmd, sha256_hex};
 use super::{
     javascript_language_config, parse_with_tree_sitter, AstParseResult, BuildModuleMessage,
     BuildOptions, BuildOutput, McpServerDependency, ModuleCapability, TestOptions,
@@ -250,6 +250,75 @@ impl NodeBuildModule {
             exit_code: output.status.code(),
         })
     }
+
+    /// True when package.json declares the named npm script.
+    fn has_script(path: &Path, name: &str) -> bool {
+        let Ok(content) = std::fs::read_to_string(path.join("package.json")) else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|json| json.get("scripts").cloned())
+            .and_then(|scripts| scripts.get(name).cloned())
+            .is_some()
+    }
+
+    /// Clean the project: run the `clean` script when declared, otherwise
+    /// remove the common build-output dirs (dist/, build/, coverage/, .next/).
+    async fn clean(&self, path: &Path, _metadata: &BuildMetadata) -> Result<BuildOutput, String> {
+        let pm = detect_pm(path);
+        if Self::has_script(path, "clean") {
+            self.run_pm(path, pm, &["run".to_string(), "clean".to_string()])
+                .await
+        } else {
+            run_cmd(path, "rm", &["-rf", "dist", "build", "coverage", ".next"]).await
+        }
+    }
+
+    /// Lint with `eslint .`, or the project's `lint` script when declared.
+    async fn lint(
+        &self,
+        path: &Path,
+        _metadata: &BuildMetadata,
+        _platform: Option<&str>,
+    ) -> Result<BuildOutput, String> {
+        let pm = detect_pm(path);
+        if Self::has_script(path, "lint") {
+            self.run_pm(path, pm, &["run".to_string(), "lint".to_string()])
+                .await
+        } else {
+            run_cmd(path, "eslint", &["."]).await
+        }
+    }
+
+    /// Check formatting with `prettier --check .`, or the `format` script.
+    async fn format(&self, path: &Path, _metadata: &BuildMetadata) -> Result<BuildOutput, String> {
+        let pm = detect_pm(path);
+        if Self::has_script(path, "format") {
+            self.run_pm(path, pm, &["run".to_string(), "format".to_string()])
+                .await
+        } else {
+            run_cmd(path, "prettier", &["--check", "."]).await
+        }
+    }
+
+    /// Auto-fix with `eslint --fix .`, or the `fix` / `lint:fix` script.
+    async fn fix(&self, path: &Path, _metadata: &BuildMetadata) -> Result<BuildOutput, String> {
+        let pm = detect_pm(path);
+        let script = if Self::has_script(path, "fix") {
+            "fix"
+        } else if Self::has_script(path, "lint:fix") {
+            "lint:fix"
+        } else {
+            ""
+        };
+        if !script.is_empty() {
+            self.run_pm(path, pm, &["run".to_string(), script.to_string()])
+                .await
+        } else {
+            run_cmd(path, "eslint", &["--fix", "."]).await
+        }
+    }
 }
 
 impl Default for NodeBuildModule {
@@ -385,10 +454,10 @@ impl Actor for NodeBuildModule {
                         "ts".to_string(),
                         "tsx".to_string(),
                     ],
-                supports_clean: false,
-                supports_lint: false,
-                supports_format: false,
-                supports_fix: false,
+                supports_clean: true,
+                supports_lint: true,
+                supports_format: true,
+                supports_fix: true,
                 mcp_servers: vec![McpServerDependency {
                         name: "npm-mcp".to_string(),
                         package: "npm-mcp-server".to_string(),
@@ -452,26 +521,82 @@ impl Actor for NodeBuildModule {
                 let _ = reply_to.send(result);
             }
 
-            BuildModuleMessage::Clean { reply_to, .. } => {
-                let _ = reply_to.send(Err("clean not implemented for this module".to_string()));
+            BuildModuleMessage::Clean {
+                path,
+                metadata,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.clean(&path, &metadata).await);
             }
 
-            BuildModuleMessage::Lint { reply_to, .. } => {
-                let _ = reply_to.send(Err("lint not implemented for this module".to_string()));
+            BuildModuleMessage::Lint {
+                path,
+                metadata,
+                platform,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.lint(&path, &metadata, platform.as_deref()).await);
             }
 
-            BuildModuleMessage::Format { reply_to, .. } => {
-                let _ = reply_to.send(Err("format not implemented for this module".to_string()));
+            BuildModuleMessage::Format {
+                path,
+                metadata,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.format(&path, &metadata).await);
             }
-            BuildModuleMessage::Fix { reply_to, .. } => {
-                let _ = reply_to.send(Err("fix not implemented for this module".to_string()));
+            BuildModuleMessage::Fix {
+                path,
+                metadata,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.fix(&path, &metadata).await);
             }
-            BuildModuleMessage::LintStreaming { reply_to, .. } => {
-                let _ = reply_to.send(Err("lint streaming not implemented for this module".to_string()));
+            BuildModuleMessage::LintStreaming {
+                path,
+                metadata,
+                platform,
+                event_tx,
+                reply_to,
+                ..
+            } => {
+                // Batch lint + a synthetic finished event (no per-line streaming yet).
+                let result = self.lint(&path, &metadata, platform.as_deref()).await;
+                let _ = event_tx.send(super::BuildEvent {
+                    line: format!("Finished lint {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(result);
             }
 
-            BuildModuleMessage::FixStreaming { reply_to, .. } => {
-                let _ = reply_to.send(Err("fix streaming not implemented for this module".to_string()));
+            BuildModuleMessage::FixStreaming {
+                path,
+                metadata,
+                event_tx,
+                reply_to,
+                ..
+            } => {
+                // Batch fix + a synthetic finished event.
+                let result = self.fix(&path, &metadata).await;
+                let _ = event_tx.send(super::BuildEvent {
+                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(result);
             }
 
 

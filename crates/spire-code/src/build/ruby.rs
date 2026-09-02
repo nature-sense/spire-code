@@ -37,6 +37,31 @@ impl RubyBuildModule {
     async fn test(&self, path: &Path, _opts: &TestOptions) -> Result<BuildOutput, String> {
         run_cmd(path, "bundle", &["exec", "rspec"]).await
     }
+
+    /// Clean via `rake clean` when a Rakefile exists; otherwise remove the
+    /// common transient dirs (tmp, coverage).
+    async fn clean(&self, path: &Path, _metadata: &BuildMetadata) -> Result<BuildOutput, String> {
+        if path.join("Rakefile").exists() {
+            run_cmd(path, "bundle", &["exec", "rake", "clean"]).await
+        } else {
+            run_cmd(path, "rm", &["-rf", "tmp", "coverage"]).await
+        }
+    }
+
+    /// Run `bundle exec rubocop`.
+    async fn lint(
+        &self,
+        path: &Path,
+        _metadata: &BuildMetadata,
+        _platform: Option<&str>,
+    ) -> Result<BuildOutput, String> {
+        run_cmd(path, "bundle", &["exec", "rubocop"]).await
+    }
+
+    /// Run `bundle exec rubocop -A` (safe autocorrect).
+    async fn fix(&self, path: &Path, _metadata: &BuildMetadata) -> Result<BuildOutput, String> {
+        run_cmd(path, "bundle", &["exec", "rubocop", "-A"]).await
+    }
 }
 
 impl Default for RubyBuildModule {
@@ -59,10 +84,10 @@ impl Actor for RubyBuildModule {
                     build_system: "Bundler".to_string(),
                     language: "Ruby".to_string(),
                     source_extensions: vec!["rb".to_string()],
-                supports_clean: false,
-                supports_lint: false,
+                supports_clean: true,
+                supports_lint: true,
                 supports_format: false,
-                supports_fix: false,
+                supports_fix: true,
                 mcp_servers: vec![],
                 });
             }
@@ -109,26 +134,77 @@ impl Actor for RubyBuildModule {
                 let _ = reply_to.send(self.test(&path, &opts).await);
             }
 
-            BuildModuleMessage::Clean { reply_to, .. } => {
-                let _ = reply_to.send(Err("clean not implemented for this module".to_string()));
+            BuildModuleMessage::Clean {
+                path,
+                metadata,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.clean(&path, &metadata).await);
             }
 
-            BuildModuleMessage::Lint { reply_to, .. } => {
-                let _ = reply_to.send(Err("lint not implemented for this module".to_string()));
+            BuildModuleMessage::Lint {
+                path,
+                metadata,
+                platform,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.lint(&path, &metadata, platform.as_deref()).await);
             }
 
             BuildModuleMessage::Format { reply_to, .. } => {
-                let _ = reply_to.send(Err("format not implemented for this module".to_string()));
+                let _ = reply_to.send(Err("format not supported for this module".to_string()));
             }
-            BuildModuleMessage::Fix { reply_to, .. } => {
-                let _ = reply_to.send(Err("fix not implemented for this module".to_string()));
+            BuildModuleMessage::Fix {
+                path,
+                metadata,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.fix(&path, &metadata).await);
             }
-            BuildModuleMessage::LintStreaming { reply_to, .. } => {
-                let _ = reply_to.send(Err("lint streaming not implemented for this module".to_string()));
+            BuildModuleMessage::LintStreaming {
+                path,
+                metadata,
+                platform,
+                event_tx,
+                reply_to,
+                ..
+            } => {
+                // Batch lint + a synthetic finished event (no per-line streaming yet).
+                let result = self.lint(&path, &metadata, platform.as_deref()).await;
+                let _ = event_tx.send(super::BuildEvent {
+                    line: format!("Finished lint {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(result);
             }
 
-            BuildModuleMessage::FixStreaming { reply_to, .. } => {
-                let _ = reply_to.send(Err("fix streaming not implemented for this module".to_string()));
+            BuildModuleMessage::FixStreaming {
+                path,
+                metadata,
+                event_tx,
+                reply_to,
+                ..
+            } => {
+                // Batch fix + a synthetic finished event.
+                let result = self.fix(&path, &metadata).await;
+                let _ = event_tx.send(super::BuildEvent {
+                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(result);
             }
 
 

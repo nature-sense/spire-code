@@ -8,7 +8,7 @@
 //! standalone binary) wires them.
 
 pub mod coordinator;
-pub use coordinator::{CoordinatorActor, CoordinatorMessage};
+pub use coordinator::{CoordinatorActor, CoordinatorMessage, FfiSharedState};
 
 pub mod hal_fill;
 
