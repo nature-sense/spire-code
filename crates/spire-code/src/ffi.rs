@@ -19,6 +19,7 @@ use spire_core::modules::{
 use spire_core::actors::tool_providers::ToolRouterActor;
 use crate::actors::tool_providers::build_default_registry;
 use crate::subsystems::project::project_creation::{ProjectCreationActor, ProjectCreationMessage};
+use crate::subsystems::project::spec_design::{SpecDesignActor, SpecDesignMessage};
 use crate::subsystems::project::project_build::{ProjectBuildActor, ProjectBuildMessage};
 use crate::subsystems::project::project_install::{ProjectInstallActor, ProjectInstallMessage};
 use crate::subsystems::project::project_lint::{ProjectLintActor, ProjectLintMessage};
@@ -445,6 +446,39 @@ fn init_actor_system() {
         let (project_creation_tx, _pc_handle) = system.spawn(project_creation);
         let _ = registry
             .register::<ProjectCreationMessage>("project_creation", project_creation_tx.clone());
+
+        // ── SpecDesignActor — the free-form AppSpec design session ────────
+        // Summarize/Promote calls go to the same LLM (Planning role) the
+        // requirements pass uses; Decide persists via the memory graph.
+        let spec_design_llm: crate::subsystems::project::spec_design::LlmCall = {
+            let llm_for_design = llm_tx.clone();
+            Box::new(move |prompt: String| {
+                let llm_tx = llm_for_design.clone();
+                Box::pin(async move {
+                    let (t, r) = tokio::sync::oneshot::channel();
+                    if llm_tx
+                        .send(LlmMessage::Complete {
+                            prompt,
+                            role: spire_core::subsystems::llm::llm::LlmModelRole::Planning,
+                            reply_to: t,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err("LLM actor unavailable".to_string());
+                    }
+                    match r.await {
+                        Ok(Ok(text)) => Ok(text),
+                        Ok(Err(e)) => Err(format!("LLM error: {e}")),
+                        Err(e) => Err(format!("LLM reply lost: {e}")),
+                    }
+                })
+            })
+        };
+        let mut spec_design = SpecDesignActor::new(spec_design_llm);
+        spec_design.set_memory_graph(memory_graph_tx.clone());
+        let (spec_design_tx, _sd_handle) = system.spawn(spec_design);
+        let _ = registry.register::<SpecDesignMessage>("spec_design", spec_design_tx.clone());
 
         let git_tx = spawn_module(GitModule::new());
         let _ = registry.register::<GitMessage>("git", git_tx.clone());

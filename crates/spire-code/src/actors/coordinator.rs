@@ -30,6 +30,7 @@ use spire_core::transport::socket::TransportMessage;
 use crate::subsystems::project::project_analyzer::ProjectAnalysis;
 use crate::subsystems::project::project_build::ProjectBuildMessage;
 use crate::subsystems::project::project_creation::ProjectCreationMessage;
+use crate::subsystems::project::spec_design::SpecDesignMessage;
 use crate::subsystems::project::project_sync::ProjectSyncMessage;
 use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
 use spire_core::actors::rag::RagMessage;
@@ -430,6 +431,32 @@ impl CoordinatorActor {
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
                     Err(_) => serde_json::json!({"error": "Chat actor response error"}),
                 }
+            }
+
+            // ── spec-design methods (free-form AppSpec design step) ──
+            "spec-design/start" => {
+                return self.handle_spec_design_start(&params).await;
+            }
+            "spec-design/reply" => {
+                return self.handle_spec_design_reply(&params).await;
+            }
+            "spec-design/turn" => {
+                return self.handle_spec_design_turn(&params).await;
+            }
+            "spec-design/summarize" => {
+                return self.handle_spec_design_summarize(&params).await;
+            }
+            "spec-design/promote" => {
+                return self.handle_spec_design_promote(&params).await;
+            }
+            "spec-design/decide" => {
+                return self.handle_spec_design_decide(&params).await;
+            }
+            "spec-design/reopen" => {
+                return self.handle_spec_design_reopen(&params).await;
+            }
+            "spec-design/state" => {
+                return self.handle_spec_design_state(&params).await;
             }
 
             // ── Tool methods ──
@@ -3241,3 +3268,212 @@ impl CoordinatorActor {
 
 
 
+
+impl CoordinatorActor {
+    // ── spec-design RPC: the free-form AppSpec design session ─────────────
+    // Routes to the SpecDesignActor registered as "spec_design" at startup
+    // (ffi.rs). Replies are the actor's typed results, serialized.
+
+    async fn handle_spec_design_start(&self, params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let project_name = params
+            .get("projectName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let goal = params
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if project_name.is_empty() {
+            return serde_json::json!({ "error": "missing 'projectName'" });
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::Start {
+                project_name,
+                goal,
+                reply_to: tx,
+            })
+            .await;
+        match rx.await {
+            Ok(Ok(state)) => serde_json::to_value(state)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_reply(&self, params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::Reply { text, reply_to: tx })
+            .await;
+        match rx.await {
+            Ok(Ok(state)) => serde_json::to_value(state)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_turn(&self, params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let role = params
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("assistant")
+            .to_string();
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::AppendTurn {
+                role,
+                text,
+                reply_to: tx,
+            })
+            .await;
+        match rx.await {
+            Ok(Ok(state)) => serde_json::to_value(state)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_summarize(&self, params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let instruction = params
+            .get("instruction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("add to the summary")
+            .to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::Summarize {
+                instruction,
+                reply_to: tx,
+            })
+            .await;
+        match rx.await {
+            Ok(Ok(artifact)) => serde_json::to_value(artifact)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize artifact" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_promote(&self, params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let instruction = params
+            .get("instruction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("turn the summary into a spec")
+            .to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::PromoteToSpec {
+                instruction,
+                reply_to: tx,
+            })
+            .await;
+        match rx.await {
+            Ok(Ok(artifact)) => serde_json::to_value(artifact)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize artifact" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_decide(&self, _params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::Decide { reply_to: tx })
+            .await;
+        match rx.await {
+            Ok(Ok(spec)) => serde_json::to_value(spec)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize spec" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_reopen(&self, _params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::Reopen { reply_to: tx })
+            .await;
+        match rx.await {
+            Ok(Ok(state)) => serde_json::to_value(state)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_state(&self, _params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::GetState { reply_to: tx })
+            .await;
+        match rx.await {
+            Ok(state) => serde_json::to_value(state)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+}

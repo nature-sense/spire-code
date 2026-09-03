@@ -22,6 +22,7 @@
 //! The LLM is injected as a plain async closure (like [`super::spec_gen`]), so
 //! the actor is fully testable with canned scripts.
 
+use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -46,7 +47,8 @@ pub const ROLE_USER: &str = "user";
 pub const ROLE_ASSISTANT: &str = "assistant";
 
 /// Whether the design session is still free-form or has been frozen by Decide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DesignMode {
     /// Prompts drive everything (the default).
     Freeform,
@@ -55,7 +57,7 @@ pub enum DesignMode {
 }
 
 /// One conversation turn (user or assistant) in the design transcript.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DesignTurn {
     pub role: String,
     pub text: String,
@@ -63,7 +65,7 @@ pub struct DesignTurn {
 
 /// A condensed document (summary or spec). The summary is the running source of
 /// truth during the free-form phase; the spec is the `spec.md` document.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DesignArtifact {
     pub version: u32,
     pub content: String,
@@ -72,7 +74,7 @@ pub struct DesignArtifact {
 }
 
 /// One deterministic derivation recorded by a Decide press.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AcceptedSpec {
     pub version: u32,
     pub app_spec: AppSpec,
@@ -81,7 +83,7 @@ pub struct AcceptedSpec {
 }
 
 /// A point-in-time view of the design session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SpecDesignState {
     pub mode: DesignMode,
     pub project_name: String,
@@ -153,10 +155,12 @@ pub struct SpecDesignActor {
 }
 
 impl SpecDesignActor {
-    pub fn new(project_name: impl Into<String>, goal: impl Into<String>, llm: LlmCall) -> Self {
+    /// A fresh, unconfigured session. The RPC entry always calls [`Self::start`]
+    /// first, which fixes project + goal; decide/reopen guard on that.
+    pub fn new(llm: LlmCall) -> Self {
         Self {
-            project_name: project_name.into(),
-            goal: goal.into(),
+            project_name: String::new(),
+            goal: String::new(),
             llm,
             memory_graph_tx: None,
             mode: DesignMode::Freeform,
@@ -186,6 +190,14 @@ impl SpecDesignActor {
             accepted: self.accepted.clone(),
             latest: self.latest.clone(),
             last_issues: self.last_issues.clone(),
+        }
+    }
+
+    fn require_session(&self) -> Result<(), String> {
+        if self.project_name.is_empty() {
+            Err("no spec-design session — call spec-design/start first".to_string())
+        } else {
+            Ok(())
         }
     }
 
@@ -222,6 +234,7 @@ impl SpecDesignActor {
     /// Append a turn to the free-form transcript.
     pub fn append_turn(&mut self, role: &str, text: &str) -> Result<SpecDesignState, String> {
         self.require_freeform()?;
+        self.require_session()?;
         let text = text.trim().to_string();
         if text.is_empty() {
             return Err("empty turn".to_string());
@@ -236,6 +249,7 @@ impl SpecDesignActor {
     /// Free-form condensation of the transcript into the running summary.
     pub async fn summarize(&mut self, instruction: &str) -> Result<DesignArtifact, String> {
         self.require_freeform()?;
+        self.require_session()?;
         let instruction = instruction.trim();
         if instruction.is_empty() {
             return Err("summarize needs an instruction".to_string());
@@ -277,6 +291,7 @@ impl SpecDesignActor {
     /// the user keeps refining via chat until Decide freezes it.
     pub async fn promote(&mut self, instruction: &str) -> Result<DesignArtifact, String> {
         self.require_freeform()?;
+        self.require_session()?;
         let instruction = instruction.trim();
         if instruction.is_empty() {
             return Err("promote needs an instruction".to_string());
@@ -317,6 +332,7 @@ impl SpecDesignActor {
     /// THE button: freeze the spec and derive the AppSpec deterministically.
     pub async fn decide(&mut self) -> Result<AppSpec, String> {
         self.require_freeform()?;
+        self.require_session()?;
         let Some(spec) = self.spec.as_ref() else {
             return Err(format!(
                 "nothing to decide for '{}' — promote the summary to a spec first",
@@ -380,6 +396,7 @@ impl SpecDesignActor {
     /// Return to the free-form phase. The spec stays; Decide can run again after
     /// further prompt edits (each Decide appends to `accepted`).
     pub fn reopen(&mut self) -> Result<SpecDesignState, String> {
+        self.require_session()?;
         self.mode = DesignMode::Freeform;
         info!(
             "[SpecDesign] '{}' reopened for free-form editing",
@@ -572,10 +589,7 @@ mod tests {
 
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
         let (llm, prompts) = canned(responses);
-        (
-            SpecDesignActor::new("spire-gis", "view and edit map layers", llm),
-            prompts,
-        )
+        (SpecDesignActor::new(llm), prompts)
     }
 
     fn example_spec_md() -> String {
