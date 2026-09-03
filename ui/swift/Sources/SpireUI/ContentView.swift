@@ -106,6 +106,33 @@ struct ContentView: View {
             LLMSettingsView()
                 .environment(bridge)
         }
+        // Open-project AppSpec design session (scaffold-first: the design
+        // persists into the project graph of the already-open project).
+        .sheet(isPresented: Binding(
+            get: { bridge.showSpecDesign },
+            set: { bridge.showSpecDesign = $0 }
+        )) {
+            specDesignSheet
+        }
+    }
+
+    /// The design sheet content; empty when no project is open.
+    @ViewBuilder
+    private var specDesignSheet: some View {
+        let name = bridge.designProjectName
+        if name.isEmpty {
+            EmptyView()
+        } else {
+            SpecDesignView(
+                projectName: name,
+                goal: "",
+                onDecided: { spec in
+                    bridge.showSpecDesign = false
+                    Task { await bridge.runSpecDesignCodegen(spec: spec) }
+                }
+            )
+            .environment(bridge)
+        }
     }
 
     // MARK: - Left pane: state-driven content

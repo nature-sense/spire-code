@@ -16,6 +16,7 @@ enum MenuCommand {
     static let refreshProject = Notification.Name("SpireApp.menu.refreshProject")
     static let toggleChat = Notification.Name("SpireApp.menu.toggleChat")
     static let showSettings = Notification.Name("SpireApp.menu.showSettings")
+    static let designSpec = Notification.Name("SpireApp.menu.designSpec")
 }
 
 @main
@@ -74,6 +75,12 @@ struct SpireApp: App {
                     NotificationCenter.default.post(name: MenuCommand.toggleChat, object: nil)
                 }
                 .keyboardShortcut("c", modifiers: [.command, .shift])
+
+                Button("Design AppSpec…") {
+                    NotificationCenter.default.post(name: MenuCommand.designSpec, object: nil)
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .help("Open the free-form AppSpec design session for the current project")
 
                 Divider()
 
