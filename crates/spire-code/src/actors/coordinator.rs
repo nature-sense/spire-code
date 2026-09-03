@@ -3319,7 +3319,6 @@ impl CoordinatorActor {
         let mut actor =
             crate::subsystems::project::spec_design::SpecDesignActor::new(llm);
         actor.set_memory_graph(self.memory_graph_tx.clone());
-        actor.set_persist_dir(spire_core::config::config_dir().join("design"));
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let _handle = spire_core::actors::Actor::spawn(actor, rx);
         if let Ok(mut g) = map.lock() {

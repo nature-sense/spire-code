@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::actors::Actor;
+use spire_core::models::memory_graph::AttrNode;
 use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 
 use super::spec::{validate, AppSpec, SpecIssue, SpecIssueSeverity};
@@ -94,20 +95,6 @@ pub struct SpecDesignState {
     pub accepted: Vec<AcceptedSpec>,
     pub latest: Option<AppSpec>,
     pub last_issues: Vec<SpecIssue>,
-}
-
-/// On-disk snapshot that makes a brainstorm session resumable across restarts.
-/// Written to `<config>/design/<project>.json` after every mutation when a
-/// persist dir is configured; `start(reset: false)` restores it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpecDesignSnapshot {
-    pub project_name: String,
-    pub goal: String,
-    pub mode: DesignMode,
-    pub turns: Vec<DesignTurn>,
-    pub summarized_through: usize,
-    pub summary: Option<DesignArtifact>,
-    pub spec: Option<DesignArtifact>,
 }
 
 /// Messages routed to the [`SpecDesignActor`]. Each carries its own typed reply
@@ -175,10 +162,12 @@ pub struct SpecDesignActor {
     accepted: Vec<AcceptedSpec>,
     latest: Option<AppSpec>,
     last_issues: Vec<SpecIssue>,
-    /// When set, every mutation is mirrored to `<dir>/<project>.json` so the
-    /// free-form brainstorm survives restarts. Production sets this to
-    /// `<config>/design`; tests leave it unset or point it at a temp dir.
-    persist_dir: Option<std::path::PathBuf>,
+    /// Session-instance token: child nodes (turns/documents) are named under it
+    /// so a fresh `start(reset: true)` simply switches instance instead of
+    /// deleting stale nodes. Set at session creation/reset.
+    instance: String,
+    /// How many turns are already persisted to the graph (append-only writes).
+    persisted_through: usize,
 }
 
 impl SpecDesignActor {
@@ -198,7 +187,8 @@ impl SpecDesignActor {
             accepted: Vec::new(),
             latest: None,
             last_issues: Vec::new(),
-            persist_dir: None,
+            instance: String::new(),
+            persisted_through: 0,
         }
     }
 
@@ -207,83 +197,184 @@ impl SpecDesignActor {
         self.memory_graph_tx = Some(tx);
     }
 
-    /// Enable on-disk snapshots of the free-form session (resumable across
-    /// restarts). Snapshots are keyed by project name.
-    pub fn set_persist_dir(&mut self, dir: std::path::PathBuf) {
-        self.persist_dir = Some(dir);
+    /// Node/subtype + name conventions for the persisted free-form session.
+    /// Everything hangs off the session node keyed by project name; turns and
+    /// documents are named under the session `instance` token so resets never
+    /// collide with stale data. Node merges are keyed by (node_type, subtype,
+    /// name), making re-persisting idempotent.
+    fn session_node_name(&self) -> String {
+        self.project_name.clone()
     }
 
-    fn persist_path(&self) -> Option<std::path::PathBuf> {
-        self.persist_dir
-            .as_ref()
-            .map(|d| d.join(format!("{}.json", sanitize_file_name(&self.project_name))))
+    fn turn_node_name(&self, index: usize) -> String {
+        format!("turn.{}.{index}", self.instance)
     }
 
-    /// Mirror the session to disk after a mutation (best-effort).
-    fn persist(&self) {
-        let Some(path) = self.persist_path() else {
+    fn doc_node_name(&self, kind: &str) -> String {
+        format!("{kind}.{}", self.instance)
+    }
+
+    /// Persist the free-form session into the project memory graph so a
+    /// brainstorm survives restarts and lives beside the decided spec. Written
+    /// as plain typed nodes (no whole-session blob): a `design_session` node,
+    /// one `design_turn` node per new turn, and `design_document` nodes for the
+    /// current summary/spec. Best-effort — a missing graph keeps the session
+    /// in-memory.
+    async fn persist_session(&self) {
+        let Some(mg_tx) = &self.memory_graph_tx else {
             return;
         };
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                warn!("[SpecDesign] persist dir create failed: {e}");
-                return;
+        let props = |p: &[(&str, serde_json::Value)]| -> std::collections::HashMap<String, serde_json::Value> {
+            p.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        };
+        let now = chrono::Utc::now();
+        let session = AttrNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            node_type: super::spec_persist::MG_NODE_TYPE.to_string(),
+            subtype: Some(DS_SESSION.to_string()),
+            name: self.session_node_name(),
+            description: Some(self.goal.clone()),
+            properties: props(&[
+                ("goal", serde_json::json!(self.goal)),
+                ("mode", serde_json::json!(mode_str(self.mode))),
+                (
+                    "summarized_through",
+                    serde_json::json!(self.summarized_through),
+                ),
+                ("instance", serde_json::json!(self.instance)),
+                ("turn_count", serde_json::json!(self.turns.len())),
+            ]),
+            embedding_id: None,
+            created_at: now,
+            updated_at: now,
+            version: 1,
+        };
+        if let Err(e) = merge_node(mg_tx, session).await {
+            warn!(
+                "[SpecDesign] session node persist failed for '{}': {e}",
+                self.project_name
+            );
+        }
+        for index in self.persisted_through.min(self.turns.len())..self.turns.len() {
+            let turn = &self.turns[index];
+            let node = AttrNode {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_type: super::spec_persist::MG_NODE_TYPE.to_string(),
+                subtype: Some(DS_TURN.to_string()),
+                name: self.turn_node_name(index),
+                description: None,
+                properties: props(&[
+                    ("role", serde_json::json!(turn.role)),
+                    ("text", serde_json::json!(turn.text)),
+                    ("index", serde_json::json!(index)),
+                ]),
+                embedding_id: None,
+                created_at: now,
+                updated_at: now,
+                version: 1,
+            };
+            if let Err(e) = merge_node(mg_tx, node).await {
+                warn!("[SpecDesign] turn node persist failed: {e}");
             }
         }
-        let snapshot = SpecDesignSnapshot {
-            project_name: self.project_name.clone(),
-            goal: self.goal.clone(),
-            mode: self.mode,
-            turns: self.turns.clone(),
-            summarized_through: self.summarized_through,
-            summary: self.summary.clone(),
-            spec: self.spec.clone(),
-        };
-        match serde_json::to_string_pretty(&snapshot) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    warn!(
-                        "[SpecDesign] snapshot write failed for '{}': {e}",
-                        self.project_name
-                    );
-                }
-            }
-            Err(e) => warn!("[SpecDesign] snapshot serialize failed: {e}"),
+        if let Some(summary) = &self.summary {
+            persist_doc(mg_tx, &self.doc_node_name("summary"), summary, DS_SUMMARY).await;
+        }
+        if let Some(spec) = &self.spec {
+            persist_doc(mg_tx, &self.doc_node_name("spec"), spec, DS_SPEC).await;
         }
     }
 
-    /// Restore a persisted session for `project_name`. Returns true when a
-    /// snapshot existed and was loaded.
-    fn resume(&mut self, project_name: &str) -> bool {
-        let Some(dir) = self.persist_dir.clone() else {
+    /// Restore a persisted session from the project graph for `project_name`.
+    /// Returns true when a session node existed and was loaded.
+    async fn resume_session(&mut self, project_name: &str) -> bool {
+        let Some(mg_tx) = &self.memory_graph_tx else {
             return false;
         };
-        let path = dir.join(format!("{}.json", sanitize_file_name(project_name)));
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Ok(mut found) = query_nodes(
+            mg_tx,
+            Some(super::spec_persist::MG_NODE_TYPE),
+            Some(DS_SESSION),
+            Some(project_name),
+            1,
+        )
+        .await
+        else {
             return false;
         };
-        let Ok(snapshot) = serde_json::from_str::<SpecDesignSnapshot>(&raw) else {
+        let Some(session) = found.pop() else {
             return false;
         };
-        if snapshot.project_name != project_name {
+        let Some(instance) = session.str_prop("instance") else {
             return false;
-        }
-        self.project_name = snapshot.project_name;
-        self.goal = snapshot.goal;
-        self.mode = snapshot.mode;
-        self.turns = snapshot.turns;
-        self.summarized_through = snapshot.summarized_through;
-        self.summary = snapshot.summary;
-        self.spec = snapshot.spec;
+        };
+        // Goal hint comes from the caller; everything else from the graph.
+        let mode = match session.str_prop("mode").as_deref() {
+            Some("decided") => DesignMode::Decided,
+            _ => DesignMode::Freeform,
+        };
+        self.project_name = project_name.to_string();
+        self.mode = mode;
+        self.instance = instance.clone();
+        self.summarized_through = session.u32_prop("summarized_through").unwrap_or(0) as usize;
+
+        // Turns under this instance, ordered by index.
+        let Ok(turn_nodes) = query_nodes(
+            mg_tx,
+            Some(super::spec_persist::MG_NODE_TYPE),
+            Some(DS_TURN),
+            None,
+            100_000,
+        )
+        .await
+        else {
+            return true;
+        };
+        let prefix = format!("turn.{instance}.");
+        let mut turns: Vec<(u32, DesignTurn)> = turn_nodes
+            .into_iter()
+            .filter(|n| n.name.starts_with(&prefix))
+            .filter_map(|n| {
+                let index = n.u32_prop("index")?;
+                let role = n.str_prop("role")?;
+                let text = n.str_prop("text")?;
+                Some((index, DesignTurn { role, text }))
+            })
+            .collect();
+        turns.sort_by_key(|(i, _)| *i);
+        self.turns = turns.into_iter().map(|(_, t)| t).collect();
+        self.persisted_through = self.turns.len();
+
+        // Summary + spec documents.
+        self.summary = load_doc(mg_tx, &format!("summary.{instance}"), DS_SUMMARY).await;
+        self.spec = load_doc(mg_tx, &format!("spec.{instance}"), DS_SPEC).await;
         self.accepted.clear();
         self.latest = None;
         self.last_issues.clear();
         info!(
-            "[SpecDesign] resumed persisted session for '{}' ({} turns)",
+            "[SpecDesign] resumed persisted session for '{}' ({} turns, instance {})",
             self.project_name,
-            self.turns.len()
+            self.turns.len(),
+            instance
         );
         true
+    }
+
+    /// Async entry used by the Start RPC: resume a persisted session unless a
+    /// reset was requested.
+    pub async fn start_session(
+        &mut self,
+        project_name: &str,
+        goal: &str,
+        reset: bool,
+    ) -> Result<SpecDesignState, String> {
+        if !reset && self.resume_session(project_name).await {
+            self.goal = goal.to_string();
+            return Ok(self.state());
+        }
+        let _ = self.start(project_name, goal);
+        self.persist_session().await;
+        Ok(self.state())
     }
 
     pub fn state(&self) -> SpecDesignState {
@@ -320,18 +411,9 @@ impl SpecDesignActor {
     }
 
     /// (Re)start the session for a project/goal.
-    pub fn start(
-        &mut self,
-        project_name: &str,
-        goal: &str,
-        reset: bool,
-    ) -> Result<SpecDesignState, String> {
-        if !reset && self.resume(project_name) {
-            // A resumed session keeps its project + transcript; only the goal
-            // hint is refreshed from the caller.
-            self.goal = goal.to_string();
-            return Ok(self.state());
-        }
+    /// Start a fresh session (the Start RPC uses [`Self::start_session`], which
+    /// resumes a persisted one unless reset).
+    pub fn start(&mut self, project_name: &str, goal: &str) -> Result<SpecDesignState, String> {
         self.project_name = project_name.to_string();
         self.goal = goal.to_string();
         self.mode = DesignMode::Freeform;
@@ -342,11 +424,12 @@ impl SpecDesignActor {
         self.accepted.clear();
         self.latest = None;
         self.last_issues.clear();
+        self.instance = uuid::Uuid::new_v4().to_string();
+        self.persisted_through = 0;
         info!(
             "[SpecDesign] session started for '{}': {}",
             self.project_name, self.goal
         );
-        self.persist();
         Ok(self.state())
     }
 
@@ -362,7 +445,6 @@ impl SpecDesignActor {
             role: role.to_string(),
             text,
         });
-        self.persist();
         Ok(self.state())
     }
 
@@ -404,7 +486,7 @@ impl SpecDesignActor {
         );
         self.summary = Some(artifact.clone());
         self.summarized_through = self.turns.len();
-        self.persist();
+        self.persist_session().await;
         Ok(artifact)
     }
 
@@ -447,7 +529,7 @@ impl SpecDesignActor {
             artifact.version, self.project_name, instruction
         );
         self.spec = Some(artifact.clone());
-        self.persist();
+        self.persist_session().await;
         Ok(artifact)
     }
 
@@ -466,7 +548,6 @@ impl SpecDesignActor {
             role: ROLE_USER.to_string(),
             text: text.clone(),
         });
-        self.persist(); // the user's question survives even an LLM failure
         let summary = self.summary.as_ref().map(|a| a.content.clone());
         let start = self.turns.len().saturating_sub(10);
         let context = self.turns[start..].to_vec();
@@ -482,7 +563,7 @@ impl SpecDesignActor {
             role: ROLE_ASSISTANT.to_string(),
             text: answer.clone(),
         });
-        self.persist();
+        self.persist_session().await;
         Ok((answer, self.state()))
     }
 
@@ -538,7 +619,7 @@ impl SpecDesignActor {
             app_spec: app.clone(),
             decided_at: chrono::Utc::now(),
         });
-        self.persist();
+        self.persist_session().await;
         info!(
             "[SpecDesign] '{}' decided — appspec v{} ({} types, {} actors, {} methods, {} screens)",
             self.project_name,
@@ -553,14 +634,14 @@ impl SpecDesignActor {
 
     /// Return to the free-form phase. The spec stays; Decide can run again after
     /// further prompt edits (each Decide appends to `accepted`).
-    pub fn reopen(&mut self) -> Result<SpecDesignState, String> {
+    pub async fn reopen(&mut self) -> Result<SpecDesignState, String> {
         self.require_session()?;
         self.mode = DesignMode::Freeform;
+        self.persist_session().await;
         info!(
             "[SpecDesign] '{}' reopened for free-form editing",
             self.project_name
         );
-        self.persist();
         Ok(self.state())
     }
 
@@ -569,6 +650,110 @@ impl SpecDesignActor {
             .await
             .map_err(|e| format!("LLM error: {e}"))
     }
+}
+
+/// Graph node subtypes for the persisted free-form design session.
+pub const DS_SESSION: &str = "design_session";
+pub const DS_TURN: &str = "design_turn";
+pub const DS_SUMMARY: &str = "design_summary";
+pub const DS_SPEC: &str = "design_spec";
+
+fn mode_str(mode: DesignMode) -> &'static str {
+    match mode {
+        DesignMode::Freeform => "freeform",
+        DesignMode::Decided => "decided",
+    }
+}
+
+async fn merge_node(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    node: AttrNode,
+) -> Result<AttrNode, String> {
+    let (t, r) = tokio::sync::oneshot::channel();
+    mg_tx
+        .send(MemoryGraphMessage::MergeAttrNode { node, reply_to: t })
+        .await
+        .map_err(|e| format!("memory graph channel closed: {e}"))?;
+    r.await
+        .map_err(|e| format!("merge reply lost: {e}"))?
+        .map_err(|e| format!("merge failed: {e}"))
+}
+
+async fn query_nodes(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    node_type: Option<&str>,
+    subtype: Option<&str>,
+    name: Option<&str>,
+    limit: u32,
+) -> Result<Vec<AttrNode>, String> {
+    let (t, r) = tokio::sync::oneshot::channel();
+    mg_tx
+        .send(MemoryGraphMessage::QueryAttrNodes {
+            node_type: node_type.map(str::to_string),
+            subtype: subtype.map(str::to_string),
+            name: name.map(str::to_string),
+            limit: Some(limit),
+            reply_to: t,
+        })
+        .await
+        .map_err(|e| format!("memory graph channel closed: {e}"))?;
+    r.await
+        .map_err(|e| format!("query reply lost: {e}"))?
+        .map_err(|e| format!("query failed: {e}"))
+}
+
+/// Upsert one design-document node (summary or spec) for an artifact.
+async fn persist_doc(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    name: &str,
+    artifact: &DesignArtifact,
+    subtype: &str,
+) {
+    let now = chrono::Utc::now();
+    let props: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::from([
+            ("version".to_string(), serde_json::json!(artifact.version)),
+            ("content".to_string(), serde_json::json!(artifact.content)),
+        ]);
+    let node = AttrNode {
+        id: uuid::Uuid::new_v4().to_string(),
+        node_type: super::spec_persist::MG_NODE_TYPE.to_string(),
+        subtype: Some(subtype.to_string()),
+        name: name.to_string(),
+        description: None,
+        properties: props,
+        embedding_id: None,
+        created_at: now,
+        updated_at: now,
+        version: 1,
+    };
+    if let Err(e) = merge_node(mg_tx, node).await {
+        warn!("[SpecDesign] document node persist failed: {e}");
+    }
+}
+
+/// Read a design-document node back as an artifact.
+async fn load_doc(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    name: &str,
+    subtype: &str,
+) -> Option<DesignArtifact> {
+    let nodes = query_nodes(
+        mg_tx,
+        Some(super::spec_persist::MG_NODE_TYPE),
+        Some(subtype),
+        Some(name),
+        1,
+    )
+    .await
+    .ok()?;
+    let node = nodes.into_iter().next()?;
+    Some(DesignArtifact {
+        version: node.u32_prop("version").unwrap_or(1) as u32,
+        content: node.str_prop("content").unwrap_or_default(),
+        source_turns: Vec::new(),
+        produced_at: chrono::Utc::now(),
+    })
 }
 
 /// Keywords in a summarize instruction that ask for a full-material rewrite
@@ -705,19 +890,6 @@ fn brainstorm_prompt(
     parts.join("\n")
 }
 
-/// Map a project name to a safe file stem for snapshots.
-fn sanitize_file_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[async_trait]
 impl Actor for SpecDesignActor {
     type Message = SpecDesignMessage;
@@ -730,18 +902,32 @@ impl Actor for SpecDesignActor {
                 reset,
                 reply_to,
             } => {
-                let _ = reply_to.send(self.start(&project_name, &goal, reset));
+                let _ = reply_to.send(self.start_session(&project_name, &goal, reset).await);
             }
             SpecDesignMessage::Reply { text, reply_to } => {
-                let _ = reply_to.send(self.append_turn(ROLE_USER, &text));
+                match self.append_turn(ROLE_USER, &text) {
+                    Ok(state) => {
+                        self.persist_session().await;
+                        let _ = reply_to.send(Ok(state));
+                    }
+                    Err(e) => {
+                        let _ = reply_to.send(Err(e));
+                    }
+                }
             }
             SpecDesignMessage::AppendTurn {
                 role,
                 text,
                 reply_to,
-            } => {
-                let _ = reply_to.send(self.append_turn(&role, &text));
-            }
+            } => match self.append_turn(&role, &text) {
+                Ok(state) => {
+                    self.persist_session().await;
+                    let _ = reply_to.send(Ok(state));
+                }
+                Err(e) => {
+                    let _ = reply_to.send(Err(e));
+                }
+            },
             SpecDesignMessage::Summarize {
                 instruction,
                 reply_to,
@@ -761,7 +947,7 @@ impl Actor for SpecDesignActor {
                 let _ = reply_to.send(self.decide().await);
             }
             SpecDesignMessage::Reopen { reply_to } => {
-                let _ = reply_to.send(self.reopen());
+                let _ = reply_to.send(self.reopen().await);
             }
             SpecDesignMessage::GetState { reply_to } => {
                 let _ = reply_to.send(self.state());
@@ -822,9 +1008,7 @@ mod tests {
     #[test]
     fn transcript_grows_and_state_tracks_turns() {
         let (mut a, _) = actor(vec![]);
-        let s = a
-            .start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        let s = a.start("spire-gis", "view and edit map layers").unwrap();
         assert_eq!(s.mode, DesignMode::Freeform);
         assert_eq!(s.turn_count, 0);
         seed_conversation(&mut a);
@@ -842,8 +1026,7 @@ mod tests {
             "v1: store WKB, serve GeoJSON".to_string(),
             "v2: v1 + Parquet for analytics".to_string(),
         ]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
 
         let s1 = pollster(a.summarize("summarize with storage techniques")).unwrap();
@@ -872,8 +1055,7 @@ mod tests {
     #[test]
     fn summarize_recreate_passes_the_full_transcript() {
         let (mut a, prompts) = actor(vec!["fresh summary".to_string()]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         let s = pollster(a.summarize("recreate the summary from scratch around storage")).unwrap();
         assert_eq!(s.version, 1);
@@ -890,8 +1072,7 @@ mod tests {
             "decision: WKB in SeleneDB, GeoJSON served".to_string(),
             example_spec_md(),
         ]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         let spec = pollster(a.promote("turn this into a spec")).unwrap();
         assert_eq!(spec.version, 1);
@@ -917,8 +1098,7 @@ mod tests {
             "summary one + more".to_string(),
             example_spec_md(),
         ]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         pollster(a.promote("turn this into a spec")).unwrap();
         a.append_turn(ROLE_USER, "add an inspect screen for a selected feature")
@@ -940,8 +1120,7 @@ mod tests {
     #[test]
     fn decide_validates_freezes_and_records_an_accepted_version() {
         let (mut a, _) = actor(vec!["summary text".to_string(), example_spec_md()]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         pollster(a.summarize("summarize the design")).unwrap();
         let spec = pollster(a.promote("turn this into a spec")).unwrap();
@@ -973,15 +1152,14 @@ mod tests {
             "summary text v2".to_string(),
             example_spec_md(),
         ]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         pollster(a.summarize("summarize")).unwrap();
         pollster(a.promote("to spec")).unwrap();
         let v1 = pollster(a.decide()).unwrap();
         assert_eq!(v1.bridge.len(), 2);
 
-        a.reopen().unwrap();
+        pollster(a.reopen()).unwrap();
         assert_eq!(a.state().mode, DesignMode::Freeform);
         a.append_turn(
             ROLE_USER,
@@ -1000,8 +1178,7 @@ mod tests {
     #[test]
     fn decide_requires_a_promoted_spec() {
         let (mut a, _) = actor(vec![]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         let err = pollster(a.decide()).unwrap_err();
         assert!(err.contains("promote the summary to a spec first"));
@@ -1019,8 +1196,7 @@ mod tests {
         });
         let bad_md = spec_md::spec_to_markdown(&bad);
         let (mut a, _) = actor(vec!["summary".to_string(), bad_md]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         pollster(a.summarize("summarize")).unwrap();
         pollster(a.promote("to spec")).unwrap();
@@ -1082,8 +1258,7 @@ mod tests {
 
         let (mut a, _) = actor(vec!["summary".to_string(), example_spec_md()]);
         a.set_memory_graph(mg_tx);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         rt.block_on(async {
             a.summarize("summarize").await.unwrap();
@@ -1105,8 +1280,7 @@ mod tests {
             "storage summary".to_string(),
             "use crate geo for spatial ops".to_string(),
         ]);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         // Ask before any summary exists.
         let (answer1, state1) = pollster(a.ask("what is the best canonical GIS format?")).unwrap();
@@ -1143,35 +1317,121 @@ mod tests {
         // Canned LLM that fails on the brainstorm call.
         let llm: LlmCall = Box::new(|_| Box::pin(async move { Err("boom".to_string()) }));
         let mut a = SpecDesignActor::new(llm);
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.start("spire-gis", "view and edit map layers").unwrap();
         let err = pollster(a.ask("question")).unwrap_err();
         assert!(err.contains("boom"));
         // The user's question was captured even though the LLM failed.
         assert_eq!(a.state().turn_count, 1);
     }
 
+    /// Minimal memory-graph double: MergeAttrNode (dedupe by key) + QueryAttrNodes.
+    struct FakeGraph {
+        nodes: Arc<Mutex<Vec<AttrNode>>>,
+    }
+
+    impl FakeGraph {
+        fn spawn(&self, mut rx: mpsc::Receiver<MemoryGraphMessage>) {
+            let nodes = self.nodes.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("fake graph runtime");
+                rt.block_on(async move {
+                    while let Some(msg) = rx.recv().await {
+                        match msg {
+                            MemoryGraphMessage::MergeAttrNode { node, reply_to } => {
+                                let mut list = nodes.lock().unwrap();
+                                let key = |n: &AttrNode| {
+                                    (n.node_type.clone(), n.subtype.clone(), n.name.clone())
+                                };
+                                match list.iter().position(|n| key(n) == key(&node)) {
+                                    // Real Merge reuses the stored id and upserts content.
+                                    Some(i) => {
+                                        let id = list[i].id.clone();
+                                        let merged = AttrNode { id, ..node };
+                                        list[i] = merged.clone();
+                                        let _ = reply_to.send(Ok(merged));
+                                    }
+                                    None => {
+                                        list.push(node.clone());
+                                        let _ = reply_to.send(Ok(node));
+                                    }
+                                }
+                                drop(list);
+                            }
+                            MemoryGraphMessage::QueryAttrNodes {
+                                node_type,
+                                subtype,
+                                name,
+                                limit,
+                                reply_to,
+                            } => {
+                                let out: Vec<AttrNode> = nodes
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .filter(|n| {
+                                        node_type.as_deref().is_none_or(|t| n.node_type == t)
+                                    })
+                                    .filter(|n| {
+                                        subtype
+                                            .as_deref()
+                                            .is_none_or(|s| n.subtype.as_deref() == Some(s))
+                                    })
+                                    .filter(|n| name.as_deref().is_none_or(|x| n.name == x))
+                                    .take(limit.unwrap_or(u32::MAX) as usize)
+                                    .cloned()
+                                    .collect();
+                                let _ = reply_to.send(Ok(out));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            });
+        }
+    }
+
+    fn fake_graph_pair() -> (mpsc::Sender<MemoryGraphMessage>, FakeGraph) {
+        let (tx, rx) = mpsc::channel(64);
+        let fake = FakeGraph {
+            nodes: Arc::new(Mutex::new(Vec::new())),
+        };
+        fake.spawn(rx);
+        (tx, fake)
+    }
+
     #[test]
-    fn persisted_session_resumes_across_actor_instances() {
-        let dir = std::env::temp_dir().join(format!("spire-spec-design-{}", uuid::Uuid::new_v4()));
+    fn design_session_roundtrips_through_the_project_graph() {
+        let (tx, fake) = fake_graph_pair();
         let (mut a, _) = actor(vec![
             "v1: store WKB, serve GeoJSON".to_string(),
             example_spec_md(),
         ]);
-        a.set_persist_dir(dir.clone());
-        a.start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        a.set_memory_graph(tx.clone());
+        pollster(a.start_session("spire-gis", "view and edit map layers", false)).unwrap();
         seed_conversation(&mut a);
         pollster(a.summarize("summarize the design")).unwrap();
         let promoted = pollster(a.promote("to spec")).unwrap();
         assert_eq!(promoted.version, 1);
 
-        // A brand-new actor on the same persist dir resumes the brainstorm.
+        let stored = fake.nodes.lock().unwrap();
+        assert!(stored
+            .iter()
+            .any(|n| n.subtype.as_deref() == Some(DS_SESSION)));
+        assert!(stored.iter().any(|n| n.subtype.as_deref() == Some(DS_TURN)));
+        assert!(stored
+            .iter()
+            .any(|n| n.subtype.as_deref() == Some(DS_SUMMARY)));
+        assert!(stored.iter().any(|n| n.subtype.as_deref() == Some(DS_SPEC)));
+        drop(stored);
+
+        // A brand-new actor resumes the brainstorm from the same project graph.
         let (mut b, _) = actor(vec![]);
-        b.set_persist_dir(dir.clone());
-        let state = b
-            .start("spire-gis", "view and edit map layers", false)
-            .unwrap();
+        b.set_memory_graph(tx.clone());
+        let state =
+            pollster(b.start_session("spire-gis", "view and edit map layers", false)).unwrap();
         assert_eq!(state.turn_count, 2, "transcript resumed");
         assert_eq!(
             state.summary.as_ref().unwrap().content,
@@ -1181,47 +1441,41 @@ mod tests {
         assert_eq!(state.spec.as_ref().unwrap().version, 1);
         assert_eq!(state.mode, DesignMode::Freeform);
 
-        // reset: true starts a clean session (fresh snapshot overwrites).
-        let state2 = b.start("spire-gis", "fresh goal", true).unwrap();
+        // reset: true starts clean (new instance) — stale nodes stay but are
+        // unreachable; a later resume sees the empty session.
+        let (mut c, _) = actor(vec![]);
+        c.set_memory_graph(tx.clone());
+        let state2 = pollster(c.start_session("spire-gis", "fresh goal", true)).unwrap();
         assert_eq!(state2.turn_count, 0);
         assert!(state2.summary.is_none());
-        assert!(state2.spec.is_none());
-
-        // And a resume AFTER reset picks up the empty session, not the old one.
-        let (mut c, _) = actor(vec![]);
-        c.set_persist_dir(dir);
-        let state3 = c
-            .start("spire-gis", "view and edit map layers", false)
-            .unwrap();
-        assert_eq!(state3.turn_count, 0);
-
-        let _ = std::fs::remove_dir_all(&state3.project_name);
+        let state3 = pollster(c.start_session("spire-gis", "again", false)).unwrap();
+        assert_eq!(state3.turn_count, 0, "resume after reset is empty");
+        let _ = tx;
     }
 
     #[test]
-    fn two_projects_persist_separate_snapshots() {
-        let dir = std::env::temp_dir().join(format!("spire-spec-design-{}", uuid::Uuid::new_v4()));
+    fn two_projects_keep_independent_sessions_in_the_graph() {
+        let (tx, _fake) = fake_graph_pair();
         let (mut a, _) = actor(vec!["alpha summary".to_string()]);
-        a.set_persist_dir(dir.clone());
-        a.start("spire-alpha", "alpha goal", false).unwrap();
+        a.set_memory_graph(tx.clone());
+        pollster(a.start_session("spire-alpha", "alpha goal", false)).unwrap();
         a.append_turn(ROLE_USER, "alpha brainstorm").unwrap();
         pollster(a.summarize("summarize")).unwrap();
 
         let (mut b, _) = actor(vec!["beta summary".to_string()]);
-        b.set_persist_dir(dir.clone());
-        b.start("spire-beta", "beta goal", false).unwrap();
+        b.set_memory_graph(tx.clone());
+        pollster(b.start_session("spire-beta", "beta goal", false)).unwrap();
         b.append_turn(ROLE_USER, "beta brainstorm").unwrap();
         pollster(b.summarize("summarize")).unwrap();
 
         let (mut c, _) = actor(vec![]);
-        c.set_persist_dir(dir.clone());
-        let sa = c.start("spire-alpha", "ignored", false).unwrap();
+        c.set_memory_graph(tx);
+        let sa = pollster(c.start_session("spire-alpha", "ignored", false)).unwrap();
         assert_eq!(sa.turn_count, 1);
         assert!(sa.summary.as_ref().unwrap().content.contains("alpha"));
-        let sb = c.start("spire-beta", "ignored", false).unwrap();
+        let sb = pollster(c.start_session("spire-beta", "ignored", false)).unwrap();
         assert_eq!(sb.turn_count, 1);
         assert!(sb.summary.as_ref().unwrap().content.contains("beta"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Block on a future from a sync test (no global runtime needed).
