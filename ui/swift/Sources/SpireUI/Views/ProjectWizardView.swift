@@ -40,6 +40,8 @@ struct ProjectWizardView: View {
     @State private var appSpec: [String: Any]?
     @State private var isDerivingSpec = false
     @State private var specError: String?
+    /// Interactive free-form AppSpec design sheet (SpecDesignView).
+    @State private var showSpecDesign = false
 
     private let buildSystems = ["Cargo", "Meson"]
 
@@ -110,6 +112,16 @@ struct ProjectWizardView: View {
         }
         .onChange(of: buildSystem) { _, _ in
             structure = structureOptions.first?.key ?? "native"
+        }
+        .sheet(isPresented: $showSpecDesign) {
+            SpecDesignView(
+                projectName: projectName.trimmingCharacters(in: .whitespaces),
+                goal: goal.trimmingCharacters(in: .whitespacesAndNewlines),
+                onDecided: { spec in
+                    appSpec = spec
+                    showSpecDesign = false
+                }
+            )
         }
     }
 
@@ -335,6 +347,16 @@ struct ProjectWizardView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         } else {
+            Button {
+                showSpecDesign = true
+            } label: {
+                Label("Design AppSpec interactively…", systemImage: "bubble.left.and.bubble.right")
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isExecuting)
+            Text("Brainstorm freely: chat, then Summarize → Promote → Decide (reversible).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Button {
                 Task { await deriveSpec() }
             } label: {

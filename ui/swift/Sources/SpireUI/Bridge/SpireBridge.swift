@@ -1889,4 +1889,95 @@ final class SpireBridge {
             mcpTools[serverName] = []
         }
     }
+
+    // MARK: - Spec design RPC (free-form AppSpec design step)
+
+    /// One spec-design RPC round trip: returns the parsed reply object (or nil)
+    /// plus a non-nil error string on failure.
+    private func specDesignCall(method: String, params: [String: Any]) async -> (value: Any?, error: String?) {
+        let body: [String: Any] = ["method": method, "params": params]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            guard let object = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
+                return (nil, "spec-design: unreadable reply")
+            }
+            if let err = object["error"] as? String {
+                return (nil, err)
+            }
+            return (object, nil)
+        } catch {
+            return (nil, error.localizedDescription)
+        }
+    }
+
+    /// Open a design session for the project. Returns the initial state.
+    func specDesignStart(projectName: String, goal: String) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/start", params: ["projectName": projectName, "goal": goal])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignState(json: value as Any), nil)
+    }
+
+    /// Mirror a user turn into the design transcript.
+    func specDesignReply(text: String) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/reply", params: ["text": text])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignState(json: value as Any), nil)
+    }
+
+    /// Mirror any other turn (e.g. the assistant's brainstorm reply) into the
+    /// design transcript.
+    func specDesignTurn(role: String, text: String) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/turn", params: ["role": role, "text": text])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignState(json: value as Any), nil)
+    }
+
+    /// Free-form condensation of the brainstorm into the running summary.
+    func specDesignSummarize(instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/summarize", params: ["instruction": instruction])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignArtifact(json: value as Any), nil)
+    }
+
+    /// Compile the summary into the spec.md document (still a prompt).
+    func specDesignPromote(instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/promote", params: ["instruction": instruction])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignArtifact(json: value as Any), nil)
+    }
+
+    /// THE button: freeze the spec and derive the AppSpec deterministically.
+    /// Returns the derived spec dictionary (feeds the wizard's codegen step).
+    func specDesignDecide() async -> (spec: [String: Any]?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/decide", params: [:])
+        guard error == nil else { return (nil, error) }
+        return (value as? [String: Any], nil)
+    }
+
+    /// Return to free-form editing (a decided spec may not meet requirements).
+    func specDesignReopen() async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/reopen", params: [:])
+        guard error == nil else { return (nil, error) }
+        return (SpecDesignState(json: value as Any), nil)
+    }
+
+    /// Current session state (mode, summary/spec versions, turn count).
+    func specDesignState() async -> SpecDesignState? {
+        let (value, error) = await specDesignCall(method: "spec-design/state", params: [:])
+        guard error == nil else { return nil }
+        return SpecDesignState(json: value as Any)
+    }
+
+    /// Ask the LLM a free-form brainstorm question through the regular chat
+    /// path; returns the assistant reply text (not appended to the chat panel).
+    func specDesignBrainstormReply(to text: String) async -> String? {
+        do {
+            let command = try MessageSerializer.encode(chat: text)
+            let reply = try await backend.send(command)
+            return try MessageSerializer.decodeChat(reply).content
+        } catch {
+            return nil
+        }
+    }
 }
