@@ -14,8 +14,8 @@
 //! keep in sync.
 
 use super::spec::{
-    ActorSpec, AppMeta, AppSpec, DomainType, Field, GraphEdgeType, GraphNodeType, GraphSchema,
-    LayoutNode, Screen, Type, UiAction, UiBinding, UiNavigation,
+    ActorSpec, AppMeta, AppSpec, BridgeMethod, DomainType, Field, GraphEdgeType, GraphNodeType,
+    GraphSchema, LayoutNode, Screen, Type, UiAction, UiBinding, UiNavigation,
 };
 
 // ── Markdown type expressions ─────────────────────────────────────────────
@@ -480,6 +480,23 @@ pub fn spec_to_markdown(spec: &AppSpec) -> String {
         }
     }
 
+    // ── bridge methods (the JSON contract; round-trips through the doc) ───
+    if !spec.bridge.is_empty() {
+        out.push_str("\n## Bridge\n");
+        for m in &spec.bridge {
+            if m.description.trim().is_empty() {
+                out.push_str(&format!("\n### `{}`\n", m.method));
+            } else {
+                out.push_str(&format!("\n### `{}` — {}\n", m.method, m.description));
+            }
+            out.push_str("| param | type |\n|-------|------|\n");
+            for p in &m.params {
+                out.push_str(&format!("| {} | {} |\n", p.name, md_type(&p.ty)));
+            }
+            out.push_str(&format!("Result: {}\n", md_type(&m.result)));
+        }
+    }
+
     // ── UI screens ────────────────────────────────────────────────────────
     if !spec.ui.is_empty() {
         out.push_str("\n## UI\n");
@@ -719,6 +736,7 @@ pub fn markdown_to_spec(md: &str) -> Result<AppSpec, String> {
         GraphNodes,
         GraphEdges,
         Backend,
+        Bridge,
         Ui,
     }
 
@@ -734,6 +752,8 @@ pub fn markdown_to_spec(md: &str) -> Result<AppSpec, String> {
             Some(Section::GraphEdges)
         } else if l.starts_with("## Backend") {
             Some(Section::Backend)
+        } else if l.starts_with("## Bridge") {
+            Some(Section::Bridge)
         } else if l.starts_with("## UI") {
             Some(Section::Ui)
         } else {
@@ -913,6 +933,55 @@ pub fn markdown_to_spec(md: &str) -> Result<AppSpec, String> {
             continue;
         }
 
+        if current == Section::Bridge {
+            // ### `method` — description, then an optional `| param | type |`
+            // table, then the mandatory `Result: <type>` line.
+            if let Some((mname, mdesc)) = parse_actor_heading(&raw) {
+                let mut params = Vec::new();
+                if it.peek().is_some_and(|l| l.trim() == "| param | type |") {
+                    it.consume();
+                    loop {
+                        let Some(row) = it.peek() else {
+                            break;
+                        };
+                        let row = row.trim();
+                        if row.is_empty() || row.starts_with("|---") {
+                            it.consume();
+                            continue;
+                        }
+                        if !row.starts_with('|') {
+                            break;
+                        }
+                        it.consume();
+                        let cols = row.trim_matches('|');
+                        let (fname, fty) = cols
+                            .split_once('|')
+                            .ok_or_else(|| format!("bad param row '{cols}'"))?;
+                        params.push(Field {
+                            name: fname.trim().to_string(),
+                            ty: parse_md_type(fty.trim())?,
+                        });
+                    }
+                }
+                spec.bridge.push(BridgeMethod {
+                    method: mname,
+                    description: mdesc,
+                    params,
+                    result: Type::Str,
+                });
+            } else if let Some(result) = strip_heading(&raw, "Result: ") {
+                let ty = parse_md_type(&result)?;
+                if let Some(last) = spec.bridge.last_mut() {
+                    last.result = ty;
+                } else {
+                    return Err("Result: line before any bridge method".to_string());
+                }
+            } else if raw.starts_with("### `") {
+                return Err(format!("unparsable bridge method heading: '{raw}'"));
+            }
+            continue;
+        }
+
         if current == Section::Ui {
             if let Some((sid, stitle)) = parse_screen_heading(&raw) {
                 let layout_line = it.expect_meaningful(&format!("Layout for '{sid}'"))?;
@@ -985,6 +1054,7 @@ mod tests {
         assert_eq!(a.types, b.types, "types mismatch");
         assert_eq!(a.graph, b.graph, "graph mismatch");
         assert_eq!(a.actors, b.actors, "actors mismatch");
+        assert_eq!(a.bridge, b.bridge, "bridge mismatch");
         assert_eq!(a.ui, b.ui, "ui mismatch");
     }
 
@@ -1170,6 +1240,7 @@ mod tests {
         assert_eq!(back.types, spec.types, "types mismatch");
         assert_eq!(back.graph, spec.graph, "graph mismatch");
         assert_eq!(back.actors, spec.actors, "actors mismatch");
+        assert_eq!(back.bridge, spec.bridge, "bridge mismatch");
         assert_eq!(back.ui, spec.ui, "ui mismatch");
     }
 
