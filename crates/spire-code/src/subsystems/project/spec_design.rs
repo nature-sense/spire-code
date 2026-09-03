@@ -22,7 +22,7 @@
 //! The LLM is injected as a plain async closure (like [`super::spec_gen`]), so
 //! the actor is fully testable with canned scripts.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -47,7 +47,7 @@ pub const ROLE_USER: &str = "user";
 pub const ROLE_ASSISTANT: &str = "assistant";
 
 /// Whether the design session is still free-form or has been frozen by Decide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DesignMode {
     /// Prompts drive everything (the default).
@@ -57,7 +57,7 @@ pub enum DesignMode {
 }
 
 /// One conversation turn (user or assistant) in the design transcript.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesignTurn {
     pub role: String,
     pub text: String,
@@ -65,7 +65,7 @@ pub struct DesignTurn {
 
 /// A condensed document (summary or spec). The summary is the running source of
 /// truth during the free-form phase; the spec is the `spec.md` document.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DesignArtifact {
     pub version: u32,
     pub content: String,
@@ -96,6 +96,20 @@ pub struct SpecDesignState {
     pub last_issues: Vec<SpecIssue>,
 }
 
+/// On-disk snapshot that makes a brainstorm session resumable across restarts.
+/// Written to `<config>/design/<project>.json` after every mutation when a
+/// persist dir is configured; `start(reset: false)` restores it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecDesignSnapshot {
+    pub project_name: String,
+    pub goal: String,
+    pub mode: DesignMode,
+    pub turns: Vec<DesignTurn>,
+    pub summarized_through: usize,
+    pub summary: Option<DesignArtifact>,
+    pub spec: Option<DesignArtifact>,
+}
+
 /// Messages routed to the [`SpecDesignActor`]. Each carries its own typed reply
 /// channel, following the crate's actor convention.
 #[derive(Debug)]
@@ -103,6 +117,8 @@ pub enum SpecDesignMessage {
     Start {
         project_name: String,
         goal: String,
+        /// false (default) resumes a persisted session; true starts fresh.
+        reset: bool,
         reply_to: oneshot::Sender<Result<SpecDesignState, String>>,
     },
     /// A user turn in the free-form brainstorm.
@@ -159,6 +175,10 @@ pub struct SpecDesignActor {
     accepted: Vec<AcceptedSpec>,
     latest: Option<AppSpec>,
     last_issues: Vec<SpecIssue>,
+    /// When set, every mutation is mirrored to `<dir>/<project>.json` so the
+    /// free-form brainstorm survives restarts. Production sets this to
+    /// `<config>/design`; tests leave it unset or point it at a temp dir.
+    persist_dir: Option<std::path::PathBuf>,
 }
 
 impl SpecDesignActor {
@@ -178,12 +198,92 @@ impl SpecDesignActor {
             accepted: Vec::new(),
             latest: None,
             last_issues: Vec::new(),
+            persist_dir: None,
         }
     }
 
     /// Wire the memory graph so Decide can persist the derived spec.
     pub fn set_memory_graph(&mut self, tx: mpsc::Sender<MemoryGraphMessage>) {
         self.memory_graph_tx = Some(tx);
+    }
+
+    /// Enable on-disk snapshots of the free-form session (resumable across
+    /// restarts). Snapshots are keyed by project name.
+    pub fn set_persist_dir(&mut self, dir: std::path::PathBuf) {
+        self.persist_dir = Some(dir);
+    }
+
+    fn persist_path(&self) -> Option<std::path::PathBuf> {
+        self.persist_dir
+            .as_ref()
+            .map(|d| d.join(format!("{}.json", sanitize_file_name(&self.project_name))))
+    }
+
+    /// Mirror the session to disk after a mutation (best-effort).
+    fn persist(&self) {
+        let Some(path) = self.persist_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!("[SpecDesign] persist dir create failed: {e}");
+                return;
+            }
+        }
+        let snapshot = SpecDesignSnapshot {
+            project_name: self.project_name.clone(),
+            goal: self.goal.clone(),
+            mode: self.mode,
+            turns: self.turns.clone(),
+            summarized_through: self.summarized_through,
+            summary: self.summary.clone(),
+            spec: self.spec.clone(),
+        };
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!(
+                        "[SpecDesign] snapshot write failed for '{}': {e}",
+                        self.project_name
+                    );
+                }
+            }
+            Err(e) => warn!("[SpecDesign] snapshot serialize failed: {e}"),
+        }
+    }
+
+    /// Restore a persisted session for `project_name`. Returns true when a
+    /// snapshot existed and was loaded.
+    fn resume(&mut self, project_name: &str) -> bool {
+        let Some(dir) = self.persist_dir.clone() else {
+            return false;
+        };
+        let path = dir.join(format!("{}.json", sanitize_file_name(project_name)));
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(snapshot) = serde_json::from_str::<SpecDesignSnapshot>(&raw) else {
+            return false;
+        };
+        if snapshot.project_name != project_name {
+            return false;
+        }
+        self.project_name = snapshot.project_name;
+        self.goal = snapshot.goal;
+        self.mode = snapshot.mode;
+        self.turns = snapshot.turns;
+        self.summarized_through = snapshot.summarized_through;
+        self.summary = snapshot.summary;
+        self.spec = snapshot.spec;
+        self.accepted.clear();
+        self.latest = None;
+        self.last_issues.clear();
+        info!(
+            "[SpecDesign] resumed persisted session for '{}' ({} turns)",
+            self.project_name,
+            self.turns.len()
+        );
+        true
     }
 
     pub fn state(&self) -> SpecDesignState {
@@ -220,7 +320,18 @@ impl SpecDesignActor {
     }
 
     /// (Re)start the session for a project/goal.
-    pub fn start(&mut self, project_name: &str, goal: &str) -> Result<SpecDesignState, String> {
+    pub fn start(
+        &mut self,
+        project_name: &str,
+        goal: &str,
+        reset: bool,
+    ) -> Result<SpecDesignState, String> {
+        if !reset && self.resume(project_name) {
+            // A resumed session keeps its project + transcript; only the goal
+            // hint is refreshed from the caller.
+            self.goal = goal.to_string();
+            return Ok(self.state());
+        }
         self.project_name = project_name.to_string();
         self.goal = goal.to_string();
         self.mode = DesignMode::Freeform;
@@ -235,6 +346,7 @@ impl SpecDesignActor {
             "[SpecDesign] session started for '{}': {}",
             self.project_name, self.goal
         );
+        self.persist();
         Ok(self.state())
     }
 
@@ -250,6 +362,7 @@ impl SpecDesignActor {
             role: role.to_string(),
             text,
         });
+        self.persist();
         Ok(self.state())
     }
 
@@ -291,6 +404,7 @@ impl SpecDesignActor {
         );
         self.summary = Some(artifact.clone());
         self.summarized_through = self.turns.len();
+        self.persist();
         Ok(artifact)
     }
 
@@ -333,6 +447,7 @@ impl SpecDesignActor {
             artifact.version, self.project_name, instruction
         );
         self.spec = Some(artifact.clone());
+        self.persist();
         Ok(artifact)
     }
 
@@ -351,6 +466,7 @@ impl SpecDesignActor {
             role: ROLE_USER.to_string(),
             text: text.clone(),
         });
+        self.persist(); // the user's question survives even an LLM failure
         let summary = self.summary.as_ref().map(|a| a.content.clone());
         let start = self.turns.len().saturating_sub(10);
         let context = self.turns[start..].to_vec();
@@ -366,6 +482,7 @@ impl SpecDesignActor {
             role: ROLE_ASSISTANT.to_string(),
             text: answer.clone(),
         });
+        self.persist();
         Ok((answer, self.state()))
     }
 
@@ -421,6 +538,7 @@ impl SpecDesignActor {
             app_spec: app.clone(),
             decided_at: chrono::Utc::now(),
         });
+        self.persist();
         info!(
             "[SpecDesign] '{}' decided — appspec v{} ({} types, {} actors, {} methods, {} screens)",
             self.project_name,
@@ -442,6 +560,7 @@ impl SpecDesignActor {
             "[SpecDesign] '{}' reopened for free-form editing",
             self.project_name
         );
+        self.persist();
         Ok(self.state())
     }
 
@@ -586,8 +705,20 @@ fn brainstorm_prompt(
     parts.join("\n")
 }
 
-#[async_trait]
+/// Map a project name to a safe file stem for snapshots.
+fn sanitize_file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
 
+#[async_trait]
 impl Actor for SpecDesignActor {
     type Message = SpecDesignMessage;
 
@@ -596,9 +727,10 @@ impl Actor for SpecDesignActor {
             SpecDesignMessage::Start {
                 project_name,
                 goal,
+                reset,
                 reply_to,
             } => {
-                let _ = reply_to.send(self.start(&project_name, &goal));
+                let _ = reply_to.send(self.start(&project_name, &goal, reset));
             }
             SpecDesignMessage::Reply { text, reply_to } => {
                 let _ = reply_to.send(self.append_turn(ROLE_USER, &text));
@@ -690,7 +822,9 @@ mod tests {
     #[test]
     fn transcript_grows_and_state_tracks_turns() {
         let (mut a, _) = actor(vec![]);
-        let s = a.start("spire-gis", "view and edit map layers").unwrap();
+        let s = a
+            .start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         assert_eq!(s.mode, DesignMode::Freeform);
         assert_eq!(s.turn_count, 0);
         seed_conversation(&mut a);
@@ -708,7 +842,8 @@ mod tests {
             "v1: store WKB, serve GeoJSON".to_string(),
             "v2: v1 + Parquet for analytics".to_string(),
         ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
 
         let s1 = pollster(a.summarize("summarize with storage techniques")).unwrap();
@@ -737,7 +872,8 @@ mod tests {
     #[test]
     fn summarize_recreate_passes_the_full_transcript() {
         let (mut a, prompts) = actor(vec!["fresh summary".to_string()]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         let s = pollster(a.summarize("recreate the summary from scratch around storage")).unwrap();
         assert_eq!(s.version, 1);
@@ -754,7 +890,8 @@ mod tests {
             "decision: WKB in SeleneDB, GeoJSON served".to_string(),
             example_spec_md(),
         ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         let spec = pollster(a.promote("turn this into a spec")).unwrap();
         assert_eq!(spec.version, 1);
@@ -780,7 +917,8 @@ mod tests {
             "summary one + more".to_string(),
             example_spec_md(),
         ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         pollster(a.promote("turn this into a spec")).unwrap();
         a.append_turn(ROLE_USER, "add an inspect screen for a selected feature")
@@ -802,7 +940,8 @@ mod tests {
     #[test]
     fn decide_validates_freezes_and_records_an_accepted_version() {
         let (mut a, _) = actor(vec!["summary text".to_string(), example_spec_md()]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         pollster(a.summarize("summarize the design")).unwrap();
         let spec = pollster(a.promote("turn this into a spec")).unwrap();
@@ -834,7 +973,8 @@ mod tests {
             "summary text v2".to_string(),
             example_spec_md(),
         ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         pollster(a.summarize("summarize")).unwrap();
         pollster(a.promote("to spec")).unwrap();
@@ -860,7 +1000,8 @@ mod tests {
     #[test]
     fn decide_requires_a_promoted_spec() {
         let (mut a, _) = actor(vec![]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         let err = pollster(a.decide()).unwrap_err();
         assert!(err.contains("promote the summary to a spec first"));
@@ -878,7 +1019,8 @@ mod tests {
         });
         let bad_md = spec_md::spec_to_markdown(&bad);
         let (mut a, _) = actor(vec!["summary".to_string(), bad_md]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         pollster(a.summarize("summarize")).unwrap();
         pollster(a.promote("to spec")).unwrap();
@@ -940,7 +1082,8 @@ mod tests {
 
         let (mut a, _) = actor(vec!["summary".to_string(), example_spec_md()]);
         a.set_memory_graph(mg_tx);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         rt.block_on(async {
             a.summarize("summarize").await.unwrap();
@@ -962,7 +1105,8 @@ mod tests {
             "storage summary".to_string(),
             "use crate geo for spatial ops".to_string(),
         ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         seed_conversation(&mut a);
         // Ask before any summary exists.
         let (answer1, state1) = pollster(a.ask("what is the best canonical GIS format?")).unwrap();
@@ -999,11 +1143,85 @@ mod tests {
         // Canned LLM that fails on the brainstorm call.
         let llm: LlmCall = Box::new(|_| Box::pin(async move { Err("boom".to_string()) }));
         let mut a = SpecDesignActor::new(llm);
-        a.start("spire-gis", "view and edit map layers").unwrap();
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
         let err = pollster(a.ask("question")).unwrap_err();
         assert!(err.contains("boom"));
         // The user's question was captured even though the LLM failed.
         assert_eq!(a.state().turn_count, 1);
+    }
+
+    #[test]
+    fn persisted_session_resumes_across_actor_instances() {
+        let dir = std::env::temp_dir().join(format!("spire-spec-design-{}", uuid::Uuid::new_v4()));
+        let (mut a, _) = actor(vec![
+            "v1: store WKB, serve GeoJSON".to_string(),
+            example_spec_md(),
+        ]);
+        a.set_persist_dir(dir.clone());
+        a.start("spire-gis", "view and edit map layers", false)
+            .unwrap();
+        seed_conversation(&mut a);
+        pollster(a.summarize("summarize the design")).unwrap();
+        let promoted = pollster(a.promote("to spec")).unwrap();
+        assert_eq!(promoted.version, 1);
+
+        // A brand-new actor on the same persist dir resumes the brainstorm.
+        let (mut b, _) = actor(vec![]);
+        b.set_persist_dir(dir.clone());
+        let state = b
+            .start("spire-gis", "view and edit map layers", false)
+            .unwrap();
+        assert_eq!(state.turn_count, 2, "transcript resumed");
+        assert_eq!(
+            state.summary.as_ref().unwrap().content,
+            "v1: store WKB, serve GeoJSON"
+        );
+        assert_eq!(state.spec.as_ref().unwrap().content, example_spec_md());
+        assert_eq!(state.spec.as_ref().unwrap().version, 1);
+        assert_eq!(state.mode, DesignMode::Freeform);
+
+        // reset: true starts a clean session (fresh snapshot overwrites).
+        let state2 = b.start("spire-gis", "fresh goal", true).unwrap();
+        assert_eq!(state2.turn_count, 0);
+        assert!(state2.summary.is_none());
+        assert!(state2.spec.is_none());
+
+        // And a resume AFTER reset picks up the empty session, not the old one.
+        let (mut c, _) = actor(vec![]);
+        c.set_persist_dir(dir);
+        let state3 = c
+            .start("spire-gis", "view and edit map layers", false)
+            .unwrap();
+        assert_eq!(state3.turn_count, 0);
+
+        let _ = std::fs::remove_dir_all(&state3.project_name);
+    }
+
+    #[test]
+    fn two_projects_persist_separate_snapshots() {
+        let dir = std::env::temp_dir().join(format!("spire-spec-design-{}", uuid::Uuid::new_v4()));
+        let (mut a, _) = actor(vec!["alpha summary".to_string()]);
+        a.set_persist_dir(dir.clone());
+        a.start("spire-alpha", "alpha goal", false).unwrap();
+        a.append_turn(ROLE_USER, "alpha brainstorm").unwrap();
+        pollster(a.summarize("summarize")).unwrap();
+
+        let (mut b, _) = actor(vec!["beta summary".to_string()]);
+        b.set_persist_dir(dir.clone());
+        b.start("spire-beta", "beta goal", false).unwrap();
+        b.append_turn(ROLE_USER, "beta brainstorm").unwrap();
+        pollster(b.summarize("summarize")).unwrap();
+
+        let (mut c, _) = actor(vec![]);
+        c.set_persist_dir(dir.clone());
+        let sa = c.start("spire-alpha", "ignored", false).unwrap();
+        assert_eq!(sa.turn_count, 1);
+        assert!(sa.summary.as_ref().unwrap().content.contains("alpha"));
+        let sb = c.start("spire-beta", "ignored", false).unwrap();
+        assert_eq!(sb.turn_count, 1);
+        assert!(sb.summary.as_ref().unwrap().content.contains("beta"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Block on a future from a sync test (no global runtime needed).

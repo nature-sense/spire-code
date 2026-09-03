@@ -1912,8 +1912,8 @@ final class SpireBridge {
     }
 
     /// Open a design session for the project. Returns the initial state.
-    func specDesignStart(projectName: String, goal: String) async -> (state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/start", params: ["projectName": projectName, "goal": goal])
+    func specDesignStart(projectName: String, goal: String, reset: Bool = false) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/start", params: ["projectName": projectName, "goal": goal, "reset": reset])
         guard error == nil else { return (nil, error) }
         return (SpecDesignState(json: value as Any), nil)
     }
@@ -1921,8 +1921,8 @@ final class SpireBridge {
     /// Ask the LLM a free-form brainstorm question INSIDE the design session
     /// (the design transcript owns the conversation). Appends user + assistant
     /// turns server-side; returns the answer text and the updated state.
-    func specDesignAsk(text: String) async -> (text: String?, state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/ask", params: ["text": text])
+    func specDesignAsk(projectName: String, text: String) async -> (text: String?, state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/ask", params: ["projectName": projectName, "text": text])
         guard error == nil else { return (nil, nil, error) }
         guard let dict = value as? [String: Any] else {
             return (nil, nil, "spec-design/ask: unreadable reply")
@@ -1932,52 +1932,52 @@ final class SpireBridge {
 
     /// Mirror a user turn into the design transcript (kept for external
     /// turn-mirroring; the design view normally uses `specDesignAsk`).
-    func specDesignReply(text: String) async -> (state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/reply", params: ["text": text])
+    func specDesignReply(projectName: String, text: String) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/reply", params: ["projectName": projectName, "text": text])
         guard error == nil else { return (nil, error) }
         return (SpecDesignState(json: value as Any), nil)
     }
 
     /// Mirror any other turn (e.g. the assistant's brainstorm reply) into the
     /// design transcript.
-    func specDesignTurn(role: String, text: String) async -> (state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/turn", params: ["role": role, "text": text])
+    func specDesignTurn(projectName: String, role: String, text: String) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/turn", params: ["projectName": projectName, "role": role, "text": text])
         guard error == nil else { return (nil, error) }
         return (SpecDesignState(json: value as Any), nil)
     }
 
     /// Free-form condensation of the brainstorm into the running summary.
-    func specDesignSummarize(instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/summarize", params: ["instruction": instruction])
+    func specDesignSummarize(projectName: String, instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/summarize", params: ["projectName": projectName, "instruction": instruction])
         guard error == nil else { return (nil, error) }
         return (SpecDesignArtifact(json: value as Any), nil)
     }
 
     /// Compile the summary into the spec.md document (still a prompt).
-    func specDesignPromote(instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/promote", params: ["instruction": instruction])
+    func specDesignPromote(projectName: String, instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/promote", params: ["projectName": projectName, "instruction": instruction])
         guard error == nil else { return (nil, error) }
         return (SpecDesignArtifact(json: value as Any), nil)
     }
 
     /// THE button: freeze the spec and derive the AppSpec deterministically.
     /// Returns the derived spec dictionary (feeds the wizard's codegen step).
-    func specDesignDecide() async -> (spec: [String: Any]?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/decide", params: [:])
+    func specDesignDecide(projectName: String) async -> (spec: [String: Any]?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/decide", params: ["projectName": projectName])
         guard error == nil else { return (nil, error) }
         return (value as? [String: Any], nil)
     }
 
     /// Return to free-form editing (a decided spec may not meet requirements).
-    func specDesignReopen() async -> (state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/reopen", params: [:])
+    func specDesignReopen(projectName: String) async -> (state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/reopen", params: ["projectName": projectName])
         guard error == nil else { return (nil, error) }
         return (SpecDesignState(json: value as Any), nil)
     }
 
     /// Current session state (mode, summary/spec versions, turn count).
-    func specDesignState() async -> SpecDesignState? {
-        let (value, error) = await specDesignCall(method: "spec-design/state", params: [:])
+    func specDesignState(projectName: String) async -> SpecDesignState? {
+        let (value, error) = await specDesignCall(method: "spec-design/state", params: ["projectName": projectName])
         guard error == nil else { return nil }
         return SpecDesignState(json: value as Any)
     }

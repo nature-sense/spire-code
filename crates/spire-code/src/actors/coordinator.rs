@@ -9,7 +9,8 @@
 use async_trait::async_trait;
 use regex::Regex;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use spire_core::subsystems::chat::chat::ChatMessage;
@@ -100,6 +101,8 @@ pub struct CoordinatorActor {
     plan_orchestrator_tx: mpsc::Sender<PlanOrchestratorMessage>,
     /// Transport sender for forwarding VSC tool calls / notifications to the extension.
     transport_tx: mpsc::Sender<TransportMessage>,
+    /// One free-form AppSpec design session per project (created lazily).
+    spec_design_sessions: Arc<Mutex<HashMap<String, mpsc::Sender<SpecDesignMessage>>>>,
     /// App-only dispatch dependencies (registry + shared state), attached via
     /// `SetFfiDeps`. `None` in the standalone binary.
     registry: Option<Arc<ServiceRegistry>>,
@@ -133,6 +136,7 @@ impl CoordinatorActor {
             tool_router_tx,
             plan_orchestrator_tx,
             transport_tx,
+            spec_design_sessions: Arc::new(Mutex::new(HashMap::new())),
             registry: None,
             ffi_state: None,
         }
@@ -3267,72 +3271,100 @@ impl CoordinatorActor {
     }
 }
 
-
-
-
-
-
 impl CoordinatorActor {
-    // ── spec-design RPC: the free-form AppSpec design session ─────────────
-    // Routes to the SpecDesignActor registered as "spec_design" at startup
-    // (ffi.rs). Replies are the actor's typed results, serialized.
+    // ── spec-design RPC: per-project free-form design sessions ────────────
+    // One SpecDesignActor per project (so several apps can be designed in
+    // parallel); each is created lazily on first use and persists its
+    // brainstorm to <config>/design/<project>.json.
 
-    async fn handle_spec_design_ask(&self, params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-        let text = params
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
-            .send(SpecDesignMessage::Ask { text, reply_to: tx })
-            .await;
-        match rx.await {
-            Ok(Ok((answer, state))) => {
-                let state_value = serde_json::to_value(state)
-                    .unwrap_or_else(|_| serde_json::json!({"error": "serialize state"}));
-                serde_json::json!({ "text": answer, "state": state_value })
-            }
-            Ok(Err(e)) => serde_json::json!({ "error": e }),
-            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+    /// Lazily create / look up the design-session sender for a project.
+    async fn spec_design_tx(
+        &self,
+        project_name: &str,
+    ) -> Result<tokio::sync::mpsc::Sender<SpecDesignMessage>, String> {
+        let map = self.spec_design_sessions.clone();
+        if let Some(tx) = map
+            .lock()
+            .map(|g| g.get(project_name).cloned())
+            .unwrap_or(None)
+        {
+            return Ok(tx);
         }
+
+        let llm: crate::subsystems::project::spec_design::LlmCall = {
+            let llm_tx = self.llm_tx.clone();
+            Box::new(move |prompt: String| {
+                let llm_tx = llm_tx.clone();
+                Box::pin(async move {
+                    let (t, r) = tokio::sync::oneshot::channel();
+                    if llm_tx
+                        .send(crate::actors::LlmMessage::Complete {
+                            prompt,
+                            role: spire_core::subsystems::llm::llm::LlmModelRole::Planning,
+                            reply_to: t,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err("LLM actor unavailable".to_string());
+                    }
+                    match r.await {
+                        Ok(Ok(text)) => Ok(text),
+                        Ok(Err(e)) => Err(format!("LLM error: {e}")),
+                        Err(e) => Err(format!("LLM reply lost: {e}")),
+                    }
+                })
+            })
+        };
+        let mut actor =
+            crate::subsystems::project::spec_design::SpecDesignActor::new(llm);
+        actor.set_memory_graph(self.memory_graph_tx.clone());
+        actor.set_persist_dir(spire_core::config::config_dir().join("design"));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let _handle = spire_core::actors::Actor::spawn(actor, rx);
+        if let Ok(mut g) = map.lock() {
+            g.insert(project_name.to_string(), tx.clone());
+        }
+        Ok(tx)
+    }
+
+    fn spec_design_project(&self, params: &serde_json::Value) -> Result<String, serde_json::Value> {
+        params
+            .get("projectName")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .ok_or_else(|| serde_json::json!({ "error": "missing 'projectName'" }))
     }
 
     async fn handle_spec_design_start(&self, params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
-            Err(e) => return serde_json::json!({ "error": e }),
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
-        let project_name = params
-            .get("projectName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         let goal = params
             .get("goal")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if project_name.is_empty() {
-            return serde_json::json!({ "error": "missing 'projectName'" });
-        }
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
+        let reset = params
+            .get("reset")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx
             .send(SpecDesignMessage::Start {
                 project_name,
                 goal,
-                reply_to: tx,
+                reset,
+                reply_to: t,
             })
             .await;
-        match rx.await {
+        match r.await {
             Ok(Ok(state)) => serde_json::to_value(state)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
@@ -3340,23 +3372,52 @@ impl CoordinatorActor {
         }
     }
 
-    async fn handle_spec_design_reply(&self, params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
-            Err(e) => return serde_json::json!({ "error": e }),
+    async fn handle_spec_design_ask(&self, params: &serde_json::Value) -> serde_json::Value {
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         let text = params
             .get("text")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
-            .send(SpecDesignMessage::Reply { text, reply_to: tx })
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx
+            .send(SpecDesignMessage::Ask { text, reply_to: t })
             .await;
-        match rx.await {
+        match r.await {
+            Ok(Ok((answer, state))) => {
+                let state_value = serde_json::to_value(state)
+                    .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" }));
+                serde_json::json!({ "text": answer, "state": state_value })
+            }
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_reply(&self, params: &serde_json::Value) -> serde_json::Value {
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx.send(SpecDesignMessage::Reply { text, reply_to: t }).await;
+        match r.await {
             Ok(Ok(state)) => serde_json::to_value(state)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
@@ -3365,9 +3426,9 @@ impl CoordinatorActor {
     }
 
     async fn handle_spec_design_turn(&self, params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
-            Err(e) => return serde_json::json!({ "error": e }),
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         let role = params
             .get("role")
@@ -3379,17 +3440,19 @@ impl CoordinatorActor {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx
             .send(SpecDesignMessage::AppendTurn {
                 role,
                 text,
-                reply_to: tx,
+                reply_to: t,
             })
             .await;
-        match rx.await {
+        match r.await {
             Ok(Ok(state)) => serde_json::to_value(state)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
@@ -3398,25 +3461,27 @@ impl CoordinatorActor {
     }
 
     async fn handle_spec_design_summarize(&self, params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
-            Err(e) => return serde_json::json!({ "error": e }),
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         let instruction = params
             .get("instruction")
             .and_then(|v| v.as_str())
             .unwrap_or("add to the summary")
             .to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx
             .send(SpecDesignMessage::Summarize {
                 instruction,
-                reply_to: tx,
+                reply_to: t,
             })
             .await;
-        match rx.await {
+        match r.await {
             Ok(Ok(artifact)) => serde_json::to_value(artifact)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize artifact" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
@@ -3425,25 +3490,27 @@ impl CoordinatorActor {
     }
 
     async fn handle_spec_design_promote(&self, params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
-            Err(e) => return serde_json::json!({ "error": e }),
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         let instruction = params
             .get("instruction")
             .and_then(|v| v.as_str())
             .unwrap_or("turn the summary into a spec")
             .to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx
             .send(SpecDesignMessage::PromoteToSpec {
                 instruction,
-                reply_to: tx,
+                reply_to: t,
             })
             .await;
-        match rx.await {
+        match r.await {
             Ok(Ok(artifact)) => serde_json::to_value(artifact)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize artifact" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
@@ -3451,18 +3518,18 @@ impl CoordinatorActor {
         }
     }
 
-    async fn handle_spec_design_decide(&self, _params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
+    async fn handle_spec_design_decide(&self, params: &serde_json::Value) -> serde_json::Value {
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
             Err(e) => return serde_json::json!({ "error": e }),
         };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
-            .send(SpecDesignMessage::Decide { reply_to: tx })
-            .await;
-        match rx.await {
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx.send(SpecDesignMessage::Decide { reply_to: t }).await;
+        match r.await {
             Ok(Ok(spec)) => serde_json::to_value(spec)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize spec" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
@@ -3470,18 +3537,18 @@ impl CoordinatorActor {
         }
     }
 
-    async fn handle_spec_design_reopen(&self, _params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
+    async fn handle_spec_design_reopen(&self, params: &serde_json::Value) -> serde_json::Value {
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
             Err(e) => return serde_json::json!({ "error": e }),
         };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
-            .send(SpecDesignMessage::Reopen { reply_to: tx })
-            .await;
-        match rx.await {
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx.send(SpecDesignMessage::Reopen { reply_to: t }).await;
+        match r.await {
             Ok(Ok(state)) => serde_json::to_value(state)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
@@ -3489,18 +3556,18 @@ impl CoordinatorActor {
         }
     }
 
-    async fn handle_spec_design_state(&self, _params: &serde_json::Value) -> serde_json::Value {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
+    async fn handle_spec_design_state(&self, params: &serde_json::Value) -> serde_json::Value {
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
             Err(e) => return serde_json::json!({ "error": e }),
         };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<SpecDesignMessage>("spec_design")
-            .unwrap_or_else(dummy_tx)
-            .send(SpecDesignMessage::GetState { reply_to: tx })
-            .await;
-        match rx.await {
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx.send(SpecDesignMessage::GetState { reply_to: t }).await;
+        match r.await {
             Ok(state) => serde_json::to_value(state)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
             Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),

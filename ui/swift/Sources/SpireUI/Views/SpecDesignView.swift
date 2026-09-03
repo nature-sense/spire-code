@@ -80,6 +80,12 @@ struct SpecDesignView: View {
                 Label("Free-form", systemImage: "pencil.and.outline")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Button("Start over") {
+                    Task { await resetDesign() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(busy)
+                .help("Discard the persisted session and design from scratch")
                 Button {
                     Task { await decide() }
                 } label: {
@@ -255,7 +261,7 @@ struct SpecDesignView: View {
         lines.append(SpecDesignLine(role: "user", text: text))
         busy = true
         defer { busy = false }
-        let (answer, state, error) = await bridge.specDesignAsk(text: text)
+        let (answer, state, error) = await bridge.specDesignAsk(projectName: projectName, text: text)
         apply(state: state, error: error)
         if let answer, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.append(SpecDesignLine(role: "assistant", text: answer))
@@ -272,7 +278,7 @@ struct SpecDesignView: View {
         errorMessage = nil
         busy = true
         defer { busy = false }
-        let (artifact, error) = await bridge.specDesignSummarize(instruction: instruction)
+        let (artifact, error) = await bridge.specDesignSummarize(projectName: projectName, instruction: instruction)
         if let artifact {
             summary = artifact
         }
@@ -286,7 +292,7 @@ struct SpecDesignView: View {
         errorMessage = nil
         busy = true
         defer { busy = false }
-        let (artifact, error) = await bridge.specDesignPromote(instruction: instruction)
+        let (artifact, error) = await bridge.specDesignPromote(projectName: projectName, instruction: instruction)
         if let artifact {
             spec = artifact
         }
@@ -300,7 +306,7 @@ struct SpecDesignView: View {
         errorMessage = nil
         busy = true
         defer { busy = false }
-        let (specDict, error) = await bridge.specDesignDecide()
+        let (specDict, error) = await bridge.specDesignDecide(projectName: projectName)
         if let specDict {
             onDecided(specDict)
             dismiss()
@@ -312,11 +318,23 @@ struct SpecDesignView: View {
     }
 
     @MainActor
+    private func resetDesign() async {
+        errorMessage = nil
+        busy = true
+        defer { busy = false }
+        let (state, error) = await bridge.specDesignStart(projectName: projectName, goal: goal, reset: true)
+        apply(state: state, error: error)
+        if state != nil {
+            lines = []
+        }
+    }
+
+    @MainActor
     private func reopen() async {
         errorMessage = nil
         busy = true
         defer { busy = false }
-        let (state, error) = await bridge.specDesignReopen()
+        let (state, error) = await bridge.specDesignReopen(projectName: projectName)
         apply(state: state, error: error)
     }
 }
