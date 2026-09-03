@@ -5,6 +5,7 @@
 
 pub mod spec;
 pub mod spec_codegen;
+pub mod spec_design;
 pub mod spec_gen;
 pub mod spec_graph;
 pub mod spec_md;
