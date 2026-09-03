@@ -125,6 +125,13 @@ pub enum SpecDesignMessage {
         instruction: String,
         reply_to: oneshot::Sender<Result<DesignArtifact, String>>,
     },
+    /// Free-form brainstorm turn INSIDE the design session: appends the user
+    /// question, asks the LLM (opinionated options + recommendation, grounded
+    /// in the running summary), appends the answer, replies with both.
+    Ask {
+        text: String,
+        reply_to: oneshot::Sender<Result<(String, SpecDesignState), String>>,
+    },
     Decide {
         reply_to: oneshot::Sender<Result<AppSpec, String>>,
     },
@@ -329,6 +336,39 @@ impl SpecDesignActor {
         Ok(artifact)
     }
 
+    /// Free-form brainstorm answer inside the design session (see the `Ask`
+    /// message). Appends the user turn FIRST (capture survives an LLM error),
+    /// then asks the LLM grounded in the current summary + recent turns,
+    /// appends the assistant answer, and returns (answer, state).
+    pub async fn ask(&mut self, text: &str) -> Result<(String, SpecDesignState), String> {
+        self.require_freeform()?;
+        self.require_session()?;
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err("empty question".to_string());
+        }
+        self.turns.push(DesignTurn {
+            role: ROLE_USER.to_string(),
+            text: text.clone(),
+        });
+        let summary = self.summary.as_ref().map(|a| a.content.clone());
+        let start = self.turns.len().saturating_sub(10);
+        let context = self.turns[start..].to_vec();
+        let prompt = brainstorm_prompt(
+            &self.project_name,
+            &self.goal,
+            &text,
+            summary.as_deref(),
+            &context,
+        );
+        let answer = self.call_llm(prompt).await?;
+        self.turns.push(DesignTurn {
+            role: ROLE_ASSISTANT.to_string(),
+            text: answer.clone(),
+        });
+        Ok((answer, self.state()))
+    }
+
     /// THE button: freeze the spec and derive the AppSpec deterministically.
     pub async fn decide(&mut self) -> Result<AppSpec, String> {
         self.require_freeform()?;
@@ -509,7 +549,45 @@ fn compile_spec_prompt(
     )
 }
 
+/// Free-form brainstorm prompt: an opinionated design partner that offers
+/// options + trade-offs + a recommendation and ends with one pointed question.
+/// Grounded in the running summary (if any) and the recent conversation.
+fn brainstorm_prompt(
+    project_name: &str,
+    goal: &str,
+    question: &str,
+    summary: Option<&str>,
+    context: &[DesignTurn],
+) -> String {
+    let summary = summary.unwrap_or("(no summary yet — the brainstorm is still open)");
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("Project: {project_name}"));
+    parts.push(format!("Goal: {goal}"));
+    parts.push(String::new());
+    parts.push("## The user's question".to_string());
+    parts.push(question.to_string());
+    parts.push(String::new());
+    parts.push("## Running summary (source of truth so far)".to_string());
+    parts.push(summary.to_string());
+    parts.push(String::new());
+    parts.push("## Recent conversation".to_string());
+    parts.push(format_turns(context));
+    parts.push(String::new());
+    parts.push(
+        "You are an opinionated design partner for this project. Answer the question".to_string(),
+    );
+    parts.push(
+        "in the free-form brainstorm. When it involves a choice, offer 2-3 concrete".to_string(),
+    );
+    parts.push("options with trade-offs and a clear recommendation, then end with one".to_string());
+    parts.push("pointed question so the user can react. Nothing is decided yet — no".to_string());
+    parts.push("statuses, no forced structure. Do not invent facts outside the".to_string());
+    parts.push("conversation.".to_string());
+    parts.join("\n")
+}
+
 #[async_trait]
+
 impl Actor for SpecDesignActor {
     type Message = SpecDesignMessage;
 
@@ -543,6 +621,9 @@ impl Actor for SpecDesignActor {
                 reply_to,
             } => {
                 let _ = reply_to.send(self.promote(&instruction).await);
+            }
+            SpecDesignMessage::Ask { text, reply_to } => {
+                let _ = reply_to.send(self.ask(&text).await);
             }
             SpecDesignMessage::Decide { reply_to } => {
                 let _ = reply_to.send(self.decide().await);
@@ -872,6 +953,57 @@ mod tests {
         let r = rels.lock().unwrap();
         assert!(r.iter().any(|p| p == "HAS_ACTOR"));
         assert!(r.iter().any(|p| p == "HAS_METHOD"));
+    }
+
+    #[test]
+    fn ask_answers_inside_the_session_and_grounds_on_the_summary() {
+        let (mut a, prompts) = actor(vec![
+            "store WKB in SeleneDB; serve GeoJSON at the bridge".to_string(),
+            "storage summary".to_string(),
+            "use crate geo for spatial ops".to_string(),
+        ]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        // Ask before any summary exists.
+        let (answer1, state1) = pollster(a.ask("what is the best canonical GIS format?")).unwrap();
+        assert_eq!(
+            answer1,
+            "store WKB in SeleneDB; serve GeoJSON at the bridge"
+        );
+        assert_eq!(state1.turn_count, 4); // 2 seeded + question + answer
+        let p1 = prompts.lock().unwrap()[0].clone();
+        assert!(p1.contains("Project: spire-gis"));
+        assert!(p1.contains("The user's question"));
+        assert!(p1.contains("what is the best canonical GIS format?"));
+        assert!(p1.contains("no summary yet"));
+
+        // Fold the brainstorm into a summary, then ask again — the summary is
+        // now in the prompt context, and the assistant answer is captured.
+        let s = pollster(a.summarize("summarize the storage decision")).unwrap();
+        assert_eq!(s.version, 1);
+        let (answer2, state2) = pollster(a.ask("which rust crate for spatial ops?")).unwrap();
+        assert_eq!(answer2, "use crate geo for spatial ops");
+        let p2 = prompts.lock().unwrap()[2].clone();
+        assert!(
+            p2.contains("store WKB in SeleneDB; serve GeoJSON at the bridge"),
+            "ask must ground on the running summary"
+        );
+        assert_eq!(
+            state2.turn_count, 6,
+            "question + answer appended to the transcript"
+        );
+    }
+
+    #[test]
+    fn ask_is_rejected_after_decide_and_user_turns_survive_llm_failure() {
+        // Canned LLM that fails on the brainstorm call.
+        let llm: LlmCall = Box::new(|_| Box::pin(async move { Err("boom".to_string()) }));
+        let mut a = SpecDesignActor::new(llm);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        let err = pollster(a.ask("question")).unwrap_err();
+        assert!(err.contains("boom"));
+        // The user's question was captured even though the LLM failed.
+        assert_eq!(a.state().turn_count, 1);
     }
 
     /// Block on a future from a sync test (no global runtime needed).

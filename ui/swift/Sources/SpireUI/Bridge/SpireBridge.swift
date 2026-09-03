@@ -1918,7 +1918,20 @@ final class SpireBridge {
         return (SpecDesignState(json: value as Any), nil)
     }
 
-    /// Mirror a user turn into the design transcript.
+    /// Ask the LLM a free-form brainstorm question INSIDE the design session
+    /// (the design transcript owns the conversation). Appends user + assistant
+    /// turns server-side; returns the answer text and the updated state.
+    func specDesignAsk(text: String) async -> (text: String?, state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/ask", params: ["text": text])
+        guard error == nil else { return (nil, nil, error) }
+        guard let dict = value as? [String: Any] else {
+            return (nil, nil, "spec-design/ask: unreadable reply")
+        }
+        return (dict["text"] as? String, SpecDesignState(json: dict["state"]), nil)
+    }
+
+    /// Mirror a user turn into the design transcript (kept for external
+    /// turn-mirroring; the design view normally uses `specDesignAsk`).
     func specDesignReply(text: String) async -> (state: SpecDesignState?, error: String?) {
         let (value, error) = await specDesignCall(method: "spec-design/reply", params: ["text": text])
         guard error == nil else { return (nil, error) }
@@ -1967,17 +1980,5 @@ final class SpireBridge {
         let (value, error) = await specDesignCall(method: "spec-design/state", params: [:])
         guard error == nil else { return nil }
         return SpecDesignState(json: value as Any)
-    }
-
-    /// Ask the LLM a free-form brainstorm question through the regular chat
-    /// path; returns the assistant reply text (not appended to the chat panel).
-    func specDesignBrainstormReply(to text: String) async -> String? {
-        do {
-            let command = try MessageSerializer.encode(chat: text)
-            let reply = try await backend.send(command)
-            return try MessageSerializer.decodeChat(reply).content
-        } catch {
-            return nil
-        }
     }
 }

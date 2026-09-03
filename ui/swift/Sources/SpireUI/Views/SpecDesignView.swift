@@ -255,14 +255,11 @@ struct SpecDesignView: View {
         lines.append(SpecDesignLine(role: "user", text: text))
         busy = true
         defer { busy = false }
-        let (state, error) = await bridge.specDesignReply(text: text)
+        let (answer, state, error) = await bridge.specDesignAsk(text: text)
         apply(state: state, error: error)
-        guard error == nil else { return }
-        if let assistant = await bridge.specDesignBrainstormReply(to: text) {
-            let (s2, e2) = await bridge.specDesignTurn(role: "assistant", text: assistant)
-            apply(state: s2, error: e2)
-            lines.append(SpecDesignLine(role: "assistant", text: assistant))
-        } else {
+        if let answer, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lines.append(SpecDesignLine(role: "assistant", text: answer))
+        } else if error == nil {
             lines.append(SpecDesignLine(
                 role: "system",
                 text: "No assistant reply (LLM unavailable?) — Summarize/Promote still work on what you have said."

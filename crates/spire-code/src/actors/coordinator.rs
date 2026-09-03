@@ -437,6 +437,9 @@ impl CoordinatorActor {
             "spec-design/start" => {
                 return self.handle_spec_design_start(&params).await;
             }
+            "spec-design/ask" => {
+                return self.handle_spec_design_ask(&params).await;
+            }
             "spec-design/reply" => {
                 return self.handle_spec_design_reply(&params).await;
             }
@@ -3273,6 +3276,33 @@ impl CoordinatorActor {
     // ── spec-design RPC: the free-form AppSpec design session ─────────────
     // Routes to the SpecDesignActor registered as "spec_design" at startup
     // (ffi.rs). Replies are the actor's typed results, serialized.
+
+    async fn handle_spec_design_ask(&self, params: &serde_json::Value) -> serde_json::Value {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<SpecDesignMessage>("spec_design")
+            .unwrap_or_else(dummy_tx)
+            .send(SpecDesignMessage::Ask { text, reply_to: tx })
+            .await;
+        match rx.await {
+            Ok(Ok((answer, state))) => {
+                let state_value = serde_json::to_value(state)
+                    .unwrap_or_else(|_| serde_json::json!({"error": "serialize state"}));
+                serde_json::json!({ "text": answer, "state": state_value })
+            }
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
 
     async fn handle_spec_design_start(&self, params: &serde_json::Value) -> serde_json::Value {
         let (registry, _ffi_state) = match self.ffi_deps() {
