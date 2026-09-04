@@ -132,6 +132,7 @@ struct ContentView: View {
                 }
             )
             .environment(bridge)
+            .environment(theme)
         }
     }
 

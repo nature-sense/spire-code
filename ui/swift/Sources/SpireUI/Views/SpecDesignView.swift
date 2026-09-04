@@ -15,6 +15,7 @@ struct SpecDesignLine: Identifiable {
 /// via Back to design).
 struct SpecDesignView: View {
     @Environment(SpireBridge.self) private var bridge
+    @Environment(AppTheme.self) private var theme
     @Environment(\.dismiss) private var dismiss
 
     let projectName: String
@@ -161,13 +162,28 @@ struct SpecDesignView: View {
 
     private var inputBar: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                TextField("Ask a question or bounce an idea…", text: $draft, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(1...4)
-                    .onSubmit {
-                        Task { await send() }
+            HStack(alignment: .bottom, spacing: 8) {
+                // Large multi-line prompt: Return inserts a newline and long
+                // input scrolls inside the box (never truncates or submits).
+                TextEditor(text: $draft)
+                    .font(.callout)
+                    .scrollContentBackground(.hidden)
+                    .textSelection(.enabled)
+                    .padding(5)
+                    .frame(height: 130)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(theme.nodeBackground))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
+                    .overlay(alignment: .topLeading) {
+                        if draft.isEmpty {
+                            Text("Ask a question or bounce an idea…")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 12)
+                                .allowsHitTesting(false)
+                        }
                     }
+                    .disabled(busy || isDecided)
                 Button {
                     Task { await send() }
                 } label: {
@@ -189,6 +205,14 @@ struct SpecDesignView: View {
             .padding(.horizontal, 10)
             .padding(.bottom, 6)
         }
+        // ⌘Return sends (plain Return inserts a newline inside the editor).
+        .background(Button("sendTurn") {
+            Task { await send() }
+        }
+        .keyboardShortcut(.return, modifiers: [.command])
+        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || isDecided)
+        .frame(width: 0, height: 0)
+        .opacity(0))
     }
 
     // MARK: - Document pane (summary + spec)
@@ -360,5 +384,6 @@ struct SpecDesignView: View {
 #Preview {
     SpecDesignView(projectName: "spire-gis", goal: "view and edit map layers", onDecided: { _ in })
         .environment(SpireBridge.shared)
+        .environment(AppTheme())
         .frame(width: 1100, height: 700)
 }
