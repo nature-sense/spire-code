@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import UniformTypeIdentifiers
 
 /// One line in the free-form design conversation.
 struct SpecDesignLine: Identifiable {
@@ -47,35 +46,32 @@ enum SpecDesignPortal {
     }
 }
 
-/// The interactive AppSpec design step: a free-form brainstorm on the left
-/// (user turns + LLM replies), the running summary and the spec document on
-/// the right. Everything is changed through prompts; **Decide** is the button
-/// that freezes the spec and derives the AppSpec deterministically (reversible
-/// via Back to design).
+/// The AppSpec design step as a single conversation. The assistant proposes a
+/// recommended design, asks questions only when a choice genuinely matters, and
+/// — once the design is complete — calls the `submit_appspec` tool itself. The
+/// view then runs the wizard code generation automatically. No separate
+/// Summarize/Promote/Decide steps: everything happens through the chat.
 struct SpecDesignView: View {
     @Environment(SpireBridge.self) private var bridge
     @Environment(AppTheme.self) private var theme
-    @Environment(\.dismiss) private var dismiss
 
     let projectName: String
     let goal: String
-    /// Called when the session window should close (used by the portal; a
-    /// harmless no-op inside a sheet).
+    /// Called when the session window should close (used by the portal).
     var onClose: () -> Void = {}
-    /// Called with the decided AppSpec dictionary (feeds the wizard's codegen).
+    /// Called with the submitted AppSpec dictionary (feeds the wizard's codegen).
     let onDecided: ([String: Any]) -> Void
 
     @State private var lines: [SpecDesignLine] = []
     @State private var draft = ""
-    @State private var instruction = "add to the summary"
-    @State private var summary: SpecDesignArtifact?
-    @State private var spec: SpecDesignArtifact?
     @State private var isDecided = false
     @State private var acceptedCount = 0
     @State private var busy = false
     @State private var errorMessage: String?
-    /// Questions/options still unanswered (Decide is disabled while non-empty).
+    /// Questions/options still unanswered (the model must not submit while any remain).
     @State private var openQuestions: [String] = []
+    /// acceptedCount already handed to the code generator (fires once per submit).
+    @State private var codegenVersion = 0
     /// Request grounding for the next brainstorm question.
     @State private var useDocsRAG = false
     @State private var useWebSearch = false
@@ -86,7 +82,7 @@ struct SpecDesignView: View {
             Divider()
             HSplitView {
                 chatPane
-                documentPane
+                statusPane
             }
         }
         .frame(minWidth: 1000, minHeight: 700)
@@ -96,13 +92,13 @@ struct SpecDesignView: View {
             if state != nil {
                 lines.append(SpecDesignLine(
                     role: "system",
-                    text: "Free-form design session for '\(projectName)'. Bounce ideas and ask questions; press Summarize to fold the conversation into the running summary, Promote to draft the spec.md, Decide when it meets the requirements."
+                    text: "Free-form design session for '\(projectName)'. Ask questions, bounce ideas, adjust the plan — when the design is complete the assistant submits the AppSpec itself and code generation starts automatically."
                 ))
             }
         }
     }
 
-    // MARK: - Header (mode + Decide / Back to design)
+    // MARK: - Header (mode + Done / Back to design)
 
     private var header: some View {
         HStack(spacing: 12) {
@@ -113,16 +109,20 @@ struct SpecDesignView: View {
                 .foregroundStyle(.secondary)
             Spacer()
             if isDecided {
-                Label("Decided", systemImage: "checkmark.seal.fill")
+                Label("AppSpec submitted", systemImage: "checkmark.seal.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
-                if acceptedCount > 1 {
-                    Text("v\(acceptedCount)").font(.caption).foregroundStyle(.secondary)
-                }
-                Button("Back to design") {
+                Text("v\(acceptedCount)").font(.caption).foregroundStyle(.secondary)
+                Button("Revise") {
                     Task { await reopen() }
                 }
                 .buttonStyle(.bordered)
+                .disabled(busy)
+                .help("Reopen the design: edit in the chat and the assistant submits a new version")
+                Button("Done") {
+                    onClose()
+                }
+                .buttonStyle(.borderedProminent)
                 .disabled(busy)
             } else {
                 Label("Free-form", systemImage: "pencil.and.outline")
@@ -134,20 +134,6 @@ struct SpecDesignView: View {
                 .buttonStyle(.bordered)
                 .disabled(busy)
                 .help("Discard the persisted session and design from scratch")
-                Button {
-                    Task { await decide() }
-                } label: {
-                    if busy {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Label("Decide", systemImage: "checkmark.seal")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(busy || spec == nil || !openQuestions.isEmpty)
-                .help(openQuestions.isEmpty
-                    ? "Freeze the spec and derive the AppSpec deterministically"
-                    : "Answer the open questions first (chat, then Summarize)")
             }
         }
         .padding(12)
@@ -259,142 +245,74 @@ struct SpecDesignView: View {
         .opacity(0))
     }
 
-    // MARK: - Document pane (summary + spec)
+    // MARK: - Status pane
 
-    private var documentPane: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                TextField("Instruction (e.g. \"summarize with techniques X\", \"recreate…\")", text: $instruction)
-                    .textFieldStyle(.roundedBorder)
-                Button {
-                    Task { await summarize() }
-                } label: {
-                    Label("Summarize", systemImage: "text.badge.checkmark")
+    private var statusPane: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Session", systemImage: "info.circle")
+                .font(.headline)
+            if isDecided {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("AppSpec submitted", systemImage: "checkmark.seal.fill")
+                        .font(.headline)
+                        .foregroundStyle(.green)
+                    Text("v\(acceptedCount) — code generation started automatically.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Press Revise (top right) to adjust the design in the chat and submit a new version.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
-                .buttonStyle(.bordered)
-                .disabled(busy || isDecided)
-            }
-            HStack(spacing: 8) {
-                TextField("Instruction", text: $instruction)
-                    .textFieldStyle(.roundedBorder)
-                Button {
-                    Task { await promote() }
-                } label: {
-                    Label("Promote to spec", systemImage: "doc.badge.gearshape")
-                }
-                .buttonStyle(.bordered)
-                .disabled(busy || isDecided || summary == nil)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(.green.opacity(0.08)))
             }
             if let errorMessage {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            if !openQuestions.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Label("Open questions", systemImage: "questionmark.circle")
+                            .font(.headline)
+                            .foregroundStyle(.orange)
+                        Text("\(openQuestions.count)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
+                        Text("\(idx + 1). \(q)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("Answer these in the chat — the assistant must not submit the AppSpec while any remain.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(.orange.opacity(0.06)))
+            }
             Divider()
-            openQuestionsCard
-            if !openQuestions.isEmpty { Divider() }
-            artifactCard(title: "Summary", artifact: summary, systemImage: "text.alignleft")
-            artifactCard(title: "Spec", artifact: spec, systemImage: "doc.plaintext", markdown: false)
-        }
-        .padding(12)
-        .frame(minWidth: 440)
-    }
-
-    @ViewBuilder
-    private var openQuestionsCard: some View {
-        if !openQuestions.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Label("Open questions", systemImage: "questionmark.circle")
-                        .font(.headline)
-                        .foregroundStyle(.orange)
-                    Text("\(openQuestions.count)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
-                    Text("\(idx + 1). \(q)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Text("Answer each in the chat, then press Summarize to refresh. Decide is locked until none remain.")
+            VStack(alignment: .leading, spacing: 6) {
+                Text("How this works")
+                    .font(.subheadline.weight(.semibold))
+                Text("The assistant proposes one recommended design — types, graph, actors, bridge and UI — and asks only when a choice really matters.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("When the design is complete it calls the submit_appspec tool itself; the spec is validated and stored, and code generation starts automatically.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("Tick \(Image(systemName: "square.on.square")) Spire docs to ground answers in the spire-actor/spire-core docs corpus.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
+            Spacer(minLength: 0)
         }
-    }
-
-    private func artifactCard(title: String, artifact: SpecDesignArtifact?, systemImage: String, markdown: Bool = true) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Label(title, systemImage: systemImage).font(.headline)
-                Spacer()
-                if let artifact {
-                    Text("v\(artifact.version)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button {
-                        copyArtifact(artifact.content)
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
-                            .font(.caption.weight(.medium))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Copy the \(title.lowercased()) markdown to the clipboard")
-                    Button {
-                        exportArtifact(title: title, content: artifact.content)
-                    } label: {
-                        Label("Export…", systemImage: "square.and.arrow.up")
-                            .font(.caption.weight(.medium))
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Save the \(title.lowercased()) to a .md file")
-                }
-            }
-            ScrollView {
-                if let artifact, markdown {
-                    MarkdownText(artifact.content)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                } else {
-                    Text(artifact?.content ?? "Not drafted yet — chat first, then Summarize / Promote.")
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-            }
-            .frame(maxHeight: .infinity)
-            .padding(6)
-            .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.4)))
-        }
-    }
-
-    // MARK: - Artifact copy / export
-
-    /// Put an artifact's raw markdown on the clipboard (pasting keeps the
-    /// headings/lists structure).
-    private func copyArtifact(_ content: String) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(content, forType: .string)
-    }
-
-    /// Save an artifact to a .md file the user chooses.
-    @MainActor
-    private func exportArtifact(title: String, content: String) {
-        let panel = NSSavePanel()
-        panel.title = "Export \(title)"
-        panel.nameFieldStringValue = "\(projectName)-\(title.lowercased()).md"
-        panel.canCreateDirectories = true
-        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try content.write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            errorMessage = "Export failed: \(error.localizedDescription)"
-        }
+        .padding(12)
+        .frame(minWidth: 300, maxWidth: 380)
     }
 
     // MARK: - Actions
@@ -402,8 +320,6 @@ struct SpecDesignView: View {
     @MainActor
     private func apply(state: SpecDesignState?, error: String?) {
         if let state {
-            summary = state.summary
-            spec = state.spec
             isDecided = state.isDecided
             acceptedCount = state.acceptedCount
             openQuestions = state.openQuestions
@@ -426,58 +342,23 @@ struct SpecDesignView: View {
         useDocsRAG = false
         useWebSearch = false
         apply(state: state, error: error)
+        if let state, state.isDecided, let latest = state.latest, state.acceptedCount > codegenVersion {
+            // The assistant just submitted the AppSpec: feed it to the codegen
+            // wizard exactly once and surface the new state in the chat.
+            codegenVersion = state.acceptedCount
+            onDecided(latest)
+            lines.append(SpecDesignLine(
+                role: "system",
+                text: "AppSpec v\(state.acceptedCount) submitted — code generation started. The spec has been persisted for the project."
+            ))
+        }
         if let answer, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.append(SpecDesignLine(role: "assistant", text: answer))
         } else if error == nil {
             lines.append(SpecDesignLine(
                 role: "system",
-                text: "No assistant reply (LLM unavailable?) — Summarize/Promote still work on what you have said."
+                text: "No assistant reply (LLM unavailable?) — try again."
             ))
-        }
-    }
-
-    @MainActor
-    private func summarize() async {
-        errorMessage = nil
-        busy = true
-        defer { busy = false }
-        let (artifact, error) = await bridge.specDesignSummarize(projectName: projectName, instruction: instruction)
-        if let artifact {
-            summary = artifact
-        }
-        if let error {
-            errorMessage = error
-        }
-    }
-
-    @MainActor
-    private func promote() async {
-        errorMessage = nil
-        busy = true
-        defer { busy = false }
-        let (artifact, error) = await bridge.specDesignPromote(projectName: projectName, instruction: instruction)
-        if let artifact {
-            spec = artifact
-        }
-        if let error {
-            errorMessage = error
-        }
-    }
-
-    @MainActor
-    private func decide() async {
-        errorMessage = nil
-        busy = true
-        defer { busy = false }
-        let (specDict, error) = await bridge.specDesignDecide(projectName: projectName)
-        if let specDict {
-            onDecided(specDict)
-            onClose()
-            dismiss()
-        } else if let error {
-            errorMessage = error
-        } else {
-            errorMessage = "Decide returned no spec"
         }
     }
 
@@ -486,6 +367,7 @@ struct SpecDesignView: View {
         errorMessage = nil
         busy = true
         defer { busy = false }
+        codegenVersion = 0
         let (state, error) = await bridge.specDesignStart(projectName: projectName, goal: goal, reset: true)
         apply(state: state, error: error)
         if state != nil {

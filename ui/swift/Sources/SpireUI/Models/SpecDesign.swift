@@ -16,9 +16,9 @@ struct SpecDesignArtifact {
 }
 
 /// A point-in-time view of the design session. Mirrors the Rust
-/// `SpecDesignState` (snake_case keys). `accepted`/`latest` are intentionally
-/// not carried here — the decided spec is returned separately by
-/// `spec-design/decide`.
+/// `SpecDesignState` (snake_case keys). `latest` carries the most recent
+/// accepted AppSpec dictionary (the same shape `runSpecDesignCodegen` expects)
+/// and is set whenever the assistant submits the design through the chat.
 struct SpecDesignState {
     /// "freeform" or "decided" (Rust `DesignMode`, lowercase serialized).
     let mode: String
@@ -26,9 +26,11 @@ struct SpecDesignState {
     let spec: SpecDesignArtifact?
     let turnCount: Int
     let acceptedCount: Int
-    /// Questions/options the assistant raised that are still unanswered -
-    /// Decide is blocked until this is empty.
+    /// Questions/options the assistant raised that are still unanswered - the
+    /// assistant must not submit the AppSpec while any remain.
     let openQuestions: [String]
+    /// Most recent accepted AppSpec (present once the design is submitted).
+    let latest: [String: Any]?
 
     var isDecided: Bool { mode == "decided" }
 
@@ -45,5 +47,6 @@ struct SpecDesignState {
         self.openQuestions = dict["open_questions"] as? [String] ?? []
         self.summary = SpecDesignArtifact(json: dict["summary"])
         self.spec = SpecDesignArtifact(json: dict["spec"])
+        self.latest = dict["latest"] as? [String: Any]
     }
 }

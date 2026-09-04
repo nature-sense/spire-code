@@ -39,9 +39,19 @@ use super::spec::{validate, AppSpec, SpecIssue, SpecIssueSeverity};
 use super::spec_graph;
 use super::spec_md;
 
-/// An injected LLM call: prompt text → reply text (mirrors `spec_gen`).
+/// The injected design-model reply: the assistant's free-form text plus an
+/// optional AppSpec hand-off (`spec.md` in the strict grammar) the model
+/// produced via the `submit_appspec` tool when it considers the design
+/// complete.
+#[derive(Debug, Clone, Default)]
+pub struct DesignReply {
+    pub text: String,
+    pub spec_md: Option<String>,
+}
+
+/// An injected LLM call: a design prompt → a [`DesignReply`].
 pub type LlmCall = Box<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync,
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<DesignReply, String>> + Send>> + Send + Sync,
 >;
 
 /// An injected grounding lookup (docs RAG or web search): query + top_k →
@@ -517,7 +527,7 @@ impl SpecDesignActor {
             &material,
             &self.open_questions,
         );
-        let mut content = self.call_llm(prompt).await?;
+        let mut content = self.call_llm(prompt).await?.text;
         // Lift the trailing "## Open questions" block into the session's
         // open-question list (Decide gates on it) and store only the decisions
         // in the summary. A missing block means the model drifted from the
@@ -571,7 +581,7 @@ impl SpecDesignActor {
             existing_spec.as_deref(),
             &context,
         );
-        let content = self.call_llm(prompt).await?;
+        let content = self.call_llm(prompt).await?.text;
         let version = self.spec.as_ref().map(|a| a.version).unwrap_or(0) + 1;
         let artifact = DesignArtifact {
             version,
@@ -648,11 +658,56 @@ impl SpecDesignActor {
             &context,
             &grounding,
         );
-        let answer = self.call_llm(prompt).await?;
-        self.turns.push(DesignTurn {
-            role: ROLE_ASSISTANT.to_string(),
-            text: answer.clone(),
-        });
+        let reply = self.call_llm(prompt).await?;
+        let mut answer = reply.text.clone();
+        // The model may finish the design by calling the `submit_appspec` tool.
+        if let Some(submitted) = reply.spec_md.as_deref() {
+            // Refuse while design questions are still open (mirrors the old
+            // Decide gate, which the model is also told about in the prompt).
+            if !self.open_questions.is_empty() {
+                let line = format!(
+                    "The model tried to submit the AppSpec while {} open question(s) remain — answer them, then ask it to submit again.",
+                    self.open_questions.len()
+                );
+                answer = if answer.trim().is_empty() {
+                    line.clone()
+                } else {
+                    format!("{answer}\n\n{line}")
+                };
+            } else {
+                match self.accept_spec_markdown(submitted).await {
+                    Ok(app) => {
+                        let line = format!(
+                            "AppSpec submitted — v{} ({} types, {} actors, {} bridge methods, {} screens). The design is decided; press Revise to change it.",
+                            self.accepted.len(),
+                            app.types.len(),
+                            app.actors.len(),
+                            app.bridge.len(),
+                            app.ui.len()
+                        );
+                        answer = if answer.trim().is_empty() {
+                            line.clone()
+                        } else {
+                            format!("{answer}\n\n{line}")
+                        };
+                    }
+                    Err(e) => {
+                        let line = format!("submit_appspec was rejected: {e}");
+                        answer = if answer.trim().is_empty() {
+                            line.clone()
+                        } else {
+                            format!("{answer}\n\n{line}")
+                        };
+                    }
+                }
+            }
+        }
+        if !answer.trim().is_empty() {
+            self.turns.push(DesignTurn {
+                role: ROLE_ASSISTANT.to_string(),
+                text: answer.clone(),
+            });
+        }
         self.persist_session().await;
         Ok((answer, self.state()))
     }
@@ -682,7 +737,18 @@ impl SpecDesignActor {
                 self.open_questions.len()
             ));
         }
-        let app: AppSpec = spec_md::markdown_to_spec(&spec.content)?;
+        let spec_content = spec.content.clone();
+        self.accept_spec_markdown(&spec_content).await
+    }
+
+    /// Parse + validate a submitted spec.md (via the chat `submit_appspec` tool
+    /// or a promoted spec) and, when valid, persist the graph derivation, mark
+    /// the session decided, and record an accepted version. Used by both the
+    /// chat submit path and the (legacy) Decide action.
+    pub async fn accept_spec_markdown(&mut self, markdown: &str) -> Result<AppSpec, String> {
+        self.require_freeform()?;
+        self.require_session()?;
+        let app: AppSpec = spec_md::markdown_to_spec(markdown)?;
         let issues = validate(&app);
         let errors: Vec<&SpecIssue> = issues
             .iter()
@@ -695,7 +761,7 @@ impl SpecDesignActor {
                 .collect::<Vec<_>>()
                 .join("\n");
             return Err(format!(
-                "spec for '{}' does not validate — {} error(s):\n{detail}\nReopen and refine via prompts, then Decide again.",
+                "spec for '{}' does not validate — {} error(s):\n{detail}\nReopen and refine via prompts, then submit again.",
                 self.project_name,
                 errors.len()
             ));
@@ -709,7 +775,7 @@ impl SpecDesignActor {
                     .await;
             if persisted.is_none() {
                 warn!(
-                    "[SpecDesign] Decide: spec persisted without an anchor for '{}' (graph unavailable?)",
+                    "[SpecDesign] spec persisted without an anchor for '{}' (graph unavailable?)",
                     self.project_name
                 );
             }
@@ -750,7 +816,7 @@ impl SpecDesignActor {
         Ok(self.state())
     }
 
-    async fn call_llm(&self, prompt: String) -> Result<String, String> {
+    async fn call_llm(&self, prompt: String) -> Result<DesignReply, String> {
         (self.llm)(prompt)
             .await
             .map_err(|e| format!("LLM error: {e}"))
@@ -1068,17 +1134,18 @@ fn brainstorm_prompt(
     }
     parts.push(String::new());
     parts.push(
-        "You are an opinionated design partner for this project. Answer the question".to_string(),
+        "You are a decisive design partner for a Spire app who knows the platform.".to_string(),
     );
-    parts.push("in the free-form brainstorm. Ground your answer in the supplied".to_string());
-    parts.push(
-        "architecture/web references when present; otherwise answer from knowledge.".to_string(),
-    );
-    parts.push("When it involves a choice, offer 2-3 concrete".to_string());
-    parts.push("options with trade-offs and a clear recommendation, then end with one".to_string());
-    parts.push("pointed question so the user can react. Nothing is decided yet — no".to_string());
-    parts.push("statuses, no forced structure. Do not invent facts outside the".to_string());
-    parts.push("conversation.".to_string());
+    parts.push("Ground your answer in the supplied architecture/web references when present;".to_string());
+    parts.push("otherwise answer from knowledge. Propose ONE concrete recommended solution".to_string());
+    parts.push("by default — name the specific types, actors, bridge methods and screens, and".to_string());
+    parts.push("reuse the platform primitives above. Keep answers short. Ask a question only".to_string());
+    parts.push("when a choice is genuinely consequential and no sensible default exists;".to_string());
+    parts.push("ask exactly one, and mark it as the single open question. Do not repeat".to_string());
+    parts.push("settled ground or loop on one area. When the design is complete and no open".to_string());
+    parts.push("questions remain, call the `submit_appspec` tool with the FULL spec.md in the".to_string());
+    parts.push("strict grammar (Data types / Graph / Backend / Bridge / UI). Do NOT submit".to_string());
+    parts.push("while questions are still open.".to_string());
     parts.join("\n")
 }
 
@@ -1177,11 +1244,78 @@ mod tests {
                 prompts.lock().unwrap().push(prompt);
                 let mut q = queue.lock().unwrap();
                 let next = q.pop_front().or_else(|| q.back().cloned());
-                Ok(next.unwrap_or_default())
+                Ok(DesignReply {
+                    text: next.unwrap_or_default(),
+                    spec_md: None,
+                })
             })
         });
         (call, prompts)
     }
+
+    #[test]
+    fn submit_via_tool_marks_decided_and_persists() {
+        let (mut a, _) = actor(vec![]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        let md = example_spec_md();
+        a.llm = Box::new(move |_p: String| {
+            let md = md.clone();
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: "final proposal".to_string(),
+                    spec_md: Some(md),
+                })
+            })
+        });
+        let (answer, s) = pollster(a.ask("draft the AppSpec now", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Decided);
+        assert_eq!(s.accepted.len(), 1);
+        assert!(s.latest.is_some());
+        assert!(answer.contains("AppSpec submitted"), "{answer}");
+    }
+
+    #[test]
+    fn invalid_submission_stays_freeform() {
+        let (mut a, _) = actor(vec![]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        a.llm = Box::new(move |_p: String| {
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: String::new(),
+                    spec_md: Some("# Not a spec at all\n\nrandom".to_string()),
+                })
+            })
+        });
+        let (answer, s) = pollster(a.ask("submit now", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Freeform);
+        assert_eq!(s.accepted.len(), 0);
+        assert!(answer.contains("rejected"), "{answer}");
+    }
+
+    #[test]
+    fn submit_while_open_questions_is_refused() {
+        let (mut a, _) = actor(vec![]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        a.open_questions = vec!["what units for distances?".to_string()];
+        let md = example_spec_md();
+        a.llm = Box::new(move |_p: String| {
+            let md = md.clone();
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: String::new(),
+                    spec_md: Some(md),
+                })
+            })
+        });
+        let (answer, s) = pollster(a.ask("submit", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Freeform);
+        assert_eq!(s.accepted.len(), 0);
+        assert!(answer.contains("open question"), "{answer}");
+    }
+
 
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
         let (llm, prompts) = canned(responses);
