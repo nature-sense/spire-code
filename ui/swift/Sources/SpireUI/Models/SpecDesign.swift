@@ -26,6 +26,9 @@ struct SpecDesignState {
     let spec: SpecDesignArtifact?
     let turnCount: Int
     let acceptedCount: Int
+    /// Questions/options the assistant raised that are still unanswered -
+    /// Decide is blocked until this is empty.
+    let openQuestions: [String]
 
     var isDecided: Bool { mode == "decided" }
 
@@ -39,6 +42,7 @@ struct SpecDesignState {
         } else {
             self.acceptedCount = 0
         }
+        self.openQuestions = dict["open_questions"] as? [String] ?? []
         self.summary = SpecDesignArtifact(json: dict["summary"])
         self.spec = SpecDesignArtifact(json: dict["spec"])
     }

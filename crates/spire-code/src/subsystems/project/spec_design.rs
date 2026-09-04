@@ -98,6 +98,9 @@ pub struct SpecDesignState {
     pub summary: Option<DesignArtifact>,
     pub spec: Option<DesignArtifact>,
     pub turn_count: usize,
+    /// Design questions/options the design partner raised that the user has
+    /// NOT answered yet; refreshed at each Summarize and gating Decide.
+    pub open_questions: Vec<String>,
     pub accepted: Vec<AcceptedSpec>,
     pub latest: Option<AppSpec>,
     pub last_issues: Vec<SpecIssue>,
@@ -168,6 +171,8 @@ pub struct SpecDesignActor {
     turns: Vec<DesignTurn>,
     /// Turns already folded into the current summary (delta = turns after it).
     summarized_through: usize,
+    /// Open design questions/options (see [`SpecDesignState::open_questions`]).
+    open_questions: Vec<String>,
     summary: Option<DesignArtifact>,
     spec: Option<DesignArtifact>,
     accepted: Vec<AcceptedSpec>,
@@ -196,6 +201,7 @@ impl SpecDesignActor {
             mode: DesignMode::Freeform,
             turns: Vec::new(),
             summarized_through: 0,
+            open_questions: Vec::new(),
             summary: None,
             spec: None,
             accepted: Vec::new(),
@@ -269,6 +275,11 @@ impl SpecDesignActor {
                 ),
                 ("instance", serde_json::json!(self.instance)),
                 ("turn_count", serde_json::json!(self.turns.len())),
+                (
+                    "open_questions",
+                    serde_json::to_value(&self.open_questions)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                ),
             ]),
             embedding_id: None,
             created_at: now,
@@ -343,6 +354,11 @@ impl SpecDesignActor {
         self.mode = mode;
         self.instance = instance.clone();
         self.summarized_through = session.u32_prop("summarized_through").unwrap_or(0) as usize;
+        self.open_questions = session
+            .properties
+            .get("open_questions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
         // Turns under this instance, ordered by index.
         let Ok(turn_nodes) = query_nodes(
@@ -411,6 +427,7 @@ impl SpecDesignActor {
             summary: self.summary.clone(),
             spec: self.spec.clone(),
             turn_count: self.turns.len(),
+            open_questions: self.open_questions.clone(),
             accepted: self.accepted.clone(),
             latest: self.latest.clone(),
             last_issues: self.last_issues.clone(),
@@ -445,6 +462,7 @@ impl SpecDesignActor {
         self.mode = DesignMode::Freeform;
         self.turns.clear();
         self.summarized_through = 0;
+        self.open_questions.clear();
         self.summary = None;
         self.spec = None;
         self.accepted.clear();
@@ -497,8 +515,19 @@ impl SpecDesignActor {
             instruction,
             existing.as_deref(),
             &material,
+            &self.open_questions,
         );
-        let content = self.call_llm(prompt).await?;
+        let mut content = self.call_llm(prompt).await?;
+        // Lift the trailing "## Open questions" block into the session's
+        // open-question list (Decide gates on it) and store only the decisions
+        // in the summary. A missing block means the model drifted from the
+        // required format: keep the previously known open questions.
+        if let Some((body, open)) = split_open_questions(&content) {
+            self.open_questions = open;
+            if !body.trim().is_empty() {
+                content = body;
+            }
+        }
         let version = self.summary.as_ref().map(|a| a.version).unwrap_or(0) + 1;
         let artifact = DesignArtifact {
             version,
@@ -638,6 +667,21 @@ impl SpecDesignActor {
                 self.project_name
             ));
         };
+        // Gate: unanswered design questions must be resolved before the AppSpec
+        // is created (the list is refreshed at each Summarize).
+        if !self.open_questions.is_empty() {
+            let list = self
+                .open_questions
+                .iter()
+                .map(|q| format!("  • {q}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!(
+                "'{}' still has {} open question(s) that must be answered before the AppSpec can be created:\n{list}\nAnswer them in the brainstorm, press Summarize, then Decide again.",
+                self.project_name,
+                self.open_questions.len()
+            ));
+        }
         let app: AppSpec = spec_md::markdown_to_spec(&spec.content)?;
         let issues = validate(&app);
         let errors: Vec<&SpecIssue> = issues
@@ -872,6 +916,37 @@ HARD CONSTRAINTS:\n\
 - The app's backend IS its own Rust actors; persistence is via the memory graph.\n\
 - Project/crate naming convention: `spire-<name>`.";
 
+/// Split the trailing "## Open questions" block the summarize model emits from
+/// the summary body. Returns `None` when the model omitted the block (model
+/// drift — keep the previously known open questions).
+fn split_open_questions(summary: &str) -> Option<(String, Vec<String>)> {
+    const MARKER: &str = "## Open questions";
+    let idx = summary.rfind(MARKER)?;
+    let body = summary[..idx].trim_end().to_string();
+    let mut open: Vec<String> = Vec::new();
+    for line in summary[idx + MARKER.len()..].lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let item = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* "))
+            .unwrap_or(t)
+            .trim();
+        if item.is_empty()
+            || item.eq_ignore_ascii_case("none")
+            || item.eq_ignore_ascii_case("none.")
+            || item.eq_ignore_ascii_case("no open questions")
+        {
+            continue;
+        }
+        open.push(item.to_string());
+    }
+    Some((body, open))
+}
+
+
 /// Free-form summarize prompt: folds the delta into the running summary unless
 /// the instruction asks for a full-material rewrite. NO statuses, NO "decided"
 /// markers — the summary is prose; nothing is decided until the Decide button.
@@ -881,26 +956,44 @@ fn summarize_prompt(
     instruction: &str,
     existing_summary: Option<&str>,
     material: &[DesignTurn],
+    previous_open: &[String],
 ) -> String {
     let existing = existing_summary.unwrap_or("none yet");
+    let open = if previous_open.is_empty() {
+        "(none known)".to_string()
+    } else {
+        previous_open
+            .iter()
+            .map(|q| format!("- {q}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let body = format!(
         "# Summarize the design conversation\n\nProject: {project_name}\nGoal: {goal}\n\n\
          ## The user's instruction\n{instruction}\n\n\
          ## Current summary (the running source of truth)\n{existing}\n\n\
          ## Conversation turns to fold in\n{}\n\n\
-         Follow the instruction above exactly. If it asks to add to or update the\n\
-         existing summary, keep every point that still stands and fold in only the\n\
-         new information from the conversation turns. If it asks to recreate or\n\
-         summarize with a specific lens (techniques, protocols, data format, ...),\n\
-         rewrite the summary from the provided material, focused on that lens.\n\
-         The summary is freeform prose — any structure you like. No status labels,\n\
-         no \"decided\" markers, no forced sections. Nothing is decided yet.\n\
-         Do not invent facts; only reflect what was actually discussed.\n\
-         Output only the summary text.",
+         ## Open questions from earlier (still open unless the turns above answer them)\n{open}\n\n\
+         Fold the conversation into the summary per the instruction above. The summary\n\
+         records only DECISIONS and settled facts — never questions, open options, or\n\
+         \"should we …?\" proposals. If the new turns resolved a previously open\n\
+         question, fold the answer in and drop the question.\n\
+         Then end the summary with an Open questions section listing everything still\n\
+         unanswered:\n\n\
+         ## Open questions\n\
+         - <one unresolved question or open option per line>\n\n\
+         If nothing remains unanswered, end with exactly:\n\n\
+         ## Open questions\n\
+         None\n\n\
+         The summary is freeform prose — any structure you like. No status labels, no\n\
+         \"decided\" markers, no forced sections. Nothing is decided yet. Do not invent\n\
+         facts; only reflect what was actually discussed. Output only the summary text\n\
+         (including the final Open questions section).",
         format_turns(material)
     );
     format!("{SPIRE_APP_CONTEXT}\n\n{body}")
 }
+
 
 /// Free-form promote prompt: compiles the (mature) summary onto the strict
 /// spec_md grammar, folding the existing spec forward.
@@ -939,7 +1032,7 @@ fn compile_spec_prompt(
          Output ONLY the spec markdown.",
         format_turns(recent_context)
     );
-    format!("{SPIRE_APP_CONTEXT}\n\n{body}")
+    format!("{SPIRE_APP_CONTEXT}\n\nDESIGN RULE: Never carry open questions or unresolved options into the spec — content must be decisions only.\n\n{body}")
 }
 
 /// Free-form brainstorm prompt: an opinionated design partner that offers
@@ -1288,6 +1381,42 @@ mod tests {
         assert!(err.contains("promote the summary to a spec first"));
         assert_eq!(a.state().mode, DesignMode::Freeform);
     }
+    #[test]
+    fn summarize_lifts_open_questions_into_state() {
+        let (mut a, _) = actor(vec![
+            "decided the layer model.\n\n## Open questions\n- Raster or vector first?\n- Which projection?".to_string(),
+        ]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        pollster(a.summarize("summarize")).unwrap();
+        assert_eq!(a.open_questions, vec!["Raster or vector first?", "Which projection?"]);
+        assert!(!a.summary.as_ref().unwrap().content.contains("Open questions"));
+    }
+
+    #[test]
+    fn summarize_with_none_clears_open_questions() {
+        let (mut a, _) = actor(vec!["decided.\n\n## Open questions\nNone".to_string()]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        a.open_questions.push("stale question?".to_string());
+        pollster(a.summarize("summarize")).unwrap();
+        assert!(a.open_questions.is_empty());
+    }
+
+    #[test]
+    fn decide_is_blocked_while_open_questions_remain() {
+        let (mut a, _) = actor(vec![
+            "decided the layer model.\n\n## Open questions\n- Raster or vector first?".to_string(),
+            example_spec_md(),
+        ]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        pollster(a.promote("to spec")).unwrap(); // auto-summarizes then compiles
+        let err = pollster(a.decide()).unwrap_err();
+        assert!(err.contains("open question"));
+        assert_eq!(a.state().mode, DesignMode::Freeform);
+    }
+
 
     #[test]
     fn decide_rejects_an_invalid_spec_and_stays_freeform() {
@@ -1639,7 +1768,7 @@ mod spire_context_tests {
         assert!(b.contains("actor pattern"));
         assert!(b.contains("Rust"));
 
-        let s = summarize_prompt("spire-gis", "view and edit map layers", "add to the summary", None, &[]);
+        let s = summarize_prompt("spire-gis", "view and edit map layers", "add to the summary", None, &[], &[]);
         assert!(s.contains("SPIRE APP CONTEXT"));
 
         let p = compile_spec_prompt("spire-gis", "view and edit map layers", "compile", "summary", None, &[]);

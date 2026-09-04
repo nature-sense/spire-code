@@ -74,6 +74,8 @@ struct SpecDesignView: View {
     @State private var acceptedCount = 0
     @State private var busy = false
     @State private var errorMessage: String?
+    /// Questions/options still unanswered (Decide is disabled while non-empty).
+    @State private var openQuestions: [String] = []
     /// Request grounding for the next brainstorm question.
     @State private var useDocsRAG = false
     @State private var useWebSearch = false
@@ -142,8 +144,10 @@ struct SpecDesignView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(busy || spec == nil)
-                .help("Freeze the spec and derive the AppSpec deterministically")
+                .disabled(busy || spec == nil || !openQuestions.isEmpty)
+                .help(openQuestions.isEmpty
+                    ? "Freeze the spec and derive the AppSpec deterministically"
+                    : "Answer the open questions first (chat, then Summarize)")
             }
         }
         .padding(12)
@@ -287,11 +291,37 @@ struct SpecDesignView: View {
                     .foregroundStyle(.red)
             }
             Divider()
+            openQuestionsCard
+            if !openQuestions.isEmpty { Divider() }
             artifactCard(title: "Summary", artifact: summary, systemImage: "text.alignleft")
             artifactCard(title: "Spec", artifact: spec, systemImage: "doc.plaintext", markdown: false)
         }
         .padding(12)
         .frame(minWidth: 440)
+    }
+
+    @ViewBuilder
+    private var openQuestionsCard: some View {
+        if !openQuestions.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Label("Open questions", systemImage: "questionmark.circle")
+                        .font(.headline)
+                        .foregroundStyle(.orange)
+                    Text("\(openQuestions.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
+                    Text("\(idx + 1). \(q)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Answer each in the chat, then press Summarize to refresh. Decide is locked until none remain.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
     }
 
     private func artifactCard(title: String, artifact: SpecDesignArtifact?, systemImage: String, markdown: Bool = true) -> some View {
@@ -376,6 +406,7 @@ struct SpecDesignView: View {
             spec = state.spec
             isDecided = state.isDecided
             acceptedCount = state.acceptedCount
+            openQuestions = state.openQuestions
         }
         if let error {
             errorMessage = error
