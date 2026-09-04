@@ -450,15 +450,6 @@ impl CoordinatorActor {
             "spec-design/turn" => {
                 return self.handle_spec_design_turn(&params).await;
             }
-            "spec-design/summarize" => {
-                return self.handle_spec_design_summarize(&params).await;
-            }
-            "spec-design/promote" => {
-                return self.handle_spec_design_promote(&params).await;
-            }
-            "spec-design/decide" => {
-                return self.handle_spec_design_decide(&params).await;
-            }
             "spec-design/reopen" => {
                 return self.handle_spec_design_reopen(&params).await;
             }
@@ -3624,83 +3615,6 @@ impl CoordinatorActor {
         match r.await {
             Ok(Ok(state)) => serde_json::to_value(state)
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
-            Ok(Err(e)) => serde_json::json!({ "error": e }),
-            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
-        }
-    }
-
-    async fn handle_spec_design_summarize(&self, params: &serde_json::Value) -> serde_json::Value {
-        let project_name = match self.spec_design_project(params) {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
-        let instruction = params
-            .get("instruction")
-            .and_then(|v| v.as_str())
-            .unwrap_or("add to the summary")
-            .to_string();
-        let tx = match self.spec_design_tx(&project_name).await {
-            Ok(tx) => tx,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = tx
-            .send(SpecDesignMessage::Summarize {
-                instruction,
-                reply_to: t,
-            })
-            .await;
-        match r.await {
-            Ok(Ok(artifact)) => serde_json::to_value(artifact)
-                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize artifact" })),
-            Ok(Err(e)) => serde_json::json!({ "error": e }),
-            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
-        }
-    }
-
-    async fn handle_spec_design_promote(&self, params: &serde_json::Value) -> serde_json::Value {
-        let project_name = match self.spec_design_project(params) {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
-        let instruction = params
-            .get("instruction")
-            .and_then(|v| v.as_str())
-            .unwrap_or("turn the summary into a spec")
-            .to_string();
-        let tx = match self.spec_design_tx(&project_name).await {
-            Ok(tx) => tx,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = tx
-            .send(SpecDesignMessage::PromoteToSpec {
-                instruction,
-                reply_to: t,
-            })
-            .await;
-        match r.await {
-            Ok(Ok(artifact)) => serde_json::to_value(artifact)
-                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize artifact" })),
-            Ok(Err(e)) => serde_json::json!({ "error": e }),
-            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
-        }
-    }
-
-    async fn handle_spec_design_decide(&self, params: &serde_json::Value) -> serde_json::Value {
-        let project_name = match self.spec_design_project(params) {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
-        let tx = match self.spec_design_tx(&project_name).await {
-            Ok(tx) => tx,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = tx.send(SpecDesignMessage::Decide { reply_to: t }).await;
-        match r.await {
-            Ok(Ok(spec)) => serde_json::to_value(spec)
-                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize spec" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
             Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
         }

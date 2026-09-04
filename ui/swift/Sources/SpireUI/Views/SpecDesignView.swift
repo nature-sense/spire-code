@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// One line in the free-form design conversation.
 struct SpecDesignLine: Identifiable {
@@ -68,8 +69,6 @@ struct SpecDesignView: View {
     @State private var acceptedCount = 0
     @State private var busy = false
     @State private var errorMessage: String?
-    /// Questions/options still unanswered (the model must not submit while any remain).
-    @State private var openQuestions: [String] = []
     /// acceptedCount already handed to the code generator (fires once per submit).
     @State private var codegenVersion = 0
     /// Request grounding for the next brainstorm question.
@@ -171,15 +170,21 @@ struct SpecDesignView: View {
         case "user":
             HStack {
                 Spacer(minLength: 60)
-                MarkdownText(line.text)
-                    .padding(8)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(.blue.opacity(0.15)))
+                VStack(alignment: .trailing, spacing: 4) {
+                    MarkdownText(line.text)
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(.blue.opacity(0.15)))
+                    messageActions(line)
+                }
             }
         case "assistant":
             HStack {
-                MarkdownText(line.text)
-                    .padding(8)
-                    .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary))
+                VStack(alignment: .leading, spacing: 4) {
+                    MarkdownText(line.text)
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary))
+                    messageActions(line)
+                }
                 Spacer(minLength: 40)
             }
         default:
@@ -187,6 +192,55 @@ struct SpecDesignView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .italic()
+        }
+    }
+
+    /// Copy + Export actions under a message bubble, mirroring the helpers the
+    /// old Summary/Spec artifact cards offered.
+    private func messageActions(_ line: SpecDesignLine) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                copyToClipboard(line.text)
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+                    .font(.caption2.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Copy this message's text to the clipboard")
+            Button {
+                exportMessage(line)
+            } label: {
+                Label("Export…", systemImage: "square.and.arrow.up")
+                    .font(.caption2.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help("Save this message's text to a .md file")
+        }
+    }
+
+    /// Put a message's raw text on the clipboard (pasting keeps the markdown
+    /// structure).
+    private func copyToClipboard(_ content: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(content, forType: .string)
+    }
+
+    /// Save a message to a .md file the user chooses.
+    @MainActor
+    private func exportMessage(_ line: SpecDesignLine) {
+        let panel = NSSavePanel()
+        panel.title = "Export message"
+        panel.nameFieldStringValue = "\(projectName)-\(line.role)-\(Int(Date().timeIntervalSince1970)).md"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try line.text.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = "Export failed: \(error.localizedDescription)"
         }
     }
 
@@ -272,29 +326,6 @@ struct SpecDesignView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
-            if !openQuestions.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Label("Open questions", systemImage: "questionmark.circle")
-                            .font(.headline)
-                            .foregroundStyle(.orange)
-                        Text("\(openQuestions.count)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
-                        Text("\(idx + 1). \(q)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("Answer these in the chat — the assistant must not submit the AppSpec while any remain.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 8).fill(.orange.opacity(0.06)))
-            }
             Divider()
             VStack(alignment: .leading, spacing: 6) {
                 Text("How this works")
@@ -322,7 +353,6 @@ struct SpecDesignView: View {
         if let state {
             isDecided = state.isDecided
             acceptedCount = state.acceptedCount
-            openQuestions = state.openQuestions
         }
         if let error {
             errorMessage = error

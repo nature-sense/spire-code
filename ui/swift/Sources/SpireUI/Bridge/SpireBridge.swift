@@ -1964,28 +1964,6 @@ final class SpireBridge {
         return (SpecDesignState(json: value as Any), nil)
     }
 
-    /// Free-form condensation of the brainstorm into the running summary.
-    func specDesignSummarize(projectName: String, instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/summarize", params: ["projectName": projectName, "instruction": instruction])
-        guard error == nil else { return (nil, error) }
-        return (SpecDesignArtifact(json: value as Any), nil)
-    }
-
-    /// Compile the summary into the spec.md document (still a prompt).
-    func specDesignPromote(projectName: String, instruction: String) async -> (artifact: SpecDesignArtifact?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/promote", params: ["projectName": projectName, "instruction": instruction])
-        guard error == nil else { return (nil, error) }
-        return (SpecDesignArtifact(json: value as Any), nil)
-    }
-
-    /// THE button: freeze the spec and derive the AppSpec deterministically.
-    /// Returns the derived spec dictionary (feeds the wizard's codegen step).
-    func specDesignDecide(projectName: String) async -> (spec: [String: Any]?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/decide", params: ["projectName": projectName])
-        guard error == nil else { return (nil, error) }
-        return (value as? [String: Any], nil)
-    }
-
     /// Return to free-form editing (a decided spec may not meet requirements).
     func specDesignReopen(projectName: String) async -> (state: SpecDesignState?, error: String?) {
         let (value, error) = await specDesignCall(method: "spec-design/reopen", params: ["projectName": projectName])
@@ -1993,7 +1971,7 @@ final class SpireBridge {
         return (SpecDesignState(json: value as Any), nil)
     }
 
-    /// Current session state (mode, summary/spec versions, turn count).
+    /// Current session state (mode + turn count).
     func specDesignState(projectName: String) async -> SpecDesignState? {
         let (value, error) = await specDesignCall(method: "spec-design/state", params: ["projectName": projectName])
         guard error == nil else { return nil }

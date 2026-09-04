@@ -1,23 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
 
-//! **Spec design actor** — the free-form brainstorm step that precedes spec
-//! generation.
+//! **Spec design actor** — a single free-form conversation that drives the app
+//! to an AppSpec.
 //!
 //! Interaction model (agreed with the product):
 //!
-//! - Everything before **Decide** is free-form and changed **through prompts**: a
-//!   chat transcript accumulates turns, `Summarize` condenses it into a running
-//!   summary (the source of truth), and `PromoteToSpec` compiles the summary
-//!   into a `spec.md` document. The user steers with a free-form instruction
-//!   ("summarize with techniques X", "add the new findings", "recreate around
-//!   storage"). Nothing is marked "decided" during this phase.
-//! - **Decide** is a *button*, not a prompt: it freezes the spec and switches to
-//!   a deterministic tail — `markdown_to_spec` → `validate` → persist. After
-//!   Decide the doc is the accepted contract. **Reopen** always returns to the
-//!   free-form phase (the derived AppSpec may not actually meet requirements), so
-//!   decide/reopen is cheap and repeatable; every Decide is recorded in
-//!   `accepted` for comparison.
+//! - The chat transcript accumulates user + assistant turns. The assistant is a
+//!   decisive design partner: it proposes one recommended solution, asks a
+//!   question only when a choice genuinely matters, and does not loop on
+//!   settled ground.
+//! - When the model considers the design complete it calls the `submit_appspec`
+//!   tool with the full `spec.md`. The coordinator surfaces that hand-off to the
+//!   actor as `DesignReply.spec_md`; the actor validates via `markdown_to_spec`
+//!   → `validate` and, when valid, runs the deterministic tail: persist the
+//!   derivation into the memory graph and mark the session `Decided`. Every
+//!   accepted submission is recorded in `accepted`; **Reopen** returns to the
+//!   free-form phase so the design can be revised and re-submitted.
 //!
 //! The LLM is injected as a plain async closure (like [`super::spec_gen`]), so
 //! the actor is fully testable with canned scripts.
@@ -80,16 +79,6 @@ pub struct DesignTurn {
     pub text: String,
 }
 
-/// A condensed document (summary or spec). The summary is the running source of
-/// truth during the free-form phase; the spec is the `spec.md` document.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DesignArtifact {
-    pub version: u32,
-    pub content: String,
-    pub source_turns: Vec<usize>,
-    pub produced_at: chrono::DateTime<chrono::Utc>,
-}
-
 /// One deterministic derivation recorded by a Decide press.
 #[derive(Debug, Clone, Serialize)]
 pub struct AcceptedSpec {
@@ -105,12 +94,7 @@ pub struct SpecDesignState {
     pub mode: DesignMode,
     pub project_name: String,
     pub goal: String,
-    pub summary: Option<DesignArtifact>,
-    pub spec: Option<DesignArtifact>,
     pub turn_count: usize,
-    /// Design questions/options the design partner raised that the user has
-    /// NOT answered yet; refreshed at each Summarize and gating Decide.
-    pub open_questions: Vec<String>,
     pub accepted: Vec<AcceptedSpec>,
     pub latest: Option<AppSpec>,
     pub last_issues: Vec<SpecIssue>,
@@ -127,30 +111,23 @@ pub enum SpecDesignMessage {
         reset: bool,
         reply_to: oneshot::Sender<Result<SpecDesignState, String>>,
     },
-    /// A user turn in the free-form brainstorm.
+    /// A user turn appended directly to the transcript (RPC mirror).
     Reply {
         text: String,
         reply_to: oneshot::Sender<Result<SpecDesignState, String>>,
     },
     /// Mirror any other turn (e.g. the assistant's chat reply) into the
-    /// transcript so a later summarize sees the whole conversation.
+    /// transcript so the whole conversation is captured.
     AppendTurn {
         role: String,
         text: String,
         reply_to: oneshot::Sender<Result<SpecDesignState, String>>,
     },
-    Summarize {
-        instruction: String,
-        reply_to: oneshot::Sender<Result<DesignArtifact, String>>,
-    },
-    PromoteToSpec {
-        instruction: String,
-        reply_to: oneshot::Sender<Result<DesignArtifact, String>>,
-    },
     /// Free-form brainstorm turn INSIDE the design session: appends the user
-    /// question, asks the LLM (opinionated options + recommendation, grounded
-    /// in the running summary and any requested grounding), appends the
-    /// answer, replies with both.
+    /// question, asks the LLM (decisive recommendation, grounded in recent
+    /// turns + any requested docs/web references), appends the answer, and
+    /// replies with both. The model may finish by submitting the AppSpec via
+    /// the `submit_appspec` tool (surfaced as `DesignReply.spec_md`).
     Ask {
         text: String,
         /// Ground the answer in the Spire docs RAG (spire-actor/spire-core).
@@ -159,9 +136,7 @@ pub enum SpecDesignMessage {
         web: bool,
         reply_to: oneshot::Sender<Result<(String, SpecDesignState), String>>,
     },
-    Decide {
-        reply_to: oneshot::Sender<Result<AppSpec, String>>,
-    },
+    /// Return to the free-form phase after a submit (Revise).
     Reopen {
         reply_to: oneshot::Sender<Result<SpecDesignState, String>>,
     },
@@ -171,7 +146,7 @@ pub enum SpecDesignMessage {
 }
 
 /// Free-form design session. Created per project (the wizard starts one when it
-/// opens the design step); holds the transcript + the running summary/spec.
+/// opens the design step); holds the chat transcript + the submitted AppSpecs.
 pub struct SpecDesignActor {
     project_name: String,
     goal: String,
@@ -179,12 +154,6 @@ pub struct SpecDesignActor {
     memory_graph_tx: Option<mpsc::Sender<MemoryGraphMessage>>,
     mode: DesignMode,
     turns: Vec<DesignTurn>,
-    /// Turns already folded into the current summary (delta = turns after it).
-    summarized_through: usize,
-    /// Open design questions/options (see [`SpecDesignState::open_questions`]).
-    open_questions: Vec<String>,
-    summary: Option<DesignArtifact>,
-    spec: Option<DesignArtifact>,
     accepted: Vec<AcceptedSpec>,
     latest: Option<AppSpec>,
     last_issues: Vec<SpecIssue>,
@@ -201,7 +170,7 @@ pub struct SpecDesignActor {
 
 impl SpecDesignActor {
     /// A fresh, unconfigured session. The RPC entry always calls [`Self::start`]
-    /// first, which fixes project + goal; decide/reopen guard on that.
+    /// first, which fixes project + goal; submit/reopen guard on that.
     pub fn new(llm: LlmCall) -> Self {
         Self {
             project_name: String::new(),
@@ -210,10 +179,6 @@ impl SpecDesignActor {
             memory_graph_tx: None,
             mode: DesignMode::Freeform,
             turns: Vec::new(),
-            summarized_through: 0,
-            open_questions: Vec::new(),
-            summary: None,
-            spec: None,
             accepted: Vec::new(),
             latest: None,
             last_issues: Vec::new(),
@@ -224,7 +189,7 @@ impl SpecDesignActor {
         }
     }
 
-    /// Wire the memory graph so Decide can persist the derived spec.
+    /// Wire the memory graph so a submitted AppSpec can be persisted.
     pub fn set_memory_graph(&mut self, tx: mpsc::Sender<MemoryGraphMessage>) {
         self.memory_graph_tx = Some(tx);
     }
@@ -252,16 +217,11 @@ impl SpecDesignActor {
         format!("turn.{}.{index}", self.instance)
     }
 
-    fn doc_node_name(&self, kind: &str) -> String {
-        format!("{kind}.{}", self.instance)
-    }
-
     /// Persist the free-form session into the project memory graph so a
     /// brainstorm survives restarts and lives beside the decided spec. Written
-    /// as plain typed nodes (no whole-session blob): a `design_session` node,
-    /// one `design_turn` node per new turn, and `design_document` nodes for the
-    /// current summary/spec. Best-effort — a missing graph keeps the session
-    /// in-memory.
+    /// as plain typed nodes (no whole-session blob): a `design_session` node and
+    /// one `design_turn` node per new turn. Best-effort — a missing graph keeps
+    /// the session in-memory.
     async fn persist_session(&self) {
         let Some(mg_tx) = &self.memory_graph_tx else {
             return;
@@ -279,17 +239,8 @@ impl SpecDesignActor {
             properties: props(&[
                 ("goal", serde_json::json!(self.goal)),
                 ("mode", serde_json::json!(mode_str(self.mode))),
-                (
-                    "summarized_through",
-                    serde_json::json!(self.summarized_through),
-                ),
                 ("instance", serde_json::json!(self.instance)),
                 ("turn_count", serde_json::json!(self.turns.len())),
-                (
-                    "open_questions",
-                    serde_json::to_value(&self.open_questions)
-                        .unwrap_or_else(|_| serde_json::json!([])),
-                ),
             ]),
             embedding_id: None,
             created_at: now,
@@ -324,12 +275,6 @@ impl SpecDesignActor {
                 warn!("[SpecDesign] turn node persist failed: {e}");
             }
         }
-        if let Some(summary) = &self.summary {
-            persist_doc(mg_tx, &self.doc_node_name("summary"), summary, DS_SUMMARY).await;
-        }
-        if let Some(spec) = &self.spec {
-            persist_doc(mg_tx, &self.doc_node_name("spec"), spec, DS_SPEC).await;
-        }
     }
 
     /// Restore a persisted session from the project graph for `project_name`.
@@ -363,12 +308,6 @@ impl SpecDesignActor {
         self.project_name = project_name.to_string();
         self.mode = mode;
         self.instance = instance.clone();
-        self.summarized_through = session.u32_prop("summarized_through").unwrap_or(0) as usize;
-        self.open_questions = session
-            .properties
-            .get("open_questions")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
 
         // Turns under this instance, ordered by index.
         let Ok(turn_nodes) = query_nodes(
@@ -397,9 +336,6 @@ impl SpecDesignActor {
         self.turns = turns.into_iter().map(|(_, t)| t).collect();
         self.persisted_through = self.turns.len();
 
-        // Summary + spec documents.
-        self.summary = load_doc(mg_tx, &format!("summary.{instance}"), DS_SUMMARY).await;
-        self.spec = load_doc(mg_tx, &format!("spec.{instance}"), DS_SPEC).await;
         self.accepted.clear();
         self.latest = None;
         self.last_issues.clear();
@@ -434,10 +370,7 @@ impl SpecDesignActor {
             mode: self.mode,
             project_name: self.project_name.clone(),
             goal: self.goal.clone(),
-            summary: self.summary.clone(),
-            spec: self.spec.clone(),
             turn_count: self.turns.len(),
-            open_questions: self.open_questions.clone(),
             accepted: self.accepted.clone(),
             latest: self.latest.clone(),
             last_issues: self.last_issues.clone(),
@@ -471,10 +404,6 @@ impl SpecDesignActor {
         self.goal = goal.to_string();
         self.mode = DesignMode::Freeform;
         self.turns.clear();
-        self.summarized_through = 0;
-        self.open_questions.clear();
-        self.summary = None;
-        self.spec = None;
         self.accepted.clear();
         self.latest = None;
         self.last_issues.clear();
@@ -502,105 +431,9 @@ impl SpecDesignActor {
         Ok(self.state())
     }
 
-    /// Free-form condensation of the transcript into the running summary.
-    pub async fn summarize(&mut self, instruction: &str) -> Result<DesignArtifact, String> {
-        self.require_freeform()?;
-        self.require_session()?;
-        let instruction = instruction.trim();
-        if instruction.is_empty() {
-            return Err("summarize needs an instruction".to_string());
-        }
-        let existing = self.summary.as_ref().map(|a| a.content.clone());
-        let (material, source_turns) = if wants_full_material(instruction) {
-            (self.turns.clone(), (0..self.turns.len()).collect())
-        } else {
-            (
-                self.turns[self.summarized_through.min(self.turns.len())..].to_vec(),
-                (self.summarized_through.min(self.turns.len())..self.turns.len()).collect(),
-            )
-        };
-        let prompt = summarize_prompt(
-            &self.project_name,
-            &self.goal,
-            instruction,
-            existing.as_deref(),
-            &material,
-            &self.open_questions,
-        );
-        let mut content = self.call_llm(prompt).await?.text;
-        // Lift the trailing "## Open questions" block into the session's
-        // open-question list (Decide gates on it) and store only the decisions
-        // in the summary. A missing block means the model drifted from the
-        // required format: keep the previously known open questions.
-        if let Some((body, open)) = split_open_questions(&content) {
-            self.open_questions = open;
-            if !body.trim().is_empty() {
-                content = body;
-            }
-        }
-        let version = self.summary.as_ref().map(|a| a.version).unwrap_or(0) + 1;
-        let artifact = DesignArtifact {
-            version,
-            content,
-            source_turns,
-            produced_at: chrono::Utc::now(),
-        };
-        info!(
-            "[SpecDesign] summary v{} for '{}' ({:?} instruction)",
-            artifact.version, self.project_name, instruction
-        );
-        self.summary = Some(artifact.clone());
-        self.summarized_through = self.turns.len();
-        self.persist_session().await;
-        Ok(artifact)
-    }
-
-    /// Compile the (mature) summary into the `spec.md` document. Still a prompt:
-    /// the user keeps refining via chat until Decide freezes it.
-    pub async fn promote(&mut self, instruction: &str) -> Result<DesignArtifact, String> {
-        self.require_freeform()?;
-        self.require_session()?;
-        let instruction = instruction.trim();
-        if instruction.is_empty() {
-            return Err("promote needs an instruction".to_string());
-        }
-        // A summary is the source of truth for the spec — create one on demand.
-        if self.summary.is_none() {
-            self.summarize("Create a first summary of the whole design conversation.")
-                .await?;
-        }
-        let summary = self.summary.clone().expect("summary created above");
-        let existing_spec = self.spec.as_ref().map(|a| a.content.clone());
-        let context: Vec<DesignTurn> =
-            self.turns[self.summarized_through.min(self.turns.len())..].to_vec();
-        let prompt = compile_spec_prompt(
-            &self.project_name,
-            &self.goal,
-            instruction,
-            &summary.content,
-            existing_spec.as_deref(),
-            &context,
-        );
-        let content = self.call_llm(prompt).await?.text;
-        let version = self.spec.as_ref().map(|a| a.version).unwrap_or(0) + 1;
-        let artifact = DesignArtifact {
-            version,
-            content,
-            source_turns: (0..self.turns.len()).collect(),
-            produced_at: chrono::Utc::now(),
-        };
-        info!(
-            "[SpecDesign] spec v{} for '{}' ({:?} instruction)",
-            artifact.version, self.project_name, instruction
-        );
-        self.spec = Some(artifact.clone());
-        self.persist_session().await;
-        Ok(artifact)
-    }
-
     /// Free-form brainstorm answer inside the design session (see the `Ask`
     /// message). Appends the user turn FIRST (capture survives an LLM error),
-    /// then asks the LLM grounded in the current summary + recent turns,
+    /// then asks the LLM grounded in the recent turns
     /// appends the assistant answer, and returns (answer, state).
     pub async fn ask(
         &mut self,
@@ -619,7 +452,6 @@ impl SpecDesignActor {
             text: text.clone(),
         });
         self.persist_session().await;
-        let summary = self.summary.as_ref().map(|a| a.content.clone());
         let start = self.turns.len().saturating_sub(10);
         let context = self.turns[start..].to_vec();
         // Optional grounding: docs RAG and/or web search, requested explicitly.
@@ -654,7 +486,6 @@ impl SpecDesignActor {
             &self.project_name,
             &self.goal,
             &text,
-            summary.as_deref(),
             &context,
             &grounding,
         );
@@ -662,43 +493,33 @@ impl SpecDesignActor {
         let mut answer = reply.text.clone();
         // The model may finish the design by calling the `submit_appspec` tool.
         if let Some(submitted) = reply.spec_md.as_deref() {
-            // Refuse while design questions are still open (mirrors the old
-            // Decide gate, which the model is also told about in the prompt).
-            if !self.open_questions.is_empty() {
-                let line = format!(
-                    "The model tried to submit the AppSpec while {} open question(s) remain — answer them, then ask it to submit again.",
-                    self.open_questions.len()
-                );
-                answer = if answer.trim().is_empty() {
-                    line.clone()
-                } else {
-                    format!("{answer}\n\n{line}")
-                };
-            } else {
-                match self.accept_spec_markdown(submitted).await {
-                    Ok(app) => {
-                        let line = format!(
-                            "AppSpec submitted — v{} ({} types, {} actors, {} bridge methods, {} screens). The design is decided; press Revise to change it.",
-                            self.accepted.len(),
-                            app.types.len(),
-                            app.actors.len(),
-                            app.bridge.len(),
-                            app.ui.len()
-                        );
-                        answer = if answer.trim().is_empty() {
-                            line.clone()
-                        } else {
-                            format!("{answer}\n\n{line}")
-                        };
-                    }
-                    Err(e) => {
-                        let line = format!("submit_appspec was rejected: {e}");
-                        answer = if answer.trim().is_empty() {
-                            line.clone()
-                        } else {
-                            format!("{answer}\n\n{line}")
-                        };
-                    }
+            match self.accept_spec_markdown(submitted).await {
+                Ok(app) => {
+                    let line = format!(
+                        "AppSpec submitted — v{} ({} types, {} actors, {} bridge methods, {} screens). The design is decided; press Revise to change it.",
+                        self.accepted.len(),
+                        app.types.len(),
+                        app.actors.len(),
+                        app.bridge.len(),
+                        app.ui.len()
+                    );
+                    answer = if answer.trim().is_empty() {
+                        line.clone()
+                    } else {
+                        format!("{answer}
+
+{line}")
+                    };
+                }
+                Err(e) => {
+                    let line = format!("submit_appspec was rejected: {e}");
+                    answer = if answer.trim().is_empty() {
+                        line.clone()
+                    } else {
+                        format!("{answer}
+
+{line}")
+                    };
                 }
             }
         }
@@ -712,40 +533,10 @@ impl SpecDesignActor {
         Ok((answer, self.state()))
     }
 
-    /// THE button: freeze the spec and derive the AppSpec deterministically.
-    pub async fn decide(&mut self) -> Result<AppSpec, String> {
-        self.require_freeform()?;
-        self.require_session()?;
-        let Some(spec) = self.spec.as_ref() else {
-            return Err(format!(
-                "nothing to decide for '{}' — promote the summary to a spec first",
-                self.project_name
-            ));
-        };
-        // Gate: unanswered design questions must be resolved before the AppSpec
-        // is created (the list is refreshed at each Summarize).
-        if !self.open_questions.is_empty() {
-            let list = self
-                .open_questions
-                .iter()
-                .map(|q| format!("  • {q}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(format!(
-                "'{}' still has {} open question(s) that must be answered before the AppSpec can be created:\n{list}\nAnswer them in the brainstorm, press Summarize, then Decide again.",
-                self.project_name,
-                self.open_questions.len()
-            ));
-        }
-        let spec_content = spec.content.clone();
-        self.accept_spec_markdown(&spec_content).await
-    }
-
-    /// Parse + validate a submitted spec.md (via the chat `submit_appspec` tool
-    /// or a promoted spec) and, when valid, persist the graph derivation, mark
-    /// the session decided, and record an accepted version. Used by both the
-    /// chat submit path and the (legacy) Decide action.
-    pub async fn accept_spec_markdown(&mut self, markdown: &str) -> Result<AppSpec, String> {
+    /// Parse + validate a submitted spec.md (the chat `submit_appspec` hand-off)
+    /// and, when valid, persist the graph derivation, mark the session decided,
+    /// and record an accepted version.
+    async fn accept_spec_markdown(&mut self, markdown: &str) -> Result<AppSpec, String> {
         self.require_freeform()?;
         self.require_session()?;
         let app: AppSpec = spec_md::markdown_to_spec(markdown)?;
@@ -792,7 +583,7 @@ impl SpecDesignActor {
         });
         self.persist_session().await;
         info!(
-            "[SpecDesign] '{}' decided — appspec v{} ({} types, {} actors, {} methods, {} screens)",
+            "[SpecDesign] '{}' accepted — appspec v{} ({} types, {} actors, {} methods, {} screens)",
             self.project_name,
             self.accepted.len(),
             app.types.len(),
@@ -803,8 +594,9 @@ impl SpecDesignActor {
         Ok(app)
     }
 
-    /// Return to the free-form phase. The spec stays; Decide can run again after
-    /// further prompt edits (each Decide appends to `accepted`).
+    /// Return to the free-form phase. The accepted spec stays recorded; the
+    /// model can refine the design and submit again (each accepted submission
+    /// appends to `accepted`).
     pub async fn reopen(&mut self) -> Result<SpecDesignState, String> {
         self.require_session()?;
         self.mode = DesignMode::Freeform;
@@ -826,8 +618,6 @@ impl SpecDesignActor {
 /// Graph node subtypes for the persisted free-form design session.
 pub const DS_SESSION: &str = "design_session";
 pub const DS_TURN: &str = "design_turn";
-pub const DS_SUMMARY: &str = "design_summary";
-pub const DS_SPEC: &str = "design_spec";
 
 fn mode_str(mode: DesignMode) -> &'static str {
     match mode {
@@ -873,80 +663,9 @@ async fn query_nodes(
         .map_err(|e| format!("query failed: {e}"))
 }
 
-/// Upsert one design-document node (summary or spec) for an artifact.
-async fn persist_doc(
-    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
-    name: &str,
-    artifact: &DesignArtifact,
-    subtype: &str,
-) {
-    let now = chrono::Utc::now();
-    let props: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::from([
-            ("version".to_string(), serde_json::json!(artifact.version)),
-            ("content".to_string(), serde_json::json!(artifact.content)),
-        ]);
-    let node = AttrNode {
-        id: uuid::Uuid::new_v4().to_string(),
-        node_type: super::spec_persist::MG_NODE_TYPE.to_string(),
-        subtype: Some(subtype.to_string()),
-        name: name.to_string(),
-        description: None,
-        properties: props,
-        embedding_id: None,
-        created_at: now,
-        updated_at: now,
-        version: 1,
-    };
-    if let Err(e) = merge_node(mg_tx, node).await {
-        warn!("[SpecDesign] document node persist failed: {e}");
-    }
-}
-
-/// Read a design-document node back as an artifact.
-async fn load_doc(
-    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
-    name: &str,
-    subtype: &str,
-) -> Option<DesignArtifact> {
-    let nodes = query_nodes(
-        mg_tx,
-        Some(super::spec_persist::MG_NODE_TYPE),
-        Some(subtype),
-        Some(name),
-        1,
-    )
-    .await
-    .ok()?;
-    let node = nodes.into_iter().next()?;
-    Some(DesignArtifact {
-        version: node.u32_prop("version").unwrap_or(1) as u32,
-        content: node.str_prop("content").unwrap_or_default(),
-        source_turns: Vec::new(),
-        produced_at: chrono::Utc::now(),
-    })
-}
-
-/// Keywords in a summarize instruction that ask for a full-material rewrite
-/// rather than a fold of the new turns only.
-fn wants_full_material(instruction: &str) -> bool {
-    let lower = instruction.to_lowercase();
-    [
-        "recreate",
-        "regenerate",
-        "rewrite",
-        "start over",
-        "from scratch",
-        "from the beginning",
-        "fresh",
-    ]
-    .iter()
-    .any(|k| lower.contains(k))
-}
-
 fn format_turns(turns: &[DesignTurn]) -> String {
     if turns.is_empty() {
-        "(no new conversation turns since the summary was last written)".to_string()
+        "(no conversation turns yet)".to_string()
     } else {
         turns
             .iter()
@@ -982,137 +701,16 @@ HARD CONSTRAINTS:\n\
 - The app's backend IS its own Rust actors; persistence is via the memory graph.\n\
 - Project/crate naming convention: `spire-<name>`.";
 
-/// Split the trailing "## Open questions" block the summarize model emits from
-/// the summary body. Returns `None` when the model omitted the block (model
-/// drift — keep the previously known open questions).
-fn split_open_questions(summary: &str) -> Option<(String, Vec<String>)> {
-    const MARKER: &str = "## Open questions";
-    let idx = summary.rfind(MARKER)?;
-    let body = summary[..idx].trim_end().to_string();
-    let mut open: Vec<String> = Vec::new();
-    for line in summary[idx + MARKER.len()..].lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let item = t
-            .strip_prefix("- ")
-            .or_else(|| t.strip_prefix("* "))
-            .unwrap_or(t)
-            .trim();
-        if item.is_empty()
-            || item.eq_ignore_ascii_case("none")
-            || item.eq_ignore_ascii_case("none.")
-            || item.eq_ignore_ascii_case("no open questions")
-        {
-            continue;
-        }
-        open.push(item.to_string());
-    }
-    Some((body, open))
-}
-
-
-/// Free-form summarize prompt: folds the delta into the running summary unless
-/// the instruction asks for a full-material rewrite. NO statuses, NO "decided"
-/// markers — the summary is prose; nothing is decided until the Decide button.
-fn summarize_prompt(
-    project_name: &str,
-    goal: &str,
-    instruction: &str,
-    existing_summary: Option<&str>,
-    material: &[DesignTurn],
-    previous_open: &[String],
-) -> String {
-    let existing = existing_summary.unwrap_or("none yet");
-    let open = if previous_open.is_empty() {
-        "(none known)".to_string()
-    } else {
-        previous_open
-            .iter()
-            .map(|q| format!("- {q}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let body = format!(
-        "# Summarize the design conversation\n\nProject: {project_name}\nGoal: {goal}\n\n\
-         ## The user's instruction\n{instruction}\n\n\
-         ## Current summary (the running source of truth)\n{existing}\n\n\
-         ## Conversation turns to fold in\n{}\n\n\
-         ## Open questions from earlier (still open unless the turns above answer them)\n{open}\n\n\
-         Fold the conversation into the summary per the instruction above. The summary\n\
-         records only DECISIONS and settled facts — never questions, open options, or\n\
-         \"should we …?\" proposals. If the new turns resolved a previously open\n\
-         question, fold the answer in and drop the question.\n\
-         Then end the summary with an Open questions section listing everything still\n\
-         unanswered:\n\n\
-         ## Open questions\n\
-         - <one unresolved question or open option per line>\n\n\
-         If nothing remains unanswered, end with exactly:\n\n\
-         ## Open questions\n\
-         None\n\n\
-         The summary is freeform prose — any structure you like. No status labels, no\n\
-         \"decided\" markers, no forced sections. Nothing is decided yet. Do not invent\n\
-         facts; only reflect what was actually discussed. Output only the summary text\n\
-         (including the final Open questions section).",
-        format_turns(material)
-    );
-    format!("{SPIRE_APP_CONTEXT}\n\n{body}")
-}
-
-
-/// Free-form promote prompt: compiles the (mature) summary onto the strict
-/// spec_md grammar, folding the existing spec forward.
-fn compile_spec_prompt(
-    project_name: &str,
-    goal: &str,
-    instruction: &str,
-    summary: &str,
-    existing_spec: Option<&str>,
-    recent_context: &[DesignTurn],
-) -> String {
-    let existing = existing_spec.unwrap_or("none yet");
-    let body = format!(
-        "# Turn the design summary into a spec\n\nProject: {project_name}\nGoal: {goal}\n\n\
-         ## The user's instruction\n{instruction}\n\n\
-         ## Design summary (the running source of truth)\n{summary}\n\n\
-         ## Recent conversation (context not yet folded into the summary)\n{}\n\n\
-         ## Current spec (fold it forward — keep every section the summary does\n\
-         not change)\n{existing}\n\n\
-         SPEC GRAMMAR (strict, parseable 1:1):\n\
-         # AppSpec: <name>\n\
-         **Goal**: <goal>\n\
-         ## Data types — records as `| field | type |` tables; enums as `a | b | c`\n\
-         ## Graph — ### nodes (`- **name** — desc` then `  - field: type`); ### edges\n\
-         ## Backend — ### `Actor` — desc; Handlers: ...; State: ...; Uses: ...\n\
-         ## Bridge — ### `method` — desc; `| param | type |` table; Result: <type>\n\
-         ## UI — ### id — title; Layout: vstack/hstack/list/text/button(\"x\")->a/\n\
-         input(\"p\")@b/spacer/empty; Actions: ...; Bindings: ...; Navigation: ...\n\
-         Type expressions: str | int | float | bool | name | list<T> | T? |\n\
-         record(f:T;...)  Layout strings are a single line.\n\n\
-         Only turn what the summary actually decided into spec content. If the\n\
-         summary lacks information a section needs, leave that section out — never\n\
-         invent bridge methods, types, or screens. Handlers listed in Backend and\n\
-         methods called by UI actions must each exist in ## Bridge for the spec to\n\
-         validate.\n\
-         Output ONLY the spec markdown.",
-        format_turns(recent_context)
-    );
-    format!("{SPIRE_APP_CONTEXT}\n\nDESIGN RULE: Never carry open questions or unresolved options into the spec — content must be decisions only.\n\n{body}")
-}
-
-/// Free-form brainstorm prompt: an opinionated design partner that offers
-/// options + trade-offs + a recommendation and ends with one pointed question.
-/// Grounded in the running summary (if any) and the recent conversation.
+/// Free-form brainstorm prompt: a decisive design partner that proposes ONE
+/// recommended solution and asks only when a choice genuinely matters. Grounded
+/// in the recent conversation and any requested docs/web references.
 fn brainstorm_prompt(
     project_name: &str,
     goal: &str,
     question: &str,
-    summary: Option<&str>,
     context: &[DesignTurn],
     grounding: &[String],
 ) -> String {
-    let summary = summary.unwrap_or("(no summary yet — the brainstorm is still open)");
     let mut parts: Vec<String> = Vec::new();
     parts.push(SPIRE_APP_CONTEXT.to_string());
     parts.push(format!("Project: {project_name}"));
@@ -1120,9 +718,6 @@ fn brainstorm_prompt(
     parts.push(String::new());
     parts.push("## The user's question".to_string());
     parts.push(question.to_string());
-    parts.push(String::new());
-    parts.push("## Running summary (source of truth so far)".to_string());
-    parts.push(summary.to_string());
     parts.push(String::new());
     parts.push("## Recent conversation".to_string());
     parts.push(format_turns(context));
@@ -1187,18 +782,6 @@ impl Actor for SpecDesignActor {
                     let _ = reply_to.send(Err(e));
                 }
             },
-            SpecDesignMessage::Summarize {
-                instruction,
-                reply_to,
-            } => {
-                let _ = reply_to.send(self.summarize(&instruction).await);
-            }
-            SpecDesignMessage::PromoteToSpec {
-                instruction,
-                reply_to,
-            } => {
-                let _ = reply_to.send(self.promote(&instruction).await);
-            }
             SpecDesignMessage::Ask {
                 text,
                 docs,
@@ -1206,9 +789,6 @@ impl Actor for SpecDesignActor {
                 reply_to,
             } => {
                 let _ = reply_to.send(self.ask(&text, docs, web).await);
-            }
-            SpecDesignMessage::Decide { reply_to } => {
-                let _ = reply_to.send(self.decide().await);
             }
             SpecDesignMessage::Reopen { reply_to } => {
                 let _ = reply_to.send(self.reopen().await);
@@ -1294,29 +874,6 @@ mod tests {
         assert!(answer.contains("rejected"), "{answer}");
     }
 
-    #[test]
-    fn submit_while_open_questions_is_refused() {
-        let (mut a, _) = actor(vec![]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        a.open_questions = vec!["what units for distances?".to_string()];
-        let md = example_spec_md();
-        a.llm = Box::new(move |_p: String| {
-            let md = md.clone();
-            Box::pin(async move {
-                Ok(DesignReply {
-                    text: String::new(),
-                    spec_md: Some(md),
-                })
-            })
-        });
-        let (answer, s) = pollster(a.ask("submit", false, false)).unwrap();
-        assert_eq!(s.mode, DesignMode::Freeform);
-        assert_eq!(s.accepted.len(), 0);
-        assert!(answer.contains("open question"), "{answer}");
-    }
-
-
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
         let (llm, prompts) = canned(responses);
         (SpecDesignActor::new(llm), prompts)
@@ -1352,240 +909,41 @@ mod tests {
     }
 
     #[test]
-    fn summarize_folds_only_the_delta_and_bumps_versions() {
+    fn ask_answers_inside_the_session_and_appends_turns() {
         let (mut a, prompts) = actor(vec![
-            "v1: store WKB, serve GeoJSON".to_string(),
-            "v2: v1 + Parquet for analytics".to_string(),
+            "store WKB in SeleneDB; serve GeoJSON at the bridge".to_string(),
+            "use crate geo for spatial ops".to_string(),
         ]);
         a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
-
-        let s1 = pollster(a.summarize("summarize with storage techniques")).unwrap();
-        assert_eq!(s1.version, 1);
-        assert_eq!(s1.content, "v1: store WKB, serve GeoJSON");
-        assert_eq!(s1.source_turns, vec![0, 1]);
+        // Ask before any grounding exists.
+        let (answer1, state1) =
+            pollster(a.ask("what is the best canonical GIS format?", false, false)).unwrap();
+        assert_eq!(answer1, "store WKB in SeleneDB; serve GeoJSON at the bridge");
+        assert_eq!(state1.turn_count, 4); // 2 seeded + question + answer
         let p1 = prompts.lock().unwrap()[0].clone();
-        assert!(p1.contains("summarize with storage techniques"));
-        assert!(p1.contains("none yet"));
+        assert!(p1.contains("Project: spire-gis"));
+        assert!(p1.contains("The user's question"));
+        assert!(p1.contains("what is the best canonical GIS format?"));
         assert!(p1.contains("[user] what is the best canonical GIS format?"));
 
-        a.append_turn(ROLE_USER, "actually, also evaluate Parquet for analytics")
-            .unwrap();
-        let s2 = pollster(a.summarize("add the new findings to the summary")).unwrap();
-        assert_eq!(s2.version, 2);
+        // A second turn carries the conversation forward (recent-context window).
+        let (answer2, state2) =
+            pollster(a.ask("which rust crate for spatial ops?", false, false)).unwrap();
+        assert_eq!(answer2, "use crate geo for spatial ops");
+        assert_eq!(state2.turn_count, 6, "question + answer appended again");
         let p2 = prompts.lock().unwrap()[1].clone();
-        // Fold: previous summary is present; only the delta turn is material.
-        assert!(p2.contains("v1: store WKB, serve GeoJSON"));
-        assert!(p2.contains("actually, also evaluate Parquet"));
         assert!(
-            !p2.contains("what is the best canonical GIS format?"),
-            "add-to must fold only the delta, not the whole transcript"
+            p2.contains("which rust crate for spatial ops?"),
+            "ask must include the latest question"
         );
     }
 
+    /// The deterministic tail must persist the decomposition when a graph is
+    /// wired — driven through the chat submit path (merge + relationship
+    /// messages flow to the graph double).
     #[test]
-    fn summarize_recreate_passes_the_full_transcript() {
-        let (mut a, prompts) = actor(vec!["fresh summary".to_string()]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        let s = pollster(a.summarize("recreate the summary from scratch around storage")).unwrap();
-        assert_eq!(s.version, 1);
-        let p = prompts.lock().unwrap()[0].clone();
-        assert!(
-            p.contains("what is the best canonical GIS format?"),
-            "recreate must see the full transcript"
-        );
-    }
-
-    #[test]
-    fn promote_auto_summarizes_then_compiles_the_spec() {
-        let (mut a, prompts) = actor(vec![
-            "decision: WKB in SeleneDB, GeoJSON served".to_string(),
-            example_spec_md(),
-        ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        let spec = pollster(a.promote("turn this into a spec")).unwrap();
-        assert_eq!(spec.version, 1);
-        assert_eq!(spec.content, example_spec_md());
-        let ps = prompts.lock().unwrap();
-        assert_eq!(
-            ps.len(),
-            2,
-            "promote auto-summarizes when no summary exists"
-        );
-        assert!(ps[1].contains("Project: spire-gis"));
-        assert!(ps[1].contains("## Bridge"));
-        assert!(ps[1].contains("SPEC GRAMMAR"));
-        assert!(ps[1].contains("Current spec"));
-        assert!(a.state().summary.is_some());
-    }
-
-    #[test]
-    fn promote_folds_the_previous_spec_forward() {
-        let (mut a, prompts) = actor(vec![
-            "summary one".to_string(),
-            example_spec_md(),
-            "summary one + more".to_string(),
-            example_spec_md(),
-        ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        pollster(a.promote("turn this into a spec")).unwrap();
-        a.append_turn(ROLE_USER, "add an inspect screen for a selected feature")
-            .unwrap();
-        let spec2 = pollster(a.promote("update the spec with the new screen")).unwrap();
-        assert_eq!(spec2.version, 2);
-        let ps = prompts.lock().unwrap();
-        assert_eq!(
-            ps.len(),
-            3,
-            "auto-summarize (1) + compile (1) + second compile (1)"
-        );
-        assert!(
-            ps[2].contains("## Current spec") && ps[2].contains("## UI"),
-            "second promote carries the existing spec forward"
-        );
-    }
-
-    #[test]
-    fn decide_validates_freezes_and_records_an_accepted_version() {
-        let (mut a, _) = actor(vec!["summary text".to_string(), example_spec_md()]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        pollster(a.summarize("summarize the design")).unwrap();
-        let spec = pollster(a.promote("turn this into a spec")).unwrap();
-        assert!(spec.content.contains("## Bridge"));
-
-        let app = pollster(a.decide()).expect("decide succeeds on a valid spec");
-        let expected = spec_md::markdown_to_spec(&example_spec_md()).unwrap();
-        assert_eq!(app, expected);
-        assert!(app.is_valid());
-        let s = a.state();
-        assert_eq!(s.mode, DesignMode::Decided);
-        assert_eq!(s.accepted.len(), 1);
-        assert_eq!(s.accepted[0].version, 1);
-        assert!(s.accepted[0].issues.is_empty());
-        assert!(s.latest.is_some());
-
-        // Free-form is frozen: prompts are rejected until Reopen.
-        assert!(a.append_turn(ROLE_USER, "more ideas").is_err());
-        let err = pollster(a.summarize("add")).unwrap_err();
-        assert!(err.contains("already decided"));
-        assert!(pollster(a.decide()).is_err());
-    }
-
-    #[test]
-    fn reopen_resumes_editing_and_a_second_decide_appends_a_version() {
-        let (mut a, _) = actor(vec![
-            "summary text".to_string(),
-            example_spec_md(),
-            "summary text v2".to_string(),
-            example_spec_md(),
-        ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        pollster(a.summarize("summarize")).unwrap();
-        pollster(a.promote("to spec")).unwrap();
-        let v1 = pollster(a.decide()).unwrap();
-        assert_eq!(v1.bridge.len(), 2);
-
-        pollster(a.reopen()).unwrap();
-        assert_eq!(a.state().mode, DesignMode::Freeform);
-        a.append_turn(
-            ROLE_USER,
-            "the generated spec missed the ingest actor — fix that",
-        )
-        .unwrap();
-        pollster(a.summarize("add this to the summary")).unwrap();
-        pollster(a.promote("regenerate the spec with the fix")).unwrap();
-        let v2 = pollster(a.decide()).expect("second decide succeeds");
-        assert_eq!(v2, v1, "re-deciding the same doc yields the same appspec");
-        let s = a.state();
-        assert_eq!(s.accepted.len(), 2);
-        assert_eq!(s.accepted[1].version, 2);
-    }
-
-    #[test]
-    fn decide_requires_a_promoted_spec() {
-        let (mut a, _) = actor(vec![]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        let err = pollster(a.decide()).unwrap_err();
-        assert!(err.contains("promote the summary to a spec first"));
-        assert_eq!(a.state().mode, DesignMode::Freeform);
-    }
-    #[test]
-    fn summarize_lifts_open_questions_into_state() {
-        let (mut a, _) = actor(vec![
-            "decided the layer model.\n\n## Open questions\n- Raster or vector first?\n- Which projection?".to_string(),
-        ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        pollster(a.summarize("summarize")).unwrap();
-        assert_eq!(a.open_questions, vec!["Raster or vector first?", "Which projection?"]);
-        assert!(!a.summary.as_ref().unwrap().content.contains("Open questions"));
-    }
-
-    #[test]
-    fn summarize_with_none_clears_open_questions() {
-        let (mut a, _) = actor(vec!["decided.\n\n## Open questions\nNone".to_string()]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        a.open_questions.push("stale question?".to_string());
-        pollster(a.summarize("summarize")).unwrap();
-        assert!(a.open_questions.is_empty());
-    }
-
-    #[test]
-    fn decide_is_blocked_while_open_questions_remain() {
-        let (mut a, _) = actor(vec![
-            "decided the layer model.\n\n## Open questions\n- Raster or vector first?".to_string(),
-            example_spec_md(),
-        ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        pollster(a.promote("to spec")).unwrap(); // auto-summarizes then compiles
-        let err = pollster(a.decide()).unwrap_err();
-        assert!(err.contains("open question"));
-        assert_eq!(a.state().mode, DesignMode::Freeform);
-    }
-
-
-    #[test]
-    fn decide_rejects_an_invalid_spec_and_stays_freeform() {
-        // A spec whose UI action calls an undefined bridge method.
-        let mut bad = example_gis_spec();
-        bad.ui[0].actions.push(super::super::spec::UiAction {
-            id: "boom".into(),
-            description: String::new(),
-            bridge: "map/doesNotExist".into(),
-        });
-        let bad_md = spec_md::spec_to_markdown(&bad);
-        let (mut a, _) = actor(vec!["summary".to_string(), bad_md]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        pollster(a.summarize("summarize")).unwrap();
-        pollster(a.promote("to spec")).unwrap();
-        let err = pollster(a.decide()).unwrap_err();
-        assert!(err.contains("does not validate"), "{err}");
-        assert!(err.contains("map/doesNotExist"));
-        assert_eq!(
-            a.state().mode,
-            DesignMode::Freeform,
-            "invalid spec never freezes"
-        );
-        assert!(a.state().accepted.is_empty());
-        assert!(
-            a.state().spec.is_some(),
-            "the spec doc survives a failed decide"
-        );
-    }
-
-    /// Deterministic tail: an actor with a memory graph persists the decided
-    /// decomposition (merge + relationship messages flow to the graph double).
-    #[test]
-    fn decide_persists_the_decomposition_when_a_graph_is_wired() {
+    fn submit_persists_the_decomposition_when_a_graph_is_wired() {
         use spire_core::models::memory_graph::{GraphEdge, RelationshipType};
         use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage as MG;
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1623,14 +981,24 @@ mod tests {
             }
         });
 
-        let (mut a, _) = actor(vec!["summary".to_string(), example_spec_md()]);
+        let (mut a, _) = actor(vec![]);
         a.set_memory_graph(mg_tx);
         a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
+        let md = example_spec_md();
+        a.llm = Box::new(move |_p: String| {
+            let md = md.clone();
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: String::new(),
+                    spec_md: Some(md),
+                })
+            })
+        });
         rt.block_on(async {
-            a.summarize("summarize").await.unwrap();
-            a.promote("to spec").await.unwrap();
-            a.decide().await.expect("decide persists best-effort");
+            a.ask("submit", false, false)
+                .await
+                .expect("submit persists best-effort");
         });
         let m = merged.lock().unwrap();
         assert!(m.iter().any(|s| s == "appspec"));
@@ -1641,48 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_answers_inside_the_session_and_grounds_on_the_summary() {
-        let (mut a, prompts) = actor(vec![
-            "store WKB in SeleneDB; serve GeoJSON at the bridge".to_string(),
-            "storage summary".to_string(),
-            "use crate geo for spatial ops".to_string(),
-        ]);
-        a.start("spire-gis", "view and edit map layers").unwrap();
-        seed_conversation(&mut a);
-        // Ask before any summary exists.
-        let (answer1, state1) =
-            pollster(a.ask("what is the best canonical GIS format?", false, false)).unwrap();
-        assert_eq!(
-            answer1,
-            "store WKB in SeleneDB; serve GeoJSON at the bridge"
-        );
-        assert_eq!(state1.turn_count, 4); // 2 seeded + question + answer
-        let p1 = prompts.lock().unwrap()[0].clone();
-        assert!(p1.contains("Project: spire-gis"));
-        assert!(p1.contains("The user's question"));
-        assert!(p1.contains("what is the best canonical GIS format?"));
-        assert!(p1.contains("no summary yet"));
-
-        // Fold the brainstorm into a summary, then ask again — the summary is
-        // now in the prompt context, and the assistant answer is captured.
-        let s = pollster(a.summarize("summarize the storage decision")).unwrap();
-        assert_eq!(s.version, 1);
-        let (answer2, state2) =
-            pollster(a.ask("which rust crate for spatial ops?", true, true)).unwrap();
-        assert_eq!(answer2, "use crate geo for spatial ops");
-        let p2 = prompts.lock().unwrap()[2].clone();
-        assert!(
-            p2.contains("store WKB in SeleneDB; serve GeoJSON at the bridge"),
-            "ask must ground on the running summary"
-        );
-        assert_eq!(
-            state2.turn_count, 6,
-            "question + answer appended to the transcript"
-        );
-    }
-
-    #[test]
-    fn ask_is_rejected_after_decide_and_user_turns_survive_llm_failure() {
+    fn ask_is_rejected_and_user_turns_survive_llm_failure() {
         // Canned LLM that fails on the brainstorm call.
         let llm: LlmCall = Box::new(|_| Box::pin(async move { Err("boom".to_string()) }));
         let mut a = SpecDesignActor::new(llm);
@@ -1774,41 +1101,36 @@ mod tests {
     #[test]
     fn design_session_roundtrips_through_the_project_graph() {
         let (tx, fake) = fake_graph_pair();
-        let (mut a, _) = actor(vec![
-            "v1: store WKB, serve GeoJSON".to_string(),
-            example_spec_md(),
-        ]);
+        let (mut a, _) = actor(vec![]);
         a.set_memory_graph(tx.clone());
         pollster(a.start_session("spire-gis", "view and edit map layers", false)).unwrap();
         seed_conversation(&mut a);
-        pollster(a.summarize("summarize the design")).unwrap();
-        let promoted = pollster(a.promote("to spec")).unwrap();
-        assert_eq!(promoted.version, 1);
+        // Submit the AppSpec through the chat tool.
+        let md = example_spec_md();
+        a.llm = Box::new(move |_p: String| {
+            let md = md.clone();
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: "final proposal".to_string(),
+                    spec_md: Some(md),
+                })
+            })
+        });
+        let (_, submitted) = pollster(a.ask("draft the AppSpec now", false, false)).unwrap();
+        assert_eq!(submitted.mode, DesignMode::Decided);
 
         let stored = fake.nodes.lock().unwrap();
-        assert!(stored
-            .iter()
-            .any(|n| n.subtype.as_deref() == Some(DS_SESSION)));
+        assert!(stored.iter().any(|n| n.subtype.as_deref() == Some(DS_SESSION)));
         assert!(stored.iter().any(|n| n.subtype.as_deref() == Some(DS_TURN)));
-        assert!(stored
-            .iter()
-            .any(|n| n.subtype.as_deref() == Some(DS_SUMMARY)));
-        assert!(stored.iter().any(|n| n.subtype.as_deref() == Some(DS_SPEC)));
         drop(stored);
 
-        // A brand-new actor resumes the brainstorm from the same project graph.
+        // A brand-new actor resumes the decided session from the same graph.
         let (mut b, _) = actor(vec![]);
         b.set_memory_graph(tx.clone());
         let state =
             pollster(b.start_session("spire-gis", "view and edit map layers", false)).unwrap();
-        assert_eq!(state.turn_count, 2, "transcript resumed");
-        assert_eq!(
-            state.summary.as_ref().unwrap().content,
-            "v1: store WKB, serve GeoJSON"
-        );
-        assert_eq!(state.spec.as_ref().unwrap().content, example_spec_md());
-        assert_eq!(state.spec.as_ref().unwrap().version, 1);
-        assert_eq!(state.mode, DesignMode::Freeform);
+        assert_eq!(state.turn_count, 4, "transcript resumed (2 seeded + ask + answer)");
+        assert_eq!(state.mode, DesignMode::Decided, "decided mode survives restart");
 
         // reset: true starts clean (new instance) — stale nodes stay but are
         // unreachable; a later resume sees the empty session.
@@ -1816,7 +1138,7 @@ mod tests {
         c.set_memory_graph(tx.clone());
         let state2 = pollster(c.start_session("spire-gis", "fresh goal", true)).unwrap();
         assert_eq!(state2.turn_count, 0);
-        assert!(state2.summary.is_none());
+        assert_eq!(state2.mode, DesignMode::Freeform);
         let state3 = pollster(c.start_session("spire-gis", "again", false)).unwrap();
         assert_eq!(state3.turn_count, 0, "resume after reset is empty");
         let _ = tx;
@@ -1825,26 +1147,37 @@ mod tests {
     #[test]
     fn two_projects_keep_independent_sessions_in_the_graph() {
         let (tx, _fake) = fake_graph_pair();
-        let (mut a, _) = actor(vec!["alpha summary".to_string()]);
+        let (mut a, _) = actor(vec![]);
         a.set_memory_graph(tx.clone());
         pollster(a.start_session("spire-alpha", "alpha goal", false)).unwrap();
         a.append_turn(ROLE_USER, "alpha brainstorm").unwrap();
-        pollster(a.summarize("summarize")).unwrap();
+        let md = example_spec_md();
+        a.llm = Box::new(move |_p: String| {
+            let md = md.clone();
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: "alpha final".to_string(),
+                    spec_md: Some(md),
+                })
+            })
+        });
+        pollster(a.ask("draft it", false, false)).unwrap();
 
-        let (mut b, _) = actor(vec!["beta summary".to_string()]);
+        let (mut b, _) = actor(vec!["beta answer".to_string()]);
         b.set_memory_graph(tx.clone());
         pollster(b.start_session("spire-beta", "beta goal", false)).unwrap();
         b.append_turn(ROLE_USER, "beta brainstorm").unwrap();
-        pollster(b.summarize("summarize")).unwrap();
+        pollster(b.ask("what format?", false, false)).unwrap();
 
+        // Each project resumes its own transcript + state.
         let (mut c, _) = actor(vec![]);
         c.set_memory_graph(tx);
         let sa = pollster(c.start_session("spire-alpha", "ignored", false)).unwrap();
-        assert_eq!(sa.turn_count, 1);
-        assert!(sa.summary.as_ref().unwrap().content.contains("alpha"));
+        assert_eq!(sa.turn_count, 3); // brainstorm + ask question + answer
+        assert_eq!(sa.mode, DesignMode::Decided);
         let sb = pollster(c.start_session("spire-beta", "ignored", false)).unwrap();
-        assert_eq!(sb.turn_count, 1);
-        assert!(sb.summary.as_ref().unwrap().content.contains("beta"));
+        assert_eq!(sb.turn_count, 3);
+        assert_eq!(sb.mode, DesignMode::Freeform);
     }
 
     #[test]
@@ -1896,16 +1229,10 @@ mod spire_context_tests {
 
     #[test]
     fn design_prompts_carry_the_spire_app_context() {
-        let b = brainstorm_prompt("spire-gis", "view and edit map layers", "what stack?", None, &[], &[]);
+        let b = brainstorm_prompt("spire-gis", "view and edit map layers", "what stack?", &[], &[]);
         assert!(b.contains("SPIRE APP CONTEXT"));
         assert!(b.contains("SwiftUI"));
         assert!(b.contains("actor pattern"));
         assert!(b.contains("Rust"));
-
-        let s = summarize_prompt("spire-gis", "view and edit map layers", "add to the summary", None, &[], &[]);
-        assert!(s.contains("SPIRE APP CONTEXT"));
-
-        let p = compile_spec_prompt("spire-gis", "view and edit map layers", "compile", "summary", None, &[]);
-        assert!(p.contains("SPIRE APP CONTEXT"));
     }
 }
