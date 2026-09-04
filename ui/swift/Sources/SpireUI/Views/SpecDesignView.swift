@@ -8,6 +8,63 @@ struct SpecDesignLine: Identifiable {
     let text: String
 }
 
+/// Renders LLM prose markdown (headings, bold/italic, inline + fenced code,
+/// links) via the built-in AttributedString parser. Foundation has no table
+/// support, so the formal spec document intentionally stays raw monospaced.
+struct MarkdownText: View {
+    let attributed: AttributedString?
+    let raw: String
+    init(_ text: String) {
+        raw = text
+        attributed = try? AttributedString(markdown: text)
+    }
+    var body: some View {
+        if let attributed {
+            Text(attributed)
+        } else {
+            Text(raw)
+        }
+    }
+}
+
+/// Opens the AppSpec design session as a large, resizable floating window —
+/// the brainstorm is text-heavy and a sheet would be capped by the main
+/// window. Mirrors the RagPortal / TerminalPortal pattern.
+enum SpecDesignPortal {
+    private static var windows: [NSWindow] = []
+    @MainActor static func open(bridge: SpireBridge, theme: AppTheme, projectName: String, goal: String = "") {
+        let size = NSSize(width: 1240, height: 820)
+        let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                         backing: .buffered, defer: false)
+        w.title = "Design AppSpec — \(projectName)"
+        w.isReleasedWhenClosed = false
+        let view = SpecDesignView(
+            projectName: projectName,
+            goal: goal,
+            onClose: { [weak w] in w?.close() },
+            onDecided: { spec in
+                Task { await bridge.runSpecDesignCodegen(spec: spec) }
+            }
+        )
+        .environment(bridge)
+        .environment(theme)
+        w.contentViewController = NSHostingController(rootView: view)
+        w.setContentSize(size)
+        if let m = NSApp.mainWindow?.frame {
+            w.setFrameOrigin(NSPoint(x: m.midX - size.width / 2, y: m.midY - size.height / 2))
+        } else {
+            w.center()
+        }
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        windows.append(w)
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
+            windows.removeAll { $0 === w }
+        }
+    }
+}
+
 /// The interactive AppSpec design step: a free-form brainstorm on the left
 /// (user turns + LLM replies), the running summary and the spec document on
 /// the right. Everything is changed through prompts; **Decide** is the button
@@ -20,6 +77,9 @@ struct SpecDesignView: View {
 
     let projectName: String
     let goal: String
+    /// Called when the session window should close (used by the portal; a
+    /// harmless no-op inside a sheet).
+    var onClose: () -> Void = {}
     /// Called with the decided AppSpec dictionary (feeds the wizard's codegen).
     let onDecided: ([String: Any]) -> Void
 
@@ -45,7 +105,7 @@ struct SpecDesignView: View {
                 documentPane
             }
         }
-        .frame(minWidth: 900, minHeight: 560)
+        .frame(minWidth: 1000, minHeight: 700)
         .task {
             let (state, error) = await bridge.specDesignStart(projectName: projectName, goal: goal)
             apply(state: state, error: error)
@@ -139,15 +199,13 @@ struct SpecDesignView: View {
         case "user":
             HStack {
                 Spacer(minLength: 60)
-                Text(line.text)
-                    .font(.callout)
+                MarkdownText(line.text)
                     .padding(8)
                     .background(RoundedRectangle(cornerRadius: 10).fill(.blue.opacity(0.15)))
             }
         case "assistant":
             HStack {
-                Text(line.text)
-                    .font(.callout)
+                MarkdownText(line.text)
                     .padding(8)
                     .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary))
                 Spacer(minLength: 40)
@@ -248,13 +306,13 @@ struct SpecDesignView: View {
             }
             Divider()
             artifactCard(title: "Summary", artifact: summary, systemImage: "text.alignleft")
-            artifactCard(title: "Spec", artifact: spec, systemImage: "doc.plaintext")
+            artifactCard(title: "Spec", artifact: spec, systemImage: "doc.plaintext", markdown: false)
         }
         .padding(12)
         .frame(minWidth: 440)
     }
 
-    private func artifactCard(title: String, artifact: SpecDesignArtifact?, systemImage: String) -> some View {
+    private func artifactCard(title: String, artifact: SpecDesignArtifact?, systemImage: String, markdown: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Label(title, systemImage: systemImage).font(.headline)
@@ -266,10 +324,16 @@ struct SpecDesignView: View {
                 }
             }
             ScrollView {
-                Text(artifact?.content ?? "Not drafted yet — chat first, then Summarize / Promote.")
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
+                if let artifact, markdown {
+                    MarkdownText(artifact.content)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                } else {
+                    Text(artifact?.content ?? "Not drafted yet — chat first, then Summarize / Promote.")
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
             }
             .frame(maxHeight: .infinity)
             .padding(6)
@@ -351,6 +415,7 @@ struct SpecDesignView: View {
         let (specDict, error) = await bridge.specDesignDecide(projectName: projectName)
         if let specDict {
             onDecided(specDict)
+            onClose()
             dismiss()
         } else if let error {
             errorMessage = error

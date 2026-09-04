@@ -219,8 +219,6 @@ final class SpireBridge {
     }
 
     var showSettings: Bool = false
-    /// True when the "Design AppSpec…" sheet should be presented (open project).
-    var showSpecDesign: Bool = false
 
     private var menuObservers: [NSObjectProtocol] = []
 
@@ -243,14 +241,6 @@ final class SpireBridge {
                 self.closeProject()
                 self.state = .creating(plan: nil, executing: false)
                 self.currentMode = .project
-            },
-            nc.addObserver(forName: MenuCommand.designSpec, object: nil, queue: .main) { [weak self] _ in
-                guard let self else { return }
-                // The design session persists into the OPEN project's graph, so
-                // it only makes sense once a project is loaded.
-                if self.projectRoot != nil {
-                    self.showSpecDesign = true
-                }
             },
         ]
     }
@@ -2024,7 +2014,6 @@ final class SpireBridge {
     func runSpecDesignCodegen(spec: [String: Any]) async {
         let name = designProjectName
         guard !name.isEmpty else { return }
-        showSpecDesign = false
         Self.logScaffold("Design AppSpec decided for '\(name)' — running codegen")
         if let steps = await generateCodeSteps(projectName: name, spec: spec), !steps.isEmpty,
            let root = projectRoot {

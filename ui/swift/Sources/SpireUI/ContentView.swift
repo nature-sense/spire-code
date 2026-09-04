@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 /// Root content view: a CONSTANT window shell. Only the pane *content* changes
 /// with state — the shell (icon sidebar, dividers, right action pane, bottom
@@ -107,32 +108,14 @@ struct ContentView: View {
                 .environment(bridge)
         }
         // Open-project AppSpec design session (scaffold-first: the design
-        // persists into the project graph of the already-open project).
-        .sheet(isPresented: Binding(
-            get: { bridge.showSpecDesign },
-            set: { bridge.showSpecDesign = $0 }
-        )) {
-            specDesignSheet
-        }
-    }
-
-    /// The design sheet content; empty when no project is open.
-    @ViewBuilder
-    private var specDesignSheet: some View {
-        let name = bridge.designProjectName
-        if name.isEmpty {
-            EmptyView()
-        } else {
-            SpecDesignView(
-                projectName: name,
-                goal: "",
-                onDecided: { spec in
-                    bridge.showSpecDesign = false
-                    Task { await bridge.runSpecDesignCodegen(spec: spec) }
-                }
-            )
-            .environment(bridge)
-            .environment(theme)
+        // persists into the project graph of the already-open project). It is
+        // opened as a large resizable floating window — a sheet is capped at
+        // the main window's size, which is too small for the brainstorm text.
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.designSpec)) { _ in
+            let name = bridge.designProjectName
+            if !name.isEmpty {
+                SpecDesignPortal.open(bridge: bridge, theme: theme, projectName: name)
+            }
         }
     }
 
