@@ -31,6 +31,9 @@ struct SpecDesignView: View {
     @State private var acceptedCount = 0
     @State private var busy = false
     @State private var errorMessage: String?
+    /// Request grounding for the next brainstorm question.
+    @State private var useDocsRAG = false
+    @State private var useWebSearch = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -157,22 +160,35 @@ struct SpecDesignView: View {
     }
 
     private var inputBar: some View {
-        HStack(spacing: 8) {
-            TextField("Ask a question or bounce an idea…", text: $draft, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...4)
-                .onSubmit {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                TextField("Ask a question or bounce an idea…", text: $draft, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...4)
+                    .onSubmit {
+                        Task { await send() }
+                    }
+                Button {
                     Task { await send() }
+                } label: {
+                    Label("Send", systemImage: "arrow.up.circle.fill")
                 }
-            Button {
-                Task { await send() }
-            } label: {
-                Label("Send", systemImage: "arrow.up.circle.fill")
+                .buttonStyle(.borderedProminent)
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || isDecided)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || isDecided)
+            .padding(10)
+            HStack(spacing: 10) {
+                Toggle("Spire docs", isOn: $useDocsRAG)
+                    .toggleStyle(.checkbox)
+                    .help("Ground the answer in the spire-actor/spire-core docs corpus")
+                Toggle("Web search", isOn: $useWebSearch)
+                    .toggleStyle(.checkbox)
+                    .help("Ground the answer in a web search (Tavily, Wikipedia fallback)")
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 6)
         }
-        .padding(10)
     }
 
     // MARK: - Document pane (summary + spec)
@@ -261,7 +277,9 @@ struct SpecDesignView: View {
         lines.append(SpecDesignLine(role: "user", text: text))
         busy = true
         defer { busy = false }
-        let (answer, state, error) = await bridge.specDesignAsk(projectName: projectName, text: text)
+        let (answer, state, error) = await bridge.specDesignAsk(projectName: projectName, text: text, docs: useDocsRAG, web: useWebSearch)
+        useDocsRAG = false
+        useWebSearch = false
         apply(state: state, error: error)
         if let answer, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             lines.append(SpecDesignLine(role: "assistant", text: answer))

@@ -44,6 +44,12 @@ pub type LlmCall = Box<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync,
 >;
 
+/// An injected grounding lookup (docs RAG or web search): query + top_k →
+/// formatted result lines. Testable with canned closures; the coordinator
+/// supplies the real implementations.
+pub type GroundingFn =
+    Box<dyn Fn(&str, usize) -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync>;
+
 pub const ROLE_USER: &str = "user";
 pub const ROLE_ASSISTANT: &str = "assistant";
 
@@ -130,9 +136,14 @@ pub enum SpecDesignMessage {
     },
     /// Free-form brainstorm turn INSIDE the design session: appends the user
     /// question, asks the LLM (opinionated options + recommendation, grounded
-    /// in the running summary), appends the answer, replies with both.
+    /// in the running summary and any requested grounding), appends the
+    /// answer, replies with both.
     Ask {
         text: String,
+        /// Ground the answer in the Spire docs RAG (spire-actor/spire-core).
+        docs: bool,
+        /// Ground the answer in a web search.
+        web: bool,
         reply_to: oneshot::Sender<Result<(String, SpecDesignState), String>>,
     },
     Decide {
@@ -168,6 +179,9 @@ pub struct SpecDesignActor {
     instance: String,
     /// How many turns are already persisted to the graph (append-only writes).
     persisted_through: usize,
+    /// Optional grounding lookups used only when the Ask flags request them.
+    rag_search: Option<GroundingFn>,
+    web_search: Option<GroundingFn>,
 }
 
 impl SpecDesignActor {
@@ -189,12 +203,24 @@ impl SpecDesignActor {
             last_issues: Vec::new(),
             instance: String::new(),
             persisted_through: 0,
+            rag_search: None,
+            web_search: None,
         }
     }
 
     /// Wire the memory graph so Decide can persist the derived spec.
     pub fn set_memory_graph(&mut self, tx: mpsc::Sender<MemoryGraphMessage>) {
         self.memory_graph_tx = Some(tx);
+    }
+
+    /// Optional docs-RAG grounding (Spire docs domain) for Ask turns.
+    pub fn set_rag_search(&mut self, f: GroundingFn) {
+        self.rag_search = Some(f);
+    }
+
+    /// Optional web-search grounding for Ask turns.
+    pub fn set_web_search(&mut self, f: GroundingFn) {
+        self.web_search = Some(f);
     }
 
     /// Node/subtype + name conventions for the persisted free-form session.
@@ -537,7 +563,12 @@ impl SpecDesignActor {
     /// message). Appends the user turn FIRST (capture survives an LLM error),
     /// then asks the LLM grounded in the current summary + recent turns,
     /// appends the assistant answer, and returns (answer, state).
-    pub async fn ask(&mut self, text: &str) -> Result<(String, SpecDesignState), String> {
+    pub async fn ask(
+        &mut self,
+        text: &str,
+        docs: bool,
+        web: bool,
+    ) -> Result<(String, SpecDesignState), String> {
         self.require_freeform()?;
         self.require_session()?;
         let text = text.trim().to_string();
@@ -548,15 +579,45 @@ impl SpecDesignActor {
             role: ROLE_USER.to_string(),
             text: text.clone(),
         });
+        self.persist_session().await;
         let summary = self.summary.as_ref().map(|a| a.content.clone());
         let start = self.turns.len().saturating_sub(10);
         let context = self.turns[start..].to_vec();
+        // Optional grounding: docs RAG and/or web search, requested explicitly.
+        let mut grounding: Vec<String> = Vec::new();
+        if docs {
+            if let Some(f) = &self.rag_search {
+                let hits = f(&text, 4).await;
+                if !hits.is_empty() {
+                    let mut block = "## Spire architecture (docs)".to_string();
+                    for h in hits {
+                        block.push('\n');
+                        block.push_str(&h);
+                    }
+                    grounding.push(block);
+                }
+            }
+        }
+        if web {
+            if let Some(f) = &self.web_search {
+                let hits = f(&text, 4).await;
+                if !hits.is_empty() {
+                    let mut block = "## Web results".to_string();
+                    for h in hits {
+                        block.push('\n');
+                        block.push_str(&h);
+                    }
+                    grounding.push(block);
+                }
+            }
+        }
         let prompt = brainstorm_prompt(
             &self.project_name,
             &self.goal,
             &text,
             summary.as_deref(),
             &context,
+            &grounding,
         );
         let answer = self.call_llm(prompt).await?;
         self.turns.push(DesignTurn {
@@ -862,6 +923,7 @@ fn brainstorm_prompt(
     question: &str,
     summary: Option<&str>,
     context: &[DesignTurn],
+    grounding: &[String],
 ) -> String {
     let summary = summary.unwrap_or("(no summary yet — the brainstorm is still open)");
     let mut parts: Vec<String> = Vec::new();
@@ -876,13 +938,21 @@ fn brainstorm_prompt(
     parts.push(String::new());
     parts.push("## Recent conversation".to_string());
     parts.push(format_turns(context));
+    if !grounding.is_empty() {
+        parts.push(String::new());
+        for block in grounding {
+            parts.push(block.clone());
+        }
+    }
     parts.push(String::new());
     parts.push(
         "You are an opinionated design partner for this project. Answer the question".to_string(),
     );
+    parts.push("in the free-form brainstorm. Ground your answer in the supplied".to_string());
     parts.push(
-        "in the free-form brainstorm. When it involves a choice, offer 2-3 concrete".to_string(),
+        "architecture/web references when present; otherwise answer from knowledge.".to_string(),
     );
+    parts.push("When it involves a choice, offer 2-3 concrete".to_string());
     parts.push("options with trade-offs and a clear recommendation, then end with one".to_string());
     parts.push("pointed question so the user can react. Nothing is decided yet — no".to_string());
     parts.push("statuses, no forced structure. Do not invent facts outside the".to_string());
@@ -940,8 +1010,13 @@ impl Actor for SpecDesignActor {
             } => {
                 let _ = reply_to.send(self.promote(&instruction).await);
             }
-            SpecDesignMessage::Ask { text, reply_to } => {
-                let _ = reply_to.send(self.ask(&text).await);
+            SpecDesignMessage::Ask {
+                text,
+                docs,
+                web,
+                reply_to,
+            } => {
+                let _ = reply_to.send(self.ask(&text, docs, web).await);
             }
             SpecDesignMessage::Decide { reply_to } => {
                 let _ = reply_to.send(self.decide().await);
@@ -1283,7 +1358,8 @@ mod tests {
         a.start("spire-gis", "view and edit map layers").unwrap();
         seed_conversation(&mut a);
         // Ask before any summary exists.
-        let (answer1, state1) = pollster(a.ask("what is the best canonical GIS format?")).unwrap();
+        let (answer1, state1) =
+            pollster(a.ask("what is the best canonical GIS format?", false, false)).unwrap();
         assert_eq!(
             answer1,
             "store WKB in SeleneDB; serve GeoJSON at the bridge"
@@ -1299,7 +1375,8 @@ mod tests {
         // now in the prompt context, and the assistant answer is captured.
         let s = pollster(a.summarize("summarize the storage decision")).unwrap();
         assert_eq!(s.version, 1);
-        let (answer2, state2) = pollster(a.ask("which rust crate for spatial ops?")).unwrap();
+        let (answer2, state2) =
+            pollster(a.ask("which rust crate for spatial ops?", true, true)).unwrap();
         assert_eq!(answer2, "use crate geo for spatial ops");
         let p2 = prompts.lock().unwrap()[2].clone();
         assert!(
@@ -1318,7 +1395,7 @@ mod tests {
         let llm: LlmCall = Box::new(|_| Box::pin(async move { Err("boom".to_string()) }));
         let mut a = SpecDesignActor::new(llm);
         a.start("spire-gis", "view and edit map layers").unwrap();
-        let err = pollster(a.ask("question")).unwrap_err();
+        let err = pollster(a.ask("question", false, false)).unwrap_err();
         assert!(err.contains("boom"));
         // The user's question was captured even though the LLM failed.
         assert_eq!(a.state().turn_count, 1);
@@ -1476,6 +1553,38 @@ mod tests {
         let sb = pollster(c.start_session("spire-beta", "ignored", false)).unwrap();
         assert_eq!(sb.turn_count, 1);
         assert!(sb.summary.as_ref().unwrap().content.contains("beta"));
+    }
+
+    #[test]
+    fn ask_grounds_on_docs_and_web_when_requested() {
+        let (mut a, prompts) = actor(vec!["answer one".to_string(), "answer two".to_string()]);
+        let rag: GroundingFn = Box::new(|_, _| {
+            Box::pin(async move { vec!["- Actor trait: handle(&mut self, msg)".to_string()] })
+        });
+        let web: GroundingFn = Box::new(|_, _| {
+            Box::pin(async move { vec!["- GeoJSON vs WKB (wikipedia)".to_string()] })
+        });
+        a.set_rag_search(rag);
+        a.set_web_search(web);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+
+        let (_, _) = pollster(a.ask("what is the best canonical GIS format?", true, true)).unwrap();
+        let p = prompts.lock().unwrap()[0].clone();
+        assert!(
+            p.contains("## Spire architecture (docs)"),
+            "docs grounding block"
+        );
+        assert!(p.contains("- Actor trait: handle(&mut self, msg)"));
+        assert!(p.contains("## Web results"), "web grounding block");
+        assert!(p.contains("- GeoJSON vs WKB (wikipedia)"));
+
+        // No flag -> no grounding sections, and the freeform answer is produced.
+        let (answer, _) = pollster(a.ask("summarize the storage idea", false, false)).unwrap();
+        assert_eq!(answer, "answer two");
+        let p2 = prompts.lock().unwrap()[1].clone();
+        assert!(!p2.contains("## Web results"));
+        assert!(!p2.contains("## Spire architecture (docs)"));
     }
 
     /// Block on a future from a sync test (no global runtime needed).

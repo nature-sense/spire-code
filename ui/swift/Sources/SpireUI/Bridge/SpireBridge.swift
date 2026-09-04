@@ -1949,8 +1949,8 @@ final class SpireBridge {
     /// Ask the LLM a free-form brainstorm question INSIDE the design session
     /// (the design transcript owns the conversation). Appends user + assistant
     /// turns server-side; returns the answer text and the updated state.
-    func specDesignAsk(projectName: String, text: String) async -> (text: String?, state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/ask", params: ["projectName": projectName, "text": text])
+    func specDesignAsk(projectName: String, text: String, docs: Bool = false, web: Bool = false) async -> (text: String?, state: SpecDesignState?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/ask", params: ["projectName": projectName, "text": text, "docs": docs, "web": web])
         guard error == nil else { return (nil, nil, error) }
         guard let dict = value as? [String: Any] else {
             return (nil, nil, "spec-design/ask: unreadable reply")

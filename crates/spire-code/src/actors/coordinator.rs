@@ -3350,6 +3350,89 @@ impl CoordinatorActor {
         let mut actor =
             crate::subsystems::project::spec_design::SpecDesignActor::new(llm);
         actor.set_memory_graph(self.memory_graph_tx.clone());
+        // Docs RAG grounding (spire-actor/spire-core application corpora).
+        let rag_tx = self
+            .registry
+            .as_ref()
+            .and_then(|r| r.get::<RagMessage>("rag"));
+        if let Some(rag_tx) = rag_tx {
+            let docs: crate::subsystems::project::spec_design::GroundingFn = Box::new(
+                move |query: &str, top_k: usize| {
+                    let rag_tx = rag_tx.clone();
+                    let query = query.to_string();
+                    Box::pin(async move {
+                        let mut out: Vec<String> = Vec::new();
+                        for domain in ["spire-core", "spire-actor"] {
+                            let (t, r) = tokio::sync::oneshot::channel();
+                            if rag_tx
+                                .send(RagMessage::Query {
+                                    domain: domain.to_string(),
+                                    query: query.clone(),
+                                    top_k,
+                                    reply_to: t,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            if let Ok(Ok(chunks)) = r.await {
+                                for c in chunks {
+                                    out.push(format!(
+                                        "[{domain}] {}: {}",
+                                        c.source_path,
+                                        c.text.trim()
+                                    ));
+                                }
+                            }
+                        }
+                        out
+                    })
+                },
+            );
+            actor.set_rag_search(docs);
+        }
+        // Web-search grounding (Tavily when keyed; Wikipedia fallback).
+        let web: crate::subsystems::project::spec_design::GroundingFn = Box::new(
+            |query: &str, top_k: usize| {
+                let query = query.to_string();
+                Box::pin(async move {
+                    match spire_core::actors::web_search::call(
+                        "search/web",
+                        serde_json::json!({ "query": query, "max_results": top_k }),
+                    )
+                    .await
+                    {
+                        Ok(value) => match value.as_array() {
+                            Some(items) => items
+                                .iter()
+                                .filter_map(|it| {
+                                    let title = it
+                                        .get("title")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let url = it.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                    let snippet = it
+                                        .get("content")
+                                        .or_else(|| it.get("snippet"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if title.is_empty() && url.is_empty() {
+                                        None
+                                    } else {
+                                        Some(format!("- {title} — {url}
+  {snippet}"))
+                                    }
+                                })
+                                .collect(),
+                            None => Vec::new(),
+                        },
+                        Err(_) => Vec::new(),
+                    }
+                })
+            },
+        );
+        actor.set_web_search(web);
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let _handle = spire_core::actors::Actor::spawn(actor, rx);
         if let Ok(mut g) = map.lock() {
@@ -3412,13 +3495,20 @@ impl CoordinatorActor {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let docs = params.get("docs").and_then(|v| v.as_bool()).unwrap_or(false);
+        let web = params.get("web").and_then(|v| v.as_bool()).unwrap_or(false);
         let tx = match self.spec_design_tx(&project_name).await {
             Ok(tx) => tx,
             Err(e) => return serde_json::json!({ "error": e }),
         };
         let (t, r) = tokio::sync::oneshot::channel();
         let _ = tx
-            .send(SpecDesignMessage::Ask { text, reply_to: t })
+            .send(SpecDesignMessage::Ask {
+                text,
+                docs,
+                web,
+                reply_to: t,
+            })
             .await;
         match r.await {
             Ok(Ok((answer, state))) => {
