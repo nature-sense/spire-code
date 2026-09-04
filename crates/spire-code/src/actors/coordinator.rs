@@ -3210,6 +3210,37 @@ impl CoordinatorActor {
                     Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
                 }
             }
+            "rag/install-bundle-manifests" => {
+                // Ship the application-wisdom corpora (spire-actor + spire-core
+                // docs) into the KnowledgeStore's manifest scan dirs so RagView
+                // discovers them and its existing Ingest buttons build the
+                // corpus. Portable: sources fetch from GitHub (cached).
+                let dir = spire_core::config::knowledge_dir();
+                let bundles: [(&str, &str); 2] = [
+                    (
+                        "spire-core",
+                        include_str!("../../resources/rag-ingest/spire-core.ingest.yaml"),
+                    ),
+                    (
+                        "spire-actor",
+                        include_str!("../../resources/rag-ingest/spire-actor.ingest.yaml"),
+                    ),
+                ];
+                let mut installed: Vec<String> = Vec::new();
+                for (name, content) in bundles {
+                    let target = dir.join(name).join("ingest.yaml");
+                    if let Some(parent) = target.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            return serde_json::json!({ "error": format!("create dir: {e}") });
+                        }
+                    }
+                    if let Err(e) = std::fs::write(&target, content) {
+                        return serde_json::json!({"error": format!("write {name}: {e}") });
+                    }
+                    installed.push(name.to_string());
+                }
+                serde_json::json!({ "success": true, "installed": installed })
+            }
             "rag/list-manifests" => {
                 let project_root = params
                     .get("project_root")

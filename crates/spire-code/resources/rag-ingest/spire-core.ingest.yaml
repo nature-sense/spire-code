@@ -1,0 +1,28 @@
+# Application wisdom corpus: the spire-core library documentation (docs/*.md +
+# README), ingested into the user-level KnowledgeStore. Sources are fetched
+# from GitHub (cached) so this manifest is portable and version-controlled.
+version: "1.0"
+pipeline:
+  name: spire-core
+  target_platform: spire-core
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: spire-core
+      patterns:
+        - "**/*.md"
+  sources:
+    - id: spire-core-docs
+      type: github_repo
+      enabled: true
+      url: https://github.com/nature-sense/spire-core.git
+      processing:
+        parser: markdown
+        include_files:
+          - "docs/**/*.md"
+          - "README.md"
+        exclude_paths:
+          - "target/**"
+          - "**/target/**"

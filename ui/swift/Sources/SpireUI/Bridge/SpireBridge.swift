@@ -890,6 +890,24 @@ final class SpireBridge {
         }
     }
 
+    /// Install the bundled application-wisdom manifests (spire-actor +
+    /// spire-core docs) into the KnowledgeStore scan dirs so RagView lists
+    /// them and their Ingest buttons build the corpus.
+    func installSpireDocsManifests() async -> Bool {
+        let body: [String: Any] = ["method": "rag/install-bundle-manifests", "params": [:]]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               json["error"] is String {
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
     /// Discover the available ingestion manifests (`ingest.yaml` per
     /// platform) via `rag/list-manifests`. RAG is project-independent.
     func fetchRagManifests() async -> [RagManifestInfo] {

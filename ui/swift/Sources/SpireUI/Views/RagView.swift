@@ -41,6 +41,7 @@ struct RagView: View {
 
     // Ingest state
     @State private var ingestingPath: String?
+    @State private var installingDocs = false
     @State private var lastIngestMessage: String?
     /// Per-domain persisted per-source statuses (fetched from the
     /// KnowledgeStore on load — visible WITHOUT re-ingesting).
@@ -206,6 +207,27 @@ struct RagView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 10)
 
+            Button {
+                Task { await installDocsManifests() }
+            } label: {
+                if installingDocs {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Installing…")
+                    }
+                } else {
+                    Label("Install bundled Spire docs manifests", systemImage: "square.and.arrow.down")
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .padding(.horizontal, 10)
+            .disabled(installingDocs)
+            Text("Install the spire-actor + spire-core doc corpora (application wisdom), then press Ingest on each.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+
             if manifests.isEmpty {
                 ContentUnavailableView("No manifests", systemImage: "doc.text.magnifyingglass",
                     description: Text("Place an ingestion.yaml in ~/.spire/knowledge/<platform>/"))
@@ -320,6 +342,18 @@ struct RagView: View {
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 8).fill(theme.nodeBackground))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
+    }
+
+    @MainActor
+    private func installDocsManifests() async {
+        installingDocs = true
+        defer { installingDocs = false }
+        if await bridge.installSpireDocsManifests() {
+            lastIngestMessage = "Installed — press Ingest on each manifest to build the corpus."
+        } else {
+            lastIngestMessage = "Install failed — check ~/.spire/logs/spire-scaffold.log."
+        }
+        await load()
     }
 
     private func ingest(_ m: RagManifestInfo) async {

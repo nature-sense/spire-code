@@ -1,0 +1,28 @@
+# Application wisdom corpus: the spire-actor library documentation (docs/*.md +
+# README), ingested into the user-level KnowledgeStore. Sources are fetched
+# from GitHub (cached) so this manifest is portable and version-controlled.
+version: "1.0"
+pipeline:
+  name: spire-actor
+  target_platform: spire-actor
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: spire-actor
+      patterns:
+        - "**/*.md"
+  sources:
+    - id: spire-actor-docs
+      type: github_repo
+      enabled: true
+      url: https://github.com/nature-sense/spire-actor.git
+      processing:
+        parser: markdown
+        include_files:
+          - "docs/**/*.md"
+          - "README.md"
+        exclude_paths:
+          - "target/**"
+          - "**/target/**"
