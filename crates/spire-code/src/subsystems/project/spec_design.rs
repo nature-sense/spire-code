@@ -846,6 +846,32 @@ fn format_turns(turns: &[DesignTurn]) -> String {
     }
 }
 
+/// Injected at the top of every design prompt so the model always designs
+/// within the Spire stack instead of proposing arbitrary tech (Python/JS/web).
+const SPIRE_APP_CONTEXT: &str = "SPIRE APP CONTEXT — always design within this.\n\
+A Spire app is a native macOS application with a FIXED, non-negotiable stack:\n\
+- UI: SwiftUI (macOS) — declarative screens.\n\
+- Core: Rust, built on the actor pattern — isolated actors that own their state\n\
+  and exchange typed messages over channels (no shared mutable state).\n\
+- Integration: a JSON FFI bridge — actors expose named methods with typed\n\
+  parameters and a typed result, called from SwiftUI.\n\
+- Specification: the design is captured as a formal AppSpec with these sections:\n\
+  * app    — project name + goal\n\
+  * types  — shared records/enums referenced by actors, bridge and UI\n\
+  * graph  — the memory-graph schema (nodes + edges) actors persist/query\n\
+  * actors — the Rust side: each actor lists the bridge methods it handles\n\
+  * bridge — the JSON method contract (method + params + result types)\n\
+  * ui     — SwiftUI screens whose actions bind to bridge methods\n\
+\n\
+HARD CONSTRAINTS:\n\
+- Design ONLY within the Spire stack: SwiftUI UI + Rust actors + the JSON\n\
+  bridge + the AppSpec sections above.\n\
+- Do NOT propose other languages or frameworks (Python, JavaScript, web/React,\n\
+  Node, Flutter, Electron, or external servers/databases as the primary\n\
+  backend).\n\
+- The app's backend IS its own Rust actors; persistence is via the memory graph.\n\
+- Project/crate naming convention: `spire-<name>`.";
+
 /// Free-form summarize prompt: folds the delta into the running summary unless
 /// the instruction asks for a full-material rewrite. NO statuses, NO "decided"
 /// markers — the summary is prose; nothing is decided until the Decide button.
@@ -857,7 +883,7 @@ fn summarize_prompt(
     material: &[DesignTurn],
 ) -> String {
     let existing = existing_summary.unwrap_or("none yet");
-    format!(
+    let body = format!(
         "# Summarize the design conversation\n\nProject: {project_name}\nGoal: {goal}\n\n\
          ## The user's instruction\n{instruction}\n\n\
          ## Current summary (the running source of truth)\n{existing}\n\n\
@@ -872,7 +898,8 @@ fn summarize_prompt(
          Do not invent facts; only reflect what was actually discussed.\n\
          Output only the summary text.",
         format_turns(material)
-    )
+    );
+    format!("{SPIRE_APP_CONTEXT}\n\n{body}")
 }
 
 /// Free-form promote prompt: compiles the (mature) summary onto the strict
@@ -886,7 +913,7 @@ fn compile_spec_prompt(
     recent_context: &[DesignTurn],
 ) -> String {
     let existing = existing_spec.unwrap_or("none yet");
-    format!(
+    let body = format!(
         "# Turn the design summary into a spec\n\nProject: {project_name}\nGoal: {goal}\n\n\
          ## The user's instruction\n{instruction}\n\n\
          ## Design summary (the running source of truth)\n{summary}\n\n\
@@ -911,7 +938,8 @@ fn compile_spec_prompt(
          validate.\n\
          Output ONLY the spec markdown.",
         format_turns(recent_context)
-    )
+    );
+    format!("{SPIRE_APP_CONTEXT}\n\n{body}")
 }
 
 /// Free-form brainstorm prompt: an opinionated design partner that offers
@@ -927,6 +955,7 @@ fn brainstorm_prompt(
 ) -> String {
     let summary = summary.unwrap_or("(no summary yet — the brainstorm is still open)");
     let mut parts: Vec<String> = Vec::new();
+    parts.push(SPIRE_APP_CONTEXT.to_string());
     parts.push(format!("Project: {project_name}"));
     parts.push(format!("Goal: {goal}"));
     parts.push(String::new());
@@ -1594,5 +1623,26 @@ mod tests {
             .build()
             .unwrap()
             .block_on(fut)
+    }
+}
+
+
+#[cfg(test)]
+mod spire_context_tests {
+    use super::*;
+
+    #[test]
+    fn design_prompts_carry_the_spire_app_context() {
+        let b = brainstorm_prompt("spire-gis", "view and edit map layers", "what stack?", None, &[], &[]);
+        assert!(b.contains("SPIRE APP CONTEXT"));
+        assert!(b.contains("SwiftUI"));
+        assert!(b.contains("actor pattern"));
+        assert!(b.contains("Rust"));
+
+        let s = summarize_prompt("spire-gis", "view and edit map layers", "add to the summary", None, &[]);
+        assert!(s.contains("SPIRE APP CONTEXT"));
+
+        let p = compile_spec_prompt("spire-gis", "view and edit map layers", "compile", "summary", None, &[]);
+        assert!(p.contains("SPIRE APP CONTEXT"));
     }
 }
