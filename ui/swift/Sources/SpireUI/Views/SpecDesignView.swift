@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// One line in the free-form design conversation.
 struct SpecDesignLine: Identifiable {
@@ -295,13 +296,31 @@ struct SpecDesignView: View {
 
     private func artifactCard(title: String, artifact: SpecDesignArtifact?, systemImage: String, markdown: Bool = true) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack {
+            HStack(spacing: 8) {
                 Label(title, systemImage: systemImage).font(.headline)
                 Spacer()
                 if let artifact {
                     Text("v\(artifact.version)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Button {
+                        copyArtifact(artifact.content)
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Copy the \(title.lowercased()) markdown to the clipboard")
+                    Button {
+                        exportArtifact(title: title, content: artifact.content)
+                    } label: {
+                        Label("Export…", systemImage: "square.and.arrow.up")
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Save the \(title.lowercased()) to a .md file")
                 }
             }
             ScrollView {
@@ -319,6 +338,32 @@ struct SpecDesignView: View {
             .frame(maxHeight: .infinity)
             .padding(6)
             .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.4)))
+        }
+    }
+
+    // MARK: - Artifact copy / export
+
+    /// Put an artifact's raw markdown on the clipboard (pasting keeps the
+    /// headings/lists structure).
+    private func copyArtifact(_ content: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(content, forType: .string)
+    }
+
+    /// Save an artifact to a .md file the user chooses.
+    @MainActor
+    private func exportArtifact(title: String, content: String) {
+        let panel = NSSavePanel()
+        panel.title = "Export \(title)"
+        panel.nameFieldStringValue = "\(projectName)-\(title.lowercased()).md"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try content.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = "Export failed: \(error.localizedDescription)"
         }
     }
 
