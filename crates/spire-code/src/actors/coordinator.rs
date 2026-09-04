@@ -3331,7 +3331,11 @@ impl CoordinatorActor {
                     if llm_tx
                         .send(crate::actors::LlmMessage::Complete {
                             prompt,
-                            role: spire_core::subsystems::llm::llm::LlmModelRole::Planning,
+                            // Free-form brainstorm/spec drafting — prose, NOT
+                            // structured JSON. The Planning role forces
+                            // json_object mode, which DeepSeek rejects (400)
+                            // for non-JSON prompts.
+                            role: spire_core::subsystems::llm::llm::LlmModelRole::Freeform,
                             reply_to: t,
                         })
                         .await
