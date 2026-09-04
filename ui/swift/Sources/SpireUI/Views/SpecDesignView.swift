@@ -8,25 +8,6 @@ struct SpecDesignLine: Identifiable {
     let text: String
 }
 
-/// Renders LLM prose markdown (headings, bold/italic, inline + fenced code,
-/// links) via the built-in AttributedString parser. Foundation has no table
-/// support, so the formal spec document intentionally stays raw monospaced.
-struct MarkdownText: View {
-    let attributed: AttributedString?
-    let raw: String
-    init(_ text: String) {
-        raw = text
-        attributed = try? AttributedString(markdown: text)
-    }
-    var body: some View {
-        if let attributed {
-            Text(attributed)
-        } else {
-            Text(raw)
-        }
-    }
-}
-
 /// Opens the AppSpec design session as a large, resizable floating window —
 /// the brainstorm is text-heavy and a sheet would be capped by the main
 /// window. Mirrors the RagPortal / TerminalPortal pattern.
