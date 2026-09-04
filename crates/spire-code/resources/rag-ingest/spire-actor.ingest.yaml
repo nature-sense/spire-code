@@ -3,8 +3,8 @@
 # from GitHub (cached) so this manifest is portable and version-controlled.
 version: "1.0"
 pipeline:
-  name: spire-actor
-  target_platform: spire-actor
+  name: Spire Actor — actor-model library docs
+  corpus: spire-actor
   settings:
     chunk_size: 1800
     chunk_overlap: 120

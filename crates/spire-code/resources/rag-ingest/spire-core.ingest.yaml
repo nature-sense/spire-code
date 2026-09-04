@@ -3,8 +3,8 @@
 # from GitHub (cached) so this manifest is portable and version-controlled.
 version: "1.0"
 pipeline:
-  name: spire-core
-  target_platform: spire-core
+  name: Spire Core — architecture & API docs
+  corpus: spire-core
   settings:
     chunk_size: 1800
     chunk_overlap: 120

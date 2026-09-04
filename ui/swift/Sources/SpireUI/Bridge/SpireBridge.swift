@@ -908,8 +908,8 @@ final class SpireBridge {
         }
     }
 
-    /// Discover the available ingestion manifests (`ingest.yaml` per
-    /// platform) via `rag/list-manifests`. RAG is project-independent.
+    /// Discover the available ingestion manifests (`ingest.yaml`, one per
+    /// corpus directory) via `rag/list-manifests`. RAG is project-independent.
     func fetchRagManifests() async -> [RagManifestInfo] {
         do {
             let body: [String: Any] = [
@@ -945,7 +945,7 @@ final class SpireBridge {
     }
 
     /// Set the default RAG domain used by `rag/search` when `domain` is omitted
-    /// (kept in sync with the platform selected in the UI).
+    /// (kept in sync with the corpus selected in the UI).
     func setRagDomain(domain: String) async {
         let body: [String: Any] = [
             "method": "rag/set-domain",

@@ -3,7 +3,7 @@ import Foundation
 /// A per-domain summary of the ingested RAG corpus ("state of the data"),
 /// mirror of `spire_core::actors::rag::RagDomainInfo`.
 struct RagDomainInfo: Codable, Identifiable, Hashable {
-    /// Clean platform/domain id (e.g. "rpi5") — NOT `rag_domain:<id>`.
+    /// Clean corpus/domain id (e.g. "rpi5", "spire-core") — NOT `rag_domain:<id>`.
     let id: String
     let name: String
     let description: String
@@ -24,11 +24,12 @@ struct RagDomainInfo: Codable, Identifiable, Hashable {
 }
 
 /// A discoverable ingestion manifest ("ingest script"), mirror of
-/// `spire_core::actors::rag::RagManifestInfo`.
+/// `spire_core::actors::rag::RagManifestInfo`. `domain` is the corpus the
+/// script builds — declared via `pipeline.corpus`, else the manifest's own
+/// directory name (`~/.spire/knowledge/<corpus>/ingest.yaml`).
 struct RagManifestInfo: Codable, Identifiable, Hashable {
-    let platformId: String
     let domain: String
-    /// Absolute path to the `ingestion.yaml` / `rag.yaml` file.
+    /// Absolute path to the `ingest.yaml` file.
     let path: String
     let corpusVersion: String
     let description: String
@@ -36,7 +37,6 @@ struct RagManifestInfo: Codable, Identifiable, Hashable {
     var id: String { path }
 
     enum CodingKeys: String, CodingKey {
-        case platformId = "platform_id"
         case domain
         case path
         case corpusVersion = "corpus_version"
@@ -124,7 +124,6 @@ struct HalFillItem: Codable, Hashable, Identifiable {
 
 struct RagIngestReport: Codable, Hashable {
     let domain: String
-    let platformId: String
     let corpusVersion: String
     let chunks: Int
     let entities: Int
@@ -133,7 +132,6 @@ struct RagIngestReport: Codable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case domain
-        case platformId = "platform_id"
         case corpusVersion = "corpus_version"
         case chunks
         case entities

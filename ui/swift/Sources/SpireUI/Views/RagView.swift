@@ -22,16 +22,23 @@ enum RagPortal {
     }
 }
 
-/// The RAG panel: platforms ↔ ingested corpora, ingest manifests ("scripts"),
-/// ingest controls, corpus state, and semantic search.
+/// A row in the Corpora pane: an ingested domain, or a corpus declared by an
+/// ingest script that hasn't been ingested yet.
+private struct CorpusEntry: Identifiable {
+    let id: String
+    let domain: RagDomainInfo?
+}
+
+/// The RAG panel: ingested corpora/domains (driven by the available ingest
+/// scripts), ingest controls, corpus state, and semantic search. Corpora are
+/// named by the scripts themselves — no build-platform coupling.
 struct RagView: View {
     @Environment(SpireBridge.self) private var bridge
     @Environment(AppTheme.self) private var theme
 
-    @State private var platforms: [Platform] = []
     @State private var domains: [RagDomainInfo] = []
     @State private var manifests: [RagManifestInfo] = []
-    @State private var selectedPlatformId: String?
+    @State private var selectedCorpusId: String?
     @State private var loading = true
 
     // Search state
@@ -49,8 +56,8 @@ struct RagView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // ── Left: platform ↔ corpus table ──
-            platformList
+            // ── Left: corpora (from ingested domains + ingest scripts) ──
+            corpusList
                 .frame(width: 220)
 
             Divider()
@@ -68,14 +75,12 @@ struct RagView: View {
         .task { await load() }
     }
 
-    /// Fresh load of platforms + domain summaries + manifests.
+    /// Fresh load of domain summaries + ingest scripts.
     private func load() async {
         loading = true
-        async let ps = bridge.fetchPlatforms()
         async let ds = bridge.fetchRagDomains()
         async let ms = bridge.fetchRagManifests()
-        let (p, d, m) = await (ps, ds, ms)
-        platforms = p
+        let (d, m) = await (ds, ms)
         domains = d
         manifests = m
         // Persisted per-source status (survives reloads; no ingest required).
@@ -87,41 +92,54 @@ struct RagView: View {
             }
         }
         sourcesByDomain = byDomain
-        if selectedPlatformId == nil {
-            selectedPlatformId = platforms.first?.id
+        if selectedCorpusId == nil {
+            selectedCorpusId = domains.first?.id ?? manifests.first?.domain
         }
-        if let id = selectedPlatformId {
+        if let id = selectedCorpusId {
             await bridge.setRagDomain(domain: id)
         }
         loading = false
     }
 
-    // MARK: - Platform ↔ corpus list
+    // MARK: - Corpus list
 
-    private var platformList: some View {
+    /// Every ingested domain, plus corpora declared by the ingest scripts that
+    /// have not been ingested yet (they still select; their row reads
+    /// "Not ingested").
+    private var corpusEntries: [CorpusEntry] {
+        var seen = Set<String>()
+        var out: [CorpusEntry] = []
+        for d in domains where seen.insert(d.id).inserted {
+            out.append(CorpusEntry(id: d.id, domain: d))
+        }
+        for m in manifests where seen.insert(m.domain).inserted {
+            out.append(CorpusEntry(id: m.domain, domain: nil))
+        }
+        return out
+    }
+
+    private var corpusList: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Platforms")
+            Text("Corpora")
                 .font(.subheadline.weight(.semibold))
                 .padding(.horizontal, 10)
                 .padding(.top, 10)
+            Text("domains produced by the ingest scripts")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
 
             if loading {
                 ProgressView().padding()
                 Spacer()
-            } else if platforms.isEmpty && domains.isEmpty {
+            } else if corpusEntries.isEmpty {
                 ContentUnavailableView("No knowledge yet", systemImage: "books.vertical",
-                    description: Text("Run an ingest manifest to build the corpus."))
+                    description: Text("Install or place an ingest script, then run Ingest to build the corpus."))
                 Spacer()
             } else {
                 List {
-                    // Every registry platform gets a row (even without a corpus).
-                    ForEach(platforms) { p in
-                        row(platform: p)
-                    }
-                    // Domains that exist in the store but have no registry
-                    // entry (legacy `rag.yaml` without a platform seed).
-                    ForEach(orphanDomains) { d in
-                        orphanRow(domain: d)
+                    ForEach(corpusEntries) { entry in
+                        corpusRow(entry)
                     }
                 }
                 .scrollContentBackground(.hidden)
@@ -130,20 +148,21 @@ struct RagView: View {
         .background(theme.surface)
     }
 
-    /// Registry platforms joined with their corpus summary (if ingested).
-    private func row(platform: Platform) -> some View {
-        let domain = domains.first { $0.id == platform.id }
+    /// One corpus row: selection also pins the default `rag/search` domain.
+    private func corpusRow(_ entry: CorpusEntry) -> some View {
+        let domain = entry.domain
+        let chunked = (domain?.chunkCount ?? 0) > 0
         return Button {
-            selectedPlatformId = platform.id
-            Task { await bridge.setRagDomain(domain: platform.id) }
+            selectedCorpusId = entry.id
+            Task { await bridge.setRagDomain(domain: entry.id) }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
-                    Image(systemName: domain.map { $0.chunkCount > 0 } == true ? "checkmark.circle.fill" : "circle.dashed")
+                    Image(systemName: chunked ? "checkmark.circle.fill" : "circle.dashed")
                         .font(.caption)
-                        .foregroundStyle(domain.map { $0.chunkCount > 0 } == true ? theme.accent : .secondary)
-                    Text(platform.name).font(.callout.weight(.medium))
-                        .foregroundStyle(selectedPlatformId == platform.id ? theme.accent : theme.textPrimary)
+                        .foregroundStyle(chunked ? theme.accent : .secondary)
+                    Text(domain?.name ?? entry.id).font(.callout.weight(.medium))
+                        .foregroundStyle(selectedCorpusId == entry.id ? theme.accent : theme.textPrimary)
                 }
                 Text(summaryLine(domain))
                     .font(.caption2)
@@ -154,41 +173,11 @@ struct RagView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .listRowBackground(selectedPlatformId == platform.id ? theme.accentBackground : Color.clear)
-    }
-
-    private func orphanRow(domain: RagDomainInfo) -> some View {
-        Button {
-            selectedPlatformId = domain.id
-            Task { await bridge.setRagDomain(domain: domain.id) }
-        } label: {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    Image(systemName: domain.chunkCount > 0 ? "checkmark.circle.fill" : "circle.dashed")
-                        .font(.caption)
-                        .foregroundStyle(domain.chunkCount > 0 ? theme.accent : .secondary)
-                    Text(domain.id).font(.callout.weight(.medium))
-                        .foregroundStyle(selectedPlatformId == domain.id ? theme.accent : theme.textPrimary)
-                }
-                Text(summaryLine(domain))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .listRowBackground(selectedPlatformId == domain.id ? theme.accentBackground : Color.clear)
-    }
-
-    private var orphanDomains: [RagDomainInfo] {
-        let knownIds = Set(platforms.map(\.id))
-        return domains.filter { !knownIds.contains($0.id) }
+        .listRowBackground(selectedCorpusId == entry.id ? theme.accentBackground : Color.clear)
     }
 
     private func summaryLine(_ d: RagDomainInfo?) -> String {
-        guard let d else { return "No corpus" }
+        guard let d else { return "Not ingested — run its script" }
         if d.chunkCount == 0 { return "Not ingested" }
         return "\(d.chunkCount) chunks · \(d.sourceCount) sources · \(d.tokenCount) tokens"
     }
@@ -202,7 +191,7 @@ struct RagView: View {
                 .padding(.horizontal, 10)
                 .padding(.top, 10)
 
-            Text("ingestion.yaml manifests (per platform)")
+            Text("ingest.yaml scripts — each builds its named corpus")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 10)
@@ -230,7 +219,7 @@ struct RagView: View {
 
             if manifests.isEmpty {
                 ContentUnavailableView("No manifests", systemImage: "doc.text.magnifyingglass",
-                    description: Text("Place an ingestion.yaml in ~/.spire/knowledge/<platform>/"))
+                    description: Text("Place an ingest.yaml in ~/.spire/knowledge/<corpus>/ or install the bundled docs."))
                     .frame(maxHeight: .infinity)
             } else {
                 ScrollView {
@@ -273,7 +262,7 @@ struct RagView: View {
             HStack(spacing: 4) {
                 Image(systemName: "doc.badge.gearshape")
                     .foregroundStyle(theme.accent)
-                Text(m.platformId)
+                Text(m.domain)
                     .font(.callout.weight(.semibold))
                 if let srcs = sourcesByDomain[m.domain], !srcs.isEmpty {
                     Text("\(srcs.count) sources")
@@ -288,6 +277,12 @@ struct RagView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            if !m.description.isEmpty && m.description != m.domain {
+                Text(m.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Text("corpus \(m.corpusVersion.prefix(8))")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
@@ -384,7 +379,7 @@ struct RagView: View {
             if let selected = selectedDomain {
                 domainDetail(selected)
             } else {
-                Text("Select a platform")
+                Text("Select a corpus")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -423,7 +418,7 @@ struct RagView: View {
     }
 
     private var selectedDomain: RagDomainInfo? {
-        guard let id = selectedPlatformId else { return nil }
+        guard let id = selectedCorpusId else { return nil }
         return domains.first { $0.id == id }
     }
 
@@ -492,7 +487,7 @@ struct RagView: View {
     }
 
     private func runSearch() async {
-        guard let domainId = selectedPlatformId, !domainId.isEmpty else { return }
+        guard let domainId = selectedCorpusId, !domainId.isEmpty else { return }
         let q = searchQuery.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
         searching = true
