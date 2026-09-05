@@ -2,16 +2,8 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// One line in the free-form design conversation.
-struct SpecDesignLine: Identifiable {
-    let id = UUID()
-    let role: String   // "user" | "assistant" | "system"
-    let text: String
-}
-
-/// Opens the AppSpec design session as a large, resizable floating window —
-/// the brainstorm is text-heavy and a sheet would be capped by the main
-/// window. Mirrors the RagPortal / TerminalPortal pattern.
+/// Opens the AppSpec design session as a large, resizable floating window.
+/// Mirrors the RagPortal / TerminalPortal pattern.
 enum SpecDesignPortal {
     private static var windows: [NSWindow] = []
     @MainActor static func open(bridge: SpireBridge, theme: AppTheme, projectName: String, goal: String = "") {
@@ -47,11 +39,9 @@ enum SpecDesignPortal {
     }
 }
 
-/// The AppSpec design step as a single conversation. The assistant proposes a
-/// recommended design, asks questions only when a choice genuinely matters, and
-/// — once the design is complete — calls the `submit_appspec` tool itself. The
-/// view then runs the wizard code generation automatically. No separate
-/// Summarize/Promote/Decide steps: everything happens through the chat.
+/// The AppSpec design step: paste a freeform but detailed spec (or load it from
+/// a file), convert it into the strict textual AppSpec, review the generated
+/// AppSpec, and accept it once it looks right.
 struct SpecDesignView: View {
     @Environment(SpireBridge.self) private var bridge
     @Environment(AppTheme.self) private var theme
@@ -60,58 +50,45 @@ struct SpecDesignView: View {
     let goal: String
     /// Called when the session window should close (used by the portal).
     var onClose: () -> Void = {}
-    /// Called with the submitted AppSpec dictionary (feeds the wizard's codegen).
+    /// Called with the accepted AppSpec dictionary (feeds the wizard's codegen).
     let onDecided: ([String: Any]) -> Void
 
-    @State private var lines: [SpecDesignLine] = []
-    @State private var draft = ""
+    @State private var freeform = ""
+    @State private var specMd: String?
+    @State private var issues: [SpecIssue] = []
     @State private var isDecided = false
     @State private var acceptedCount = 0
     @State private var busy = false
     @State private var errorMessage: String?
-    /// Questions the assistant still needs answered (blocks submission).
-    @State private var outline: String?
-    @State private var openQuestions: [DesignQuestion] = []
-    /// acceptedCount already handed to the code generator (fires once per submit).
-    @State private var codegenVersion = 0
-    /// Request grounding for the next brainstorm question.
-    @State private var useDocsRAG = false
-    @State private var useWebSearch = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
             HSplitView {
-                chatPane
-                statusPane
+                freeformPane
+                generatedPane
             }
         }
         .frame(minWidth: 1000, minHeight: 700)
         .task {
             let (state, error) = await bridge.specDesignStart(projectName: projectName, goal: goal)
             apply(state: state, error: error)
-            if state != nil {
-                lines.append(SpecDesignLine(
-                    role: "system",
-                    text: "Free-form design session for '\(projectName)'. Ask questions, bounce ideas, adjust the plan — when the design is complete the assistant submits the AppSpec itself and code generation starts automatically."
-                ))
-            }
         }
     }
 
-    // MARK: - Header (mode + Done / Back to design)
+    // MARK: - Header
 
     private var header: some View {
         HStack(spacing: 12) {
-            Label("Design AppSpec", systemImage: "bubble.left.and.bubble.right")
+            Label("Design AppSpec", systemImage: "doc.text.magnifyingglass")
                 .font(.title3.weight(.semibold))
             Text(projectName)
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
             if isDecided {
-                Label("AppSpec submitted", systemImage: "checkmark.seal.fill")
+                Label("AppSpec accepted", systemImage: "checkmark.seal.fill")
                     .font(.caption)
                     .foregroundStyle(.green)
                 Text("v\(acceptedCount)").font(.caption).foregroundStyle(.secondary)
@@ -120,326 +97,182 @@ struct SpecDesignView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(busy)
-                .help("Reopen the design: edit in the chat and the assistant submits a new version")
+                .help("Back to editing: change the freeform spec and convert again")
                 Button("Done") {
                     onClose()
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(busy)
             } else {
-                Label("Free-form", systemImage: "pencil.and.outline")
+                Text("Freeform spec → AppSpec → Accept")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Start over") {
-                    Task { await resetDesign() }
-                }
-                .buttonStyle(.bordered)
-                .disabled(busy)
-                .help("Discard the persisted session and design from scratch")
-            }
-        }
-        .padding(12)
-    }
-
-    // MARK: - Chat pane
-
-    private var chatPane: some View {
-        VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(lines) { line in
-                            bubble(for: line)
-                                .id(line.id)
-                        }
-                    }
-                    .padding(12)
-                }
-                .onChange(of: lines.count) { _, _ in
-                    if let last = lines.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
-                }
-            }
-            Divider()
-            inputBar
-        }
-        .frame(minWidth: 380)
-    }
-
-    @ViewBuilder
-    private func bubble(for line: SpecDesignLine) -> some View {
-        switch line.role {
-        case "user":
-            HStack {
-                Spacer(minLength: 60)
-                VStack(alignment: .trailing, spacing: 4) {
-                    MarkdownText(line.text)
-                        .padding(8)
-                        .background(RoundedRectangle(cornerRadius: 10).fill(.blue.opacity(0.15)))
-                    messageActions(line)
-                }
-            }
-        case "assistant":
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    MarkdownText(line.text)
-                        .padding(8)
-                        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary))
-                    messageActions(line)
-                }
-                Spacer(minLength: 40)
-            }
-        default:
-            Text(line.text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .italic()
-        }
-    }
-
-    /// Copy + Export actions under a message bubble, mirroring the helpers the
-    /// old Summary/Spec artifact cards offered.
-    private func messageActions(_ line: SpecDesignLine) -> some View {
-        HStack(spacing: 10) {
-            Button {
-                copyToClipboard(line.text)
-            } label: {
-                Label("Copy", systemImage: "doc.on.doc")
-                    .font(.caption2.weight(.medium))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .help("Copy this message's text to the clipboard")
-            Button {
-                exportMessage(line)
-            } label: {
-                Label("Export…", systemImage: "square.and.arrow.up")
-                    .font(.caption2.weight(.medium))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .help("Save this message's text to a .md file")
-        }
-    }
-
-    /// Put a message's raw text on the clipboard (pasting keeps the markdown
-    /// structure).
-    private func copyToClipboard(_ content: String) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(content, forType: .string)
-    }
-
-    /// Save a message to a .md file the user chooses.
-    @MainActor
-    private func exportMessage(_ line: SpecDesignLine) {
-        let panel = NSSavePanel()
-        panel.title = "Export message"
-        panel.nameFieldStringValue = "\(projectName)-\(line.role)-\(Int(Date().timeIntervalSince1970)).md"
-        panel.canCreateDirectories = true
-        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try line.text.write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            errorMessage = "Export failed: \(error.localizedDescription)"
-        }
-    }
-
-    private var inputBar: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .bottom, spacing: 8) {
-                // Large multi-line prompt: Return inserts a newline and long
-                // input scrolls inside the box (never truncates or submits).
-                TextEditor(text: $draft)
-                    .font(.callout)
-                    .scrollContentBackground(.hidden)
-                    .textSelection(.enabled)
-                    .padding(5)
-                    .frame(height: 130)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(theme.nodeBackground))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
-                    .overlay(alignment: .topLeading) {
-                        if draft.isEmpty {
-                            Text("Ask a question or bounce an idea…")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 12)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .disabled(busy || isDecided)
-                Button {
-                    Task { await send() }
-                } label: {
-                    Label("Send", systemImage: "arrow.up.circle.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || isDecided)
-            }
-            .padding(10)
-            HStack(spacing: 10) {
-                Toggle("Spire docs", isOn: $useDocsRAG)
-                    .toggleStyle(.checkbox)
-                    .help("Ground the answer in the spire-actor/spire-core docs corpus")
-                Toggle("Web search", isOn: $useWebSearch)
-                    .toggleStyle(.checkbox)
-                    .help("Ground the answer in a web search (Tavily, Wikipedia fallback)")
-                Spacer()
-            }
-            .padding(.horizontal, 10)
-            .padding(.bottom, 6)
-        }
-        // ⌘Return sends (plain Return inserts a newline inside the editor).
-        .background(Button("sendTurn") {
-            Task { await send() }
-        }
-        .keyboardShortcut(.return, modifiers: [.command])
-        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || isDecided)
-        .frame(width: 0, height: 0)
-        .opacity(0))
-    }
-
-    // MARK: - Status pane
-
-    private var statusPane: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label("Session", systemImage: "info.circle")
-                .font(.headline)
-            if isDecided {
-                VStack(alignment: .leading, spacing: 4) {
-                    Label("AppSpec submitted", systemImage: "checkmark.seal.fill")
-                        .font(.headline)
-                        .foregroundStyle(.green)
-                    Text("v\(acceptedCount) — code generation started automatically.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text("Press Revise (top right) to adjust the design in the chat and submit a new version.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 8).fill(.green.opacity(0.08)))
-            }
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-            if let outline, !outline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Concept", systemImage: "square.stack.3d.up")
-                        .font(.headline)
-                    ScrollView {
-                        MarkdownText(outline)
-                            .textSelection(.enabled)
-                    }
-                    .frame(maxHeight: 240)
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.4)))
-            }
-            if !openQuestions.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 6) {
-                        Label("Open questions", systemImage: "questionmark.circle")
-                            .font(.headline)
-                            .foregroundStyle(.orange)
-                        Text("\(openQuestions.count)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
-                                questionCard(index: idx, question: q)
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
-                    .frame(maxHeight: 240)
-                    Text("Tap a recommended answer (or an option) to reply — it is sent as your message.")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 8).fill(.orange.opacity(0.06)))
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 6) {
-                Text("How this works")
-                    .font(.subheadline.weight(.semibold))
-                Text("The assistant proposes one recommended design — types, graph, actors, bridge and UI — and asks only when a choice really matters.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text("When the design is complete it calls the submit_appspec tool itself; the spec is validated and stored, and code generation starts automatically.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text("Tick \(Image(systemName: "square.on.square")) Spire docs to ground answers in the spire-actor/spire-core docs corpus.")
-                    .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            Spacer(minLength: 0)
         }
         .padding(12)
-        .frame(minWidth: 300, maxWidth: 380)
     }
 
-    /// One open question with its recommended answer + alternatives; tapping an
-    /// answer auto-sends it as the user's next message (existing ask path).
-    private func questionCard(index: Int, question: DesignQuestion) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
-                Text("\(index + 1).")
-                    .font(.caption.weight(.semibold))
-                    .monospacedDigit()
-                if !question.section.isEmpty {
-                    Text(question.section)
-                        .font(.caption2.weight(.medium))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(.blue.opacity(0.15)))
-                }
-                Text(question.question)
-                    .font(.caption.weight(.semibold))
-                    .textSelection(.enabled)
-            }
-            if !question.recommendation.isEmpty {
-                Button {
-                    acceptAnswer(question, choice: question.recommendation)
-                } label: {
-                    Label("Use recommendation: \(question.recommendation)", systemImage: "checkmark.circle")
-                        .font(.caption2.weight(.medium))
-                        .multilineTextAlignment(.leading)
+    // MARK: - Left: freeform spec
+
+    private var freeformPane: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Label("1. Freeform spec", systemImage: "doc.text")
+                    .font(.headline)
+                Spacer()
+                Button("Load from file…") {
+                    loadFreeformFromFile()
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .disabled(busy || isDecided)
+                Button {
+                    Task { await convert() }
+                } label: {
+                    if busy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Convert", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .disabled(freeform.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy || isDecided)
+                .help("Convert this freeform spec into the textual AppSpec")
             }
-            if !question.options.isEmpty {
-                HStack(spacing: 6) {
-                    ForEach(question.options, id: \.self) { opt in
+            .padding(10)
+
+            TextEditor(text: $freeform)
+                .font(.system(.body, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .textSelection(.enabled)
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(theme.nodeBackground))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(theme.border, lineWidth: 0.5))
+                .overlay(alignment: .topLeading) {
+                    if freeform.isEmpty {
+                        Text("Paste or write the freeform spec here…\n\nExample:\nA map UI to view GIS features that live in the memory graph. Users can list, select and edit feature attributes; changes are saved back to the feature store.")
+                            .font(.callout)
+                            .foregroundStyle(.tertiary)
+                            .padding(10)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .disabled(busy || isDecided)
+                .padding([.horizontal, .bottom], 10)
+        }
+        .frame(minWidth: 380)
+    }
+
+    // MARK: - Right: generated AppSpec
+
+    private var generatedPane: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("2. Generated AppSpec", systemImage: "doc.richtext")
+                    .font(.headline)
+                Spacer()
+                if let specMd, !specMd.isEmpty {
+                    Button { copySpec() } label: {
+                        Label("Copy", systemImage: "doc.on.doc").font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Copy the AppSpec markdown to the clipboard")
+                    Button { exportSpec() } label: {
+                        Label("Export…", systemImage: "square.and.arrow.up").font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Save the AppSpec to a .md file")
+                }
+            }
+
+            issueStrip
+
+            if let specMd, !specMd.isEmpty {
+                ScrollView {
+                    MarkdownText(specMd)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.35)))
+
+                HStack {
+                    if isDecided {
+                        Label("AppSpec accepted — code generation started.", systemImage: "checkmark.circle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.green)
+                    } else {
                         Button {
-                            acceptAnswer(question, choice: opt)
+                            Task { await accept() }
                         } label: {
-                            Text(opt)
-                                .font(.caption2)
+                            if busy {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Label("Accept AppSpec", systemImage: "checkmark.seal")
+                            }
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .disabled(busy || isDecided)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .disabled(busy || hasErrors || specMd.isEmpty)
+                        .help(hasErrors
+                            ? "Resolve the validation errors in the freeform spec, then Convert again"
+                            : "Accept this AppSpec and start code generation")
+                        Text(hasErrors ? "Fix the errors below, then Convert again." : "Review, then accept to persist and generate.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(.top, 4)
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "doc.richtext")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.tertiary)
+                    Text("No AppSpec yet")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    Text("Write or paste a freeform spec on the left, then press Convert.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .padding(12)
+        .frame(minWidth: 400, maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var issueStrip: some View {
+        if !issues.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(issues, id: \.message) { issue in
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: issue.isError ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(issue.isError ? .red : .orange)
+                        Text("\(issue.message)")
+                            .font(.caption)
+                        Spacer()
                     }
                 }
             }
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 6).fill(.orange.opacity(0.08)))
         }
-        .padding(6)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.35)))
+        if let errorMessage {
+            Text(errorMessage)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    private var hasErrors: Bool {
+        issues.contains { $0.isError }
     }
 
     // MARK: - Actions
@@ -447,10 +280,11 @@ struct SpecDesignView: View {
     @MainActor
     private func apply(state: SpecDesignState?, error: String?) {
         if let state {
+            freeform = state.freeformSpec
+            specMd = state.specMd
+            issues = state.issues
             isDecided = state.isDecided
             acceptedCount = state.acceptedCount
-            outline = state.outline
-            openQuestions = state.openQuestions
         }
         if let error {
             errorMessage = error
@@ -458,59 +292,39 @@ struct SpecDesignView: View {
     }
 
     @MainActor
-    private func send() async {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func convert() async {
+        let text = freeform.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        draft = ""
-        errorMessage = nil
-        lines.append(SpecDesignLine(role: "user", text: text))
-        busy = true
-        defer { busy = false }
-        let (answer, state, error) = await bridge.specDesignAsk(projectName: projectName, text: text, docs: useDocsRAG, web: useWebSearch)
-        useDocsRAG = false
-        useWebSearch = false
-        apply(state: state, error: error)
-        if let state, state.isDecided, let latest = state.latest, state.acceptedCount > codegenVersion {
-            // The assistant just submitted the AppSpec: feed it to the codegen
-            // wizard exactly once and surface the new state in the chat.
-            codegenVersion = state.acceptedCount
-            onDecided(latest)
-            lines.append(SpecDesignLine(
-                role: "system",
-                text: "AppSpec v\(state.acceptedCount) submitted — code generation started. The spec has been persisted for the project."
-            ))
-        }
-        if let answer, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            lines.append(SpecDesignLine(role: "assistant", text: answer))
-        } else if error == nil {
-            lines.append(SpecDesignLine(
-                role: "system",
-                text: "No new message from the assistant — check the Concept and Open questions on the right, then continue."
-            ))
-        }
-    }
-
-    /// Answer an open question by sending the chosen answer as the next chat
-    /// turn (auto-send through the normal ask path, no grounding requested).
-    @MainActor
-    private func acceptAnswer(_ question: DesignQuestion, choice: String) {
-        errorMessage = nil
-        useDocsRAG = false
-        useWebSearch = false
-        draft = "For \"\(question.question)\", I'll go with: \(choice)"
-        Task { await send() }
-    }
-
-    @MainActor
-    private func resetDesign() async {
         errorMessage = nil
         busy = true
         defer { busy = false }
-        codegenVersion = 0
-        let (state, error) = await bridge.specDesignStart(projectName: projectName, goal: goal, reset: true)
-        apply(state: state, error: error)
-        if state != nil {
-            lines = []
+        let (outcome, error) = await bridge.specDesignConvert(projectName: projectName, specText: text)
+        if let outcome {
+            specMd = outcome.specMd
+            issues = outcome.issues
+            if let parseError = outcome.parseError {
+                errorMessage = "The generated AppSpec could not be parsed: \(parseError)"
+            }
+            apply(state: outcome.state, error: nil)
+        }
+        if let error {
+            errorMessage = error
+        }
+    }
+
+    @MainActor
+    private func accept() async {
+        errorMessage = nil
+        busy = true
+        defer { busy = false }
+        let (spec, error) = await bridge.specDesignAccept(projectName: projectName)
+        if let spec {
+            onDecided(spec)
+            onClose()
+        } else if let error {
+            errorMessage = error
+        } else {
+            errorMessage = "Accept returned no AppSpec"
         }
     }
 
@@ -521,6 +335,46 @@ struct SpecDesignView: View {
         defer { busy = false }
         let (state, error) = await bridge.specDesignReopen(projectName: projectName)
         apply(state: state, error: error)
+    }
+
+    // MARK: - File / clipboard helpers
+
+    private func loadFreeformFromFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Load"
+        panel.message = "Choose a text file with the freeform spec"
+        panel.allowedContentTypes = [.plainText, .text, UTType(filenameExtension: "md") ?? .plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            freeform = try String(contentsOf: url, encoding: .utf8)
+        } catch {
+            errorMessage = "Load failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func copySpec() {
+        guard let specMd else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(specMd, forType: .string)
+    }
+
+    private func exportSpec() {
+        guard let specMd else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export AppSpec"
+        panel.nameFieldStringValue = "\(projectName)-appspec.md"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try specMd.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = "Export failed: \(error.localizedDescription)"
+        }
     }
 }
 

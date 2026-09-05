@@ -441,14 +441,11 @@ impl CoordinatorActor {
             "spec-design/start" => {
                 return self.handle_spec_design_start(&params).await;
             }
-            "spec-design/ask" => {
-                return self.handle_spec_design_ask(&params).await;
+            "spec-design/convert" => {
+                return self.handle_spec_design_convert(&params).await;
             }
-            "spec-design/reply" => {
-                return self.handle_spec_design_reply(&params).await;
-            }
-            "spec-design/turn" => {
-                return self.handle_spec_design_turn(&params).await;
+            "spec-design/accept" => {
+                return self.handle_spec_design_accept(&params).await;
             }
             "spec-design/reopen" => {
                 return self.handle_spec_design_reopen(&params).await;
@@ -3318,19 +3315,14 @@ impl CoordinatorActor {
             Box::new(move |prompt: String| {
                 let llm_tx = llm_tx.clone();
                 Box::pin(async move {
-                    let tools = crate::subsystems::project::spec_design::design_tools();
-                    let messages = vec![spire_core::subsystems::chat::chat::ChatMessageData {
-                        id: "spec-design-prompt".to_string(),
-                        role: "user".to_string(),
-                        content: prompt,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        widget: None,
-                    }];
                     let (t, r) = tokio::sync::oneshot::channel();
                     if llm_tx
-                        .send(crate::actors::LlmMessage::CompleteWithTools {
-                            messages,
-                            tools,
+                        .send(crate::actors::LlmMessage::Complete {
+                            prompt,
+                            // Free-form conversion — prose output, NOT structured
+                            // JSON. The Planning role forces json_object mode, which
+                            // DeepSeek rejects (400) for non-JSON prompts.
+                            role: spire_core::subsystems::llm::llm::LlmModelRole::Freeform,
                             reply_to: t,
                         })
                         .await
@@ -3338,20 +3330,11 @@ impl CoordinatorActor {
                     {
                         return Err("LLM actor unavailable".to_string());
                     }
-                    let raw = match r.await {
-                        Ok(Ok(text)) => text,
-                        Ok(Err(e)) => return Err(format!("LLM error: {e}")),
-                        Err(e) => return Err(format!("LLM reply lost: {e}")),
-                    };
-                    let parsed = crate::subsystems::project::spec_design::parse_design_reply(&raw);
-                    tracing::info!(
-                        "[SpecDesign] llm reply parsed: text={} outline={} questions={} spec_md={}",
-                        parsed.text.len(),
-                        parsed.outline.is_some(),
-                        parsed.open_questions.as_ref().map(|q| q.len()).unwrap_or(0),
-                        parsed.spec_md.is_some()
-                    );
-                    Ok(parsed)
+                    match r.await {
+                        Ok(Ok(text)) => Ok(text),
+                        Ok(Err(e)) => Err(format!("LLM error: {e}")),
+                        Err(e) => Err(format!("LLM reply lost: {e}")),
+                    }
                 })
             })
         };
@@ -3359,89 +3342,6 @@ impl CoordinatorActor {
         let mut actor =
             crate::subsystems::project::spec_design::SpecDesignActor::new(llm);
         actor.set_memory_graph(self.memory_graph_tx.clone());
-        // Docs RAG grounding (spire-actor/spire-core application corpora).
-        let rag_tx = self
-            .registry
-            .as_ref()
-            .and_then(|r| r.get::<RagMessage>("rag"));
-        if let Some(rag_tx) = rag_tx {
-            let docs: crate::subsystems::project::spec_design::GroundingFn = Box::new(
-                move |query: &str, top_k: usize| {
-                    let rag_tx = rag_tx.clone();
-                    let query = query.to_string();
-                    Box::pin(async move {
-                        let mut out: Vec<String> = Vec::new();
-                        for domain in ["spire-core", "spire-actor"] {
-                            let (t, r) = tokio::sync::oneshot::channel();
-                            if rag_tx
-                                .send(RagMessage::Query {
-                                    domain: domain.to_string(),
-                                    query: query.clone(),
-                                    top_k,
-                                    reply_to: t,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                continue;
-                            }
-                            if let Ok(Ok(chunks)) = r.await {
-                                for c in chunks {
-                                    out.push(format!(
-                                        "[{domain}] {}: {}",
-                                        c.source_path,
-                                        c.text.trim()
-                                    ));
-                                }
-                            }
-                        }
-                        out
-                    })
-                },
-            );
-            actor.set_rag_search(docs);
-        }
-        // Web-search grounding (Tavily when keyed; Wikipedia fallback).
-        let web: crate::subsystems::project::spec_design::GroundingFn = Box::new(
-            |query: &str, top_k: usize| {
-                let query = query.to_string();
-                Box::pin(async move {
-                    match spire_core::actors::web_search::call(
-                        "search/web",
-                        serde_json::json!({ "query": query, "max_results": top_k }),
-                    )
-                    .await
-                    {
-                        Ok(value) => match value.as_array() {
-                            Some(items) => items
-                                .iter()
-                                .filter_map(|it| {
-                                    let title = it
-                                        .get("title")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    let url = it.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                                    let snippet = it
-                                        .get("content")
-                                        .or_else(|| it.get("snippet"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    if title.is_empty() && url.is_empty() {
-                                        None
-                                    } else {
-                                        Some(format!("- {title} — {url}
-  {snippet}"))
-                                    }
-                                })
-                                .collect(),
-                            None => Vec::new(),
-                        },
-                        Err(_) => Vec::new(),
-                    }
-                })
-            },
-        );
-        actor.set_web_search(web);
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let _handle = spire_core::actors::Actor::spawn(actor, rx);
         if let Ok(mut g) = map.lock() {
@@ -3494,78 +3394,13 @@ impl CoordinatorActor {
         }
     }
 
-    async fn handle_spec_design_ask(&self, params: &serde_json::Value) -> serde_json::Value {
+    async fn handle_spec_design_convert(&self, params: &serde_json::Value) -> serde_json::Value {
         let project_name = match self.spec_design_project(params) {
             Ok(n) => n,
             Err(e) => return e,
         };
-        let text = params
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let docs = params.get("docs").and_then(|v| v.as_bool()).unwrap_or(false);
-        let web = params.get("web").and_then(|v| v.as_bool()).unwrap_or(false);
-        let tx = match self.spec_design_tx(&project_name).await {
-            Ok(tx) => tx,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = tx
-            .send(SpecDesignMessage::Ask {
-                text,
-                docs,
-                web,
-                reply_to: t,
-            })
-            .await;
-        match r.await {
-            Ok(Ok((answer, state))) => {
-                let state_value = serde_json::to_value(state)
-                    .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" }));
-                serde_json::json!({ "text": answer, "state": state_value })
-            }
-            Ok(Err(e)) => serde_json::json!({ "error": e }),
-            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
-        }
-    }
-
-    async fn handle_spec_design_reply(&self, params: &serde_json::Value) -> serde_json::Value {
-        let project_name = match self.spec_design_project(params) {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
-        let text = params
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let tx = match self.spec_design_tx(&project_name).await {
-            Ok(tx) => tx,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = tx.send(SpecDesignMessage::Reply { text, reply_to: t }).await;
-        match r.await {
-            Ok(Ok(state)) => serde_json::to_value(state)
-                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
-            Ok(Err(e)) => serde_json::json!({ "error": e }),
-            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
-        }
-    }
-
-    async fn handle_spec_design_turn(&self, params: &serde_json::Value) -> serde_json::Value {
-        let project_name = match self.spec_design_project(params) {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
-        let role = params
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("assistant")
-            .to_string();
-        let text = params
-            .get("text")
+        let spec_text = params
+            .get("spec_text")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -3575,15 +3410,33 @@ impl CoordinatorActor {
         };
         let (t, r) = tokio::sync::oneshot::channel();
         let _ = tx
-            .send(SpecDesignMessage::AppendTurn {
-                role,
-                text,
+            .send(SpecDesignMessage::Convert {
+                spec_text,
                 reply_to: t,
             })
             .await;
         match r.await {
-            Ok(Ok(state)) => serde_json::to_value(state)
-                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
+            Ok(Ok(outcome)) => serde_json::to_value(outcome)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize outcome" })),
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
+        }
+    }
+
+    async fn handle_spec_design_accept(&self, params: &serde_json::Value) -> serde_json::Value {
+        let project_name = match self.spec_design_project(params) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let tx = match self.spec_design_tx(&project_name).await {
+            Ok(tx) => tx,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = tx.send(SpecDesignMessage::Accept { reply_to: t }).await;
+        match r.await {
+            Ok(Ok(spec)) => serde_json::to_value(spec)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "serialize spec" })),
             Ok(Err(e)) => serde_json::json!({ "error": e }),
             Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
         }

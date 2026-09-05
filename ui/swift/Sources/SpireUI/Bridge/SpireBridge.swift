@@ -1936,32 +1936,20 @@ final class SpireBridge {
         return (SpecDesignState(json: value as Any), nil)
     }
 
-    /// Ask the LLM a free-form brainstorm question INSIDE the design session
-    /// (the design transcript owns the conversation). Appends user + assistant
-    /// turns server-side; returns the answer text and the updated state.
-    func specDesignAsk(projectName: String, text: String, docs: Bool = false, web: Bool = false) async -> (text: String?, state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/ask", params: ["projectName": projectName, "text": text, "docs": docs, "web": web])
-        guard error == nil else { return (nil, nil, error) }
-        guard let dict = value as? [String: Any] else {
-            return (nil, nil, "spec-design/ask: unreadable reply")
-        }
-        return (dict["text"] as? String, SpecDesignState(json: dict["state"]), nil)
+    /// Convert a freeform spec into the textual AppSpec. Returns the generated
+    /// markdown + validation issues + the updated session state.
+    func specDesignConvert(projectName: String, specText: String) async -> (outcome: ConvertOutcome?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/convert", params: ["projectName": projectName, "spec_text": specText])
+        guard error == nil else { return (nil, error) }
+        return (ConvertOutcome(json: value as Any), nil)
     }
 
-    /// Mirror a user turn into the design transcript (kept for external
-    /// turn-mirroring; the design view normally uses `specDesignAsk`).
-    func specDesignReply(projectName: String, text: String) async -> (state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/reply", params: ["projectName": projectName, "text": text])
+    /// Accept the generated AppSpec: validate + persist + decide. Returns the
+    /// accepted AppSpec dictionary (feeds the codegen step).
+    func specDesignAccept(projectName: String) async -> (spec: [String: Any]?, error: String?) {
+        let (value, error) = await specDesignCall(method: "spec-design/accept", params: ["projectName": projectName])
         guard error == nil else { return (nil, error) }
-        return (SpecDesignState(json: value as Any), nil)
-    }
-
-    /// Mirror any other turn (e.g. the assistant's brainstorm reply) into the
-    /// design transcript.
-    func specDesignTurn(projectName: String, role: String, text: String) async -> (state: SpecDesignState?, error: String?) {
-        let (value, error) = await specDesignCall(method: "spec-design/turn", params: ["projectName": projectName, "role": role, "text": text])
-        guard error == nil else { return (nil, error) }
-        return (SpecDesignState(json: value as Any), nil)
+        return (value as? [String: Any], nil)
     }
 
     /// Return to free-form editing (a decided spec may not meet requirements).
