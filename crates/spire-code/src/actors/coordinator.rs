@@ -3343,7 +3343,15 @@ impl CoordinatorActor {
                         Ok(Err(e)) => return Err(format!("LLM error: {e}")),
                         Err(e) => return Err(format!("LLM reply lost: {e}")),
                     };
-                    Ok(crate::subsystems::project::spec_design::parse_design_reply(&raw))
+                    let parsed = crate::subsystems::project::spec_design::parse_design_reply(&raw);
+                    tracing::info!(
+                        "[SpecDesign] llm reply parsed: text={} outline={} questions={} spec_md={}",
+                        parsed.text.len(),
+                        parsed.outline.is_some(),
+                        parsed.open_questions.as_ref().map(|q| q.len()).unwrap_or(0),
+                        parsed.spec_md.is_some()
+                    );
+                    Ok(parsed)
                 })
             })
         };

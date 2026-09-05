@@ -551,8 +551,10 @@ impl SpecDesignActor {
             &self.open_questions,
         );
         let reply = self.call_llm(prompt).await?;
-        let mut answer = reply.text.clone();
+        let model_text = reply.text.clone();
+        let mut answer = model_text.clone();
         let outline_sent = reply.outline.is_some();
+        let spec_sent = reply.spec_md.is_some();
         // The model keeps its draft outline current via the `set_outline` tool.
         if let Some(o) = reply.outline {
             let trimmed = o.trim().to_string();
@@ -697,6 +699,53 @@ Answer each (or pick its recommended answer on the right), then ask it to submit
                 );
             }
             answer = lines.join(" ");
+        }
+
+        // Deterministic finalize: the model reliably updates the concept and
+        // question list but rarely calls submit_appspec itself. When the user
+        // asks to submit (or the model says it is submitting) and no spec_md
+        // arrived, drive a focused submit pass so "continue" actually produces
+        // the AppSpec. A user command overrides the question gate; a model claim
+        // only counts once the open-question list is empty.
+        if !spec_sent
+            && (submit_intent(&text, self.open_questions.is_empty())
+                || (self.open_questions.is_empty() && model_signals_submit(&model_text)))
+        {
+            let prompt = submit_spec_prompt(
+                &self.project_name,
+                &self.goal,
+                self.outline.as_deref(),
+            );
+            let outcome = match self.call_llm(prompt).await {
+                Ok(sr) => {
+                    let candidate = sr.spec_md.or_else(|| {
+                        if sr.text.trim().is_empty() {
+                            None
+                        } else {
+                            Some(sr.text)
+                        }
+                    });
+                    match candidate {
+                        Some(md) => match self.accept_spec_markdown(&md).await {
+                            Ok(app) => format!(
+                                "AppSpec submitted — v{} ({} types, {} actors, {} bridge methods, {} screens). The design is decided; press Revise to change it.",
+                                self.accepted.len(),
+                                app.types.len(),
+                                app.actors.len(),
+                                app.bridge.len(),
+                                app.ui.len()
+                            ),
+                            Err(e) => format!(
+                                "submit did not go through — the spec did not validate:
+{e}"
+                            ),
+                        },
+                        None => "submit produced no spec — say submit again.".to_string(),
+                    }
+                }
+                Err(e) => format!("submit pass failed: {e}"),
+            };
+            answer = outcome;
         }
 
         if !answer.trim().is_empty() {
@@ -1132,6 +1181,59 @@ fn coverage_note(open: &[DesignQuestion]) -> Option<String> {
         covered_list = covered_list,
         missing = missing.join(", ")
     ))
+}
+
+/// Does this user message ask the design to be finalized? Strong words always
+/// trigger submission; weak/affirmative words only do when no questions remain
+/// (otherwise they just continue the Q&A).
+fn submit_intent(text: &str, questions_empty: bool) -> bool {
+    let lower = text.to_lowercase();
+    let strong = ["submit", "finalize"]
+        .iter()
+        .any(|k| lower.contains(k))
+        || (["generate", "create", "draft", "write"]
+            .iter()
+            .any(|k| lower.contains(k))
+            && lower.contains("appspec"));
+    let weak = [
+        "continue", "go ahead", "go", "proceed", "yes", "ok", "okay", "done", "ready", "send",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
+    strong || (questions_empty && weak)
+}
+
+/// The model narrated a submission ("sending the AppSpec", ...) without actually
+/// calling the submit tool — treat that as a request to finalize deterministically.
+fn model_signals_submit(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["submitting", "sending", "ready to submit", "will submit", "finaliz", "submit_appspec"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
+/// Focused prompt for the deterministic finalize pass: convert the settled
+/// concept into the full strict-grammar spec.md, nothing else.
+fn submit_spec_prompt(project_name: &str, goal: &str, outline: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(SPIRE_APP_CONTEXT.to_string());
+    parts.push(format!("Project: {project_name}"));
+    parts.push(format!("Goal: {goal}"));
+    parts.push(String::new());
+    parts.push("The design is complete — do NOT ask questions. Produce ONLY the full".to_string());
+    parts.push("spec.md document for this project in the strict grammar below. Output".to_string());
+    parts.push("the spec.md content directly as your reply text (no commentary), or call".to_string());
+    parts.push("the `submit_appspec` tool with it.".to_string());
+    if let Some(o) = outline.filter(|o| !o.trim().is_empty()) {
+        parts.push(String::new());
+        parts.push("## Current concept (source of truth — convert it faithfully)".to_string());
+        parts.push(o.trim().to_string());
+    }
+    parts.push(String::new());
+    parts.push("SPEC GRAMMAR:".to_string());
+    parts.push(SPEC_MD_GRAMMAR.to_string());
+    parts.join("
+")
 }
 
 /// Free-form brainstorm prompt: an outline-first workflow. The user's message is
@@ -1732,6 +1834,66 @@ mod tests {
         assert!(answer2.contains("Next up"), "{answer2}");
         assert!(answer2.contains("what units?"), "{answer2}");
         assert!(answer2.contains("meters"), "{answer2}");
+    }
+
+    #[test]
+    fn submit_intent_detection_is_sensible() {
+        assert!(submit_intent("submit", true));
+        assert!(submit_intent("please finalize", false));
+        assert!(submit_intent("go ahead and create the appspec", false));
+        assert!(submit_intent("continue", true));
+        assert!(!submit_intent("continue", false), "weak words only finalize when empty");
+        assert!(!submit_intent("what projection do you recommend?", false));
+    }
+
+    #[test]
+    fn continue_command_runs_the_deterministic_submit_pass() {
+        // Canned LLM: first call answers normally, the submit pass converts the
+        // settled concept into the spec.md (returned as plain text).
+        let (mut a, prompts) = actor(vec!["design ready".to_string(), example_spec_md()]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        let (answer, s) = pollster(a.ask("continue", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Decided);
+        assert_eq!(s.accepted.len(), 1);
+        assert!(answer.contains("AppSpec submitted"), "{answer}");
+        // The submit pass used a dedicated prompt.
+        let prompts = prompts.lock().unwrap();
+        assert!(prompts[1].contains("SPEC GRAMMAR"), "{}", prompts[1]);
+        assert!(prompts[1].contains("do NOT ask questions"));
+    }
+
+    #[test]
+    fn submit_pass_surfaces_validation_errors_and_stays_freeform() {
+        let (mut a, _) = actor(vec!["ready".to_string(), "# Not a spec at all
+
+random".to_string()]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        let (answer, s) = pollster(a.ask("submit", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Freeform);
+        assert!(s.accepted.is_empty());
+        assert!(answer.contains("did not validate"), "{answer}");
+    }
+
+    #[test]
+    fn submit_command_still_respects_open_questions() {
+        // With open questions the weak "continue" does not trigger the submit
+        // pass (the model's answer is returned as-is).
+        let (mut a, prompts) = actor(vec!["what about the projection?".to_string()]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        a.open_questions.push(DesignQuestion {
+            section: "graph".to_string(),
+            question: "which projection?".to_string(),
+            recommendation: "EPSG:3857".to_string(),
+            options: vec![],
+        });
+        let (answer, s) = pollster(a.ask("continue", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Freeform);
+        assert_eq!(answer, "what about the projection?");
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "no submit pass while questions remain");
     }
 
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
