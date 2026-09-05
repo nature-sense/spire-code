@@ -3318,21 +3318,7 @@ impl CoordinatorActor {
             Box::new(move |prompt: String| {
                 let llm_tx = llm_tx.clone();
                 Box::pin(async move {
-                    let tool = spire_core::actors::messages::ToolInfo {
-                        name: "submit_appspec".to_string(),
-                        description: "Finalize the AppSpec for this project. Call ONLY when the\n                    design is complete and no open questions remain; pass the full spec.md\n                    in the strict AppSpec grammar (Data types / Graph / Backend / Bridge / UI)."
-                            .to_string(),
-                        input_schema: serde_json::json!({
-                            "type": "object",
-                            "properties": {
-                                "spec_md": {
-                                    "type": "string",
-                                    "description": "The full spec.md document in the strict AppSpec markdown grammar."
-                                }
-                            },
-                            "required": ["spec_md"]
-                        }),
-                    };
+                    let tools = crate::subsystems::project::spec_design::design_tools();
                     let messages = vec![spire_core::subsystems::chat::chat::ChatMessageData {
                         id: "spec-design-prompt".to_string(),
                         role: "user".to_string(),
@@ -3344,7 +3330,7 @@ impl CoordinatorActor {
                     if llm_tx
                         .send(crate::actors::LlmMessage::CompleteWithTools {
                             messages,
-                            tools: vec![tool],
+                            tools,
                             reply_to: t,
                         })
                         .await
@@ -3357,32 +3343,7 @@ impl CoordinatorActor {
                         Ok(Err(e)) => return Err(format!("LLM error: {e}")),
                         Err(e) => return Err(format!("LLM reply lost: {e}")),
                     };
-                    let mut text = String::new();
-                    let mut spec_md: Option<String> = None;
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        if let Some(c) = v["content"].as_str() {
-                            text = c.to_string();
-                        }
-                        if let Some(calls) = v["tool_calls"].as_array() {
-                            for tc in calls {
-                                if tc["function"]["name"].as_str() == Some("submit_appspec") {
-                                    if let Some(args) = tc["function"]["arguments"].as_str() {
-                                        if let Ok(args_v) =
-                                            serde_json::from_str::<serde_json::Value>(args)
-                                        {
-                                            spec_md = args_v
-                                                .get("spec_md")
-                                                .and_then(|m| m.as_str())
-                                                .map(|x| x.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        text = raw;
-                    }
-                    Ok(crate::subsystems::project::spec_design::DesignReply { text, spec_md })
+                    Ok(crate::subsystems::project::spec_design::parse_design_reply(&raw))
                 })
             })
         };

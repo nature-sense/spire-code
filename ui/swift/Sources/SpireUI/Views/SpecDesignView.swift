@@ -69,6 +69,8 @@ struct SpecDesignView: View {
     @State private var acceptedCount = 0
     @State private var busy = false
     @State private var errorMessage: String?
+    /// Questions the assistant still needs answered (blocks submission).
+    @State private var openQuestions: [String] = []
     /// acceptedCount already handed to the code generator (fires once per submit).
     @State private var codegenVersion = 0
     /// Request grounding for the next brainstorm question.
@@ -326,6 +328,29 @@ struct SpecDesignView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            if !openQuestions.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Label("Open questions", systemImage: "questionmark.circle")
+                            .font(.headline)
+                            .foregroundStyle(.orange)
+                        Text("\(openQuestions.count)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
+                        Text("\(idx + 1). \(q)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("The assistant tracks what it still needs answered — it cannot submit the AppSpec while any remain.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(.orange.opacity(0.06)))
+            }
             Divider()
             VStack(alignment: .leading, spacing: 6) {
                 Text("How this works")
@@ -353,6 +378,7 @@ struct SpecDesignView: View {
         if let state {
             isDecided = state.isDecided
             acceptedCount = state.acceptedCount
+            openQuestions = state.openQuestions
         }
         if let error {
             errorMessage = error

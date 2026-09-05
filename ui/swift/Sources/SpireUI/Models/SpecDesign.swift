@@ -8,6 +8,9 @@ struct SpecDesignState {
     /// "freeform" or "decided" (Rust `DesignMode`, lowercase serialized).
     let mode: String
     let turnCount: Int
+    /// Design questions the assistant still needs answered (the submit gate
+    /// refuses while any remain).
+    let openQuestions: [String]
     let acceptedCount: Int
     /// Most recent accepted AppSpec (present once the design is submitted).
     let latest: [String: Any]?
@@ -19,6 +22,7 @@ struct SpecDesignState {
               let mode = dict["mode"] as? String else { return nil }
         self.mode = mode
         self.turnCount = dict["turn_count"] as? Int ?? 0
+        self.openQuestions = dict["open_questions"] as? [String] ?? []
         if let accepted = dict["accepted"] as? [Any] {
             self.acceptedCount = accepted.count
         } else {

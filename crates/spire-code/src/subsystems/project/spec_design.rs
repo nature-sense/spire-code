@@ -38,14 +38,18 @@ use super::spec::{validate, AppSpec, SpecIssue, SpecIssueSeverity};
 use super::spec_graph;
 use super::spec_md;
 
-/// The injected design-model reply: the assistant's free-form text plus an
-/// optional AppSpec hand-off (`spec.md` in the strict grammar) the model
-/// produced via the `submit_appspec` tool when it considers the design
-/// complete.
+/// The injected design-model reply: the assistant's free-form text plus two
+/// optional tool hand-offs:
+/// - `spec_md` — the full AppSpec (`spec.md` in the strict grammar) produced via
+///   the `submit_appspec` tool when the model considers the design complete;
+/// - `open_questions` — the model's current open-question list (replace
+///   semantics) maintained via the `set_open_questions` tool. Submission is
+///   refused while the list is non-empty.
 #[derive(Debug, Clone, Default)]
 pub struct DesignReply {
     pub text: String,
     pub spec_md: Option<String>,
+    pub open_questions: Option<Vec<String>>,
 }
 
 /// An injected LLM call: a design prompt → a [`DesignReply`].
@@ -95,6 +99,10 @@ pub struct SpecDesignState {
     pub project_name: String,
     pub goal: String,
     pub turn_count: usize,
+    /// Design questions/options the assistant raised that are still unanswered.
+    /// The assistant maintains the list via the `set_open_questions` tool and
+    /// must clear it before the AppSpec can be submitted.
+    pub open_questions: Vec<String>,
     pub accepted: Vec<AcceptedSpec>,
     pub latest: Option<AppSpec>,
     pub last_issues: Vec<SpecIssue>,
@@ -154,6 +162,8 @@ pub struct SpecDesignActor {
     memory_graph_tx: Option<mpsc::Sender<MemoryGraphMessage>>,
     mode: DesignMode,
     turns: Vec<DesignTurn>,
+    /// Current open design questions, model-maintained via `set_open_questions`.
+    open_questions: Vec<String>,
     accepted: Vec<AcceptedSpec>,
     latest: Option<AppSpec>,
     last_issues: Vec<SpecIssue>,
@@ -179,6 +189,7 @@ impl SpecDesignActor {
             memory_graph_tx: None,
             mode: DesignMode::Freeform,
             turns: Vec::new(),
+            open_questions: Vec::new(),
             accepted: Vec::new(),
             latest: None,
             last_issues: Vec::new(),
@@ -241,6 +252,11 @@ impl SpecDesignActor {
                 ("mode", serde_json::json!(mode_str(self.mode))),
                 ("instance", serde_json::json!(self.instance)),
                 ("turn_count", serde_json::json!(self.turns.len())),
+                (
+                    "open_questions",
+                    serde_json::to_value(&self.open_questions)
+                        .unwrap_or_else(|_| serde_json::json!([])),
+                ),
             ]),
             embedding_id: None,
             created_at: now,
@@ -308,6 +324,11 @@ impl SpecDesignActor {
         self.project_name = project_name.to_string();
         self.mode = mode;
         self.instance = instance.clone();
+        self.open_questions = session
+            .properties
+            .get("open_questions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
 
         // Turns under this instance, ordered by index.
         let Ok(turn_nodes) = query_nodes(
@@ -371,6 +392,7 @@ impl SpecDesignActor {
             project_name: self.project_name.clone(),
             goal: self.goal.clone(),
             turn_count: self.turns.len(),
+            open_questions: self.open_questions.clone(),
             accepted: self.accepted.clone(),
             latest: self.latest.clone(),
             last_issues: self.last_issues.clone(),
@@ -404,6 +426,7 @@ impl SpecDesignActor {
         self.goal = goal.to_string();
         self.mode = DesignMode::Freeform;
         self.turns.clear();
+        self.open_questions.clear();
         self.accepted.clear();
         self.latest = None;
         self.last_issues.clear();
@@ -491,35 +514,79 @@ impl SpecDesignActor {
         );
         let reply = self.call_llm(prompt).await?;
         let mut answer = reply.text.clone();
+        // The model keeps its open-question list current via the
+        // `set_open_questions` tool (replace semantics: the full list each time,
+        // [] once nothing remains unanswered). Surface the list in the chat so
+        // the user sees what still blocks a submission.
+        if let Some(open) = reply.open_questions {
+            self.open_questions = open
+                .iter()
+                .map(|q| q.trim().to_string())
+                .filter(|q| !q.is_empty())
+                .collect();
+            if !self.open_questions.is_empty() {
+                let qs = self
+                    .open_questions
+                    .iter()
+                    .map(|q| format!("  • {q}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let line = format!(
+                    "Open questions still to resolve before the AppSpec can be submitted:\n{qs}"
+                );
+                answer = if answer.trim().is_empty() {
+                    line.clone()
+                } else {
+                    format!("{answer}\n\n{line}")
+                };
+            }
+        }
         // The model may finish the design by calling the `submit_appspec` tool.
         if let Some(submitted) = reply.spec_md.as_deref() {
-            match self.accept_spec_markdown(submitted).await {
-                Ok(app) => {
-                    let line = format!(
-                        "AppSpec submitted — v{} ({} types, {} actors, {} bridge methods, {} screens). The design is decided; press Revise to change it.",
-                        self.accepted.len(),
-                        app.types.len(),
-                        app.actors.len(),
-                        app.bridge.len(),
-                        app.ui.len()
-                    );
-                    answer = if answer.trim().is_empty() {
-                        line.clone()
-                    } else {
-                        format!("{answer}
-
-{line}")
-                    };
-                }
-                Err(e) => {
-                    let line = format!("submit_appspec was rejected: {e}");
-                    answer = if answer.trim().is_empty() {
-                        line.clone()
-                    } else {
-                        format!("{answer}
-
-{line}")
-                    };
+            if !self.open_questions.is_empty() {
+                // Deterministic gate: never accept a submission while the model
+                // still tracks open questions — surface them so the user can
+                // answer and the model can re-submit.
+                let qs = self
+                    .open_questions
+                    .iter()
+                    .map(|q| format!("  • {q}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let line = format!(
+                    "submit_appspec was rejected — {} open question(s) must be answered first:\n{qs}",
+                    self.open_questions.len()
+                );
+                answer = if answer.trim().is_empty() {
+                    line.clone()
+                } else {
+                    format!("{answer}\n\n{line}")
+                };
+            } else {
+                match self.accept_spec_markdown(submitted).await {
+                    Ok(app) => {
+                        let line = format!(
+                            "AppSpec submitted — v{} ({} types, {} actors, {} bridge methods, {} screens). The design is decided; press Revise to change it.",
+                            self.accepted.len(),
+                            app.types.len(),
+                            app.actors.len(),
+                            app.bridge.len(),
+                            app.ui.len()
+                        );
+                        answer = if answer.trim().is_empty() {
+                            line.clone()
+                        } else {
+                            format!("{answer}\n\n{line}")
+                        };
+                    }
+                    Err(e) => {
+                        let line = format!("submit_appspec was rejected: {e}");
+                        answer = if answer.trim().is_empty() {
+                            line.clone()
+                        } else {
+                            format!("{answer}\n\n{line}")
+                        };
+                    }
                 }
             }
         }
@@ -701,6 +768,148 @@ HARD CONSTRAINTS:\n\
 - The app's backend IS its own Rust actors; persistence is via the memory graph.\n\
 - Project/crate naming convention: `spire-<name>`.";
 
+/// Names of the two tools the design model may call (kept in one place so the
+/// coordinator advertises exactly what [`parse_design_reply`] understands).
+pub const SUBMIT_APPSPEC_TOOL: &str = "submit_appspec";
+pub const SET_OPEN_QUESTIONS_TOOL: &str = "set_open_questions";
+
+/// The strict spec.md grammar the design model must produce for
+/// `submit_appspec` (1:1 parseable by the AppSpec parser). Injected into the
+/// tool schema so the model sees it exactly when it composes the submission.
+pub const SPEC_MD_GRAMMAR: &str = r#"# AppSpec: <name>
+**Goal**: <goal>
+
+## Data types
+### `Name` (record)
+| field | type |
+|-------|------|
+| <field> | <type> |
+### `Name` (enum)
+A | B | C
+
+## Graph
+### nodes
+- **NodeName** — <description>
+  - <field>: <type>
+### edges
+| name | from | to | description |
+|------|------|----|-------------|
+| <edge> | <FromNode> | <ToNode> | <desc> |
+
+## Backend
+### `ActorName` — <description>
+Handlers: <bridge method 1>, <bridge method 2>
+State: <field>: <type>
+Uses: <dependency>
+
+## Bridge
+### `method` — <description>
+| param | type |
+|-------|------|
+| <param> | <type> |
+Result: <type>
+
+## UI
+### <screenId> — Screen Title
+Layout: vstack(text("..."), list(<item>), button("Save")->save, input("Name")@name, spacer)
+Actions: <actionId>("label")-><bridgeMethod>   (or <actionId>-><bridgeMethod> when no label)
+Bindings: <field><-<bridgeMethod>
+Navigation: <actionId>-><screenId>
+
+Type expressions: str | int | float | bool | <Name> | list<T> | T? | record(f:T;...)
+
+Only include a section when the conversation actually decided it — never invent
+content. Every UI action/binding/layout button must reference a ## Bridge method
+and every bridge method must appear in exactly one actor's Handlers."#;
+
+/// Parse the raw LLM reply (plain text, or the native/synthetic JSON assistant
+/// message with `tool_calls`) into a [`DesignReply`]. Understands the
+/// `submit_appspec` and `set_open_questions` tools.
+pub fn parse_design_reply(raw: &str) -> DesignReply {
+    let mut reply = DesignReply::default();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        // Normal text reply (no tool calls): the whole payload is the answer.
+        reply.text = raw.to_string();
+        return reply;
+    };
+    if let Some(c) = v["content"].as_str() {
+        reply.text = c.to_string();
+    }
+    let Some(calls) = v["tool_calls"].as_array() else {
+        return reply;
+    };
+    for tc in calls {
+        let Some(name) = tc["function"]["name"].as_str() else {
+            continue;
+        };
+        let Some(args) = tc["function"]["arguments"].as_str().and_then(|a| {
+            serde_json::from_str::<serde_json::Value>(a).ok()
+        }) else {
+            continue;
+        };
+        match name {
+            SUBMIT_APPSPEC_TOOL => {
+                reply.spec_md = args
+                    .get("spec_md")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string);
+            }
+            SET_OPEN_QUESTIONS_TOOL => {
+                reply.open_questions = args
+                    .get("questions")
+                    .and_then(|q| q.as_array())
+                    .map(|qs| {
+                        qs.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    });
+            }
+            _ => {}
+        }
+    }
+    reply
+}
+
+/// The tools advertised to the design model: finalize the AppSpec and keep the
+/// open-question list current.
+pub fn design_tools() -> Vec<spire_core::actors::messages::ToolInfo> {
+    let submit = spire_core::actors::messages::ToolInfo {
+        name: SUBMIT_APPSPEC_TOOL.to_string(),
+        description: "Finalize the AppSpec for this project. Call ONLY when the design is\n            complete AND the open-question list is empty — never after a single\n            underspecified goal. When in doubt, ask a clarifying question instead.\n            Pass the FULL spec.md in the strict grammar below."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec_md": {
+                    "type": "string",
+                    "description": format!(
+                        "The full spec.md document in this strict grammar:\n{SPEC_MD_GRAMMAR}"
+                    ),
+                }
+            },
+            "required": ["spec_md"]
+        }),
+    };
+    let questions = spire_core::actors::messages::ToolInfo {
+        name: SET_OPEN_QUESTIONS_TOOL.to_string(),
+        description: "Replace the design session's open-question list — what must still be\n            answered before an AppSpec can be submitted. Call it whenever the set\n            changes, INCLUDING to clear it (pass an empty list once every question\n            is resolved). Keep it to concrete, answerable questions."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The complete list of open questions ([] when none remain).",
+                }
+            },
+            "required": ["questions"]
+        }),
+    };
+    vec![submit, questions]
+}
+
 /// Free-form brainstorm prompt: a decisive design partner that proposes ONE
 /// recommended solution and asks only when a choice genuinely matters. Grounded
 /// in the recent conversation and any requested docs/web references.
@@ -733,14 +942,24 @@ fn brainstorm_prompt(
     );
     parts.push("Ground your answer in the supplied architecture/web references when present;".to_string());
     parts.push("otherwise answer from knowledge. Propose ONE concrete recommended solution".to_string());
-    parts.push("by default — name the specific types, actors, bridge methods and screens, and".to_string());
-    parts.push("reuse the platform primitives above. Keep answers short. Ask a question only".to_string());
-    parts.push("when a choice is genuinely consequential and no sensible default exists;".to_string());
-    parts.push("ask exactly one, and mark it as the single open question. Do not repeat".to_string());
-    parts.push("settled ground or loop on one area. When the design is complete and no open".to_string());
-    parts.push("questions remain, call the `submit_appspec` tool with the FULL spec.md in the".to_string());
-    parts.push("strict grammar (Data types / Graph / Backend / Bridge / UI). Do NOT submit".to_string());
-    parts.push("while questions are still open.".to_string());
+    parts.push("by default — name the specific domain types, graph nodes, actors, bridge".to_string());
+    parts.push("methods and screens, and reuse the platform primitives above. Keep answers".to_string());
+    parts.push("short. Do not repeat settled ground or loop on one area.".to_string());
+    parts.push(String::new());
+    parts.push("Open questions: before the design can be frozen you must be able to fill".to_string());
+    parts.push("every AppSpec section (Data types, Graph, Backend, Bridge, UI) from the".to_string());
+    parts.push("conversation. Whenever anything is still unknown or genuinely consequential,".to_string());
+    parts.push("call the `set_open_questions` tool with the FULL current list of open".to_string());
+    parts.push("questions (replace semantics), then ask one of them in the chat. When a".to_string());
+    parts.push("question is answered, call `set_open_questions` again with the updated".to_string());
+    parts.push("list — passing [] once none remain. Do NOT invent sections you cannot".to_string());
+    parts.push("ground in the conversation: a missing requirement is an open question,".to_string());
+    parts.push("not a guess. Ask questions rather than submitting after an underspecified".to_string());
+    parts.push("goal.".to_string());
+    parts.push(String::new());
+    parts.push("Only when the design is complete and the open-question list is empty, call".to_string());
+    parts.push("the `submit_appspec` tool with the FULL spec.md in the strict grammar".to_string());
+    parts.push("described on that tool (Data types / Graph / Backend / Bridge / UI).".to_string());
     parts.join("\n")
 }
 
@@ -827,6 +1046,7 @@ mod tests {
                 Ok(DesignReply {
                     text: next.unwrap_or_default(),
                     spec_md: None,
+                    open_questions: None,
                 })
             })
         });
@@ -845,6 +1065,7 @@ mod tests {
                 Ok(DesignReply {
                     text: "final proposal".to_string(),
                     spec_md: Some(md),
+                    open_questions: None,
                 })
             })
         });
@@ -865,6 +1086,7 @@ mod tests {
                 Ok(DesignReply {
                     text: String::new(),
                     spec_md: Some("# Not a spec at all\n\nrandom".to_string()),
+                    open_questions: None,
                 })
             })
         });
@@ -872,6 +1094,138 @@ mod tests {
         assert_eq!(s.mode, DesignMode::Freeform);
         assert_eq!(s.accepted.len(), 0);
         assert!(answer.contains("rejected"), "{answer}");
+    }
+
+    #[test]
+    fn parse_design_reply_understands_text_and_tools() {
+        // Plain text reply.
+        let t = parse_design_reply("just some prose");
+        assert_eq!(t.text, "just some prose");
+        assert!(t.spec_md.is_none() && t.open_questions.is_none());
+
+        // JSON assistant message with a submit_appspec tool call.
+        let json = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "x",
+                "type": "function",
+                "function": { "name": "submit_appspec", "arguments": "{\"spec_md\":\"# AppSpec: X\\n\"}" }
+            }]
+        });
+        let r = parse_design_reply(&json.to_string());
+        assert_eq!(r.text, "");
+        assert_eq!(r.spec_md.as_deref(), Some("# AppSpec: X\n"));
+
+        // set_open_questions call alongside prose.
+        let json2 = serde_json::json!({
+            "content": "two questions for you",
+            "tool_calls": [{
+                "function": { "name": "set_open_questions", "arguments": "{\"questions\":[\"a\",\" b \"]}" }
+            }]
+        });
+        let r2 = parse_design_reply(&json2.to_string());
+        assert_eq!(r2.text, "two questions for you");
+        assert_eq!(
+            r2.open_questions,
+            Some(vec!["a".to_string(), " b ".to_string()])
+        );
+
+        // Both tools in one message.
+        let json3 = serde_json::json!({
+            "content": null,
+            "tool_calls": [
+                { "function": { "name": "set_open_questions", "arguments": "{\"questions\":[]}" } },
+                { "function": { "name": "submit_appspec", "arguments": "{\"spec_md\":\"# A\\n\"}" } }
+            ]
+        });
+        let r3 = parse_design_reply(&json3.to_string());
+        assert_eq!(r3.open_questions, Some(vec![]));
+        assert_eq!(r3.spec_md.as_deref(), Some("# A\n"));
+    }
+
+    #[test]
+    fn design_tools_carry_the_submit_and_questions_tools() {
+        let tools = design_tools();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, SUBMIT_APPSPEC_TOOL);
+        assert_eq!(tools[1].name, SET_OPEN_QUESTIONS_TOOL);
+        // The grammar is embedded in the submit tool so the model can compose a
+        // parseable spec.md.
+        let schema = serde_json::to_string(&tools[0].input_schema).unwrap();
+        assert!(schema.contains("## Data types"));
+        assert!(schema.contains("## Bridge"));
+        assert!(schema.contains("## UI"));
+    }
+
+    #[test]
+    fn submit_is_refused_while_open_questions_remain() {
+        let (mut a, _) = actor(vec![]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        let md = example_spec_md();
+        a.llm = Box::new(move |_p: String| {
+            let md = md.clone();
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: String::new(),
+                    spec_md: Some(md),
+                    open_questions: Some(vec!["vector or raster?".to_string()]),
+                })
+            })
+        });
+        let (answer, s) = pollster(a.ask("draft it now", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Freeform, "gate holds while questions remain");
+        assert!(s.accepted.is_empty());
+        assert!(answer.contains("rejected"), "{answer}");
+        assert!(answer.contains("vector or raster?"), "{answer}");
+    }
+
+    #[test]
+    fn cleared_open_questions_unblock_submission() {
+        let (mut a, _) = actor(vec![]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        let md = example_spec_md();
+        a.llm = Box::new(move |_p: String| {
+            let md = md.clone();
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: "done".to_string(),
+                    spec_md: Some(md),
+                    open_questions: Some(vec![]),
+                })
+            })
+        });
+        let (answer, s) = pollster(a.ask("submit", false, false)).unwrap();
+        assert_eq!(s.mode, DesignMode::Decided);
+        assert_eq!(s.accepted.len(), 1);
+        assert!(answer.contains("AppSpec submitted"), "{answer}");
+    }
+
+    #[test]
+    fn open_questions_persist_and_resume() {
+        let (tx, _fake) = fake_graph_pair();
+        let (mut a, _) = actor(vec![]);
+        a.set_memory_graph(tx.clone());
+        pollster(a.start_session("spire-gis", "view and edit map layers", false)).unwrap();
+        a.llm = Box::new(|_p: String| {
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: "ok".to_string(),
+                    spec_md: None,
+                    open_questions: Some(vec!["units?".to_string(), "projection?".to_string()]),
+                })
+            })
+        });
+        let (_, s1) = pollster(a.ask("what format?", false, false)).unwrap();
+        assert_eq!(s1.open_questions, vec!["units?", "projection?"]);
+
+        // A brand-new actor resumes the same list from the graph.
+        let (mut b, _) = actor(vec![]);
+        b.set_memory_graph(tx);
+        let s2 = pollster(b.start_session("spire-gis", "again", false)).unwrap();
+        assert_eq!(s2.open_questions, vec!["units?", "projection?"]);
     }
 
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
@@ -992,6 +1346,7 @@ mod tests {
                 Ok(DesignReply {
                     text: String::new(),
                     spec_md: Some(md),
+                    open_questions: None,
                 })
             })
         });
@@ -1113,6 +1468,7 @@ mod tests {
                 Ok(DesignReply {
                     text: "final proposal".to_string(),
                     spec_md: Some(md),
+                    open_questions: None,
                 })
             })
         });
@@ -1158,6 +1514,7 @@ mod tests {
                 Ok(DesignReply {
                     text: "alpha final".to_string(),
                     spec_md: Some(md),
+                    open_questions: None,
                 })
             })
         });
@@ -1234,5 +1591,15 @@ mod spire_context_tests {
         assert!(b.contains("SwiftUI"));
         assert!(b.contains("actor pattern"));
         assert!(b.contains("Rust"));
+        // The model must keep its open questions current and not submit early.
+        assert!(b.contains("set_open_questions"));
+        assert!(b.contains("submit_appspec"));
+        assert!(b.contains("underspecified"));
+        // The strict grammar the submit tool advertises is complete.
+        assert!(SPEC_MD_GRAMMAR.contains("## Data types"));
+        assert!(SPEC_MD_GRAMMAR.contains("## Graph"));
+        assert!(SPEC_MD_GRAMMAR.contains("## Backend"));
+        assert!(SPEC_MD_GRAMMAR.contains("## Bridge"));
+        assert!(SPEC_MD_GRAMMAR.contains("## UI"));
     }
 }
