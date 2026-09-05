@@ -659,6 +659,24 @@ Answer each (or pick its recommended answer on the right), then ask it to submit
                 }
             }
         }
+        // Tool-only replies (e.g. just a concept/outline update) carry no prose —
+        // never return an empty answer that looks like the LLM failed.
+        if answer.trim().is_empty() {
+            let mut notes: Vec<String> = Vec::new();
+            if self.outline.is_some() {
+                notes.push("Concept/outline updated — see the panel on the right.".to_string());
+            }
+            if !self.open_questions.is_empty() {
+                notes.push(format!(
+                    "{} open question(s) pending — answer them or accept a recommendation on the right.",
+                    self.open_questions.len()
+                ));
+            }
+            if !notes.is_empty() {
+                answer = notes.join(" ");
+            }
+        }
+
         if !answer.trim().is_empty() {
             self.turns.push(DesignTurn {
                 role: ROLE_ASSISTANT.to_string(),
@@ -1040,18 +1058,18 @@ pub fn design_tools() -> Vec<spire_core::actors::messages::ToolInfo> {
     };
     let outline = spire_core::actors::messages::ToolInfo {
         name: SET_OUTLINE_TOOL.to_string(),
-        description: "Replace the session's draft design outline (markdown, one section
-            per AppSpec section: Data types / Graph / Backend / Bridge / UI). Emit
-            it every turn so the session always shows the current skeleton; mark
-            items that still need a decision with `(to decide)` and leave unknown
-            sections open rather than omitting them."
+        description: "Replace the session's concept draft — the basic assignment of the app
+            across its core modules (UI / Graph / Backend / Bridge, plus shared data
+            types), in markdown. Emit it every turn so the session always shows the
+            current concept; give every part a concrete name and a sensible default,
+            and mark only genuine forks with `(to decide)`."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "outline_md": {
                     "type": "string",
-                    "description": "The current draft design outline in markdown.",
+                    "description": "The current concept/outline in markdown, organized by UI / Graph / Backend / Bridge / types.",
                 }
             },
             "required": ["outline_md"]
@@ -1138,51 +1156,54 @@ fn brainstorm_prompt(
         "You are a decisive design partner for a Spire app who knows the platform.".to_string(),
     );
     parts.push(String::new());
-    parts.push("WORKFLOW — the user's message is ALWAYS an incomplete list of functional".to_string());
-    parts.push("requirements, never a finished design. Run this loop every turn:".to_string());
+    parts.push("WORKFLOW — the user's message is ALWAYS a vague, incomplete list of functional".to_string());
+    parts.push("requirements. Your job is to turn it into a concrete Spire app. Be creative:".to_string());
+    parts.push("invent a basic concept and assign every responsibility to one of the app's".to_string());
+    parts.push("core modules — UI (SwiftUI screens), backend (Rust actors), graph (the".to_string());
+    parts.push("memory-graph schema), bridge (the JSON contract between UI and actors).".to_string());
     parts.push(String::new());
-    parts.push("1. OUTLINE. Keep the draft design outline current: emit it via the".to_string());
-    parts.push("   `set_outline` tool as markdown with one section per AppSpec section —".to_string());
-    parts.push("   Data types, Graph, Backend, Bridge, UI — listing the concrete items".to_string());
-    parts.push("   you can infer from the conversation and marking items that still need".to_string());
-    parts.push("   a decision with `(to decide)`. A section you cannot draft yet is a gap,".to_string());
-    parts.push("   not an omission: leave it open in the outline.".to_string());
+    parts.push("CONCEPT (be creative, decide by default). With every reply, first make sure a".to_string());
+    parts.push("basic concept exists that assigns the requirement across the modules. Give".to_string());
+    parts.push("every part a concrete name and a sensible default — do NOT wait to be asked.".to_string());
+    parts.push("For a requirement like \"a UI to view GIS data stored in the memory graph\",".to_string());
+    parts.push("invent: a `MapScreen` (UI) that lists/views `Feature` nodes; a `Feature`".to_string());
+    parts.push("graph node (with fields) plus edges to its source; a `FeatureStore` actor".to_string());
+    parts.push("that owns them; and `list_features`/`get_feature` bridge methods the screen".to_string());
+    parts.push("calls. Fill in whatever the requirements imply — only mark something `(to".to_string());
+    parts.push("decide)` when the requirement is genuinely silent on a real fork that".to_string());
+    parts.push("changes the design.".to_string());
     parts.push(String::new());
-    parts.push("2. QUESTIONS. Derive the open-question list from the outline gaps and keep".to_string());
-    parts.push("   it current via `set_open_questions` (replace semantics). Every entry".to_string());
-    parts.push("   must name its `section` (one of: types | graph | backend | bridge |".to_string());
-    parts.push("   ui), include the answer you recommend, and add 2-3 `options` only".to_string());
-    parts.push("   when a real choice exists. Cover EVERY section — the graph schema in".to_string());
-    parts.push("   particular needs its own questions: which node types, which edges".to_string());
-    parts.push("   connect them, and which fields each node persists. Also cover backend".to_string());
-    parts.push("   actors (state + which bridge methods they handle), the bridge contract".to_string());
-    parts.push("   (params + result per method), and the UI screens (layout + which".to_string());
-    parts.push("   actions/bindings map to bridge methods).".to_string());
+    parts.push("OUTLINE. Keep the concept as the current draft via the `set_outline` tool:".to_string());
+    parts.push("markdown organized by UI / Graph / Backend / Bridge (plus shared Data".to_string());
+    parts.push("types), listing the concrete items you have decided and marking items that".to_string());
+    parts.push("still genuinely need a decision with `(to decide)`.".to_string());
     parts.push(String::new());
-    parts.push("3. ASK ONE. Then ask exactly one question in the chat — the single most".to_string());
-    parts.push("   consequential gap in the list. Do not dump the whole list into the".to_string());
-    parts.push("   reply text; the list lives in `set_open_questions`.".to_string());
+    parts.push("QUESTIONS. For the few items marked `(to decide)`, keep the open-question".to_string());
+    parts.push("list current via `set_open_questions` (replace semantics). Every entry must".to_string());
+    parts.push("name its `section` (types | graph | backend | bridge | ui), include the".to_string());
+    parts.push("answer you recommend, and add 2-3 `options` only when a real choice".to_string());
+    parts.push("exists. Ask exactly ONE of them in the chat — the most consequential — and".to_string());
+    parts.push("let the rest live in the list.".to_string());
     parts.push(String::new());
-    parts.push("4. CONVERGE. When a question is answered, update the outline and the list".to_string());
-    parts.push("   (drop the resolved question; pass [] when none remain) and ask the".to_string());
-    parts.push("   next most consequential question. Do NOT invent requirements or".to_string());
-    parts.push("   sections — an unanswered requirement is an open question, never a guess.".to_string());
+    parts.push("CONVERGE. When a question is answered, fold the decision into the concept,".to_string());
+    parts.push("update the outline and the list (drop the resolved question; pass [] when".to_string());
+    parts.push("none remain), and move on. Do not re-open settled ground and do not invent".to_string());
+    parts.push("requirements the user never stated.".to_string());
     parts.push(String::new());
-    parts.push("5. SUBMIT. Only when the outline shows no remaining gaps AND the open-".to_string());
-    parts.push("   question list is empty, call `submit_appspec` with the FULL spec.md in".to_string());
-    parts.push("   the strict grammar described on that tool. Never submit after the".to_string());
-    parts.push("   first message.".to_string());
+    parts.push("SUBMIT. Only when every module of the concept is decided AND the open-".to_string());
+    parts.push("question list is empty, call `submit_appspec` with the FULL spec.md in the".to_string());
+    parts.push("strict grammar described on that tool. Do not submit after the first".to_string());
+    parts.push("message unless you have genuinely filled every module.".to_string());
     parts.push(String::new());
-    parts.push("COMPLETENESS CHECKLIST (read before drafting questions — every row below".to_string());
-    parts.push("must be concretely pinned down before you submit):".to_string());
+    parts.push("COMPLETENESS CHECKLIST — the concept must concretely pin down each module:".to_string());
     parts.push("  - app: project name + a crisp goal".to_string());
     parts.push("  - types: the shared records/enums actors, bridge and UI reference".to_string());
-    parts.push("  - graph: the node types with their fields, and the edges between them".to_string());
-    parts.push("  - backend: actors, their state, and which bridge methods each handles".to_string());
+    parts.push("  - graph: the node types (with fields) that store the domain data, and the edges".to_string());
+    parts.push("  - backend: the actors, their state, and which bridge methods each handles".to_string());
     parts.push("  - bridge: every method with its params and Result type".to_string());
-    parts.push("  - ui: each screen's layout, plus actions/bindings to bridge methods".to_string());
+    parts.push("  - ui: each screen, what it shows/does, and its actions/bindings to bridge".to_string());
     parts.push("Every bridge method must be handled by exactly one actor; every UI action".to_string());
-    parts.push("must call a bridge method. Ask questions until each row above is settled.".to_string());
+    parts.push("must call a bridge method. Decide what you can, ask only about real forks.".to_string());
     parts.join("\n")
 }
 
@@ -1608,6 +1629,29 @@ mod tests {
         assert_eq!(s2.outline.as_deref(), Some("## Graph\n- nodes (to decide)"));
     }
 
+    #[test]
+    fn tool_only_reply_still_returns_a_meaningful_answer() {
+        let (mut a, _) = actor(vec![]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        a.llm = Box::new(|_p: String| {
+            Box::pin(async move {
+                Ok(DesignReply {
+                    text: String::new(),
+                    outline: Some("## UI
+- MapScreen".to_string()),
+                    spec_md: None,
+                    open_questions: None,
+                })
+            })
+        });
+        let (answer, s) = pollster(a.ask("draft it", false, false)).unwrap();
+        assert!(!answer.trim().is_empty(), "tool-only reply must not come back empty");
+        assert!(answer.contains("outline"), "{answer}");
+        assert_eq!(s.outline.as_deref(), Some("## UI
+- MapScreen"));
+    }
+
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
         let (llm, prompts) = canned(responses);
         (SpecDesignActor::new(llm), prompts)
@@ -1974,8 +2018,11 @@ mod spire_context_tests {
         assert!(b.contains("SwiftUI"));
         assert!(b.contains("actor pattern"));
         assert!(b.contains("Rust"));
-        // Outline-first workflow + coverage + no early submit.
+        // Concept-first workflow + coverage + no early submit.
         assert!(b.contains("WORKFLOW"));
+        assert!(b.contains("CONCEPT"));
+        assert!(b.contains("be creative"));
+        assert!(b.contains("core modules"));
         assert!(b.contains("set_outline"));
         assert!(b.contains("set_open_questions"));
         assert!(b.contains("submit_appspec"));

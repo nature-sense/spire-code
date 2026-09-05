@@ -331,7 +331,7 @@ struct SpecDesignView: View {
             }
             if let outline, !outline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    Label("Design outline", systemImage: "square.stack.3d.up")
+                    Label("Concept", systemImage: "square.stack.3d.up")
                         .font(.headline)
                     ScrollView {
                         MarkdownText(outline)
