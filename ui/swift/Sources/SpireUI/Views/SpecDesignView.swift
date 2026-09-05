@@ -70,6 +70,7 @@ struct SpecDesignView: View {
     @State private var busy = false
     @State private var errorMessage: String?
     /// Questions the assistant still needs answered (blocks submission).
+    @State private var outline: String?
     @State private var openQuestions: [DesignQuestion] = []
     /// acceptedCount already handed to the code generator (fires once per submit).
     @State private var codegenVersion = 0
@@ -328,6 +329,20 @@ struct SpecDesignView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            if let outline, !outline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Design outline", systemImage: "square.stack.3d.up")
+                        .font(.headline)
+                    ScrollView {
+                        MarkdownText(outline)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 240)
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.4)))
+            }
             if !openQuestions.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {
@@ -379,9 +394,21 @@ struct SpecDesignView: View {
     /// answer auto-sends it as the user's next message (existing ask path).
     private func questionCard(index: Int, question: DesignQuestion) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("\(index + 1). \(question.question)")
-                .font(.caption.weight(.semibold))
-                .textSelection(.enabled)
+            HStack(alignment: .top, spacing: 6) {
+                Text("\(index + 1).")
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                if !question.section.isEmpty {
+                    Text(question.section)
+                        .font(.caption2.weight(.medium))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(.blue.opacity(0.15)))
+                }
+                Text(question.question)
+                    .font(.caption.weight(.semibold))
+                    .textSelection(.enabled)
+            }
             if !question.recommendation.isEmpty {
                 Button {
                     acceptAnswer(question, choice: question.recommendation)
@@ -422,6 +449,7 @@ struct SpecDesignView: View {
         if let state {
             isDecided = state.isDecided
             acceptedCount = state.acceptedCount
+            outline = state.outline
             openQuestions = state.openQuestions
         }
         if let error {

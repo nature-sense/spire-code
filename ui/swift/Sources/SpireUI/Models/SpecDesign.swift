@@ -3,6 +3,8 @@ import Foundation
 /// One open design question with the answer the assistant recommends (and any
 /// alternatives). Mirrors the Rust `DesignQuestion`.
 struct DesignQuestion {
+    /// AppSpec section this question belongs to (types | graph | backend | bridge | ui).
+    let section: String
     let question: String
     let recommendation: String
     let options: [String]
@@ -10,6 +12,7 @@ struct DesignQuestion {
     init?(json: Any) {
         guard let dict = json as? [String: Any],
               let question = dict["question"] as? String else { return nil }
+        self.section = dict["section"] as? String ?? ""
         self.question = question
         self.recommendation = dict["recommendation"] as? String ?? ""
         self.options = dict["options"] as? [String] ?? []
@@ -24,6 +27,8 @@ struct SpecDesignState {
     /// "freeform" or "decided" (Rust `DesignMode`, lowercase serialized).
     let mode: String
     let turnCount: Int
+    /// The assistant's current draft design outline (markdown) if any.
+    let outline: String?
     /// Design questions the assistant still needs answered, each with a
     /// recommended answer the user can accept (the submit gate refuses while any
     /// remain).
@@ -39,6 +44,7 @@ struct SpecDesignState {
               let mode = dict["mode"] as? String else { return nil }
         self.mode = mode
         self.turnCount = dict["turn_count"] as? Int ?? 0
+        self.outline = dict["outline"] as? String
         if let raw = dict["open_questions"] as? [Any] {
             self.openQuestions = raw.compactMap { DesignQuestion(json: $0) }
         } else {

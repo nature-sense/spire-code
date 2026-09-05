@@ -42,6 +42,10 @@ use super::spec_md;
 /// the user can accept it (or pick an alternative) instead of typing an answer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DesignQuestion {
+    /// Which AppSpec section the question belongs to: one of "types", "graph",
+    /// "backend", "bridge" or "ui" ("" when unknown). Used to surface coverage.
+    #[serde(default)]
+    pub section: String,
     pub question: String,
     /// The answer the model recommends (what "Use recommendation" fills in).
     pub recommendation: String,
@@ -50,16 +54,20 @@ pub struct DesignQuestion {
     pub options: Vec<String>,
 }
 
-/// The injected design-model reply: the assistant's free-form text plus two
+/// The injected design-model reply: the assistant's free-form text plus the
 /// optional tool hand-offs:
-/// - `spec_md` — the full AppSpec (`spec.md` in the strict grammar) produced via
-///   the `submit_appspec` tool when the model considers the design complete;
+/// - `outline` — the model's current draft design outline (markdown, one
+///   section per AppSpec section) via the `set_outline` tool, kept current every
+///   turn so the session always shows the design skeleton;
 /// - `open_questions` — the model's current open-question list (replace
 ///   semantics) maintained via the `set_open_questions` tool. Submission is
-///   refused while the list is non-empty.
+///   refused while the list is non-empty;
+/// - `spec_md` — the full AppSpec (`spec.md` in the strict grammar) produced via
+///   the `submit_appspec` tool when the model considers the design complete.
 #[derive(Debug, Clone, Default)]
 pub struct DesignReply {
     pub text: String,
+    pub outline: Option<String>,
     pub spec_md: Option<String>,
     pub open_questions: Option<Vec<DesignQuestion>>,
 }
@@ -111,6 +119,9 @@ pub struct SpecDesignState {
     pub project_name: String,
     pub goal: String,
     pub turn_count: usize,
+    /// The model's current draft design outline (markdown, one section per
+    /// AppSpec section), kept current via the `set_outline` tool.
+    pub outline: Option<String>,
     /// Design questions the assistant raised that are still unanswered, each
     /// with a recommended answer the user can accept. The assistant maintains
     /// the list via the `set_open_questions` tool and must clear it before the
@@ -175,6 +186,8 @@ pub struct SpecDesignActor {
     memory_graph_tx: Option<mpsc::Sender<MemoryGraphMessage>>,
     mode: DesignMode,
     turns: Vec<DesignTurn>,
+    /// Current draft design outline (model-maintained via `set_outline`).
+    outline: Option<String>,
     /// Current open design questions (question + recommended answer),
     /// model-maintained via `set_open_questions`.
     open_questions: Vec<DesignQuestion>,
@@ -203,6 +216,7 @@ impl SpecDesignActor {
             memory_graph_tx: None,
             mode: DesignMode::Freeform,
             turns: Vec::new(),
+            outline: None,
             open_questions: Vec::new(),
             accepted: Vec::new(),
             latest: None,
@@ -266,6 +280,7 @@ impl SpecDesignActor {
                 ("mode", serde_json::json!(mode_str(self.mode))),
                 ("instance", serde_json::json!(self.instance)),
                 ("turn_count", serde_json::json!(self.turns.len())),
+                ("outline", serde_json::json!(self.outline)),
                 (
                     "open_questions",
                     serde_json::to_value(&self.open_questions)
@@ -338,6 +353,11 @@ impl SpecDesignActor {
         self.project_name = project_name.to_string();
         self.mode = mode;
         self.instance = instance.clone();
+        self.outline = session
+            .properties
+            .get("outline")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         self.open_questions = session
             .properties
             .get("open_questions")
@@ -406,6 +426,7 @@ impl SpecDesignActor {
             project_name: self.project_name.clone(),
             goal: self.goal.clone(),
             turn_count: self.turns.len(),
+            outline: self.outline.clone(),
             open_questions: self.open_questions.clone(),
             accepted: self.accepted.clone(),
             latest: self.latest.clone(),
@@ -440,6 +461,7 @@ impl SpecDesignActor {
         self.goal = goal.to_string();
         self.mode = DesignMode::Freeform;
         self.turns.clear();
+        self.outline = None;
         self.open_questions.clear();
         self.accepted.clear();
         self.latest = None;
@@ -525,9 +547,18 @@ impl SpecDesignActor {
             &text,
             &context,
             &grounding,
+            self.outline.as_deref(),
+            &self.open_questions,
         );
         let reply = self.call_llm(prompt).await?;
         let mut answer = reply.text.clone();
+        // The model keeps its draft outline current via the `set_outline` tool.
+        if let Some(o) = reply.outline {
+            let trimmed = o.trim().to_string();
+            if !trimmed.is_empty() {
+                self.outline = Some(trimmed);
+            }
+        }
         // The model keeps its open-question list current via the
         // `set_open_questions` tool (replace semantics: the full list each time,
         // [] once nothing remains unanswered). Surface the list in the chat so
@@ -536,6 +567,7 @@ impl SpecDesignActor {
             self.open_questions = open
                 .into_iter()
                 .map(|q| DesignQuestion {
+                    section: q.section.trim().to_string(),
                     question: q.question.trim().to_string(),
                     recommendation: q.recommendation.trim().to_string(),
                     options: q
@@ -809,6 +841,7 @@ HARD CONSTRAINTS:\n\
 /// coordinator advertises exactly what [`parse_design_reply`] understands).
 pub const SUBMIT_APPSPEC_TOOL: &str = "submit_appspec";
 pub const SET_OPEN_QUESTIONS_TOOL: &str = "set_open_questions";
+pub const SET_OUTLINE_TOOL: &str = "set_outline";
 
 /// The strict spec.md grammar the design model must produce for
 /// `submit_appspec` (1:1 parseable by the AppSpec parser). Injected into the
@@ -891,6 +924,12 @@ pub fn parse_design_reply(raw: &str) -> DesignReply {
                     .and_then(|m| m.as_str())
                     .map(str::to_string);
             }
+            SET_OUTLINE_TOOL => {
+                reply.outline = args
+                    .get("outline_md")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string);
+            }
             SET_OPEN_QUESTIONS_TOOL => {
                 reply.open_questions = args.get("questions").and_then(|q| q.as_array()).map(
                     |qs| {
@@ -900,12 +939,18 @@ pub fn parse_design_reply(raw: &str) -> DesignReply {
                                     // Back-compat: a bare string is a question
                                     // without a recommendation.
                                     return Some(DesignQuestion {
+                                        section: String::new(),
                                         question: s.to_string(),
                                         recommendation: String::new(),
                                         options: Vec::new(),
                                     });
                                 }
                                 let obj = x.as_object()?;
+                                let section = obj
+                                    .get("section")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
                                 let question = obj.get("question")?.as_str()?.to_string();
                                 let recommendation = obj
                                     .get("recommendation")
@@ -923,6 +968,7 @@ pub fn parse_design_reply(raw: &str) -> DesignReply {
                                     })
                                     .unwrap_or_default();
                                 Some(DesignQuestion {
+                                    section,
                                     question,
                                     recommendation,
                                     options,
@@ -975,6 +1021,7 @@ pub fn design_tools() -> Vec<spire_core::actors::messages::ToolInfo> {
                     "items": {
                         "type": "object",
                         "properties": {
+                            "section": { "type": "string", "description": "Which AppSpec section this question covers: types | graph | backend | bridge | ui." },
                             "question": { "type": "string", "description": "One concrete, answerable question." },
                             "recommendation": { "type": "string", "description": "The answer you recommend — the user can accept it with one click." },
                             "options": {
@@ -991,27 +1038,89 @@ pub fn design_tools() -> Vec<spire_core::actors::messages::ToolInfo> {
             "required": ["questions"]
         }),
     };
-    vec![submit, questions]
+    let outline = spire_core::actors::messages::ToolInfo {
+        name: SET_OUTLINE_TOOL.to_string(),
+        description: "Replace the session's draft design outline (markdown, one section
+            per AppSpec section: Data types / Graph / Backend / Bridge / UI). Emit
+            it every turn so the session always shows the current skeleton; mark
+            items that still need a decision with `(to decide)` and leave unknown
+            sections open rather than omitting them."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "outline_md": {
+                    "type": "string",
+                    "description": "The current draft design outline in markdown.",
+                }
+            },
+            "required": ["outline_md"]
+        }),
+    };
+    vec![submit, outline, questions]
 }
 
-/// Free-form brainstorm prompt: a decisive design partner that proposes ONE
-/// recommended solution and asks only when a choice genuinely matters. Grounded
-/// in the recent conversation and any requested docs/web references.
+/// The required AppSpec sections the model must cover while drafting the
+/// outline and its questions (the `section` tags on [`DesignQuestion`]).
+const DESIGN_SECTIONS: [&str; 5] = ["types", "graph", "backend", "bridge", "ui"];
+
+/// Which required sections currently have NO open question — surfaced to the
+/// model (and testable) so a section like the graph schema is never silently
+/// dropped.
+fn coverage_note(open: &[DesignQuestion]) -> Option<String> {
+    use std::collections::HashSet;
+    let covered: HashSet<&str> = open
+        .iter()
+        .map(|q| q.section.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let missing: Vec<&str> = DESIGN_SECTIONS
+        .iter()
+        .copied()
+        .filter(|s| !covered.contains(s))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let covered_list = if covered.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        covered.iter().map(|s| *s).collect::<Vec<_>>().join(", ")
+    };
+    Some(format!(
+        "## Coverage — your open questions so far touch: {covered_list}.\nNo open question yet for: {missing}. If those sections still need decisions, add questions for them.",
+        covered_list = covered_list,
+        missing = missing.join(", ")
+    ))
+}
+
+/// Free-form brainstorm prompt: an outline-first workflow. The user's message is
+/// ALWAYS an incomplete list of functional requirements; the model drafts the
+/// design outline (via `set_outline`), tracks every gap as a question (via
+/// `set_open_questions`, each tagged with its section and a recommended answer),
+/// asks one question at a time, and only submits once the outline has no gaps.
 fn brainstorm_prompt(
     project_name: &str,
     goal: &str,
     question: &str,
     context: &[DesignTurn],
     grounding: &[String],
+    outline: Option<&str>,
+    open: &[DesignQuestion],
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(SPIRE_APP_CONTEXT.to_string());
     parts.push(format!("Project: {project_name}"));
     parts.push(format!("Goal: {goal}"));
     parts.push(String::new());
-    parts.push("## The user's question".to_string());
+    parts.push("## The user's message".to_string());
     parts.push(question.to_string());
     parts.push(String::new());
+    if let Some(o) = outline.filter(|o| !o.trim().is_empty()) {
+        parts.push("## Design outline (current draft — keep it in sync)".to_string());
+        parts.push(o.trim().to_string());
+        parts.push(String::new());
+    }
     parts.push("## Recent conversation".to_string());
     parts.push(format_turns(context));
     if !grounding.is_empty() {
@@ -1020,31 +1129,60 @@ fn brainstorm_prompt(
             parts.push(block.clone());
         }
     }
+    if let Some(note) = coverage_note(open) {
+        parts.push(String::new());
+        parts.push(note);
+    }
     parts.push(String::new());
     parts.push(
         "You are a decisive design partner for a Spire app who knows the platform.".to_string(),
     );
-    parts.push("Ground your answer in the supplied architecture/web references when present;".to_string());
-    parts.push("otherwise answer from knowledge. Propose ONE concrete recommended solution".to_string());
-    parts.push("by default — name the specific domain types, graph nodes, actors, bridge".to_string());
-    parts.push("methods and screens, and reuse the platform primitives above. Keep answers".to_string());
-    parts.push("short. Do not repeat settled ground or loop on one area.".to_string());
     parts.push(String::new());
-    parts.push("Open questions: before the design can be frozen you must be able to fill".to_string());
-    parts.push("every AppSpec section (Data types, Graph, Backend, Bridge, UI) from the".to_string());
-    parts.push("conversation. Whenever anything is still unknown or genuinely consequential,".to_string());
-    parts.push("call the `set_open_questions` tool with the FULL current list of open".to_string());
-    parts.push("questions (replace semantics). Each question must include the answer".to_string());
-    parts.push("you recommend (plus 2-3 alternatives only when a real choice exists), so".to_string());
-    parts.push("the user can answer with one click. Ask only ONE question in the chat at".to_string());
-    parts.push("a time. When a question is answered, call `set_open_questions` again".to_string());
-    parts.push("with the updated list — passing [] once none remain. Do NOT invent".to_string());
-    parts.push("sections you cannot ground in the conversation: a missing requirement".to_string());
-    parts.push("is an open question, not a guess.".to_string());
+    parts.push("WORKFLOW — the user's message is ALWAYS an incomplete list of functional".to_string());
+    parts.push("requirements, never a finished design. Run this loop every turn:".to_string());
     parts.push(String::new());
-    parts.push("Only when the design is complete and the open-question list is empty, call".to_string());
-    parts.push("the `submit_appspec` tool with the FULL spec.md in the strict grammar".to_string());
-    parts.push("described on that tool (Data types / Graph / Backend / Bridge / UI).".to_string());
+    parts.push("1. OUTLINE. Keep the draft design outline current: emit it via the".to_string());
+    parts.push("   `set_outline` tool as markdown with one section per AppSpec section —".to_string());
+    parts.push("   Data types, Graph, Backend, Bridge, UI — listing the concrete items".to_string());
+    parts.push("   you can infer from the conversation and marking items that still need".to_string());
+    parts.push("   a decision with `(to decide)`. A section you cannot draft yet is a gap,".to_string());
+    parts.push("   not an omission: leave it open in the outline.".to_string());
+    parts.push(String::new());
+    parts.push("2. QUESTIONS. Derive the open-question list from the outline gaps and keep".to_string());
+    parts.push("   it current via `set_open_questions` (replace semantics). Every entry".to_string());
+    parts.push("   must name its `section` (one of: types | graph | backend | bridge |".to_string());
+    parts.push("   ui), include the answer you recommend, and add 2-3 `options` only".to_string());
+    parts.push("   when a real choice exists. Cover EVERY section — the graph schema in".to_string());
+    parts.push("   particular needs its own questions: which node types, which edges".to_string());
+    parts.push("   connect them, and which fields each node persists. Also cover backend".to_string());
+    parts.push("   actors (state + which bridge methods they handle), the bridge contract".to_string());
+    parts.push("   (params + result per method), and the UI screens (layout + which".to_string());
+    parts.push("   actions/bindings map to bridge methods).".to_string());
+    parts.push(String::new());
+    parts.push("3. ASK ONE. Then ask exactly one question in the chat — the single most".to_string());
+    parts.push("   consequential gap in the list. Do not dump the whole list into the".to_string());
+    parts.push("   reply text; the list lives in `set_open_questions`.".to_string());
+    parts.push(String::new());
+    parts.push("4. CONVERGE. When a question is answered, update the outline and the list".to_string());
+    parts.push("   (drop the resolved question; pass [] when none remain) and ask the".to_string());
+    parts.push("   next most consequential question. Do NOT invent requirements or".to_string());
+    parts.push("   sections — an unanswered requirement is an open question, never a guess.".to_string());
+    parts.push(String::new());
+    parts.push("5. SUBMIT. Only when the outline shows no remaining gaps AND the open-".to_string());
+    parts.push("   question list is empty, call `submit_appspec` with the FULL spec.md in".to_string());
+    parts.push("   the strict grammar described on that tool. Never submit after the".to_string());
+    parts.push("   first message.".to_string());
+    parts.push(String::new());
+    parts.push("COMPLETENESS CHECKLIST (read before drafting questions — every row below".to_string());
+    parts.push("must be concretely pinned down before you submit):".to_string());
+    parts.push("  - app: project name + a crisp goal".to_string());
+    parts.push("  - types: the shared records/enums actors, bridge and UI reference".to_string());
+    parts.push("  - graph: the node types with their fields, and the edges between them".to_string());
+    parts.push("  - backend: actors, their state, and which bridge methods each handles".to_string());
+    parts.push("  - bridge: every method with its params and Result type".to_string());
+    parts.push("  - ui: each screen's layout, plus actions/bindings to bridge methods".to_string());
+    parts.push("Every bridge method must be handled by exactly one actor; every UI action".to_string());
+    parts.push("must call a bridge method. Ask questions until each row above is settled.".to_string());
     parts.join("\n")
 }
 
@@ -1129,6 +1267,7 @@ mod tests {
                 let mut q = queue.lock().unwrap();
                 let next = q.pop_front().or_else(|| q.back().cloned());
                 Ok(DesignReply {
+                    outline: None,
                     text: next.unwrap_or_default(),
                     spec_md: None,
                     open_questions: None,
@@ -1148,6 +1287,7 @@ mod tests {
             let md = md.clone();
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: "final proposal".to_string(),
                     spec_md: Some(md),
                     open_questions: None,
@@ -1169,6 +1309,7 @@ mod tests {
         a.llm = Box::new(move |_p: String| {
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: String::new(),
                     spec_md: Some("# Not a spec at all\n\nrandom".to_string()),
                     open_questions: None,
@@ -1215,11 +1356,13 @@ mod tests {
             r2.open_questions,
             Some(vec![
                 DesignQuestion {
+                    section: String::new(),
                     question: "a".to_string(),
                     recommendation: String::new(),
                     options: Vec::new(),
                 },
                 DesignQuestion {
+                    section: String::new(),
                     question: " b ".to_string(),
                     recommendation: String::new(),
                     options: Vec::new(),
@@ -1267,9 +1410,10 @@ mod tests {
     #[test]
     fn design_tools_carry_the_submit_and_questions_tools() {
         let tools = design_tools();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert_eq!(tools[0].name, SUBMIT_APPSPEC_TOOL);
-        assert_eq!(tools[1].name, SET_OPEN_QUESTIONS_TOOL);
+        assert_eq!(tools[1].name, SET_OUTLINE_TOOL);
+        assert_eq!(tools[2].name, SET_OPEN_QUESTIONS_TOOL);
         // The grammar is embedded in the submit tool so the model can compose a
         // parseable spec.md.
         let schema = serde_json::to_string(&tools[0].input_schema).unwrap();
@@ -1288,9 +1432,11 @@ mod tests {
             let md = md.clone();
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: String::new(),
                     spec_md: Some(md),
                     open_questions: Some(vec![DesignQuestion {
+                        section: String::new(),
                         question: "vector or raster?".to_string(),
                         recommendation: "vector".to_string(),
                         options: Vec::new(),
@@ -1315,6 +1461,7 @@ mod tests {
             let md = md.clone();
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: "done".to_string(),
                     spec_md: Some(md),
                     open_questions: Some(vec![]),
@@ -1336,11 +1483,12 @@ mod tests {
         a.llm = Box::new(|_p: String| {
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: "ok".to_string(),
                     spec_md: None,
                     open_questions: Some(vec![
-                        DesignQuestion { question: "units?".to_string(), recommendation: "meters".to_string(), options: Vec::new() },
-                        DesignQuestion { question: "projection?".to_string(), recommendation: "EPSG:3857".to_string(), options: Vec::new() },
+                        DesignQuestion { section: String::new(), question: "units?".to_string(), recommendation: "meters".to_string(), options: Vec::new() },
+                        DesignQuestion { section: String::new(), question: "projection?".to_string(), recommendation: "EPSG:3857".to_string(), options: Vec::new() },
                     ]),
                 })
             })
@@ -1350,11 +1498,13 @@ mod tests {
             s1.open_questions,
             vec![
                 DesignQuestion {
+                    section: String::new(),
                     question: "units?".to_string(),
                     recommendation: "meters".to_string(),
                     options: Vec::new(),
                 },
                 DesignQuestion {
+                    section: String::new(),
                     question: "projection?".to_string(),
                     recommendation: "EPSG:3857".to_string(),
                     options: Vec::new(),
@@ -1370,17 +1520,92 @@ mod tests {
             s2.open_questions,
             vec![
                 DesignQuestion {
+                    section: String::new(),
                     question: "units?".to_string(),
                     recommendation: "meters".to_string(),
                     options: Vec::new(),
                 },
                 DesignQuestion {
+                    section: String::new(),
                     question: "projection?".to_string(),
                     recommendation: "EPSG:3857".to_string(),
                     options: Vec::new(),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn coverage_note_lists_sections_still_missing() {
+        // Nothing covered yet -> all five missing.
+        let none = coverage_note(&[]).expect("empty list gets a reminder");
+        assert!(none.contains("graph"), "{none}");
+        assert!(none.contains("bridge"), "{none}");
+        assert!(none.contains("ui"), "{none}");
+
+        // Partial coverage -> only the gap is named.
+        let open = vec![DesignQuestion {
+            section: "types".to_string(),
+            question: "what units?".to_string(),
+            recommendation: "meters".to_string(),
+            options: vec![],
+        }];
+        let partial = coverage_note(&open).expect("partial coverage gets a reminder");
+        assert!(partial.contains("types"));
+        assert!(partial.contains("graph"), "{partial}");
+        assert!(!partial.contains("ui,") || partial.contains("ui"), "{partial}");
+
+        // Every required section covered -> no reminder.
+        let full: Vec<DesignQuestion> = ["types", "graph", "backend", "bridge", "ui"]
+            .iter()
+            .map(|s| DesignQuestion {
+                section: s.to_string(),
+                question: "q".to_string(),
+                recommendation: "r".to_string(),
+                options: vec![],
+            })
+            .collect();
+        assert!(coverage_note(&full).is_none());
+    }
+
+    #[test]
+    fn outline_parses_and_persists_across_restart() {
+        // set_outline tool call is parsed.
+        let args = serde_json::json!({
+            "outline_md": "## Data types\n- (to decide) MapFeature\n\n## Graph\n- (to decide) nodes",
+        })
+        .to_string();
+        let json = serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "function": { "name": "set_outline", "arguments": args }
+            }]
+        });
+        let r = parse_design_reply(&json.to_string());
+        assert!(r.outline.as_deref().unwrap_or("").contains("## Graph"));
+
+        // Persist + resume.
+        let (tx, _fake) = fake_graph_pair();
+        let (mut a, _) = actor(vec![]);
+        a.set_memory_graph(tx.clone());
+        pollster(a.start_session("spire-gis", "view and edit map layers", false)).unwrap();
+        a.llm = Box::new(|_p: String| {
+            Box::pin(async move {
+                Ok(DesignReply {
+                    outline: Some("## Graph\n- nodes (to decide)".to_string()),
+                    text: "drafting".to_string(),
+                    spec_md: None,
+                    open_questions: None,
+                })
+            })
+        });
+        let (_, s1) = pollster(a.ask("what should this do?", false, false)).unwrap();
+        assert_eq!(s1.outline.as_deref(), Some("## Graph\n- nodes (to decide)"));
+
+        let (mut b, _) = actor(vec![]);
+        b.set_memory_graph(tx);
+        let s2 = pollster(b.start_session("spire-gis", "again", false)).unwrap();
+        assert_eq!(s2.outline.as_deref(), Some("## Graph\n- nodes (to decide)"));
     }
 
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
@@ -1432,7 +1657,7 @@ mod tests {
         assert_eq!(state1.turn_count, 4); // 2 seeded + question + answer
         let p1 = prompts.lock().unwrap()[0].clone();
         assert!(p1.contains("Project: spire-gis"));
-        assert!(p1.contains("The user's question"));
+        assert!(p1.contains("## The user's message"));
         assert!(p1.contains("what is the best canonical GIS format?"));
         assert!(p1.contains("[user] what is the best canonical GIS format?"));
 
@@ -1499,6 +1724,7 @@ mod tests {
             let md = md.clone();
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: String::new(),
                     spec_md: Some(md),
                     open_questions: None,
@@ -1621,6 +1847,7 @@ mod tests {
             let md = md.clone();
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: "final proposal".to_string(),
                     spec_md: Some(md),
                     open_questions: None,
@@ -1667,6 +1894,7 @@ mod tests {
             let md = md.clone();
             Box::pin(async move {
                 Ok(DesignReply {
+                    outline: None,
                     text: "alpha final".to_string(),
                     spec_md: Some(md),
                     open_questions: None,
@@ -1741,15 +1969,17 @@ mod spire_context_tests {
 
     #[test]
     fn design_prompts_carry_the_spire_app_context() {
-        let b = brainstorm_prompt("spire-gis", "view and edit map layers", "what stack?", &[], &[]);
+        let b = brainstorm_prompt("spire-gis", "view and edit map layers", "what stack?", &[], &[], None, &[]);
         assert!(b.contains("SPIRE APP CONTEXT"));
         assert!(b.contains("SwiftUI"));
         assert!(b.contains("actor pattern"));
         assert!(b.contains("Rust"));
-        // The model must keep its open questions current and not submit early.
+        // Outline-first workflow + coverage + no early submit.
+        assert!(b.contains("WORKFLOW"));
+        assert!(b.contains("set_outline"));
         assert!(b.contains("set_open_questions"));
         assert!(b.contains("submit_appspec"));
-        assert!(b.contains("not a guess"));
+        assert!(b.contains("COMPLETENESS CHECKLIST"));
         // The strict grammar the submit tool advertises is complete.
         assert!(SPEC_MD_GRAMMAR.contains("## Data types"));
         assert!(SPEC_MD_GRAMMAR.contains("## Graph"));
