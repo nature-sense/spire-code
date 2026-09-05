@@ -38,6 +38,18 @@ use super::spec::{validate, AppSpec, SpecIssue, SpecIssueSeverity};
 use super::spec_graph;
 use super::spec_md;
 
+/// One open design question the model raised, with the answer it recommends so
+/// the user can accept it (or pick an alternative) instead of typing an answer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DesignQuestion {
+    pub question: String,
+    /// The answer the model recommends (what "Use recommendation" fills in).
+    pub recommendation: String,
+    /// Optional alternative answers the user can pick instead.
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
 /// The injected design-model reply: the assistant's free-form text plus two
 /// optional tool hand-offs:
 /// - `spec_md` — the full AppSpec (`spec.md` in the strict grammar) produced via
@@ -49,7 +61,7 @@ use super::spec_md;
 pub struct DesignReply {
     pub text: String,
     pub spec_md: Option<String>,
-    pub open_questions: Option<Vec<String>>,
+    pub open_questions: Option<Vec<DesignQuestion>>,
 }
 
 /// An injected LLM call: a design prompt → a [`DesignReply`].
@@ -99,10 +111,11 @@ pub struct SpecDesignState {
     pub project_name: String,
     pub goal: String,
     pub turn_count: usize,
-    /// Design questions/options the assistant raised that are still unanswered.
-    /// The assistant maintains the list via the `set_open_questions` tool and
-    /// must clear it before the AppSpec can be submitted.
-    pub open_questions: Vec<String>,
+    /// Design questions the assistant raised that are still unanswered, each
+    /// with a recommended answer the user can accept. The assistant maintains
+    /// the list via the `set_open_questions` tool and must clear it before the
+    /// AppSpec can be submitted.
+    pub open_questions: Vec<DesignQuestion>,
     pub accepted: Vec<AcceptedSpec>,
     pub latest: Option<AppSpec>,
     pub last_issues: Vec<SpecIssue>,
@@ -162,8 +175,9 @@ pub struct SpecDesignActor {
     memory_graph_tx: Option<mpsc::Sender<MemoryGraphMessage>>,
     mode: DesignMode,
     turns: Vec<DesignTurn>,
-    /// Current open design questions, model-maintained via `set_open_questions`.
-    open_questions: Vec<String>,
+    /// Current open design questions (question + recommended answer),
+    /// model-maintained via `set_open_questions`.
+    open_questions: Vec<DesignQuestion>,
     accepted: Vec<AcceptedSpec>,
     latest: Option<AppSpec>,
     last_issues: Vec<SpecIssue>,
@@ -520,24 +534,42 @@ impl SpecDesignActor {
         // the user sees what still blocks a submission.
         if let Some(open) = reply.open_questions {
             self.open_questions = open
-                .iter()
-                .map(|q| q.trim().to_string())
-                .filter(|q| !q.is_empty())
+                .into_iter()
+                .map(|q| DesignQuestion {
+                    question: q.question.trim().to_string(),
+                    recommendation: q.recommendation.trim().to_string(),
+                    options: q
+                        .options
+                        .into_iter()
+                        .map(|o| o.trim().to_string())
+                        .filter(|o| !o.is_empty())
+                        .collect(),
+                })
+                .filter(|q| !q.question.is_empty())
                 .collect();
             if !self.open_questions.is_empty() {
+                // Numbered list so MarkdownText renders each question on its own
+                // line instead of one merged paragraph.
                 let qs = self
                     .open_questions
                     .iter()
-                    .map(|q| format!("  • {q}"))
+                    .enumerate()
+                    .map(|(i, q)| format!("{}. {}", i + 1, q.question))
                     .collect::<Vec<_>>()
-                    .join("\n");
+                    .join("
+");
                 let line = format!(
-                    "Open questions still to resolve before the AppSpec can be submitted:\n{qs}"
+                    "Open questions still to resolve before the AppSpec can be submitted:
+{qs}
+
+Accept a recommended answer on the right, or answer in the chat."
                 );
                 answer = if answer.trim().is_empty() {
                     line.clone()
                 } else {
-                    format!("{answer}\n\n{line}")
+                    format!("{answer}
+
+{line}")
                 };
             }
         }
@@ -550,11 +582,16 @@ impl SpecDesignActor {
                 let qs = self
                     .open_questions
                     .iter()
-                    .map(|q| format!("  • {q}"))
+                    .enumerate()
+                    .map(|(i, q)| format!("{}. {}", i + 1, q.question))
                     .collect::<Vec<_>>()
-                    .join("\n");
+                    .join("
+");
                 let line = format!(
-                    "submit_appspec was rejected — {} open question(s) must be answered first:\n{qs}",
+                    "submit_appspec was rejected — {} open question(s) must be answered first:
+{qs}
+
+Answer each (or pick its recommended answer on the right), then ask it to submit again.",
                     self.open_questions.len()
                 );
                 answer = if answer.trim().is_empty() {
@@ -855,15 +892,45 @@ pub fn parse_design_reply(raw: &str) -> DesignReply {
                     .map(str::to_string);
             }
             SET_OPEN_QUESTIONS_TOOL => {
-                reply.open_questions = args
-                    .get("questions")
-                    .and_then(|q| q.as_array())
-                    .map(|qs| {
+                reply.open_questions = args.get("questions").and_then(|q| q.as_array()).map(
+                    |qs| {
                         qs.iter()
-                            .filter_map(|x| x.as_str())
-                            .map(str::to_string)
+                            .filter_map(|x| {
+                                if let Some(s) = x.as_str() {
+                                    // Back-compat: a bare string is a question
+                                    // without a recommendation.
+                                    return Some(DesignQuestion {
+                                        question: s.to_string(),
+                                        recommendation: String::new(),
+                                        options: Vec::new(),
+                                    });
+                                }
+                                let obj = x.as_object()?;
+                                let question = obj.get("question")?.as_str()?.to_string();
+                                let recommendation = obj
+                                    .get("recommendation")
+                                    .and_then(|r| r.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let options = obj
+                                    .get("options")
+                                    .and_then(|o| o.as_array())
+                                    .map(|o| {
+                                        o.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .map(str::to_string)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                Some(DesignQuestion {
+                                    question,
+                                    recommendation,
+                                    options,
+                                })
+                            })
                             .collect()
-                    });
+                    },
+                );
             }
             _ => {}
         }
@@ -893,15 +960,32 @@ pub fn design_tools() -> Vec<spire_core::actors::messages::ToolInfo> {
     };
     let questions = spire_core::actors::messages::ToolInfo {
         name: SET_OPEN_QUESTIONS_TOOL.to_string(),
-        description: "Replace the design session's open-question list — what must still be\n            answered before an AppSpec can be submitted. Call it whenever the set\n            changes, INCLUDING to clear it (pass an empty list once every question\n            is resolved). Keep it to concrete, answerable questions."
+        description: "Replace the design session's open-question list — what must still be
+            answered before an AppSpec can be submitted. Each entry is a question
+            plus the answer you recommend (and optional alternatives) so the user
+            can accept one with a single click. Call it whenever the set changes,
+            INCLUDING to clear it (pass an empty list once every question is
+            resolved). Keep each question concrete and answerable."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "questions": {
                     "type": "array",
-                    "items": { "type": "string" },
-                    "description": "The complete list of open questions ([] when none remain).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string", "description": "One concrete, answerable question." },
+                            "recommendation": { "type": "string", "description": "The answer you recommend — the user can accept it with one click." },
+                            "options": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional alternative answers the user can pick instead."
+                            }
+                        },
+                        "required": ["question", "recommendation"]
+                    },
+                    "description": "The complete list of open questions ([] when none remain)."
                 }
             },
             "required": ["questions"]
@@ -950,12 +1034,13 @@ fn brainstorm_prompt(
     parts.push("every AppSpec section (Data types, Graph, Backend, Bridge, UI) from the".to_string());
     parts.push("conversation. Whenever anything is still unknown or genuinely consequential,".to_string());
     parts.push("call the `set_open_questions` tool with the FULL current list of open".to_string());
-    parts.push("questions (replace semantics), then ask one of them in the chat. When a".to_string());
-    parts.push("question is answered, call `set_open_questions` again with the updated".to_string());
-    parts.push("list — passing [] once none remain. Do NOT invent sections you cannot".to_string());
-    parts.push("ground in the conversation: a missing requirement is an open question,".to_string());
-    parts.push("not a guess. Ask questions rather than submitting after an underspecified".to_string());
-    parts.push("goal.".to_string());
+    parts.push("questions (replace semantics). Each question must include the answer".to_string());
+    parts.push("you recommend (plus 2-3 alternatives only when a real choice exists), so".to_string());
+    parts.push("the user can answer with one click. Ask only ONE question in the chat at".to_string());
+    parts.push("a time. When a question is answered, call `set_open_questions` again".to_string());
+    parts.push("with the updated list — passing [] once none remain. Do NOT invent".to_string());
+    parts.push("sections you cannot ground in the conversation: a missing requirement".to_string());
+    parts.push("is an open question, not a guess.".to_string());
     parts.push(String::new());
     parts.push("Only when the design is complete and the open-question list is empty, call".to_string());
     parts.push("the `submit_appspec` tool with the FULL spec.md in the strict grammar".to_string());
@@ -1128,8 +1213,43 @@ mod tests {
         assert_eq!(r2.text, "two questions for you");
         assert_eq!(
             r2.open_questions,
-            Some(vec!["a".to_string(), " b ".to_string()])
+            Some(vec![
+                DesignQuestion {
+                    question: "a".to_string(),
+                    recommendation: String::new(),
+                    options: Vec::new(),
+                },
+                DesignQuestion {
+                    question: " b ".to_string(),
+                    recommendation: String::new(),
+                    options: Vec::new(),
+                },
+            ])
         );
+
+        // Object-form entries (question + recommendation + options).
+        let args4 = serde_json::json!({
+            "questions": [
+                {
+                    "question": "Format?",
+                    "recommendation": "WKB",
+                    "options": ["GeoJSON", "Parquet"],
+                }
+            ]
+        })
+        .to_string();
+        let json4 = serde_json::json!({
+            "content": null,
+            "tool_calls": [{
+                "function": { "name": "set_open_questions", "arguments": args4 }
+            }]
+        });
+        let r4 = parse_design_reply(&json4.to_string());
+        let qs4 = r4.open_questions.expect("parsed object questions");
+        assert_eq!(qs4.len(), 1);
+        assert_eq!(qs4[0].question, "Format?");
+        assert_eq!(qs4[0].recommendation, "WKB");
+        assert_eq!(qs4[0].options, vec!["GeoJSON", "Parquet"]);
 
         // Both tools in one message.
         let json3 = serde_json::json!({
@@ -1170,7 +1290,11 @@ mod tests {
                 Ok(DesignReply {
                     text: String::new(),
                     spec_md: Some(md),
-                    open_questions: Some(vec!["vector or raster?".to_string()]),
+                    open_questions: Some(vec![DesignQuestion {
+                        question: "vector or raster?".to_string(),
+                        recommendation: "vector".to_string(),
+                        options: Vec::new(),
+                    }]),
                 })
             })
         });
@@ -1214,18 +1338,49 @@ mod tests {
                 Ok(DesignReply {
                     text: "ok".to_string(),
                     spec_md: None,
-                    open_questions: Some(vec!["units?".to_string(), "projection?".to_string()]),
+                    open_questions: Some(vec![
+                        DesignQuestion { question: "units?".to_string(), recommendation: "meters".to_string(), options: Vec::new() },
+                        DesignQuestion { question: "projection?".to_string(), recommendation: "EPSG:3857".to_string(), options: Vec::new() },
+                    ]),
                 })
             })
         });
         let (_, s1) = pollster(a.ask("what format?", false, false)).unwrap();
-        assert_eq!(s1.open_questions, vec!["units?", "projection?"]);
+        assert_eq!(
+            s1.open_questions,
+            vec![
+                DesignQuestion {
+                    question: "units?".to_string(),
+                    recommendation: "meters".to_string(),
+                    options: Vec::new(),
+                },
+                DesignQuestion {
+                    question: "projection?".to_string(),
+                    recommendation: "EPSG:3857".to_string(),
+                    options: Vec::new(),
+                },
+            ]
+        );
 
         // A brand-new actor resumes the same list from the graph.
         let (mut b, _) = actor(vec![]);
         b.set_memory_graph(tx);
         let s2 = pollster(b.start_session("spire-gis", "again", false)).unwrap();
-        assert_eq!(s2.open_questions, vec!["units?", "projection?"]);
+        assert_eq!(
+            s2.open_questions,
+            vec![
+                DesignQuestion {
+                    question: "units?".to_string(),
+                    recommendation: "meters".to_string(),
+                    options: Vec::new(),
+                },
+                DesignQuestion {
+                    question: "projection?".to_string(),
+                    recommendation: "EPSG:3857".to_string(),
+                    options: Vec::new(),
+                },
+            ]
+        );
     }
 
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {
@@ -1594,7 +1749,7 @@ mod spire_context_tests {
         // The model must keep its open questions current and not submit early.
         assert!(b.contains("set_open_questions"));
         assert!(b.contains("submit_appspec"));
-        assert!(b.contains("underspecified"));
+        assert!(b.contains("not a guess"));
         // The strict grammar the submit tool advertises is complete.
         assert!(SPEC_MD_GRAMMAR.contains("## Data types"));
         assert!(SPEC_MD_GRAMMAR.contains("## Graph"));

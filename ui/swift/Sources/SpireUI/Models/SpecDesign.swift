@@ -1,5 +1,21 @@
 import Foundation
 
+/// One open design question with the answer the assistant recommends (and any
+/// alternatives). Mirrors the Rust `DesignQuestion`.
+struct DesignQuestion {
+    let question: String
+    let recommendation: String
+    let options: [String]
+
+    init?(json: Any) {
+        guard let dict = json as? [String: Any],
+              let question = dict["question"] as? String else { return nil }
+        self.question = question
+        self.recommendation = dict["recommendation"] as? String ?? ""
+        self.options = dict["options"] as? [String] ?? []
+    }
+}
+
 /// A point-in-time view of the design session. Mirrors the Rust
 /// `SpecDesignState` (snake_case keys). `latest` carries the most recent
 /// accepted AppSpec dictionary (the same shape `runSpecDesignCodegen` expects)
@@ -8,9 +24,10 @@ struct SpecDesignState {
     /// "freeform" or "decided" (Rust `DesignMode`, lowercase serialized).
     let mode: String
     let turnCount: Int
-    /// Design questions the assistant still needs answered (the submit gate
-    /// refuses while any remain).
-    let openQuestions: [String]
+    /// Design questions the assistant still needs answered, each with a
+    /// recommended answer the user can accept (the submit gate refuses while any
+    /// remain).
+    let openQuestions: [DesignQuestion]
     let acceptedCount: Int
     /// Most recent accepted AppSpec (present once the design is submitted).
     let latest: [String: Any]?
@@ -22,7 +39,11 @@ struct SpecDesignState {
               let mode = dict["mode"] as? String else { return nil }
         self.mode = mode
         self.turnCount = dict["turn_count"] as? Int ?? 0
-        self.openQuestions = dict["open_questions"] as? [String] ?? []
+        if let raw = dict["open_questions"] as? [Any] {
+            self.openQuestions = raw.compactMap { DesignQuestion(json: $0) }
+        } else {
+            self.openQuestions = []
+        }
         if let accepted = dict["accepted"] as? [Any] {
             self.acceptedCount = accepted.count
         } else {

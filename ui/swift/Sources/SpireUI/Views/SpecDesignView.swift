@@ -70,7 +70,7 @@ struct SpecDesignView: View {
     @State private var busy = false
     @State private var errorMessage: String?
     /// Questions the assistant still needs answered (blocks submission).
-    @State private var openQuestions: [String] = []
+    @State private var openQuestions: [DesignQuestion] = []
     /// acceptedCount already handed to the code generator (fires once per submit).
     @State private var codegenVersion = 0
     /// Request grounding for the next brainstorm question.
@@ -329,7 +329,7 @@ struct SpecDesignView: View {
                     .foregroundStyle(.red)
             }
             if !openQuestions.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {
                         Label("Open questions", systemImage: "questionmark.circle")
                             .font(.headline)
@@ -338,12 +338,16 @@ struct SpecDesignView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
-                        Text("\(idx + 1). \(q)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(openQuestions.enumerated()), id: \.offset) { idx, q in
+                                questionCard(index: idx, question: q)
+                            }
+                        }
+                        .padding(.vertical, 2)
                     }
-                    Text("The assistant tracks what it still needs answered — it cannot submit the AppSpec while any remain.")
+                    .frame(maxHeight: 240)
+                    Text("Tap a recommended answer (or an option) to reply — it is sent as your message.")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -369,6 +373,46 @@ struct SpecDesignView: View {
         }
         .padding(12)
         .frame(minWidth: 300, maxWidth: 380)
+    }
+
+    /// One open question with its recommended answer + alternatives; tapping an
+    /// answer auto-sends it as the user's next message (existing ask path).
+    private func questionCard(index: Int, question: DesignQuestion) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(index + 1). \(question.question)")
+                .font(.caption.weight(.semibold))
+                .textSelection(.enabled)
+            if !question.recommendation.isEmpty {
+                Button {
+                    acceptAnswer(question, choice: question.recommendation)
+                } label: {
+                    Label("Use recommendation: \(question.recommendation)", systemImage: "checkmark.circle")
+                        .font(.caption2.weight(.medium))
+                        .multilineTextAlignment(.leading)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(busy || isDecided)
+            }
+            if !question.options.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(question.options, id: \.self) { opt in
+                        Button {
+                            acceptAnswer(question, choice: opt)
+                        } label: {
+                            Text(opt)
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(busy || isDecided)
+                    }
+                }
+            }
+        }
+        .padding(6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.35)))
     }
 
     // MARK: - Actions
@@ -416,6 +460,17 @@ struct SpecDesignView: View {
                 text: "No assistant reply (LLM unavailable?) — try again."
             ))
         }
+    }
+
+    /// Answer an open question by sending the chosen answer as the next chat
+    /// turn (auto-send through the normal ask path, no grounding requested).
+    @MainActor
+    private func acceptAnswer(_ question: DesignQuestion, choice: String) {
+        errorMessage = nil
+        useDocsRAG = false
+        useWebSearch = false
+        draft = "For \"\(question.question)\", I'll go with: \(choice)"
+        Task { await send() }
     }
 
     @MainActor
