@@ -552,6 +552,7 @@ impl SpecDesignActor {
         );
         let reply = self.call_llm(prompt).await?;
         let mut answer = reply.text.clone();
+        let outline_sent = reply.outline.is_some();
         // The model keeps its draft outline current via the `set_outline` tool.
         if let Some(o) = reply.outline {
             let trimmed = o.trim().to_string();
@@ -659,22 +660,43 @@ Answer each (or pick its recommended answer on the right), then ask it to submit
                 }
             }
         }
-        // Tool-only replies (e.g. just a concept/outline update) carry no prose —
-        // never return an empty answer that looks like the LLM failed.
+        // Tool-only replies (e.g. just a concept update) carry no prose — never
+        // return an empty answer that looks like the LLM failed. Drive progress:
+        // point at the next open question or, once everything is settled, invite
+        // a submission.
         if answer.trim().is_empty() {
-            let mut notes: Vec<String> = Vec::new();
-            if self.outline.is_some() {
-                notes.push("Concept/outline updated — see the panel on the right.".to_string());
+            let mut lines: Vec<String> = Vec::new();
+            if outline_sent {
+                lines.push("Concept updated.".to_string());
             }
-            if !self.open_questions.is_empty() {
-                notes.push(format!(
-                    "{} open question(s) pending — answer them or accept a recommendation on the right.",
-                    self.open_questions.len()
-                ));
+            if let Some(first) = self.open_questions.first() {
+                let next = if first.recommendation.trim().is_empty() {
+                    first.question.clone()
+                } else {
+                    format!("{} — I recommend: {}", first.question, first.recommendation)
+                };
+                lines.push(format!("Next up — 1. {next}"));
+                if self.open_questions.len() > 1 {
+                    let rest = self.open_questions[1..]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, q)| format!("{}. {}", i + 2, q.question))
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    lines.push(format!("Also still to decide: {rest}"));
+                }
+                lines.push(
+                    "Answer it here or accept the recommendation on the right.".to_string(),
+                );
+            } else {
+                if lines.is_empty() {
+                    lines.push("All questions are settled.".to_string());
+                }
+                lines.push(
+                    "I'll prepare the AppSpec — say submit when you are ready.".to_string(),
+                );
             }
-            if !notes.is_empty() {
-                answer = notes.join(" ");
-            }
+            answer = lines.join(" ");
         }
 
         if !answer.trim().is_empty() {
@@ -1183,12 +1205,15 @@ fn brainstorm_prompt(
     parts.push("name its `section` (types | graph | backend | bridge | ui), include the".to_string());
     parts.push("answer you recommend, and add 2-3 `options` only when a real choice".to_string());
     parts.push("exists. Ask exactly ONE of them in the chat — the most consequential — and".to_string());
-    parts.push("let the rest live in the list.".to_string());
+    parts.push("let the rest live in the list. ALWAYS write that question in your reply".to_string());
+    parts.push("text — never reply with only a tool call and no prose.".to_string());
     parts.push(String::new());
     parts.push("CONVERGE. When a question is answered, fold the decision into the concept,".to_string());
-    parts.push("update the outline and the list (drop the resolved question; pass [] when".to_string());
-    parts.push("none remain), and move on. Do not re-open settled ground and do not invent".to_string());
-    parts.push("requirements the user never stated.".to_string());
+    parts.push("REMOVE that question from the list and update it via `set_open_questions`".to_string());
+    parts.push("(pass [] once none remain). Then ask the NEXT question in your reply".to_string());
+    parts.push("text. Never re-ask a settled question and never stop mid-design: each".to_string());
+    parts.push("reply either asks the next question or says you are ready to submit. Do".to_string());
+    parts.push("not invent requirements the user never stated.".to_string());
     parts.push(String::new());
     parts.push("SUBMIT. Only when every module of the concept is decided AND the open-".to_string());
     parts.push("question list is empty, call `submit_appspec` with the FULL spec.md in the".to_string());
@@ -1647,9 +1672,66 @@ mod tests {
         });
         let (answer, s) = pollster(a.ask("draft it", false, false)).unwrap();
         assert!(!answer.trim().is_empty(), "tool-only reply must not come back empty");
-        assert!(answer.contains("outline"), "{answer}");
+        assert!(answer.contains("Concept updated"), "{answer}");
+        assert!(answer.contains("prepare the AppSpec"), "{answer}");
         assert_eq!(s.outline.as_deref(), Some("## UI
 - MapScreen"));
+    }
+
+    #[test]
+    fn silent_follow_up_surfaces_the_next_question() {
+        let (mut a, _) = actor(vec![]);
+        a.start("spire-gis", "view and edit map layers").unwrap();
+        seed_conversation(&mut a);
+        let calls = Arc::new(Mutex::new(0usize));
+        let c1 = calls.clone();
+        a.llm = Box::new(move |_p: String| {
+            let calls = c1.clone();
+            Box::pin(async move {
+                let n = {
+                    let mut g = calls.lock().unwrap();
+                    *g += 1;
+                    *g
+                };
+                if n == 1 {
+                    Ok(DesignReply {
+                        text: "asking about the domain".to_string(),
+                        outline: None,
+                        spec_md: None,
+                        open_questions: Some(vec![
+                            DesignQuestion {
+                                section: "types".to_string(),
+                                question: "what units?".to_string(),
+                                recommendation: "meters".to_string(),
+                                options: vec![],
+                            },
+                            DesignQuestion {
+                                section: "graph".to_string(),
+                                question: "which nodes?".to_string(),
+                                recommendation: "feature nodes".to_string(),
+                                options: vec![],
+                            },
+                        ]),
+                    })
+                } else {
+                    // Tool-only follow-up: concept update, no prose.
+                    Ok(DesignReply {
+                        text: String::new(),
+                        outline: Some("## UI
+- MapScreen".to_string()),
+                        spec_md: None,
+                        open_questions: None,
+                    })
+                }
+            })
+        });
+        let (_, s1) = pollster(a.ask("what should this do?", false, false)).unwrap();
+        assert_eq!(s1.open_questions.len(), 2);
+        let (answer2, _) = pollster(a.ask("use meters", false, false)).unwrap();
+        assert!(!answer2.trim().is_empty(), "follow-up must not be empty");
+        assert!(answer2.contains("Next up"), "{answer2}");
+        assert!(answer2.contains("what units?"), "{answer2}");
+        assert!(answer2.contains("meters"), "{answer2}");
     }
 
     fn actor(responses: Vec<String>) -> (SpecDesignActor, Arc<Mutex<Vec<String>>>) {

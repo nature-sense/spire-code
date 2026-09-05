@@ -485,7 +485,7 @@ struct SpecDesignView: View {
         } else if error == nil {
             lines.append(SpecDesignLine(
                 role: "system",
-                text: "No assistant reply (LLM unavailable?) — try again."
+                text: "No new message from the assistant — check the Concept and Open questions on the right, then continue."
             ))
         }
     }
