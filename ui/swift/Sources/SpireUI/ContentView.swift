@@ -125,7 +125,8 @@ struct ContentView: View {
     private var workspacePane: some View {
         switch bridge.state {
         case .unconnected:
-            emptyDetailsPane
+            RecentProjectsPane()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         case .opening:
             progressPane("Opening project…")
         case .creating, .scaffolding, .filling:

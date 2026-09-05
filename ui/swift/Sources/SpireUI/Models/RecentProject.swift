@@ -19,7 +19,8 @@ struct RecentProject: Codable, Identifiable, Equatable {
         guard let data = try? Data(contentsOf: url) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode([RecentProject].self, from: data)) ?? []
+        let loaded = (try? decoder.decode([RecentProject].self, from: data)) ?? []
+        return Array(loaded.prefix(5))
     }
 
     /// Save the list of recent projects (most recent first).
@@ -37,13 +38,13 @@ struct RecentProject: Codable, Identifiable, Equatable {
         }
     }
 
-    /// Record a project open: append/prepend and keep the last 8 unique entries.
+    /// Record a project open: prepend and keep the last 5 unique entries.
     static func record(path: String, name: String) {
         var list = load()
         list.removeAll { $0.path == path }
         list.insert(RecentProject(path: path, name: name, lastOpened: Date()), at: 0)
-        if list.count > 8 {
-            list = Array(list.prefix(8))
+        if list.count > 5 {
+            list = Array(list.prefix(5))
         }
         save(list)
     }
