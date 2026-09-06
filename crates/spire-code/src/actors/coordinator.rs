@@ -3285,6 +3285,27 @@ impl CoordinatorActor {
                     Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
                 }
             }
+            "rag/reingest-graph-config" => {
+                let manifest_path = params
+                    .get("manifest_path")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                let project_root = params
+                    .get("project_root")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .filter(|p| !p.as_os_str().is_empty());
+                let (t, r) = tokio::sync::oneshot::channel();
+                let _ = rag_tx
+                    .send(RagMessage::ReingestGraphConfig { manifest_path, project_root, reply_to: t })
+                    .await;
+                match r.await {
+                    Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
+                    Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
+                    Err(e) => serde_json::json!({"error": format!("lost: {}", e)}),
+                }
+            }
             _ => serde_json::json!({"error": "unknown rag method"}),
         }
     }

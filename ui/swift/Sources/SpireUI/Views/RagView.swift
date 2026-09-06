@@ -311,6 +311,16 @@ struct RagView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .disabled(isIngesting)
+                Button {
+                    Task { await reingest(m) }
+                } label: {
+                    Label("Reingest", systemImage: "arrow.clockwise")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isIngesting)
+                .help("Clear the corpus, then re-ingest from scratch (replaces stale content)")
             }
             if let sources = sourcesByDomain[m.domain] {
                 VStack(alignment: .leading, spacing: 2) {
@@ -365,6 +375,26 @@ struct RagView: View {
             }
         } else {
             lastIngestMessage = "Ingest failed (see log)."
+        }
+        await load()
+    }
+
+    /// Clear-then-ingest: the backend wipes the manifest's domain corpus and
+    /// re-ingests from scratch (stale content is replaced, not appended).
+    private func reingest(_ m: RagManifestInfo) async {
+        ingestingPath = m.path
+        lastIngestMessage = nil
+        let report = await bridge.reingestRagManifest(path: m.path)
+        ingestingPath = nil
+        if let report {
+            let skipped = report.sources.filter { $0.status != "ok" }
+            if skipped.isEmpty {
+                lastIngestMessage = "Reingested \\(report.chunks) chunks, \\(report.entities) entities, \\(report.relationships) relationships (stale content cleared)."
+            } else {
+                lastIngestMessage = "Reingested \\(report.chunks) chunks; \\(skipped.count) source(s) skipped."
+            }
+        } else {
+            lastIngestMessage = "Reingest failed (see log)."
         }
         await load()
     }

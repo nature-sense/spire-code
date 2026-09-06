@@ -969,6 +969,29 @@ final class SpireBridge {
         }
     }
 
+    /// Re-ingest one canonical `ingest.yaml` via `rag/reingest-graph-config`:
+    /// the backend clears the manifest's domain corpus first, then ingests from
+    /// scratch, so changed content replaces stale chunks.
+    func reingestRagManifest(path: String) async -> RagIngestReport? {
+        do {
+            let body: [String: Any] = [
+                "method": "rag/reingest-graph-config",
+                "params": [
+                    "manifest_path": path
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               json["error"] is String {
+                return nil
+            }
+            return try MessageSerializer.decode(reply) as RagIngestReport
+        } catch {
+            return nil
+        }
+    }
+
     /// Semantic search within a RAG domain via `rag/search`.
     func ragSearch(domain: String, query: String, topK: Int = 5) async -> [RagChunkResult] {
         do {
