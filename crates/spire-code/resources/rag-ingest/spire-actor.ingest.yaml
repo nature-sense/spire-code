@@ -20,9 +20,15 @@ pipeline:
       url: https://github.com/nature-sense/spire-actor.git
       processing:
         parser: markdown
+        # NOTE: bare file names — the include filter matches each file's
+        # basename against absolute clone paths, so globs with a directory
+        # prefix ("docs/**/*.md") never match; keep this list explicit.
         include_files:
-          - "docs/**/*.md"
           - "README.md"
+          - "01-concepts-and-architecture.md"
+          - "02-api-reference.md"
+          - "03-usage-and-examples.md"
+          - "04-best-practices.md"
         exclude_paths:
           - "target/**"
           - "**/target/**"
