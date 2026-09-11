@@ -2830,6 +2830,59 @@ impl Actor for BuildManagerActor {
     }
 }
 
+// ============================================================================
+// BuildEventLogActor — owns the incremental build-event log the FFI drains.
+// ============================================================================
+
+/// Messages for the actor-owned build-event log.
+pub enum BuildEventLogMessage {
+    /// Append one serialized build event.
+    Record(serde_json::Value),
+    /// Drain (remove + return) every accumulated event.
+    Drain {
+        reply_to: tokio::sync::oneshot::Sender<Vec<serde_json::Value>>,
+    },
+}
+
+/// Owns the accumulated build events that the Swift UI streams incrementally.
+///
+/// Replaces the previous shared `Arc<Mutex<Vec<Value>>>` + `Notify` that the
+/// streaming forwarders and the FFI both reached into directly. The
+/// BuildManagerActor is occupied for the whole duration of a streaming
+/// build/lint/fix, so event delivery cannot go through its mailbox; this small
+/// dedicated actor serializes appends and drains without a `Mutex` shared with
+/// the FFI (the FFI only holds this actor's sender + a `Notify`).
+pub struct BuildEventLogActor {
+    pending: Vec<serde_json::Value>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl BuildEventLogActor {
+    pub fn new(notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            pending: Vec::new(),
+            notify,
+        }
+    }
+}
+
+#[async_trait]
+impl Actor for BuildEventLogActor {
+    type Message = BuildEventLogMessage;
+
+    async fn handle(&mut self, msg: Self::Message) {
+        match msg {
+            BuildEventLogMessage::Record(json) => {
+                self.pending.push(json);
+                self.notify.notify_one();
+            }
+            BuildEventLogMessage::Drain { reply_to } => {
+                let _ = reply_to.send(std::mem::take(&mut self.pending));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3667,59 +3720,6 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
 
         // Verify content_hash is a SHA-256 hex string (64 chars).
         assert_eq!(parse_result.content_hash.len(), 64);
-    }
-}
-
-// ============================================================================
-// BuildEventLogActor — owns the incremental build-event log the FFI drains.
-// ============================================================================
-
-/// Messages for the actor-owned build-event log.
-pub enum BuildEventLogMessage {
-    /// Append one serialized build event.
-    Record(serde_json::Value),
-    /// Drain (remove + return) every accumulated event.
-    Drain {
-        reply_to: tokio::sync::oneshot::Sender<Vec<serde_json::Value>>,
-    },
-}
-
-/// Owns the accumulated build events that the Swift UI streams incrementally.
-///
-/// Replaces the previous shared `Arc<Mutex<Vec<Value>>>` + `Notify` that the
-/// streaming forwarders and the FFI both reached into directly. The
-/// BuildManagerActor is occupied for the whole duration of a streaming
-/// build/lint/fix, so event delivery cannot go through its mailbox; this small
-/// dedicated actor serializes appends and drains without a `Mutex` shared with
-/// the FFI (the FFI only holds this actor's sender + a `Notify`).
-pub struct BuildEventLogActor {
-    pending: Vec<serde_json::Value>,
-    notify: std::sync::Arc<tokio::sync::Notify>,
-}
-
-impl BuildEventLogActor {
-    pub fn new(notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
-        Self {
-            pending: Vec::new(),
-            notify,
-        }
-    }
-}
-
-#[async_trait]
-impl Actor for BuildEventLogActor {
-    type Message = BuildEventLogMessage;
-
-    async fn handle(&mut self, msg: Self::Message) {
-        match msg {
-            BuildEventLogMessage::Record(json) => {
-                self.pending.push(json);
-                self.notify.notify_one();
-            }
-            BuildEventLogMessage::Drain { reply_to } => {
-                let _ = reply_to.send(std::mem::take(&mut self.pending));
-            }
-        }
     }
 }
 

@@ -1472,6 +1472,14 @@ fn process_json_request(request_json: &str) -> String {
     }
 }
 
+/// Send a JSON-RPC request to the Spire core and return the JSON reply.
+///
+/// # Safety
+///
+/// `request_ptr` must be a non-null pointer to a NUL-terminated UTF-8 C string
+/// that stays valid for the duration of the call. The returned pointer is a
+/// Rust-allocated C string that the caller must release with
+/// [`spire_free_string`].
 #[no_mangle]
 pub unsafe extern "C" fn spire_send_json(
     request_ptr: *const std::ffi::c_char,
@@ -1505,6 +1513,13 @@ pub unsafe extern "C" fn spire_send_json(
     }
 }
 
+/// Block until a file-watcher event arrives or `timeout_ms` elapses.
+///
+/// # Safety
+///
+/// Takes no pointers; `unsafe` only as a C ABI entry point. The returned pointer
+/// is a Rust-allocated C string that the caller must release with
+/// [`spire_free_string`], or null when the timeout expires.
 #[no_mangle]
 pub unsafe extern "C" fn spire_wait_for_event(timeout_ms: u32) -> *mut std::ffi::c_char {
     init_actor_system();
@@ -1536,6 +1551,13 @@ pub unsafe extern "C" fn spire_wait_for_event(timeout_ms: u32) -> *mut std::ffi:
 }
 
 
+/// Drain the accumulated build events without blocking.
+///
+/// # Safety
+///
+/// Takes no pointers; `unsafe` only as a C ABI entry point. The returned pointer
+/// is a Rust-allocated C string that the caller must release with
+/// [`spire_free_string`], or null when nothing is buffered.
 #[no_mangle]
 pub unsafe extern "C" fn spire_drain_build_events() -> *mut std::ffi::c_char {
     init_actor_system();
@@ -1575,6 +1597,12 @@ pub unsafe extern "C" fn spire_drain_build_events() -> *mut std::ffi::c_char {
 /// Returns a JSON array of drained events, or null on timeout. Async push — no
 /// polling/timer on the Swift side. The buffer itself lives in the
 /// BuildEventLogActor; the FFI holds only its sender + a Notify.
+///
+/// # Safety
+///
+/// Takes no pointers; `unsafe` only as a C ABI entry point. The returned pointer
+/// is a Rust-allocated C string that the caller must release with
+/// [`spire_free_string`], or null when the timeout expires.
 #[no_mangle]
 pub unsafe extern "C" fn spire_wait_for_build_event(timeout_ms: u32) -> *mut std::ffi::c_char {
     init_actor_system();
@@ -1630,6 +1658,14 @@ pub unsafe extern "C" fn spire_wait_for_build_event(timeout_ms: u32) -> *mut std
         CString::new(payload).unwrap().into_raw()
     }
 }
+/// Free a C string previously returned by one of the `spire_*` entry points.
+///
+/// # Safety
+///
+/// `ptr` must be either null or a pointer previously returned by
+/// `spire_send_json` / `spire_wait_for_event` / `spire_drain_build_events` /
+/// `spire_wait_for_build_event` and not yet freed. Passing any other pointer, or
+/// freeing the same pointer twice, is undefined behaviour.
 #[no_mangle]
 pub unsafe extern "C" fn spire_free_string(ptr: *mut std::ffi::c_char) {
     if !ptr.is_null() {
