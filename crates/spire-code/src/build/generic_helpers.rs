@@ -1886,7 +1886,10 @@ pub fn hal_platform_coverage_map(
                 continue;
             }
             let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
-            if skip.contains(&name) || name.starts_with('.') {
+            // Skip hidden dirs AND meson build dirs (`build-a7s`, `build-rpi5`):
+            // a build dir contains a generated `<build>/hal` subdir, which would
+            // otherwise be picked up as a bogus "platform".
+            if skip.contains(&name) || name.starts_with('.') || name.starts_with("build") {
                 continue;
             }
             let legacy = p.join("hal");
@@ -3909,6 +3912,39 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
         assert!(
             m.iter().any(|m| m.name == "b" && m.return_type == "int&"),
             "impl return type must keep the reference: {m:?}"
+        );
+    }
+
+    /// Meson build dirs must NOT be reported as platforms: a build dir contains a
+    /// generated `<build>/hal` subdir, which the legacy `<name>/hal` probe would
+    /// otherwise pick up as a bogus platform (the real project showed
+    /// `build-a7s` / `build-rpi5` alongside rpi5/rock3c/a7s).
+    #[test]
+    fn coverage_skips_meson_build_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("hal/api")).unwrap();
+        std::fs::create_dir_all(root.path().join("hal/implementations/rpi5")).unwrap();
+        std::fs::create_dir_all(root.path().join("build-rpi5/hal")).unwrap();
+        std::fs::write(
+            root.path().join("hal/api/camera_hal.hpp"),
+            "#pragma once\n#include \"hal/api/hal_module.hpp\"\nnamespace hal {\n\
+             struct ICameraHAL : public hal::HalModule {\n\
+             \x20   virtual ~ICameraHAL() = default;\n\
+             \x20   virtual bool init() = 0;\n};\n} // namespace hal\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("hal/implementations/rpi5/camera_hal_rpi5.cpp"),
+            "namespace hal { bool CameraHalRpi5::init() { return true; } }\n",
+        )
+        .unwrap();
+
+        let cov = hal_platform_coverage_map(root.path());
+        let keys: Vec<&String> = cov.keys().collect();
+        assert!(cov.contains_key("rpi5"), "real platform must be present: {keys:?}");
+        assert!(
+            !cov.contains_key("build-rpi5"),
+            "the meson build dir must not be a platform: {keys:?}"
         );
     }
 
