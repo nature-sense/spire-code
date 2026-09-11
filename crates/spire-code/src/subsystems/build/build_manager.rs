@@ -196,6 +196,27 @@ fn hal_impl_generation_context(
     })
 }
 
+/// Ensure a generated implementation `.cpp` includes its OWN declaration header
+/// (`<stem>_<platform>.hpp`).
+///
+/// The module pair splits the declaration (deterministic `.hpp`, where the
+/// concrete class is declared) from the implementation (LLM `.cpp`). Models
+/// routinely open the `.cpp` with the *contract* header only, leaving the
+/// concrete class undeclared — the file then fails to compile with
+/// `use of undeclared identifier '<Class>'`. Prepending the impl-header include
+/// is deterministic and model-independent, and idempotent.
+fn ensure_impl_header_include(source: &str, hpp_name: &str) -> String {
+    if hpp_name.is_empty() {
+        return source.to_string();
+    }
+    let needle = format!("#include \"{hpp_name}\"");
+    if source.contains(&needle) {
+        source.to_string()
+    } else {
+        format!("{needle}\n\n{source}")
+    }
+}
+
 /// Run the LLM (role Coding) against the module-pair prompt with one
 /// fence-strip + structural syntax-check retry. Returns `(cleaned source,
 /// syntax verdict)` — the verdict is "ok" when the source parsed cleanly.
@@ -1552,6 +1573,8 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                 Ok(pair) => pair,
                 Err(e) => return serde_json::json!({ "error": e }),
             };
+        // Guarantee the `.cpp` includes its own declaration header.
+        let source = ensure_impl_header_include(&source, &ctx.hpp_name);
         let hpp_path = ctx.impl_dir.join(&ctx.hpp_name);
         let cpp_path = ctx.impl_dir.join(&ctx.cpp_name);
         serde_json::json!({
@@ -1586,6 +1609,13 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
         if hpp_path.is_empty() || cpp_path.is_empty() || header.is_empty() || source.is_empty() {
             return serde_json::json!({ "error": "hal_generate_impl_apply: 'hpp_path', 'cpp_path', 'header' and 'source' are required" });
         }
+        // Guarantee the `.cpp` includes its own declaration header (the UI may
+        // pass through a source that predates the include normalization).
+        let hpp_name = std::path::Path::new(hpp_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let source = ensure_impl_header_include(source, hpp_name);
         // Write the approved module pair.
         if let Some(parent) = std::path::Path::new(hpp_path).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -3098,6 +3128,22 @@ mod tests {
     
     use spire_actor::ServiceRegistry;
     use std::sync::Arc;
+
+    #[test]
+    fn ensure_impl_header_include_prepends_and_is_idempotent() {
+        let model_output = "#include \"hal/api/h264_encoder.hpp\"\n\nnamespace hal { int x; }";
+        let out = ensure_impl_header_include(model_output, "h264_encoder_a7s.hpp");
+        assert!(
+            out.starts_with("#include \"h264_encoder_a7s.hpp\"\n\n#include \"hal/api/h264_encoder.hpp\""),
+            "must prepend the impl header: {out}"
+        );
+        assert_eq!(
+            ensure_impl_header_include(&out, "h264_encoder_a7s.hpp"),
+            out,
+            "must be idempotent"
+        );
+        assert_eq!(ensure_impl_header_include(model_output, ""), model_output);
+    }
 
     // Serializes tests that mutate the PROCESS-GLOBAL `SPIRE_PLATFORM_DIR`
     // env var (the platform registry seed). Cargo runs tests in parallel, so
