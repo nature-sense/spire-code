@@ -2069,10 +2069,13 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         let mut written: Vec<String> = Vec::new();
                         let mut failures: Vec<String> = Vec::new();
                         for (stem, summary, class_name) in &interfaces {
+                            let parsed = crate::build::generic_helpers::parse_hal_contract_summary(summary);
+                            let Some((_, methods)) = parsed.first() else {
+                                failures.push(format!("{stem}: no contract methods parsed"));
+                                continue;
+                            };
                             let source = crate::build::generic_helpers::generate_hal_placeholder_source(
-                                stem, class_name,
-                                &crate::build::generic_helpers::parse_hal_contract_summary(summary)[0].1,
-                                platform,
+                                stem, class_name, methods, platform,
                             );
                             let target = impl_dir.join(format!("{stem}_stub.cpp"));
                             match std::fs::write(&target, source) {
@@ -2203,7 +2206,11 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     let mut written: Vec<String> = Vec::new();
                     let mut failures: Vec<String> = Vec::new();
                     for (stem, summary, class_name) in &interfaces {
-                        let methods = &crate::build::generic_helpers::parse_hal_contract_summary(summary)[0].1;
+                        let parsed = crate::build::generic_helpers::parse_hal_contract_summary(summary);
+                        let Some((_, methods)) = parsed.first() else {
+                            failures.push(format!("{stem}: no contract methods parsed"));
+                            continue;
+                        };
                         let src = crate::build::generic_helpers::generate_hal_placeholder_source(
                             stem, class_name, methods, platform,
                         );
@@ -2843,7 +2850,28 @@ impl Actor for BuildManagerActor {
                 args,
                 reply_to,
             } => {
-                let result = self.call_tool(&tool_name, args).await;
+                // Isolate tool panics: a panic would otherwise unwind this actor
+                // task and drop `reply_to`, surfacing to the caller as
+                // "backend response error: channel closed" AND killing the
+                // BuildManager for the rest of the session (every later build/
+                // hal call then fails too). Catch it, log it, and answer with an
+                // error instead.
+                let result = match futures::FutureExt::catch_unwind(
+                    std::panic::AssertUnwindSafe(self.call_tool(&tool_name, args)),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        tracing::error!("BuildManager: tool '{tool_name}' panicked: {msg}");
+                        serde_json::json!({ "error": format!("tool '{tool_name}' panicked: {msg}") })
+                    }
+                };
                 let _ = reply_to.send(result);
             }
 

@@ -635,14 +635,22 @@ pub fn summarize_hal_header(content: &str) -> Result<String, String> {
     }
     let mut summaries: Vec<String> = Vec::new();
     for (class_name, methods) in &classes {
+        // Collapse ALL whitespace (including the newlines a multiline C++
+        // signature carries) so each class stays on ONE summary line. The
+        // line-based `parse_hal_contract_summary` re-parse fragments a wrapped
+        // signature (the '(' ends up on a different line than its ')') and drops
+        // every method — an empty parse that made callers index `[0]` and panic.
+        let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
         let parts: Vec<String> = methods
             .iter()
             .map(|m| {
-                let ret = m.return_type.trim();
+                let ret = one_line(&m.return_type);
+                let name = one_line(&m.name);
+                let params = one_line(&m.params);
                 if ret.is_empty() {
-                    format!("{}({}) = 0", m.name, m.params.trim())
+                    format!("{name}({params}) = 0")
                 } else {
-                    format!("{} {}({}) = 0", ret, m.name, m.params.trim())
+                    format!("{ret} {name}({params}) = 0")
                 }
             })
             .collect();
@@ -3289,6 +3297,45 @@ pub fn flatten_hal_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Multiline C++ signatures must survive the summarize → parse round-trip.
+    ///
+    /// Regression: `summarize_hal_header` used to embed the raw newlines of a
+    /// wrapped signature, so the line-based `parse_hal_contract_summary` split
+    /// the `(` from its `)` and dropped every method — an empty parse that made
+    /// `hal_add_platform`/`hal_add_target` index `[0]` and panic (killing the
+    /// BuildManager actor → "backend response error: channel closed").
+    #[test]
+    fn hal_contract_summary_round_trips_multiline_signatures() {
+        let header = r#"
+#pragma once
+#include <vector>
+#include <cstdint>
+
+namespace hal {
+
+struct IJpegEncoder : public hal::HalModule {
+public:
+    virtual std::vector<uint8_t> encode_crop(int src_dma_fd,
+                                             uint32_t src_w,
+                                             uint32_t src_h,
+                                             int quality = 85) = 0;
+    virtual ~IJpegEncoder() = default;
+};
+
+}  // namespace hal
+"#;
+        let summary = summarize_hal_header(header).expect("multiline contract must summarize");
+        assert!(
+            !summary.contains('\n'),
+            "summary must be one line per class, got {summary:?}"
+        );
+        let classes = parse_hal_contract_summary(&summary);
+        assert_eq!(classes.len(), 1, "summary: {summary:?}");
+        assert_eq!(classes[0].1.len(), 1, "summary: {summary:?}");
+        assert_eq!(classes[0].1[0].name, "encode_crop");
+        assert_eq!(classes[0].1[0].return_type, "std::vector<uint8_t>");
+    }
 
     /// The C++ header method extractor must surface a HAL contract's abstract
     /// class as class + method nodes with `child` edges, correct access
