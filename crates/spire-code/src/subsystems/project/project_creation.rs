@@ -641,7 +641,7 @@ impl ProjectCreationActor {
             Some(tx) => tx.clone(),
             None => {
                 return Err(
-                    "LLM is not configured — set your DeepSeek API key in Settings before creating a project."
+                    "LLM unavailable — the project creator is not connected to the LLM service (wiring, not a missing API key)."
                         .to_string(),
                 )
             }
@@ -1155,7 +1155,7 @@ and NEVER repeat any line or block."
             Some(tx) => tx.clone(),
             None => {
                 return Err(
-                    "LLM is not configured — set your DeepSeek API key in Settings before creating a project."
+                    "LLM unavailable — the project creator is not connected to the LLM service (wiring, not a missing API key)."
                         .to_string(),
                 )
             }
@@ -1656,7 +1656,7 @@ Project:
             root_dir: root_dir.to_string_lossy().to_string(),
             steps,
             is_template: true, // deterministic template fallback (GeneratePlan)
-            fallback_reason: Some("LLM not configured — using deterministic template".to_string()),
+            fallback_reason: Some("LLM unavailable — using deterministic template".to_string()),
         }
     }
 

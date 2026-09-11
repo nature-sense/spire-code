@@ -1932,7 +1932,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                 if root.is_empty() || interface.is_empty() || platform.is_empty() {
                     serde_json::json!({ "error": "hal_generate_impl: 'root', 'interface' and 'platform' are required" })
                 } else if self.llm_tx.is_none() {
-                    serde_json::json!({ "error": "hal_generate_impl: LLM not configured — set your API key in Settings" })
+                    serde_json::json!({ "error": "hal_generate_impl: LLM unavailable — the build manager is not connected to the LLM service (wiring, not a missing API key)" })
                 } else {
                     let plan = self.hal_generate_plan(
                         root, interface, platform,
@@ -1961,7 +1961,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                 if root.is_empty() || interface.is_empty() || platform.is_empty() {
                     serde_json::json!({ "error": "hal_generate_impl_plan: 'root', 'interface' and 'platform' are required" })
                 } else if self.llm_tx.is_none() {
-                    serde_json::json!({ "error": "hal_generate_impl_plan: LLM not configured — set your API key in Settings" })
+                    serde_json::json!({ "error": "hal_generate_impl_plan: LLM unavailable — the build manager is not connected to the LLM service (wiring, not a missing API key)" })
                 } else {
                     self.hal_generate_plan(
                         root, interface, platform,
@@ -3378,7 +3378,7 @@ public:
 
     /// Step 4 (LLM half, unconfigured branch): `hal_generate_impl` must reject
     /// cleanly when the LLM sender is not attached (fresh BuildManagerActor) —
-    /// no panic, no partial writes, a clear "LLM not configured" error.
+    /// no panic, no partial writes, a clear "LLM unavailable" error.
     #[tokio::test]
     async fn hal_generate_impl_requires_configured_llm() {
         let manager = BuildManagerActor::new(
@@ -3396,7 +3396,7 @@ public:
             .await;
         let err = result["error"].as_str().expect("error field");
         assert!(
-            err.contains("LLM not configured"),
+            err.contains("LLM unavailable"),
             "must reject when LLM is unconfigured: {err}"
         );
     }

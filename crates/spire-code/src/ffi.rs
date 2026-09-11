@@ -304,7 +304,7 @@ fn init_actor_system() {
         // `hal_generate_impl_plan`) can invoke it. The standalone binary does the
         // same (`SystemMessage::SetLlm` in main.rs); without this the
         // BuildManager's `llm_tx` stays None and the app reports a misleading
-        // "LLM not configured" even when a key IS set in Settings.
+        // "LLM unavailable" even when a key IS set in Settings.
         let _ = bm_tx
             .send(BuildManagerMessage::SetLlm {
                 llm_tx: llm_tx.clone(),
