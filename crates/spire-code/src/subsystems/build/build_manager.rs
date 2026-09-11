@@ -2319,6 +2319,14 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     let mut plat_status = "wired".to_string();
                     let plat_name = platform_rec.name.clone();
                     let plat_upper = platform.to_uppercase();
+                    // Per-platform hardware facts from the registry, surfaced in the
+                    // meson skeleton so the deps TODO names the real libraries.
+                    let lib_hints: String =
+                        crate::build::generic_helpers::hal_platform_library_hints(platform)
+                            .lines()
+                            .map(|l| format!("#   {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
                     let platform_meson = format!(
                         r#"# ------------------------------------------------------------------------------
 # {plat_name} ({platform}) PLATFORM TARGET
@@ -2371,11 +2379,17 @@ endif
 {platform}_hal_sources = hal_impl_{platform}_sources
 
 # --- Application sources ---
-app_sources = files('main.cpp')
+# The generic app (main + the ONE platform-specific HAL binding) is shared
+# across platforms; only ../app/platform_hal_{platform}.cpp differs.
+app_sources = files(
+  '../app/main.cpp',
+  '../app/platform_hal_{platform}.cpp',
+)
 
 # --- Platform-specific dependencies ({platform}) ---
 # TODO({platform}): add {platform}-specific external libraries (accelerator / ISP
-# / media / camera) and append them to platform_deps.
+# / media / camera) and append them to platform_deps. Registry hints:
+{lib_hints}
 platform_deps = []
 add_project_arguments('-DHAVE_{plat_upper}', language: 'cpp')
 
@@ -2399,16 +2413,69 @@ executable('{project_name}-{platform}',
                     if let Err(e) = std::fs::write(plat_dir.join("meson.build"), &platform_meson) {
                         plat_status = format!("platform meson write failed: {e}");
                     }
-                    let main_cpp = format!(
-                        "#include <iostream>\nint main() {{\n    std::cout << \"Hello from {project_name}-{platform}!\" << std::endl;\n    return 0;\n}}\n"
+                    // 7a. The per-platform HAL binding + the concrete aggregate
+                    // HAL. The generic app/main.cpp is shared across platforms, so
+                    // there is NO per-platform main.cpp: we write the ONE binding
+                    // (app/platform_hal_<plat>.cpp) plus the aggregate that owns
+                    // the platform's components (hal/implementations/<plat>/
+                    // ai_trap_hal_<plat>.{hpp,cpp}).
+                    let suffix = crate::build::generic_helpers::platform_class_suffix(platform);
+                    let agg_class = format!("AiTrapHal{suffix}");
+
+                    let app_dir = root_path.join("app");
+                    let _ = std::fs::create_dir_all(&app_dir);
+                    let platform_hal = crate::build::generic_helpers::generate_platform_hal_source(
+                        platform, &agg_class,
                     );
-                    if let Err(e) = std::fs::write(plat_dir.join("main.cpp"), &main_cpp) {
-                        plat_status = format!("platform main write failed: {e}");
+                    if let Err(e) = std::fs::write(
+                        app_dir.join(format!("platform_hal_{platform}.cpp")),
+                        &platform_hal,
+                    ) {
+                        plat_status = format!("platform_hal write failed: {e}");
+                    }
+
+                    // The aggregate's accessors mirror the project's AiTrapHal
+                    // contract, parsed from disk, so it matches whatever the app
+                    // declares (it is not hardcoded to camera/inference/...).
+                    let mut accessors: Vec<(String, String)> = Vec::new();
+                    if let Ok(txt) =
+                        std::fs::read_to_string(root_path.join("hal/api/ai_trap_hal.hpp"))
+                    {
+                        for (cls, methods) in
+                            crate::build::generic_helpers::extract_contract_methods_cpp(&txt)
+                        {
+                            if cls != "AiTrapHal" {
+                                continue;
+                            }
+                            for m in methods {
+                                if m.name.starts_with('~') {
+                                    continue;
+                                }
+                                accessors.push((m.return_type, m.name));
+                            }
+                            break;
+                        }
+                    }
+                    let agg_hpp = crate::build::generic_helpers::generate_aggregate_hal_header(
+                        platform, &agg_class, &accessors,
+                    );
+                    let agg_cpp = crate::build::generic_helpers::generate_aggregate_hal_source(
+                        platform, &agg_class, &accessors,
+                    );
+                    if let Err(e) =
+                        std::fs::write(impl_dir.join(format!("ai_trap_hal_{platform}.hpp")), &agg_hpp)
+                    {
+                        plat_status = format!("aggregate header write failed: {e}");
+                    }
+                    if let Err(e) =
+                        std::fs::write(impl_dir.join(format!("ai_trap_hal_{platform}.cpp")), &agg_cpp)
+                    {
+                        plat_status = format!("aggregate source write failed: {e}");
                     }
 
                     // 7b. <plat>/<plat>-cross.txt — generated from the platform
                     // registry record so a freshly added platform can actually be
-                    // cross-compiled (meson.build + main.cpp alone can't build).
+                    // cross-compiled (the meson wiring alone can't build).
                     let mut cross_status =
                         "not generated (platform has no Linux cross file)".to_string();
                     if let Some(cross) = platform_rec.meson_cross_file() {
@@ -2440,6 +2507,8 @@ executable('{project_name}-{platform}',
                         "root_meson": root_status,
                         "options": options_status,
                         "platform_wiring": plat_status,
+                        "platform_binding": format!("app/platform_hal_{platform}.cpp"),
+                        "aggregate": format!("hal/implementations/{platform}/ai_trap_hal_{platform}.cpp"),
                         "cross_file": cross_status,
                         "analysis": analysis_status,
                         "needs_fill": interfaces.iter().map(|(s, _, _)| format!("{s}: SPIRE-HAL-STUB pending")).collect::<Vec<_>>(),
@@ -4021,10 +4090,45 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
             "cross file must be generated from the registry: {cross}"
         );
 
-        // 6. <plat>/main.cpp.
+        // 6. The NEW architecture: there is NO per-platform main.cpp. Instead the
+        // ONE binding (app/platform_hal_<plat>.cpp) + the concrete aggregate HAL.
         assert!(
-            std::fs::read_to_string(root.join("rock3c/main.cpp")).unwrap().contains("Hello from ai-traps-rock3c"),
-            "main.cpp missing"
+            !root.join("rock3c/main.cpp").exists(),
+            "must not scaffold a per-platform main.cpp (the app has one generic main)"
+        );
+        let ph = std::fs::read_to_string(root.join("app/platform_hal_rock3c.cpp")).unwrap();
+        assert!(ph.contains("create_platform_hal"), "platform binding: {ph}");
+        assert!(ph.contains("AiTrapHalRock3c"), "must construct the aggregate: {ph}");
+
+        let agg_hpp = std::fs::read_to_string(
+            root.join("hal/implementations/rock3c/ai_trap_hal_rock3c.hpp"),
+        )
+        .unwrap();
+        assert!(
+            agg_hpp.contains("class AiTrapHalRock3c : public AiTrapHal"),
+            "aggregate header: {agg_hpp}"
+        );
+        assert!(agg_hpp.contains("SPIRE-HAL-STUB"), "aggregate sentinel: {agg_hpp}");
+        let agg_cpp = std::fs::read_to_string(
+            root.join("hal/implementations/rock3c/ai_trap_hal_rock3c.cpp"),
+        )
+        .unwrap();
+        assert!(
+            agg_cpp.contains("AiTrapHalRock3c::AiTrapHalRock3c()"),
+            "aggregate source: {agg_cpp}"
+        );
+
+        // The platform meson compiles the SHARED generic app, not a local main.
+        assert!(plat_meson.contains("../app/main.cpp"), "plat meson: {plat_meson}");
+        assert!(
+            plat_meson.contains("../app/platform_hal_rock3c.cpp"),
+            "plat meson: {plat_meson}"
+        );
+
+        // The aggregate is wired into the platform's HAL sources.
+        assert!(
+            hal_meson.contains("ai_trap_hal_rock3c.cpp"),
+            "hal meson must link the aggregate: {hal_meson}"
         );
     }
 
