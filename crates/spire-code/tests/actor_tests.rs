@@ -2849,6 +2849,128 @@ async fn test_coordinator_routes_ffi_methods_with_deps() {
     let resp = route(&coord_tx, "ping", serde_json::json!({})).await;
     assert_eq!(resp, serde_json::json!({"pong": true}));
 }
+/// `project/getBuildTarget` must serve the SELECTED target's own dependencies
+/// and its own platform — never the flat metadata-level dependency union (which
+/// is the union of every platform's libraries). This is the "target pane shows
+/// all platforms' dependencies" regression reported for a newly added platform.
+#[tokio::test]
+async fn test_get_build_target_serves_per_target_deps_only() {
+    use spire_code::subsystems::project::project_analyzer::ProjectAnalysis;
+    use spire_core::build_types::{BuildMetadata, BuildTarget, Dependency};
+
+    fn dep(name: &str) -> Dependency {
+        Dependency {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    let system = ActorSystem::new();
+    let (chat_tx, _) = system.spawn(ChatActor::new());
+    let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
+    let (mcp_tx, _) = system.spawn(McpClientActor::new());
+    let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
+    let (system_tx, _) = system.spawn(SystemActor::new());
+    let memory_graph_tx = mock_memory_graph();
+    let project_query_tx = mock_sender();
+    let intent_router_tx = mock_sender();
+    let plan_orchestrator_tx = mock_sender();
+    let transport_tx = mock_sender();
+    let tool_router_tx: tokio::sync::mpsc::Sender<actors::ToolRouterMessage> = mock_sender();
+    let (coord_tx, _handle) = system.spawn(CoordinatorActor::new(
+        chat_tx,
+        tools_tx,
+        mcp_tx,
+        llm_tx,
+        system_tx,
+        memory_graph_tx,
+        project_query_tx,
+        intent_router_tx,
+        tool_router_tx,
+        plan_orchestrator_tx,
+        transport_tx,
+    ));
+
+    // Two platform targets with DIFFERENT libraries; the metadata-level list is
+    // the union of both (libcamera + edgetpu + libjpeg).
+    let meta = BuildMetadata {
+        build_system: "Meson".to_string(),
+        project_type: "Meson_project".to_string(),
+        platform_targets: vec!["host".to_string(), "rpi5".to_string(), "a7s".to_string()],
+        dependencies: vec![dep("libcamera"), dep("edgetpu"), dep("libjpeg")],
+        targets: vec![
+            BuildTarget {
+                name: "ai-trap-rpi5".to_string(),
+                platform: "rpi5".to_string(),
+                dependencies: vec![dep("libcamera"), dep("edgetpu")],
+                ..Default::default()
+            },
+            BuildTarget {
+                name: "ai-traps-a7s".to_string(),
+                platform: "a7s".to_string(),
+                dependencies: vec![dep("libjpeg")],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let (watcher_tx, _watcher_rx) = mpsc::channel::<actors::FileChangeNotification>(8);
+    let ffi_state = std::sync::Arc::new(FfiSharedState {
+        project_root: std::sync::Mutex::new(None),
+        analysis: std::sync::Mutex::new(Some(ProjectAnalysis {
+            project_root: "/tmp/proj".to_string(),
+            project_name: "ai-traps".to_string(),
+            file_tree: spire_core::analyzer::models::DirectoryNode::default(),
+            build_systems: vec![meta],
+            languages: Vec::new(),
+            directory_roles: Vec::new(),
+            file_roles: Vec::new(),
+            entry_points: Vec::new(),
+            architecture_summary: String::new(),
+            total_files: 0,
+            total_dirs: 0,
+            total_lines: 0,
+        })),
+        watcher_out_tx: watcher_tx,
+    });
+    coord_tx
+        .send(CoordinatorMessage::SetFfiDeps {
+            registry: std::sync::Arc::new(ServiceRegistry::new()),
+            state: ffi_state,
+        })
+        .await
+        .unwrap();
+
+    let resp = route(
+        &coord_tx,
+        "project/getBuildTarget",
+        serde_json::json!({ "name": "ai-traps-a7s" }),
+    )
+    .await;
+
+    // Only the a7s target's own dependency — NOT rpi5's libcamera/edgetpu.
+    let names: Vec<&str> = resp["dependencies"]
+        .as_array()
+        .expect("dependencies array")
+        .iter()
+        .map(|d| d["name"].as_str().expect("dep name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["libjpeg"],
+        "must be the selected target's deps only: {resp}"
+    );
+
+    // Only the selected target's own platform — not the whole project's list.
+    assert_eq!(
+        resp["platform"],
+        serde_json::json!(["a7s"]),
+        "platform must be the selected target's: {resp}"
+    );
+}
+
+
 
 /// Without SetFfiDeps (the standalone binary), FFI-inline methods return a
 /// clear error instead of being dispatched.

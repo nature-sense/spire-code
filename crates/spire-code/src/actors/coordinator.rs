@@ -2687,38 +2687,29 @@ impl CoordinatorActor {
             }
         }
 
-        // Dependencies are PER-TARGET — serve the target's own list parsed from
-        // meson.build, not the flat metadata-level list.
-        let target_deps = meta
-            .targets
+        // Dependencies are STRICTLY per-target — the selected target's own list,
+        // parsed from its meson.build section. There is deliberately NO fallback
+        // to the flat metadata-level list: that list is the union of every
+        // platform's `dependency()` calls, so falling back made one platform's
+        // pane show all platforms' libraries.
+        let deps: Vec<serde_json::Value> = target
+            .map(|t| t.dependencies.as_slice())
+            .unwrap_or(&[])
             .iter()
-            .find(|t| t.name == target_name)
-            .map(|t| t.dependencies.clone())
-            .unwrap_or_default();
-        let deps: Vec<serde_json::Value> = if !target_deps.is_empty() {
-            target_deps
-                .iter()
-                .map(|d| serde_json::json!({
-                    "name": d.name,
-                    "version": d.version_req,
-                }))
-                .collect()
-        } else {
-            meta.dependencies
-                .iter()
-                .map(|d| serde_json::json!({
-                    "name": d.name,
-                    "version": d.version_req,
-                }))
-                .collect()
-        };
+            .map(|d| serde_json::json!({
+                "name": d.name,
+                "version": d.version_req,
+            }))
+            .collect();
 
         serde_json::json!({
             "name": target_name,
             "kind": meta.targets.iter().find(|t| t.name == target_name)
                 .and_then(|t| t.kind.first()).cloned().unwrap_or_default(),
             "configFile": meta.config_files.first().cloned().unwrap_or_default(),
-            "platform": meta.platform_targets,
+            // The SELECTED target's own platform — not every platform in the
+            // project (which is what made the pane list all of them).
+            "platform": target.map(|t| vec![t.platform.clone()]).unwrap_or_default(),
             "dependencies": deps,
             "files": files,
         })
