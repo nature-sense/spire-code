@@ -65,7 +65,7 @@ fn mock_memory_graph() -> tokio::sync::mpsc::Sender<MemoryGraphMessage> {
 
 /// Helper to extract properties from an Unknown AttrNode.
 /// Returns an empty map for typed variants.
-fn unknown_props<'a>(node: &'a AttrNode) -> &'a HashMap<String, serde_json::Value> {
+fn unknown_props(node: &AttrNode) -> &HashMap<String, serde_json::Value> {
     &node.properties
 }
 
@@ -1065,7 +1065,7 @@ async fn seed_error_types_and_fixes(memory_graph: &mpsc::Sender<MemoryGraphMessa
     }
 
     seed_error(
-        &memory_graph,
+        memory_graph,
         now,
         "errorType",
         "rustc-compile-error",
@@ -1081,7 +1081,7 @@ async fn seed_error_types_and_fixes(memory_graph: &mpsc::Sender<MemoryGraphMessa
     ).await;
 
     seed_error(
-        &memory_graph,
+        memory_graph,
         now,
         "fixStrategy",
         "fix-type-error",
@@ -1100,7 +1100,7 @@ async fn seed_error_types_and_fixes(memory_graph: &mpsc::Sender<MemoryGraphMessa
     ).await;
 
     seed_error(
-        &memory_graph,
+        memory_graph,
         now,
         "fixStrategy",
         "generic-fix",

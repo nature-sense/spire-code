@@ -96,10 +96,10 @@ impl std::fmt::Display for SpecGenError {
                 issues,
                 spec,
             } => {
-                write!(
+                writeln!(
                     f,
                     "AppSpec requirements pass: spec for '{}' still invalid after {attempts} \
-                     attempt(s) with {} error(s):\n",
+                     attempt(s) with {} error(s):",
                     spec.app.name,
                     issues
                         .iter()
@@ -442,6 +442,7 @@ pub fn parse_app_spec(raw: &str) -> Option<AppSpec> {
 /// Emit phase: prompt the LLM for an AppSpec and self-heal against
 /// [`validate`] (repair prompts carry the concrete violations) until it
 /// validates or [`MAX_ATTEMPTS`] rounds are exhausted.
+#[allow(clippy::result_large_err)] // SpecGenError is a rich, diagnostic error type
 async fn emit_valid_spec<F, Fut>(
     project_name: &str,
     goal: &str,
@@ -519,6 +520,7 @@ where
 /// `call_llm` is invoked once per round with the full prompt and returns the
 /// model's raw reply (or an error string). Injecting it as a closure keeps the
 /// loop testable without a live LLM actor.
+#[allow(clippy::result_large_err)] // SpecGenError is a rich, diagnostic error type
 pub async fn generate_app_spec<F, Fut>(
     project_name: &str,
     goal: &str,
@@ -851,7 +853,7 @@ mod tests {
         let prompts = prompts.lock().unwrap();
         let improve = prompts[1].clone();
         assert!(improve.contains("IMPROVEMENT PASS"));
-        assert!(improve.contains("\"viewport\"") == false); // round 1 saw v1 (no viewport yet)
+        assert!(!improve.contains("\"viewport\"")); // round 1 saw v1 (no viewport yet)
     }
 
     #[test]

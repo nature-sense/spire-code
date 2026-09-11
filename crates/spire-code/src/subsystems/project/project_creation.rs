@@ -12,7 +12,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
@@ -142,6 +142,7 @@ fn parse_step_type(s: &str) -> Option<CreationStepType> {
 ///   2. `{"write_source_file": {"path": "...", "content": "..."}}`
 ///      (single-key object whose key IS the step type and whose value is the
 ///      parameters — this is the schema `deepseek-chat` returned verbatim).
+///
 /// Backfill sensible defaults for LLM steps that omit required fields —
 /// otherwise a `write_source_file` step with no `content` created an EMPTY
 /// file and a `path`-less step targeted nowhere.
@@ -194,14 +195,14 @@ fn step_description(step_type: &CreationStepType, params: &serde_json::Value) ->
             if let Some(deps) = params.get("dependencies").and_then(|v| v.as_array()) {
                 let names: Vec<String> = deps
                     .iter()
-                    .filter_map(|d| {
+                    .map(|d| {
                         let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                         let ver = d
                             .get("version")
                             .and_then(|v| v.as_str())
                             .filter(|v| !v.is_empty())
                             .unwrap_or("*");
-                        Some(format!("{name}@{ver}"))
+                        format!("{name}@{ver}")
                     })
                     .collect();
                 if names.is_empty() {
@@ -294,6 +295,7 @@ fn step_from_value(index: usize, v: &serde_json::Value) -> Option<CreationStep> 
 ///   2. If the full parse fails, extract the first `[` … last `]` span and
 ///      attempt each top-level element independently, keeping the VALID steps
 ///      and dropping only the broken ones.
+///
 /// Verified: the exact 13k-char fenced shape from the live API parses on the
 /// first path; the recovery path is a fallback for the occasional bad element.
 fn parse_fill_steps(text: &str) -> Option<Vec<CreationStep>> {
@@ -541,8 +543,8 @@ pub enum ProjectCreationMessage {
     /// AppSpec codegen (deterministic, no LLM): derive `write_source_file`
     /// skeleton steps from a VALIDATED AppSpec — serde types + actor skeletons
     /// + FFI dispatch (routing derived from `handlers`) on the Rust side, and
-    /// typed bridge wrappers + screen skeletons on the Swift side. Nothing is
-    /// written here; the caller executes the returned plan.
+    ///   typed bridge wrappers + screen skeletons on the Swift side. Nothing is
+    ///   written here; the caller executes the returned plan.
     GenerateCode {
         project_name: String,
         spec: AppSpec,
@@ -625,7 +627,7 @@ impl ProjectCreationActor {
     async fn generate_fill_plan(
         &self,
         goal: &str,
-        root_dir: &PathBuf,
+        root_dir: &Path,
         spec: &crate::subsystems::build::build_manager::ScaffoldSpec,
     ) -> Result<PlanGenerationResult, String> {
         let project_name = root_dir
@@ -1545,7 +1547,7 @@ Project:
     fn generate_plan(
         &self,
         goal: &str,
-        root_dir: &PathBuf,
+        root_dir: &Path,
         language: &str,
         _platforms: &[String],
     ) -> PlanGenerationResult {
@@ -2442,7 +2444,7 @@ impl Actor for ProjectCreationActor {
                     // pristine scaffold baseline. Non-fatal — scaffolding still
                     // succeeds when git is unavailable.
                     if let Err(ge) =
-                        ProjectCreationActor::ensure_scaffold_git(&root, &build_system).await
+                        ProjectCreationActor::ensure_scaffold_git(&root, build_system).await
                     {
                         warn!("[ProjectCreation] git scaffold baseline skipped: {ge}");
                     }

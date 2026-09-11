@@ -2099,11 +2099,11 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         // Re-analyze so the missing-implementation queue reflects
                         // the new target (the analyzer lists placeholders as
                         // implementations — real ones fill them via Stage 1).
-                        let analysis_status;
-                        match self.analyze_project(std::path::Path::new(root), None).await {
-                            Ok(_) => analysis_status = "re-analyzed (queued impls ready)".to_string(),
-                            Err(e) => analysis_status = format!("re-analyze failed: {e}"),
-                        }
+
+                        let analysis_status = match self.analyze_project(std::path::Path::new(root), None).await {
+                            Ok(_) => "re-analyzed (queued impls ready)".to_string(),
+                            Err(e) => format!("re-analyze failed: {e}"),
+                        };
                         serde_json::json!({
                             "platform": platform,
                             "interfaces": interfaces.iter().map(|(s, _, _)| s.clone()).collect::<Vec<_>>(),
@@ -2297,11 +2297,11 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
 
                     // 8. Re-analyze so the new domain/build target + fill queue
                     // reflect the new platform.
-                    let analysis_status;
-                    match self.analyze_project(root_path, None).await {
-                        Ok(_) => analysis_status = "re-analyzed (platform added)".to_string(),
-                        Err(e) => analysis_status = format!("re-analyze failed: {e}"),
-                    }
+
+                    let analysis_status = match self.analyze_project(root_path, None).await {
+                        Ok(_) => "re-analyzed (platform added)".to_string(),
+                        Err(e) => format!("re-analyze failed: {e}"),
+                    };
 
                     serde_json::json!({
                         "platform": platform,
@@ -2418,20 +2418,23 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     .unwrap_or_default()
                     .to_string();
                 let plan = args.get("plan").cloned();
-                if root.is_empty() || plan.is_none() {
-                    serde_json::json!({ "error": "hal_fill_apply: \"root\" and \"plan\" required" })
-                } else {
-                    let analyze = async {
-                        let r = self
-                            .analyze_project(std::path::Path::new(&root), None)
-                            .await;
-                        r.map(|_| ())
-                    };
-                    crate::actors::hal_fill::apply(
-                        std::path::Path::new(&root),
-                        plan.as_ref().unwrap(),
-                        Box::pin(analyze),
-                    ).await
+                match plan {
+                    Some(plan) if !root.is_empty() => {
+                        let analyze = async {
+                            let r = self
+                                .analyze_project(std::path::Path::new(&root), None)
+                                .await;
+                            r.map(|_| ())
+                        };
+                        crate::actors::hal_fill::apply(
+                            std::path::Path::new(&root),
+                            &plan,
+                            Box::pin(analyze),
+                        ).await
+                    }
+                    _ => serde_json::json!({
+                        "error": "hal_fill_apply: \"root\" and \"plan\" required"
+                    }),
                 }
             }
 
@@ -2892,12 +2895,12 @@ mod tests {
     use spire_actor::ServiceRegistry;
     use std::sync::Arc;
 
-    /// Serializes tests that mutate the PROCESS-GLOBAL `SPIRE_PLATFORM_DIR`
-    /// env var (the platform registry seed). Cargo runs tests in parallel, so
-    /// two registry-dependent tests must never set it concurrently — the last
-    /// writer would break the other's `Platform::from_registry` lookup.
-    /// Shared across the crate via `crate::PLATFORM_DIR_TEST_LOCK` so the
-    /// cargo/meson scaffold tests (readers) serialize against these writers.
+    // Serializes tests that mutate the PROCESS-GLOBAL `SPIRE_PLATFORM_DIR`
+    // env var (the platform registry seed). Cargo runs tests in parallel, so
+    // two registry-dependent tests must never set it concurrently — the last
+    // writer would break the other's `Platform::from_registry` lookup.
+    // Shared across the crate via `crate::PLATFORM_DIR_TEST_LOCK` so the
+    // cargo/meson scaffold tests (readers) serialize against these writers.
 
     /// Sets `SPIRE_PLATFORM_DIR` for a fixture and restores the ambient value
     /// on drop — a stale var pointing at a deleted fixture dir would break any
@@ -3184,6 +3187,9 @@ public:
     /// constrained prompt (contract + hardware profile + meson build gate).
     /// Uses the real rpi5.yaml seed via a fixture SPIRE_PLATFORM_DIR.
     #[tokio::test]
+    // The guard deliberately spans the whole test body to serialize the
+    // process-global env mutation below; it is released when the test ends.
+    #[allow(clippy::await_holding_lock)]
     async fn hal_build_impl_prompt_resolves_contract_and_registry_platform() {
         use tempfile::tempdir;
 
@@ -3505,6 +3511,9 @@ public:
     /// then (best-effort) re-analyze. Uses the real registry seed rpi5.yaml via
     /// a fixture SPIRE_PLATFORM_DIR.
     #[tokio::test]
+    // The guard deliberately spans the whole test body to serialize the
+    // process-global env mutation below; it is released when the test ends.
+    #[allow(clippy::await_holding_lock)]
     async fn hal_add_platform_scaffolds_full_platform_surface() {
         use tempfile::tempdir;
 

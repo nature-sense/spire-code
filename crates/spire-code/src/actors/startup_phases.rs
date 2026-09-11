@@ -822,7 +822,7 @@ impl StartupPhase for ProjectSyncPhase {
         let project_root = ctx.project_root.clone();
         let system_tx = ctx.system_tx.clone();
 
-        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+        let child_tx = spawn_child_eager(&ctx.system, ctx.system.registry().clone(), move |_c| {
             let (tx, rx) = oneshot::channel();
             StartupTask::new(
                 "project_sync",
@@ -969,7 +969,7 @@ impl StartupPhase for ProjectAnalysisPhase {
         let system_tx = ctx.system_tx.clone();
         let memory_graph_tx = ctx.memory_graph_tx.clone();
 
-        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+        let child_tx = spawn_child_eager(&ctx.system, ctx.system.registry().clone(), move |_c| {
             let (tx, rx) = oneshot::channel();
             StartupTask::new(
                 "project_analysis",
@@ -1068,7 +1068,7 @@ impl StartupPhase for LlmConfigPhase {
         let llm_tx = ctx.llm_tx.clone();
         let system_tx = ctx.system_tx.clone();
 
-        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+        let child_tx = spawn_child_eager(&ctx.system, ctx.system.registry().clone(), move |_c| {
             let (tx, rx) = oneshot::channel();
             StartupTask::new(
                 "llm_config",
@@ -1617,7 +1617,7 @@ impl StartupPhase for IntentsBootstrapPhase {
         let system_tx = ctx.system_tx.clone();
         let project_root = ctx.project_root.clone();
 
-        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+        let child_tx = spawn_child_eager(&ctx.system, ctx.system.registry().clone(), move |_c| {
             let (tx, rx) = oneshot::channel();
             StartupTask::new(
                 "intents_bootstrap",

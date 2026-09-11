@@ -525,6 +525,7 @@ pub enum HalHeaderKind {
 ///   files of pure data definitions);
 /// - `NoClass` when the AST has no class/struct declarations;
 /// - `ParseError` when reading fails.
+///
 /// Returns `true` when any declared class in the header derives the HAL module
 /// marker base (`HalModule`, possibly qualified `hal::HalModule`).
 fn derives_hal_module(content: &str) -> bool {
@@ -802,7 +803,7 @@ pub fn generate_hal_module_header(
         SPIRE_HAL_STUB_SENTINEL
     );
     h.push_str(&format!("#include \"hal/api/{header_stem}.hpp\"\n\n"));
-    h.push_str(&format!("namespace hal {{\n\n"));
+    h.push_str("namespace hal {\n\n");
     h.push_str(&format!("/// {impl_class} — {platform} implementation of {base_class}.\n"));
     h.push_str(&format!("class {impl_class} : public {base_class} {{\n"));
     h.push_str("public:\n");
@@ -994,6 +995,7 @@ pub fn generate_hal_module_pair(
 ///   (d) the per-target out-of-class definition you must implement, and
 ///   (e) the acceptance gate: the placeholder must compile on this target
 ///       (`meson compile -C build-<platform> <target>`).
+#[allow(clippy::too_many_arguments)] // prompt context passed explicitly, not bundled
 pub fn generate_hal_impl_prompt(
     contract_summary: &str,
     header_stem: &str,
@@ -1379,7 +1381,7 @@ pub fn extract_cpp_base_classes(content: &str) -> Vec<(String, Vec<String>)> {
                 if c.kind() == "base_class_clause" {
                     for b in named_children_of(c) {
                         // `type_identifier` / `qualified_identifier` = the base.
-                        if let Some(base) = b.utf8_text(content.as_bytes()).ok() {
+                        if let Ok(base) = b.utf8_text(content.as_bytes()) {
                             // Strip any `::` qualifier to the last segment and
                             // drop access keywords if they slipped in.
                             let name = base
@@ -1394,11 +1396,9 @@ pub fn extract_cpp_base_classes(content: &str) -> Vec<(String, Vec<String>)> {
                                 && name != "private"
                                 && name != "protected"
                                 && name != "virtual"
-                            {
-                                if !bases.contains(&name) {
+                                && !bases.contains(&name) {
                                     bases.push(name);
                                 }
-                            }
                         }
                     }
                 }
@@ -1532,7 +1532,7 @@ pub fn normalize_params(params: &str) -> String {
             // the head has more than one token (i.e. when it's `Type name`).
             let tokens: Vec<&str> = head.split_whitespace().collect();
             if tokens.len() <= 1 {
-                tokens.iter().copied().collect::<Vec<_>>().join(" ")
+                tokens.to_vec().join(" ")
             } else {
                 tokens[..tokens.len() - 1].join(" ")
             }
@@ -1837,9 +1837,7 @@ pub fn parse_hal_docs(content: &str) -> Vec<HalDoc> {
                 // follows it). Numeric/pointer literal values are never names.
                 let head_eq = stripped_line.split('=').next().unwrap_or(&stripped_line);
                 head_eq
-                    .split(|c: char| c == ' ' || c == '\t' || c == ';' || c == ',' || c == '{')
-                    .filter(|s| !s.is_empty())
-                    .next_back()
+                    .split([' ', '\t', ';', ',', '{']).rfind(|s| !s.is_empty())
                     .unwrap_or("")
                     .trim_end_matches([';', ','])
                     .to_string()
@@ -1883,7 +1881,7 @@ fn parse_doc_tags(lines: &[String]) -> (Vec<HalDocTag>, String) {
                 let mut k = rest.splitn(2, ' ');
                 let pk = k.next().unwrap_or("").to_string();
                 let pv = k.next().unwrap_or("").to_string();
-                (pk, format!("{pv}"))
+                (pk, pv.to_string())
             } else {
                 (name.trim_start_matches('@').to_string(), rest)
             };
@@ -2154,17 +2152,17 @@ fn inline_field_docs(content: &str) -> Vec<HalFieldDoc> {
             out.entry((name.clone(), type_name.clone()))
                 .and_modify(|e| {
                     if !e.prose.is_empty() { e.prose.push(' '); }
-                    e.prose.push_str(&comment);
+                    e.prose.push_str(comment);
                 })
                 .or_insert(HalFieldDoc {
-                    name: name,
+                    name,
                     type_name,
                     tags: Vec::new(),
                     prose: comment.to_string(),
                 });
         }
     }
-    out.into_iter().map(|(_, f)| f).collect()
+    out.into_values().collect()
 }
 
 /// One documented struct field (member-level annotated docs).
@@ -2355,7 +2353,7 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
                         // Strip any default (`= <value>`) BEFORE the name, so
                         // `int quality = 85` -> "quality", not "85".
                         let head = part.split('=').next().unwrap_or(part);
-                        head.trim().split_whitespace().last()
+                        head.split_whitespace().last()
                             .filter(|w| !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || c == '_'))
                             .map(|w| w.to_string())
                     })
@@ -2401,7 +2399,7 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
                 let body = t.trim_start_matches(['/', '*']).trim();
                 for word in body.split_whitespace() {
                     if word.starts_with('@') {
-                        let tag = word.split(|c: char| c == ' ' || c == '(').next().unwrap_or(word);
+                        let tag = word.split([' ', '(']).next().unwrap_or(word);
                         if !HAL_DOC_TAGS.contains(&tag) {
                             issues.push(HalDocLintIssue {
                                 severity: "warning".into(),
@@ -2457,7 +2455,7 @@ pub fn cpp_syntax_check(content: &str) -> CppSyntaxReport {
     while let Some(node) = stack.pop() {
         if node.is_error() || node.is_missing() {
             let (row, col) = (node.start_position().row, node.start_position().column);
-            let context = content.lines().nth(row as usize).map(|l| l.trim().to_string()).unwrap_or_default();
+            let context = content.lines().nth(row).map(|l| l.trim().to_string()).unwrap_or_default();
             errors.push(CppSyntaxError { line: row as u32 + 1, col: col as u32 + 1, kind: node.kind().to_string(), context });
             continue; // don't descend into erroneous nodes
         }
@@ -2475,7 +2473,7 @@ pub fn cpp_syntax_check(content: &str) -> CppSyntaxReport {
 pub fn strip_code_fences(text: &str) -> String {
     let t = text.trim();
     if t.starts_with("```") {
-        let after = &t[3..];
+        let after = t.strip_prefix("```").unwrap_or(t);
         let after = after
             .strip_prefix("cpp")
             .map(str::trim_start)
@@ -3007,6 +3005,7 @@ pub fn hal_verify(root: &std::path::Path) -> Vec<HalIssue> {
 /// the platform capability matrix (from RAG). Extends
 /// [`generate_hal_impl_prompt`] with the structured knowledge the LLM needs
 /// to write a platform-specific implementation.
+#[allow(clippy::too_many_arguments)] // prompt context passed explicitly, not bundled
 pub fn generate_hal_impl_prompt_rich(
     contract_summary: &str,
     header_stem: &str,
@@ -3089,6 +3088,7 @@ pub fn datatype_docs_to_prompt_text(root: &std::path::Path) -> String {
 /// surface (`Impl` PIMPL state + ctor/dtor + every `override`), and the
 /// structured contract/datatype docs + RAG capability matrix are attached when
 /// available.
+#[allow(clippy::too_many_arguments)] // prompt context passed explicitly, not bundled
 pub fn generate_hal_impl_prompt_pair(
     contract_summary: &str,
     header_stem: &str,
@@ -3952,11 +3952,11 @@ struct ICameraHAL : hal::HalModule {
         let titles: Vec<&str> = file.issues.iter().map(|i| i.title.as_str()).collect();
         // start() has no @param docs for device/width and no @return.
         assert!(
-            titles.iter().any(|t| *t == "method missing @param"),
+            titles.contains(&"method missing @param"),
             "missing @param issue: {titles:?}"
         );
         assert!(
-            titles.iter().any(|t| *t == "method missing @return"),
+            titles.contains(&"method missing @return"),
             "missing @return issue: {titles:?}"
         );
         // Every issue carries an LLM fix prompt.

@@ -246,7 +246,7 @@ impl<'a> LayoutParser<'a> {
         }
         let mut out = String::new();
         let mut esc = false;
-        while let Some(c) = self.chars.next() {
+        for c in self.chars.by_ref() {
             if esc {
                 out.push(c);
                 esc = false;
@@ -784,10 +784,7 @@ pub fn markdown_to_spec(md: &str) -> Result<AppSpec, String> {
                             it.consume();
                         }
                         let mut fields = Vec::new();
-                        loop {
-                            let Some(row) = it.peek() else {
-                                break;
-                            };
+                        while let Some(row) = it.peek() {
                             let row = row.trim();
                             if row.is_empty() {
                                 it.consume();
@@ -940,10 +937,7 @@ pub fn markdown_to_spec(md: &str) -> Result<AppSpec, String> {
                 let mut params = Vec::new();
                 if it.peek().is_some_and(|l| l.trim() == "| param | type |") {
                     it.consume();
-                    loop {
-                        let Some(row) = it.peek() else {
-                            break;
-                        };
+                    while let Some(row) = it.peek() {
                         let row = row.trim();
                         if row.is_empty() || row.starts_with("|---") {
                             it.consume();

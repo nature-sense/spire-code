@@ -897,7 +897,7 @@ impl ProjectSyncActor {
         // Sort directories by depth descending (children first)
         let dirs_sorted: Vec<String> = {
             let mut d: Vec<String> = all_dirs.iter().cloned().collect();
-            d.sort_by(|a, b| b.len().cmp(&a.len()));
+            d.sort_by_key(|s| std::cmp::Reverse(s.len()));
             d
         };
 
@@ -1396,7 +1396,7 @@ impl ProjectSyncActor {
 
         // Sort needed dirs by depth descending so children are created first
         let mut dirs_sorted: Vec<String> = needed_dirs.into_iter().collect();
-        dirs_sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+        dirs_sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
 
         for dir_path in &dirs_sorted {
             if dir_node_ids.contains_key(dir_path) {
@@ -2088,7 +2088,7 @@ impl ProjectSyncActor {
         let mut result = SyncResult::new();
 
         // Drain the batch
-        let batch: Vec<(ChangeType, PathBuf)> = self.event_batch.drain(..).collect();
+        let batch: Vec<(ChangeType, PathBuf)> = std::mem::take(&mut self.event_batch);
 
         if batch.is_empty() {
             return Ok(result);
@@ -2300,7 +2300,7 @@ impl ProjectSyncActor {
                     .iter()
                     .find(|(p, _)| {
                         p.file_name()
-                            .map(|n| n.to_string_lossy().to_string() == cfg)
+                            .map(|n| n.to_string_lossy() == cfg)
                             .unwrap_or(false)
                     })
                     .map(|(_, m)| m)

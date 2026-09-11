@@ -11,11 +11,10 @@
 use serde_json::json;
 use std::path::Path;
 
-/// Deriving impl class names + module-pair filenames is shared with the
-/// semantic `hal_generate_impl` path (`generic_helpers::hal_impl_class_name`
-/// / `generic_helpers::resolve_hal_impl_names`) so the fill scaffolding and
-/// the LLM generation always agree on the concrete class + file names.
-///
+// Deriving impl class names + module-pair filenames is shared with the
+// semantic `hal_generate_impl` path (`generic_helpers::hal_impl_class_name`
+// / `generic_helpers::resolve_hal_impl_names`) so the fill scaffolding and
+// the LLM generation always agree on the concrete class + file names.
 
 /// Render the full **definition** source a fill item would write (read-only)
 /// — for a NEW class (`none`) this is the concrete `.cpp` (out-of-class
@@ -274,7 +273,7 @@ pub async fn apply(
                 failures.push(format!("{iface}: header not found or no classes"));
                 continue;
             };
-            match std::fs::write(&target, src) {
+            match std::fs::write(target, src) {
                 Ok(()) => written.push(create.to_string()),
                 Err(e) => failures.push(format!("{create}: {e}")),
             }

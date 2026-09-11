@@ -54,7 +54,7 @@ async fn spawn_memory_graph(system: &ActorSystem) -> tokio::sync::mpsc::Sender<M
     tx
 }
 
-fn unknown_props<'a>(node: &'a AttrNode) -> &'a HashMap<String, Value> {
+fn unknown_props(node: &AttrNode) -> &HashMap<String, Value> {
     &node.properties
 }
 
@@ -659,7 +659,7 @@ async fn test_plan_orchestrator_update_and_query_status() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     plan_orch_tx
         .send(PlanOrchestratorMessage::GetPlanStatus {
-            plan_id: plan_id,
+            plan_id,
             reply_to: tx,
         })
         .await

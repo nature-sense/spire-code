@@ -600,14 +600,13 @@ impl CoordinatorActor {
                                         url,
                                         headers: entry.headers.unwrap_or_default(),
                                     }
-                                } else if let Some(command) = entry.command {
+                                } else {
+                                    let command = entry.command?;
                                     spire_core::mcp::client::TransportConfig::Stdio {
                                         command,
                                         args: entry.args,
                                         env: entry.env.unwrap_or_default(),
                                     }
-                                } else {
-                                    return None;
                                 };
                                 Some(spire_core::mcp::client::McpServerConfig {
                                     name: entry.name,
@@ -859,10 +858,9 @@ impl CoordinatorActor {
                                 || query.is_empty()
                             {
                                 None // defaults to "all" in project/build
-                            } else if query.starts_with("build ") {
-                                Some(query[6..].to_string()) // extract scope after "build "
                             } else {
-                                None
+                                // extract the scope after "build " (None → all)
+                                query.strip_prefix("build ").map(|rest| rest.to_string())
                             };
 
                             let mut build_args = serde_json::Map::new();
@@ -2133,13 +2131,14 @@ impl CoordinatorActor {
         let mut tool_calls = Vec::new();
         let mut call_id_counter = 0u64;
 
+        // Constant pattern — compiled once, outside the per-invoke loop.
+        let param_re = Regex::new(
+            r#"(?s)<(?:｜DSML｜)?parameter\s+name\s*=\s*"([^"]+)"(?:\s+string\s*=\s*"(true|false)")?\s*>(.*?)</(?:｜DSML｜)?parameter>"#
+        ).ok()?;
+
         for cap in invoke_re.captures_iter(content) {
             let function_name = cap.get(1)?.as_str().to_string();
             let params_body = cap.get(2)?.as_str();
-
-            let param_re = Regex::new(
-                r#"<(?:｜DSML｜)?parameter\s+name\s*=\s*"([^"]+)"(?:\s+string\s*=\s*"(true|false)")?\s*>(.*?)</(?:｜DSML｜)?parameter>"#
-            ).ok()?;
 
             let mut args = serde_json::Map::new();
             for param_cap in param_re.captures_iter(params_body) {
@@ -2305,14 +2304,13 @@ impl CoordinatorActor {
                                     url,
                                     headers: entry.headers.unwrap_or_default(),
                                 }
-                            } else if let Some(cmd) = entry.command {
+                            } else {
+                                let cmd = entry.command?;
                                 TransportConfig::Stdio {
                                     command: cmd,
                                     args: entry.args,
                                     env: entry.env.unwrap_or_default(),
                                 }
-                            } else {
-                                return None;
                             };
                             Some(McpServerConfig {
                                 name: entry.name,
@@ -2652,7 +2650,7 @@ impl CoordinatorActor {
         // compiled for it) instead of guessing directories.
         let target = meta.targets.iter().find(|t| t.name == target_name);
         let declared_sources: Vec<String> = target
-            .map(|t| t.source_files.iter().cloned().collect())
+            .map(|t| t.source_files.to_vec())
             .unwrap_or_default();
 
         let mut files: Vec<serde_json::Value> = Vec::new();

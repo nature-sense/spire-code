@@ -430,7 +430,10 @@ impl ProjectTestActor {
         }
     }
 
-    /// Collect results from parallel dispatch handles.
+    // `JoinHandle<(system, tool, optional target, result)>` tuples are inherent
+    // to the parallel MCP dispatch; the tuple is the handle's payload, not a
+    // value we thread through a public API.
+    #[allow(clippy::type_complexity)]
     async fn collect_results(
         handles: Vec<
             tokio::task::JoinHandle<(String, String, Option<String>, Result<Value, String>)>,

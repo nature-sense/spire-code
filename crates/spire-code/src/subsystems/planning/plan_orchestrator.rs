@@ -294,12 +294,12 @@ impl PlanOrchestrator {
             if let Ok(Ok(nodes)) = rx.await {
                 let step_names: Vec<String> = nodes
                     .iter()
-                    .filter_map(|n| {
+                    .map(|n| {
                         let cat = n
                             .get("category")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        Some(format!("{} ({})", n.name(), cat))
+                        format!("{} ({})", n.name(), cat)
                     })
                     .collect();
                 if !step_names.is_empty() {

@@ -269,7 +269,7 @@ impl ProjectAnalyzerActor {
                 },
             )
             .collect();
-        languages.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+        languages.sort_by_key(|x| std::cmp::Reverse(x.file_count));
 
         // 5. Compute directory role breakdown
         let mut dir_role_map: HashMap<String, usize> = HashMap::new();
@@ -278,7 +278,7 @@ impl ProjectAnalyzerActor {
             .into_iter()
             .map(|(role, count)| RoleBreakdown { role, count })
             .collect();
-        directory_roles.sort_by(|a, b| b.count.cmp(&a.count));
+        directory_roles.sort_by_key(|x| std::cmp::Reverse(x.count));
 
         // 6. Compute file role breakdown
         let mut file_role_map: HashMap<String, usize> = HashMap::new();
@@ -287,7 +287,7 @@ impl ProjectAnalyzerActor {
             .into_iter()
             .map(|(role, count)| RoleBreakdown { role, count })
             .collect();
-        file_roles.sort_by(|a, b| b.count.cmp(&a.count));
+        file_roles.sort_by_key(|x| std::cmp::Reverse(x.count));
 
         // 7. Identify entry points
         let entry_points: Vec<String> = find_entry_points(&file_tree);

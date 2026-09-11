@@ -610,10 +610,12 @@ fn find_xcworkspace(root: &Path) -> Option<String> {
     None
 }
 
+/// Targets + dependencies + optional workspace name parsed from
+/// `swift package dump-package`.
+type SwiftPmManifest = (Vec<BuildTarget>, Vec<Dependency>, Option<String>);
+
 /// Run `swift package dump-package` and extract targets + dependencies.
-fn parse_swiftpm(
-    root: &Path,
-) -> Result<(Vec<BuildTarget>, Vec<Dependency>, Option<String>), String> {
+fn parse_swiftpm(root: &Path) -> Result<SwiftPmManifest, String> {
     let output = SyncCommand::new("swift")
         .args(["package", "dump-package"])
         .current_dir(root)

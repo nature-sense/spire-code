@@ -549,7 +549,7 @@ pub(crate) fn children<'a>(g: &'a SpecGraph, parent: &str, predicate: &str) -> V
     out
 }
 
-pub(crate) fn fields_of<'a>(g: &'a SpecGraph, parent: &str) -> Result<Vec<Field>, String> {
+pub(crate) fn fields_of(g: &SpecGraph, parent: &str) -> Result<Vec<Field>, String> {
     children(g, parent, edge::HAS_FIELD)
         .into_iter()
         .map(|n| {

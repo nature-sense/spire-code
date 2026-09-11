@@ -289,6 +289,7 @@ impl ProjectQueryActor {
     ///   3. Cross-file candidates found via the symbol index that are NOT
     ///      edge-resolved — those are reported as `possibleReferences` and
     ///      NOT auto-renamed (we never guess where the usage is).
+    ///
     /// Word-boundary replacement is applied ONLY inside each resolved site's
     /// source span. `dryRun=true` (default) returns per-file diffs without
     /// touching disk.
@@ -382,7 +383,7 @@ impl ProjectQueryActor {
                 &decl_file,
                 &decl_text,
                 &old_name,
-                &new_name,
+                new_name,
                 decl_line,
                 decl_col,
                 decl_end_line,
@@ -414,7 +415,7 @@ impl ProjectQueryActor {
             let mut total = 0usize;
             for (sl, sc, el, ec) in &spans {
                 if let Some((t, n)) =
-                    Self::replace_in_span(&text, &old_name, &new_name, *sl, *sc, *el, *ec)
+                    Self::replace_in_span(&text, &old_name, new_name, *sl, *sc, *el, *ec)
                 {
                     if n > 0 {
                         text = t;
@@ -571,6 +572,7 @@ impl ProjectQueryActor {
     }
 
     /// Rename on the declaration site file; returns (new_text, replaced).
+    #[allow(clippy::too_many_arguments)]
     fn rename_span_in_file(
         _file: &str,
         text: &str,

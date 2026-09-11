@@ -17,7 +17,7 @@
 //!   cargo run --bin spire-core -- --mcp  # with MCP client connections
 
 use chrono::Local;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -74,7 +74,7 @@ fn log_dir() -> PathBuf {
 ///   - etc.
 ///
 /// The index resets on a new calendar day.
-fn resolve_log_path(log_dir: &PathBuf) -> PathBuf {
+fn resolve_log_path(log_dir: &Path) -> PathBuf {
     let date = Local::now().format("%Y-%m-%d").to_string();
     let base = log_dir.join(format!("spire-core.log.{}", date));
 

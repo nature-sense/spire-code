@@ -111,6 +111,7 @@ pub struct ProjectBuildActor {
 }
 
 impl ProjectBuildActor {
+    #[allow(clippy::too_many_arguments)] // actor wiring needs one sender per subsystem
     pub fn new(
         project_query_tx: mpsc::Sender<ProjectQueryMessage>,
         mcp_client_tx: mpsc::Sender<McpClientMessage>,
@@ -434,7 +435,6 @@ impl ProjectBuildActor {
             let build_widget_id = build_widget_id_clone.clone();
             let build_states = build_states.clone();
             let mode = mode.to_string();
-            let clean = clean;
             let project_name = dispatch
                 .project_name
                 .clone()
@@ -581,7 +581,7 @@ impl ProjectBuildActor {
                                 project_name,
                                 if success { "✅ success" } else { "❌ failed" }
                             ),
-                            percent: if success { 100.0 } else { 100.0 },
+                            percent: 100.0,
                             status: if success {
                                 ProgressStatus::Completed
                             } else {

@@ -152,19 +152,17 @@ impl MesonBuildModule {
             regex::Regex::new(r#"['"]([^'"]+\.(?:c|cpp|cc|cxx))['"]"#).unwrap();
         let var_ref_re = regex::Regex::new(r#"(?m)([a-z_][a-z0-9_]*)\s*[+]"#).unwrap();
 
+        // `library` must NOT match inside `find_library(...)` / `shared_library(...)`
+        // — those are dependency lookups or handled by their own kind. Use a
+        // word-boundary so only a standalone `library('name', ...)` matches.
+        // (Rust's regex crate lacks lookbehind, so emulate it with a boundary.)
+        // Constant pattern: compiled once, outside the per-kind loop.
+        let library_re =
+            regex::Regex::new(r#"(?:^|[^[:alnum:]_])library\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
+
         for (func, kind) in tgt_kinds {
-            // `library` must NOT match inside `find_library(...)` / `shared_library(...)`
-            // — those are dependency lookups or handled by their own kind. Use a
-            // word-boundary so only a standalone `library('name', ...)` matches.
-            // (Rust's regex crate lacks lookbehind, so emulate it with a boundary.)
             let (re, cap_idx): (regex::Regex, usize) = if *func == "library" {
-                (
-                    regex::Regex::new(
-                        r#"(?:^|[^[:alnum:]_])library\s*\(\s*['"]([^'"]+)['"]"#,
-                    )
-                    .unwrap(),
-                    1,
-                )
+                (library_re.clone(), 1)
             } else {
                 (
                     regex::Regex::new(&format!(r#"{func}\s*\(\s*['"]([^'"]+)['"]"#)).unwrap(),
@@ -682,13 +680,11 @@ impl MesonBuildModule {
                     if !prod_path.join("build.ninja").exists()
                         && !prod_path.join("meson-info").exists()
                     {
-                        let setup_args = vec![
-                            "setup".to_string(),
+                        let setup_args = ["setup".to_string(),
                             dir.clone(),
                             path.to_string_lossy().to_string(),
                             format!("--cross-file={abs_cross}"),
-                            format!("-Dplatform={plat}"),
-                        ];
+                            format!("-Dplatform={plat}")];
                         let refs: Vec<&str> = setup_args.iter().map(|s| s.as_str()).collect();
                         let setup = run_cmd(path, "meson", &refs).await?;
                         // Then compile in it.
@@ -1262,7 +1258,7 @@ int main() {
             values.push("host".to_string());
         }
         values.extend(cross.iter().map(|p| p.to_string()));
-        let values_line = values.iter().cloned().collect::<Vec<_>>().join(", ");
+        let values_line = values.to_vec().join(", ");
         files.push(super::ScaffoldFile {
             path: "meson_options.txt".to_string(),
             content: format!(
@@ -1788,6 +1784,244 @@ fn resolve_target_deps(
 impl Default for MesonBuildModule {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl Actor for MesonBuildModule {
+    type Message = BuildModuleMessage;
+
+    async fn handle(&mut self, msg: Self::Message) {
+        match msg {
+            BuildModuleMessage::DescribeCapabilities { reply_to } => {
+                let _ = reply_to.send(ModuleCapability {
+                    name: "meson".to_string(),
+                    config_files: vec!["meson.build".to_string()],
+                    build_system: "Meson".to_string(),
+                    language: "C/C++".to_string(),
+                    source_extensions: vec![
+                        "c".to_string(),
+                        "cpp".to_string(),
+                        "cc".to_string(),
+                        "cxx".to_string(),
+                        "h".to_string(),
+                        "hpp".to_string(),
+                    ],
+                    supports_clean: true,
+                    supports_lint: true,
+                    supports_format: true,
+                    supports_fix: true,
+                    mcp_servers: vec![],
+                });
+            }
+            BuildModuleMessage::Analyze { path, reply_to } => {
+                let _ = reply_to.send(self.analyze(&path));
+            }
+            BuildModuleMessage::Build {
+                path,
+                opts,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.build(&path, &opts).await);
+            }
+
+            BuildModuleMessage::BuildStreaming {
+                path,
+                metadata: _metadata,
+                opts,
+                build_spec: _,
+                event_tx,
+                reply_to,
+            } => {
+                // Not yet streaming for this module — fall back to a batch build
+                // and emit a single synthetic "finished" event.
+                let result = self.build(&path, &opts).await;
+                let _ = event_tx.send(super::BuildEvent {
+                    line: format!("Finished {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(result);
+            }
+            BuildModuleMessage::Test {
+                path,
+                opts,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(self.test(&path, &opts).await);
+            }
+
+            BuildModuleMessage::Clean { path, reply_to, .. } => {
+                let _ = reply_to.send(self.clean(&path).await);
+            }
+
+            BuildModuleMessage::Lint { path, platform, reply_to, .. } => {
+                let _ = reply_to.send(self.lint(&path, platform.as_deref()).await);
+            }
+
+            BuildModuleMessage::Format { path, reply_to, .. } => {
+                let _ = reply_to.send(self.format(&path).await);
+            }
+            BuildModuleMessage::Fix { path, reply_to, .. } => {
+                let _ = reply_to.send(self.fix(&path).await);
+            }
+            BuildModuleMessage::LintStreaming {
+                path,
+                platform,
+                event_tx,
+                reply_to,
+                ..
+            } => {
+                // Stream per-file analyzer results as they complete so the UI
+                // shows incremental progress (not a single late batch).
+                // Platform-aware compile DB: when a platform is selected (e.g.
+                // "rpi5"), prefer build-rpi5/compile_commands.json so lint uses
+                // the cross-compiled file set + flags.
+                let db_dir = if let Some(plat) = platform {
+                    self.find_named_build_dir(&path, &format!("build-{plat}"))
+                } else {
+                    self.find_compile_db_dir(&path)
+                };
+                let db = self.load_compile_commands_from(db_dir.clone());
+                let files = self.source_files(&path);
+                let mut success = true;
+                let mut output_lines: Vec<String> = Vec::new();
+                for file in &files {
+                    let (program, args) = self.analyzer_for_file(file, &db, &db_dir);
+                    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                    match run_cmd(&path, &program, &arg_refs).await {
+                        Ok(o) => {
+                            let t = strip_ansi(&o.output).trim().to_string();
+                            if !t.is_empty() {
+                                output_lines.push(t.clone());
+                            }
+                            if !o.success {
+                                success = false;
+                            }
+                            let line = if t.is_empty() {
+                                format!("\u{5b}Lint] {file}: no issues")
+                            } else {
+                                format!("\u{5b}Lint] {file}:\n{t}")
+                            };
+                            let _ = event_tx.send(super::BuildEvent {
+                                line,
+                                level: if success { "info" } else { "error" }.to_string(),
+                                target: Some(file.clone()),
+                                file: Some(file.clone()),
+                                line_number: None,
+                                message: None,
+                                detail: None,
+                            });
+                        }
+                        Err(e) => {
+                            output_lines.push(e.clone());
+                            success = false;
+                            let _ = event_tx.send(super::BuildEvent {
+                                line: format!("\u{5b}Lint] {file}: {e}"),
+                                level: "error".to_string(),
+                                target: Some(file.clone()),
+                                file: Some(file.clone()),
+                                line_number: None,
+                                message: None,
+                                detail: None,
+                            });
+                        }
+                    }
+                }
+                let _ = event_tx.send(super::BuildEvent {
+                    line: format!("Finished lint {}", path.display()),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(Ok(BuildOutput {
+                    success,
+                    command: "clang --analyze (static analyzer)".to_string(),
+                    duration_secs: 0.0,
+                    output: if output_lines.is_empty() {
+                        format!(
+                            "clang static analyzer: analyzed {} files; no issues reported",
+                            files.len()
+                        )
+                    } else {
+                        format!(
+                            "clang static analyzer: analyzed {} files\n{}",
+                            files.len(),
+                            output_lines.join("\n---\n")
+                        )
+                    },
+                    exit_code: Some(if success { 0 } else { 1 }),
+                }));
+            }
+
+            BuildModuleMessage::FixStreaming {
+                path,
+                event_tx,
+                reply_to,
+                ..
+            } => {
+                let result = self.fix(&path).await;
+                let _ = event_tx.send(super::BuildEvent {
+                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(result);
+            }
+
+            BuildModuleMessage::ParseSourceFile {
+                file_path,
+                reply_to,
+            } => {
+                // C/C++ headers (HAL contracts, .hpp/.h) get the method-level
+                // extractor so class-method nodes + child edges + pure-virtual
+                // markers land in the AST graph (the HAL contract tooling
+                // derives its method set from there).
+                let path = std::path::PathBuf::from(&file_path);
+                let is_header = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e == "hpp" || e == "h")
+                    .unwrap_or(false);
+                let result = if is_header {
+                    parse_cpp_source_file_std(&path)
+                } else {
+                    parse_source_file_std(&path, "C/C++")
+                };
+                let _ = reply_to.send(result);
+            }
+
+            BuildModuleMessage::ScaffoldBuildConfig {
+                project_name,
+                goal,
+                platforms,
+                structure,
+                embedded: _,
+                reply_to,
+            } => {
+                let result =
+                    self.scaffold_layout(&project_name, &goal, &platforms, structure);
+                let _ = reply_to.send(result);
+            }
+
+            BuildModuleMessage::CallTool { reply_to, .. } => {
+                let _ = reply_to
+                    .send(serde_json::json!({ "error": "meson module CallTool not yet wired" }));
+            }
+        }
     }
 }
 
@@ -2705,243 +2939,5 @@ mod tests {
         assert!(dep_names.contains(&"rknnrt"), "deps: {dep_names:?}");
         assert!(dep_names.contains(&"rockchip_mpp"), "deps: {dep_names:?}");
         assert!(dep_names.contains(&"yaml-cpp"), "deps: {dep_names:?}");
-    }
-}
-
-#[async_trait]
-impl Actor for MesonBuildModule {
-    type Message = BuildModuleMessage;
-
-    async fn handle(&mut self, msg: Self::Message) {
-        match msg {
-            BuildModuleMessage::DescribeCapabilities { reply_to } => {
-                let _ = reply_to.send(ModuleCapability {
-                    name: "meson".to_string(),
-                    config_files: vec!["meson.build".to_string()],
-                    build_system: "Meson".to_string(),
-                    language: "C/C++".to_string(),
-                    source_extensions: vec![
-                        "c".to_string(),
-                        "cpp".to_string(),
-                        "cc".to_string(),
-                        "cxx".to_string(),
-                        "h".to_string(),
-                        "hpp".to_string(),
-                    ],
-                    supports_clean: true,
-                    supports_lint: true,
-                    supports_format: true,
-                    supports_fix: true,
-                    mcp_servers: vec![],
-                });
-            }
-            BuildModuleMessage::Analyze { path, reply_to } => {
-                let _ = reply_to.send(self.analyze(&path));
-            }
-            BuildModuleMessage::Build {
-                path,
-                opts,
-                reply_to,
-                ..
-            } => {
-                let _ = reply_to.send(self.build(&path, &opts).await);
-            }
-
-            BuildModuleMessage::BuildStreaming {
-                path,
-                metadata: _metadata,
-                opts,
-                build_spec: _,
-                event_tx,
-                reply_to,
-            } => {
-                // Not yet streaming for this module — fall back to a batch build
-                // and emit a single synthetic "finished" event.
-                let result = self.build(&path, &opts).await;
-                let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
-                    level: "finished".to_string(),
-                    target: None,
-                    file: None,
-                    line_number: None,
-                    message: None,
-                    detail: None,
-                });
-                let _ = reply_to.send(result);
-            }
-            BuildModuleMessage::Test {
-                path,
-                opts,
-                reply_to,
-                ..
-            } => {
-                let _ = reply_to.send(self.test(&path, &opts).await);
-            }
-
-            BuildModuleMessage::Clean { path, reply_to, .. } => {
-                let _ = reply_to.send(self.clean(&path).await);
-            }
-
-            BuildModuleMessage::Lint { path, platform, reply_to, .. } => {
-                let _ = reply_to.send(self.lint(&path, platform.as_deref()).await);
-            }
-
-            BuildModuleMessage::Format { path, reply_to, .. } => {
-                let _ = reply_to.send(self.format(&path).await);
-            }
-            BuildModuleMessage::Fix { path, reply_to, .. } => {
-                let _ = reply_to.send(self.fix(&path).await);
-            }
-            BuildModuleMessage::LintStreaming {
-                path,
-                platform,
-                event_tx,
-                reply_to,
-                ..
-            } => {
-                // Stream per-file analyzer results as they complete so the UI
-                // shows incremental progress (not a single late batch).
-                // Platform-aware compile DB: when a platform is selected (e.g.
-                // "rpi5"), prefer build-rpi5/compile_commands.json so lint uses
-                // the cross-compiled file set + flags.
-                let db_dir = if let Some(plat) = platform {
-                    self.find_named_build_dir(&path, &format!("build-{plat}"))
-                } else {
-                    self.find_compile_db_dir(&path)
-                };
-                let db = self.load_compile_commands_from(db_dir.clone());
-                let files = self.source_files(&path);
-                let mut success = true;
-                let mut output_lines: Vec<String> = Vec::new();
-                for file in &files {
-                    let (program, args) = self.analyzer_for_file(file, &db, &db_dir);
-                    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                    match run_cmd(&path, &program, &arg_refs).await {
-                        Ok(o) => {
-                            let t = strip_ansi(&o.output).trim().to_string();
-                            if !t.is_empty() {
-                                output_lines.push(t.clone());
-                            }
-                            if !o.success {
-                                success = false;
-                            }
-                            let line = if t.is_empty() {
-                                format!("\u{5b}Lint] {file}: no issues")
-                            } else {
-                                format!("\u{5b}Lint] {file}:\n{t}")
-                            };
-                            let _ = event_tx.send(super::BuildEvent {
-                                line,
-                                level: if success { "info" } else { "error" }.to_string(),
-                                target: Some(file.clone()),
-                                file: Some(file.clone()),
-                                line_number: None,
-                                message: None,
-                                detail: None,
-                            });
-                        }
-                        Err(e) => {
-                            output_lines.push(e.clone());
-                            success = false;
-                            let _ = event_tx.send(super::BuildEvent {
-                                line: format!("\u{5b}Lint] {file}: {e}"),
-                                level: "error".to_string(),
-                                target: Some(file.clone()),
-                                file: Some(file.clone()),
-                                line_number: None,
-                                message: None,
-                                detail: None,
-                            });
-                        }
-                    }
-                }
-                let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished lint {}", path.display()),
-                    level: "finished".to_string(),
-                    target: None,
-                    file: None,
-                    line_number: None,
-                    message: None,
-                    detail: None,
-                });
-                let _ = reply_to.send(Ok(BuildOutput {
-                    success,
-                    command: "clang --analyze (static analyzer)".to_string(),
-                    duration_secs: 0.0,
-                    output: if output_lines.is_empty() {
-                        format!(
-                            "clang static analyzer: analyzed {} files; no issues reported",
-                            files.len()
-                        )
-                    } else {
-                        format!(
-                            "clang static analyzer: analyzed {} files\n{}",
-                            files.len(),
-                            output_lines.join("\n---\n")
-                        )
-                    },
-                    exit_code: Some(if success { 0 } else { 1 }),
-                }));
-            }
-
-            BuildModuleMessage::FixStreaming {
-                path,
-                event_tx,
-                reply_to,
-                ..
-            } => {
-                let result = self.fix(&path).await;
-                let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
-                    level: "finished".to_string(),
-                    target: None,
-                    file: None,
-                    line_number: None,
-                    message: None,
-                    detail: None,
-                });
-                let _ = reply_to.send(result);
-            }
-
-            BuildModuleMessage::ParseSourceFile {
-                file_path,
-                reply_to,
-            } => {
-                // C/C++ headers (HAL contracts, .hpp/.h) get the method-level
-                // extractor so class-method nodes + child edges + pure-virtual
-                // markers land in the AST graph (the HAL contract tooling
-                // derives its method set from there).
-                let path = std::path::PathBuf::from(&file_path);
-                let is_header = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e == "hpp" || e == "h")
-                    .unwrap_or(false);
-                let result = if is_header {
-                    parse_cpp_source_file_std(&path)
-                } else {
-                    parse_source_file_std(&path, "C/C++")
-                };
-                let _ = reply_to.send(result);
-            }
-
-            BuildModuleMessage::ScaffoldBuildConfig {
-                project_name,
-                goal,
-                platforms,
-                structure,
-                embedded: _,
-                reply_to,
-            } => {
-                let result =
-                    self.scaffold_layout(&project_name, &goal, &platforms, structure);
-                let _ = reply_to.send(result);
-            }
-
-            BuildModuleMessage::CallTool { reply_to, .. } => {
-                let _ = reply_to
-                    .send(serde_json::json!({ "error": "meson module CallTool not yet wired" }));
-            }
-        }
     }
 }

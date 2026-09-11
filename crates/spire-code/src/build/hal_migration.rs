@@ -355,7 +355,7 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
     for c in hpp_files(root, "toolkit/src/hal/api") {
         plan.reasons.push(format!("legacy contracts: {}", c.display()));
     }
-    let skip = vec!["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
     if let Ok(entries) = std::fs::read_dir(root) {
         for e in entries.flatten() {
             let p = e.path();
@@ -543,7 +543,7 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
         }
     }
 
-    plan.can_apply = !plan.conflicts.is_empty() == false && !plan.moves.is_empty();
+    plan.can_apply = plan.conflicts.is_empty() && !plan.moves.is_empty();
     if plan.moves.is_empty() && plan.write_files.is_empty() {
         plan.can_apply = false;
         plan.notes.push("Nothing to migrate.".to_string());
@@ -653,7 +653,7 @@ pub fn migrate_hal_apply(root: &Path, plan: &HalMigrationPlan) -> Result<Migrati
 /// action for anything missing. Supports BOTH layouts: canonical is validated
 /// against the hal/ container; legacy is validated against toolkit/src/hal/api
 /// + <plat>/hal/ (and the report notes migration as the recommended fix when
-/// the project is canonical-but-has-legacy-leftovers, or vice versa).
+///   the project is canonical-but-has-legacy-leftovers, or vice versa).
 pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
     let layout = detect_hal_layout(root);
     let mut issues: Vec<HalIssue> = Vec::new();
@@ -822,8 +822,8 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
                 suggested_fix: "Run the HAL migration tool (hal_migrate_plan/hal_migrate_apply) to canonicalise.".to_string(),
             });
         }
-        _ if root.join("toolkit/src/hal/api").is_dir() || root.join("hal/api").is_dir() => {
-            if layout == HalLayout::Canonical && root.join("toolkit/src/hal/api").exists() {
+        _ if (root.join("toolkit/src/hal/api").is_dir() || root.join("hal/api").is_dir())
+            && layout == HalLayout::Canonical && root.join("toolkit/src/hal/api").exists() => {
                 issues.push(HalIssue {
                     severity: "warning".to_string(),
                     title: "Legacy contract dir left behind".to_string(),
@@ -831,7 +831,6 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
                     suggested_fix: "Remove the emptied legacy dir or re-run migrations cleanup.".to_string(),
                 });
             }
-        }
         _ => {}
     }
 
