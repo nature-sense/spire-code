@@ -2165,16 +2165,16 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         .collect();
                     let template = existing.iter().find(|p| *p != "toolkit" && *p != "hal" && *p != "host" && *p != "subprojects").cloned();
                     let Some(template) = template else {
-                        return serde_json::json!({ "error": "hal_add_platform: no existing platform subdir to use as a template" });
+                        return serde_json::json!({ "error": "hal_add_platform: no existing platform subdir found (add one platform first)" });
                     };
                     if existing.iter().any(|p| p == platform) || root_path.join(platform).exists()
                         || root_path.join("hal/implementations").join(platform).exists()
                     {
                         return serde_json::json!({ "error": format!("platform '{platform}' is already present in this project") });
                     }
-                    if spire_core::build_types::Platform::from_registry(platform).is_none() {
+                    let Some(platform_rec) = spire_core::build_types::Platform::from_registry(platform) else {
                         return serde_json::json!({ "error": format!("platform '{platform}' not in registry (~/.spire/platforms)") });
-                    }
+                    };
 
                     // 2. Contract headers → (stem, summary, class_name).
                     let api_dir = root_path.join("hal/api");
@@ -2238,11 +2238,16 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         }
                     }
 
-                    // 5. Root meson.build: subdir('<plat>').
+                    // 5. Root meson.build: gated subdir('<plat>'). The platform
+                    // subdir must be included ONLY when -Dplatform=<plat>, so
+                    // append a guarded block — an unconditional subdir('x') would
+                    // pull the target into every other platform's build.
                     let mut root_status = "wired".to_string();
                     if !root_content.contains(&format!("subdir('{platform}')")) {
                         let mut updated = root_content.clone();
-                        updated.push_str(&format!("\nsubdir('{platform}')\n"));
+                        updated.push_str(&format!(
+                            "\nif platform == '{platform}'\n  subdir('{platform}')\nendif\n"
+                        ));
                         if let Err(e) = std::fs::write(&root_meson, &updated) {
                             root_status = format!("root meson write failed: {e}");
                         }
@@ -2270,30 +2275,99 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         }
                     }
 
-                    // 7. <plat>/meson.build + <plat>/main.cpp templated from the
-                    // template platform (substitute the platform id; all shared
-                    // toolkit/hal variables are inherited at meson scope).
+                    // 7. <plat>/meson.build + <plat>/main.cpp.
+                    //
+                    // Generate a CLEAN skeleton rather than cloning the template
+                    // platform's meson.build: a blind id-substituted copy drags in
+                    // the template's platform-specific external deps (e.g. rpi5's
+                    // libcamera / tensorflow-lite / edgetpu), its -DHAVE_<TEMPLATE>
+                    // define, sysroot paths and app sources — all wrong for a new
+                    // platform. Platform-specific deps are left EMPTY with a TODO;
+                    // hal_add_platform must not guess a new platform's libraries.
                     let plat_dir = root_path.join(platform);
                     let _ = std::fs::create_dir_all(&plat_dir);
                     let mut plat_status = "wired".to_string();
-                    let template_meson = root_path.join(&template).join("meson.build");
-                    if let Ok(tmpl) = std::fs::read_to_string(&template_meson) {
-                        let templated = tmpl.replace(&template, platform);
-                        if let Err(e) = std::fs::write(plat_dir.join("meson.build"), &templated) {
-                            plat_status = format!("platform meson write failed: {e}");
-                        }
-                    } else {
-                        let minimal = format!(
-                            "cpp = meson.get_compiler('cpp')\n\
-                             core_deps = []\n\
-                             platform_deps = []\n\
-                             executable('{project_name}-{platform}',\n\
-                               'main.cpp',\n\
-                               dependencies: core_deps + platform_deps)\n"
-                        );
-                        if let Err(e) = std::fs::write(plat_dir.join("meson.build"), &minimal) {
-                            plat_status = format!("platform meson write failed: {e}");
-                        }
+                    let plat_name = platform_rec.name.clone();
+                    let plat_upper = platform.to_uppercase();
+                    let platform_meson = format!(
+                        r#"# ------------------------------------------------------------------------------
+# {plat_name} ({platform}) PLATFORM TARGET
+#
+# Included from the ROOT meson.build via a subdir('{platform}') gated on
+# -Dplatform={platform}. Compiles the shared toolkit + HAL sources with the
+# {platform} cross toolchain. No project() call here (the root one is the only
+# project()).
+#
+# Scaffolded by hal_add_platform. The platform-specific deps are LEFT EMPTY on
+# purpose: a new platform's libraries are not knowable here. Fill in
+# `platform_deps` below with the real {platform} dependencies.
+#
+#   meson setup build-{platform} --cross-file {platform}/{platform}-cross.txt -Dplatform={platform}
+#   meson compile -C build-{platform}
+# ------------------------------------------------------------------------------
+
+fs  = import('fs')
+cpp = meson.get_compiler('cpp')
+
+platform = get_option('platform')
+
+# --- Core dependencies (shared across platforms; optional via pkg-config) ---
+nlohmann_json_dep = dependency('nlohmann_json', required: false)
+yaml_cpp_dep      = dependency('yaml-cpp', required: false)
+sqlite3_dep       = dependency('sqlite3', required: false)
+jpeg_dep          = dependency('libjpeg', required: false)
+turbojpeg_dep     = dependency('libturbojpeg', required: false)
+png_dep           = dependency('libpng', required: false)
+systemd_dep       = dependency('libsystemd', required: false)
+
+core_deps = []
+foreach d : [nlohmann_json_dep, yaml_cpp_dep, sqlite3_dep, jpeg_dep,
+             turbojpeg_dep, png_dep]
+  if d.found()
+    core_deps += d
+  endif
+endforeach
+
+# --- Shared toolkit sources (inherited from subdir('toolkit') in root) ---
+all_sources = toolkit_sources
+
+# WiFi provisioning requires systemd (BlueZ D-Bus GATT) - Linux only.
+if systemd_dep.found()
+  all_sources += wifi_provisioning_source
+  core_deps += systemd_dep
+endif
+
+# --- {platform} HAL sources (centralized in hal/meson.build) ---
+{platform}_hal_sources = hal_impl_{platform}_sources
+
+# --- Application sources ---
+app_sources = files('main.cpp')
+
+# --- Platform-specific dependencies ({platform}) ---
+# TODO({platform}): add {platform}-specific external libraries (accelerator / ISP
+# / media / camera) and append them to platform_deps.
+platform_deps = []
+add_project_arguments('-DHAVE_{plat_upper}', language: 'cpp')
+
+# --- Include paths (toolkit (from root subdir) + {platform}) ---
+inc = include_directories(
+  '..',
+  '.',
+  '../hal/api',
+  '../hal/implementations',
+)
+
+# --- Target: the {project_name}-{platform} binary ---
+executable('{project_name}-{platform}',
+  app_sources + {platform}_hal_sources + all_sources,
+  include_directories : [toolkit_inc, inc],
+  dependencies : core_deps + platform_deps,
+  install : true,
+  install_dir : '/usr/local/bin')
+"#
+                    );
+                    if let Err(e) = std::fs::write(plat_dir.join("meson.build"), &platform_meson) {
+                        plat_status = format!("platform meson write failed: {e}");
                     }
                     let main_cpp = format!(
                         "#include <iostream>\nint main() {{\n    std::cout << \"Hello from {project_name}-{platform}!\" << std::endl;\n    return 0;\n}}\n"
@@ -3683,10 +3757,20 @@ public:
         )
         .unwrap();
         std::fs::create_dir_all(root.join("rpi5")).unwrap();
+        // The template carries RPi5-specific external deps + a -DHAVE_RPI5 define;
+        // hal_add_platform must NOT copy these into the new platform.
         std::fs::write(
             root.join("rpi5/meson.build"),
             r#"cpp = meson.get_compiler('cpp')
 rpi5_hal_sources = hal_impl_rpi5_sources
+platform_deps = []
+if platform == 'rpi5'
+  add_project_arguments('-DHAVE_RPI5', language: 'cpp')
+  libcamera_dep = dependency('libcamera', required: true)
+  tflite_dep    = cpp.find_library('tensorflow-lite', dirs: ['/opt/cross/sysroot/rpi5/usr/lib/aarch64-linux-gnu'], required: true)
+  edgetpu_dep   = cpp.find_library('edgetpu', dirs: ['/opt/cross/sysroot/rpi5/usr/lib/aarch64-linux-gnu'], required: true)
+  platform_deps += [libcamera_dep, tflite_dep, edgetpu_dep]
+endif
 executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_deps + platform_deps)
 "#,
         )
@@ -3760,9 +3844,36 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
             "options: {opts}"
         );
 
-        // 5. <plat>/meson.build templated from rpi5 (id substituted).
+        // 5. <plat>/meson.build: a CLEAN skeleton — the template's RPi5-specific
+        // external deps and -DHAVE_RPI5 must NOT be copied in.
         let plat_meson = std::fs::read_to_string(root.join("rock3c/meson.build")).unwrap();
         assert!(plat_meson.contains("hal_impl_rock3c_sources"), "plat meson: {plat_meson}");
+        for leaked in [
+            "libcamera",
+            "tensorflow-lite",
+            "edgetpu",
+            "HAVE_RPI5",
+            "/opt/cross/sysroot/rpi5",
+        ] {
+            assert!(
+                !plat_meson.contains(leaked),
+                "template-specific '{leaked}' leaked into the new platform meson.build:\n{plat_meson}"
+            );
+        }
+        assert!(
+            plat_meson.contains("-DHAVE_ROCK3C"),
+            "correct uppercase define missing: {plat_meson}"
+        );
+        assert!(
+            plat_meson.contains("TODO(rock3c)"),
+            "platform-deps TODO missing: {plat_meson}"
+        );
+        // Root meson.build must GATE the new subdir on -Dplatform (an
+        // unconditional subdir() would build the target for every platform).
+        assert!(
+            root_meson.contains("if platform == 'rock3c'") && root_meson.contains("subdir('rock3c')"),
+            "root meson must gate subdir('rock3c'): {root_meson}"
+        );
 
         // 6. <plat>/main.cpp.
         assert!(
