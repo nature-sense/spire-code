@@ -300,6 +300,16 @@ fn init_actor_system() {
         // Spawn each module once at startup, query its capabilities, and
         // register it with the BuildManagerActor's router.
         let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(memory_graph_tx.clone()));
+        // Wire the LLM actor so the HAL Stage-1 tools (`hal_generate_impl` /
+        // `hal_generate_impl_plan`) can invoke it. The standalone binary does the
+        // same (`SystemMessage::SetLlm` in main.rs); without this the
+        // BuildManager's `llm_tx` stays None and the app reports a misleading
+        // "LLM not configured" even when a key IS set in Settings.
+        let _ = bm_tx
+            .send(BuildManagerMessage::SetLlm {
+                llm_tx: llm_tx.clone(),
+            })
+            .await;
         // Attach the UI event broadcast sender so build operations can stream
         // per-line events (e.g. "Compiling serde") to the Swift event stream.
         let _ = bm_tx
