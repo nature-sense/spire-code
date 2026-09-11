@@ -2620,7 +2620,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
 
     /// The unified build tools exposed to the LLM.
     fn list_tools() -> Vec<spire_core::actors::ToolInfo> {
-        vec![
+        let mut tools = vec![
             spire_core::actors::ToolInfo {
                 name: "build_analyze".to_string(),
                 description: "Analyze a project directory using its detected build system (Cargo, npm, Maven, CMake, etc.) and return structured metadata.".to_string(),
@@ -2700,6 +2700,91 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     "required": ["name"]
                 }),
             },
+        ];
+        tools.extend(Self::hal_tool_definitions());
+        tools
+    }
+
+    /// HAL / build-helper tools dispatched by [`Self::call_tool`].
+    ///
+    /// These MUST be advertised here: `build_default_registry` registers exactly
+    /// the tools `ListTools` returns, so any tool handled by `call_tool` but
+    /// omitted from this list is unreachable through `tools/call` — it falls
+    /// through to the MCP catch-all and fails with "no tool found <name>".
+    fn hal_tool_definitions() -> Vec<spire_core::actors::ToolInfo> {
+        fn t(
+            name: &str,
+            description: &str,
+            properties: serde_json::Value,
+            required: &[&str],
+        ) -> spire_core::actors::ToolInfo {
+            spire_core::actors::ToolInfo {
+                name: name.to_string(),
+                description: description.to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                }),
+            }
+        }
+
+        let root = serde_json::json!({ "root": { "type": "string", "description": "Project root directory" } });
+        let root_plat = serde_json::json!({
+            "root": { "type": "string", "description": "Project root directory" },
+            "platform": { "type": "string", "description": "Platform registry id (e.g. rpi5)" }
+        });
+        let root_iface_plat = serde_json::json!({
+            "root": { "type": "string" },
+            "interface": { "type": "string", "description": "HAL interface / contract stem" },
+            "platform": { "type": "string" }
+        });
+
+        vec![
+            // Project checks + migration.
+            t("hal_sanity_check", "HAL project structural sanity check (layout + missing components).", root.clone(), &["root"]),
+            t("hal_migrate_plan", "Plan a HAL layout migration (legacy <-> canonical).", root.clone(), &["root"]),
+            t("hal_migrate_apply", "Apply a HAL migration plan produced by hal_migrate_plan.",
+              serde_json::json!({ "root": { "type": "string" }, "plan": { "type": "object" } }), &["root", "plan"]),
+            t("hal_state", "Compute HAL state (contracts, platforms, coverage gaps).", root.clone(), &["root"]),
+            t("hal_docs", "Generate the HAL documentation report.", root.clone(), &["root"]),
+            t("hal_verify", "Verify every contract is implemented on every platform.", root.clone(), &["root"]),
+            t("hal_doc_lint", "Lint HAL contract doc comments across a project.", root.clone(), &["root"]),
+            t("hal_fix_prompt", "Build a doc-fix prompt for one HAL header file.",
+              serde_json::json!({ "root": { "type": "string" }, "path": { "type": "string", "description": "Header file path" } }),
+              &["root", "path"]),
+            // Contract authoring.
+            t("hal_validate_contract", "Validate a HAL contract header (C++ source) and summarize its methods.",
+              serde_json::json!({ "content": { "type": "string", "description": "C++ header source" } }), &["content"]),
+            t("hal_write_contract", "Write a validated HAL contract header into the project.",
+              serde_json::json!({ "root": { "type": "string" }, "content": { "type": "string" } }), &["root", "content"]),
+            // LLM Stage-1 implementation generation.
+            t("hal_build_impl_prompt", "Build the constrained Stage-1 implementation prompt for one interface on one platform.",
+              root_iface_plat.clone(), &["root", "interface", "platform"]),
+            t("hal_generate_impl", "Generate a platform implementation for one HAL interface (LLM Stage 1).",
+              root_iface_plat.clone(), &["root", "interface", "platform"]),
+            t("hal_generate_impl_plan", "Plan (read-only) LLM Stage-1 implementation generation for one interface.",
+              root_iface_plat.clone(), &["root", "interface", "platform"]),
+            t("hal_generate_impl_apply", "Apply a previously generated Stage-1 implementation (write files).",
+              root_iface_plat.clone(), &["root", "interface", "platform"]),
+            t("hal_generate_placeholder", "Generate a platform placeholder stub from a contract summary.",
+              serde_json::json!({ "summary": { "type": "string" }, "platform": { "type": "string" } }), &["summary", "platform"]),
+            // Platform scaffolding.
+            t("hal_add_target", "Add one platform target to a HAL project (meson dir + placeholder stubs).",
+              root_plat.clone(), &["root", "platform"]),
+            t("hal_add_platform", "Scaffold a FULL new platform target into an existing HAL project (dir, stubs, meson wiring, re-analyze).",
+              root_plat.clone(), &["root", "platform"]),
+            t("hal_missing_impls", "List the HAL implementations missing on a platform.", root.clone(), &["root"]),
+            // Gap fill.
+            t("hal_fill_plan", "Plan (read-only) the HAL gap-fill work items for a platform.", root_plat.clone(), &["root"]),
+            t("hal_fill_apply", "Apply a HAL gap-fill plan (write the concrete implementation files).",
+              serde_json::json!({ "root": { "type": "string" }, "plan": { "type": "array" } }), &["root", "plan"]),
+            t("hal_diff_contracts", "Diff two HAL contract summaries (added/removed/changed methods).",
+              serde_json::json!({ "old_summary": { "type": "object" }, "new_summary": { "type": "object" } }),
+              &["old_summary", "new_summary"]),
+            // Helpers.
+            t("cpp_syntax_check", "Run a lightweight C++ syntax check on a file.",
+              serde_json::json!({ "path": { "type": "string" } }), &["path"]),
         ]
     }
 }

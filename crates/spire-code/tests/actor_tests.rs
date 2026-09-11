@@ -14,6 +14,7 @@ use spire_code::actors::{
     FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProgressActor, ProgressMessage,
     ProgressStatus, ProgressUpdate, ProjectBuildActor, SystemActor, SystemMessage, ToolInfo,
     ToolOrchestratorMessage, ToolRouterActor, ToolsActor, ToolsMessage,
+    BuildManagerActor,
 };
 use spire_actor::registry::ServiceRegistry;
 use spire_actor::ActorSystem;
@@ -2943,6 +2944,61 @@ async fn test_build_default_registry_registers_project_meta_tools() {
             "default registry missing {tool}"
         );
     }
+}
+
+/// Regression: the HAL tools handled by `BuildManagerActor::call_tool` must be
+/// advertised through `ListTools`. `build_default_registry` registers exactly
+/// what each backend replies, so a `hal_*` tool omitted from
+/// `BuildManagerActor::list_tools()` is unreachable via `tools/call` — the
+/// router falls through to the MCP catch-all and fails with
+/// "no tool found <name>" (the reported `hal_add_platform` failure).
+#[tokio::test]
+async fn test_build_default_registry_registers_hal_tools() {
+    let system = ActorSystem::new();
+    // A REAL BuildManagerActor: the registry asks this backend for its tool list
+    // and registers exactly what it replies, so a mock sender would register
+    // nothing for this backend.
+    let (bm_tx, _bm) = system.spawn(BuildManagerActor::new(mock_sender()));
+
+    let registry = build_default_registry(
+        mock_sender(),          // transport
+        mock_sender(),          // project_query
+        Some(mock_sender()),    // project/build
+        Some(mock_sender()),    // project/test
+        Some(mock_sender()),    // project/lint
+        Some(mock_sender()),    // project/install
+        mock_sender(),          // filesystem
+        mock_sender(),          // git
+        mock_sender(),          // process
+        mock_sender(),          // search
+        mock_sender(),          // terminal
+        bm_tx,                  // build_manager
+        mock_sender(),          // rag
+    )
+    .await
+    .expect("build tool registry");
+
+    let names: Vec<String> = registry.list().iter().map(|t| t.name.clone()).collect();
+    for tool in [
+        "build_analyze",
+        "hal_add_platform",
+        "hal_add_target",
+        "hal_sanity_check",
+        "hal_missing_impls",
+        "hal_doc_lint",
+    ] {
+        assert!(
+            names.iter().any(|n| n == tool),
+            "default registry missing {tool} (handled by call_tool but not listed by list_tools)"
+        );
+    }
+
+    // Routable through the registry — `None` here means the router would fall
+    // through to the MCP catch-all ("no tool found").
+    assert!(
+        registry.call("hal_add_platform", serde_json::json!({})).is_some(),
+        "hal_add_platform must be registered/routable"
+    );
 }
 
 /// `ProjectBuildActor` rejects builds before a root is set and honors
