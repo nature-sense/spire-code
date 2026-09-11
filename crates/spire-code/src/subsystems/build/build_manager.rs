@@ -3505,6 +3505,24 @@ public:
         std::fs::copy(&seed, reg.path().join("platforms/rpi5.yaml")).unwrap();
         let _restore = SpirePlatformDirGuard::set(reg.path().join("platforms"));
 
+        // The Stage-1 prompt must carry the platform's `library_hints:` — this
+        // is how rpi5 tells the model it has a Coral Edge TPU (without it the
+        // model defaults to CPU-only inference). Inject a marker when the seed
+        // lacks one so the assertion is deterministic in any environment.
+        let copied = reg.path().join("platforms/rpi5.yaml");
+        let mut yaml = std::fs::read_to_string(&copied).unwrap();
+        if !yaml.contains("library_hints:") {
+            yaml.push_str("\nlibrary_hints: Fixture hint - FIXTURE-NPU-SDK.\n");
+            std::fs::write(&copied, &yaml).unwrap();
+        }
+        let expected_hint = serde_yaml::from_str::<serde_yaml::Value>(&yaml)
+            .expect("fixture yaml parses")
+            .get("library_hints")
+            .and_then(|v| v.as_str())
+            .expect("fixture declares library_hints")
+            .trim()
+            .to_string();
+
         // Project with the approved contract header.
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -3545,6 +3563,18 @@ public:
         assert!(
             prompt.contains("meson compile -C build-rpi5 camera_hal-rpi5"),
             "must embed the per-target gate: {prompt}"
+        );
+        // The registry `library_hints` must reach the prompt — this is the hook
+        // that tells the model about the rpi5's Coral Edge TPU (and stops it
+        // defaulting to CPU-only inference).
+        let probe: String = expected_hint
+            .split_whitespace()
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            prompt.contains(&probe),
+            "prompt must embed the platform library_hints ({probe:?}): {prompt}"
         );
         // The deterministic clean header must declare the concrete derived
         // class (module pair) and must NOT carry the pending-stub sentinel.
