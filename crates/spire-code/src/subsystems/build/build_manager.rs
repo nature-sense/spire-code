@@ -3123,6 +3123,7 @@ impl Actor for BuildEventLogActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::generic_helpers::hal_platform_library_hints;
     use crate::build::CargoBuildModule;
     use crate::Actor;
     
@@ -3172,6 +3173,51 @@ mod tests {
                 None => std::env::remove_var("SPIRE_PLATFORM_DIR"),
             }
         }
+    }
+
+    /// Per-platform HAL library hints must come from the registry YAML
+    /// (`library_hints:`) instead of a hardcoded map, with a generic fallback
+    /// when the platform YAML is absent or carries no hint.
+    #[test]
+    fn hal_library_hints_come_from_yaml_and_fall_back() {
+        use tempfile::tempdir;
+
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+
+        let reg = tempdir().unwrap();
+        let dir = reg.path().join("platforms");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fakeboard.yaml"),
+            "id: fakeboard\nname: Fake Board\nlibrary_hints: |\n  Fake SDK (fakesdk.h), DMA via ioctl\n",
+        )
+        .unwrap();
+        // A platform YAML without a `library_hints` key must still parse.
+        std::fs::write(dir.join("plain.yaml"), "id: plain\nname: Plain\n").unwrap();
+
+        let _restore = SpirePlatformDirGuard::set(&dir);
+
+        let hint = hal_platform_library_hints("fakeboard");
+        assert!(
+            hint.contains("fakesdk.h"),
+            "yaml library_hints must be used: {hint}"
+        );
+        assert!(
+            !hint.contains("standard SDK and drivers"),
+            "must not fall back when a hint is present: {hint}"
+        );
+
+        let plain = hal_platform_library_hints("plain");
+        assert!(
+            plain.contains("standard SDK and drivers"),
+            "a platform without the key must fall back: {plain}"
+        );
+
+        let missing = hal_platform_library_hints("nosuchboard");
+        assert!(
+            missing.contains("standard SDK and drivers"),
+            "an absent platform yaml must fall back: {missing}"
+        );
     }
 
     #[test]

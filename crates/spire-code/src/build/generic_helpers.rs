@@ -911,19 +911,26 @@ pub fn resolve_semantic_hal_impl_names(
     resolve_hal_impl_names(iface, plat, impl_dir)
 }
 
-/// Default library/hardware-technique hints for the Stage-1 implementation
-/// prompt. The UI can override these (`library_hints` arg); this map gives a
-/// sane default for the seeded platforms and a generic fallback otherwise.
+/// Library / hardware-technique hints for the Stage-1 implementation prompt.
+///
+/// Read from the platform registry YAML (`library_hints:`) — that is
+/// `~/.spire/platforms/<platform>.yaml`, or `$SPIRE_PLATFORM_DIR` when set — so
+/// per-platform hardware facts (SDKs, drivers, accelerators such as the rpi5's
+/// Coral EdgeTPU) live with the platform data rather than in code. The UI can
+/// still override per call via the `library_hints` argument, which takes
+/// precedence over this default. Falls back to a generic pointer when the
+/// platform YAML is missing or carries no `library_hints` key.
 pub fn hal_platform_library_hints(platform: &str) -> String {
-    for (id, hint) in [
-        ("rpi5", "libcamera / V4L2 (linux/videodev2.h, libcamera/libcamera.h), mmap frame capture via IOCTLs"),
-        ("rock3c", "rknn-toolkit2 (rknn_api.h), MPP (rockchip/mpp_buffer.h, rk_mpi.h), RGA (rga.h / librga)"),
-        ("rock5b", "rknn-toolkit2 (rknn_api.h), MPP (rockchip/mpp_buffer.h, rk_mpi.h), RGA (rga.h / librga)"),
-        ("imx219", "libcamera camera-sensor API, I2C (linux/i2c-dev.h) register programming"),
-        ("a7s", "Linux V4L2 (linux/videodev2.h), mmap streaming, I2C (linux/i2c-dev.h)"),
-    ] {
-        if id == platform {
-            return hint.to_string();
+    let dir = spire_core::build_types::Platform::default_platform_dir();
+    let path = dir.join(format!("{platform}.yaml"));
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
+            if let Some(hint) = doc.get("library_hints").and_then(|v| v.as_str()) {
+                let hint = hint.trim();
+                if !hint.is_empty() {
+                    return hint.to_string();
+                }
+            }
         }
     }
     format!("Use the platform's standard SDK and drivers (see ~/.spire/platforms/{platform}.yaml); prefer POSIX/Linux system APIs where available.")
