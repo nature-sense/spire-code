@@ -2376,6 +2376,22 @@ executable('{project_name}-{platform}',
                         plat_status = format!("platform main write failed: {e}");
                     }
 
+                    // 7b. <plat>/<plat>-cross.txt — generated from the platform
+                    // registry record so a freshly added platform can actually be
+                    // cross-compiled (meson.build + main.cpp alone can't build).
+                    let mut cross_status =
+                        "not generated (platform has no Linux cross file)".to_string();
+                    if let Some(cross) = platform_rec.meson_cross_file() {
+                        let header = format!(
+                            "# {plat_name} ({platform}) Meson cross file — generated from ~/.spire/platforms/{platform}.yaml\n\n"
+                        );
+                        let cross_path = plat_dir.join(format!("{platform}-cross.txt"));
+                        match std::fs::write(&cross_path, format!("{header}{cross}")) {
+                            Ok(()) => cross_status = "wired".to_string(),
+                            Err(e) => cross_status = format!("cross file write failed: {e}"),
+                        }
+                    }
+
                     // 8. Re-analyze so the new domain/build target + fill queue
                     // reflect the new platform.
 
@@ -2394,6 +2410,7 @@ executable('{project_name}-{platform}',
                         "root_meson": root_status,
                         "options": options_status,
                         "platform_wiring": plat_status,
+                        "cross_file": cross_status,
                         "analysis": analysis_status,
                         "needs_fill": interfaces.iter().map(|(s, _, _)| format!("{s}: SPIRE-HAL-STUB pending")).collect::<Vec<_>>(),
                     })
@@ -3873,6 +3890,13 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         assert!(
             root_meson.contains("if platform == 'rock3c'") && root_meson.contains("subdir('rock3c')"),
             "root meson must gate subdir('rock3c'): {root_meson}"
+        );
+
+        // 5b. <plat>-cross.txt generated from the platform registry record.
+        let cross = std::fs::read_to_string(root.join("rock3c/rock3c-cross.txt")).unwrap();
+        assert!(
+            cross.contains("-target") && cross.contains("--sysroot=/tmp/rock3c-sysroot"),
+            "cross file must be generated from the registry: {cross}"
         );
 
         // 6. <plat>/main.cpp.
