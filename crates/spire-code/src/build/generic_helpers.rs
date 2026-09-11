@@ -1388,6 +1388,31 @@ fn function_declarator_name_params<'t>(
 ///
 /// Returns `(class name, [methods])` per abstract class, matching the shape
 /// `summarize_hal_header` consumes.
+/// Descend through `reference_declarator` / `pointer_declarator` /
+/// `parenthesized_declarator` wrappers to the underlying `function_declarator`.
+///
+/// tree-sitter wraps the declarator when a return type is `T&`, `T*` or a
+/// parenthesized form, e.g. `virtual ICameraHAL& camera() = 0;` yields
+/// `reference_declarator(function_declarator(...))`. Without unwrapping, every
+/// method returning a reference/pointer was silently dropped.
+fn find_function_declarator(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if node.kind() == "function_declarator" {
+        return Some(node);
+    }
+    if matches!(
+        node.kind(),
+        "reference_declarator" | "pointer_declarator" | "parenthesized_declarator"
+    ) {
+        for c in named_children_of(node) {
+            if let Some(fd) = find_function_declarator(c) {
+                return Some(fd);
+            }
+        }
+    }
+    None
+}
+
+/// Extract the pure-virtual method set of every class/struct in `content`.
 pub fn extract_contract_methods_cpp(content: &str) -> Vec<(String, Vec<HalContractMethod>)> {
     use tree_sitter::Node;
 
@@ -1425,25 +1450,51 @@ pub fn extract_contract_methods_cpp(content: &str) -> Vec<(String, Vec<HalContra
                     // Note: tree-sitter-cpp does NOT emit a named 'virtual' child;
                     // the keyword is an unnamed token — detect it from the raw
                     // declaration text instead.
-                    let text = child.utf8_text(content.as_bytes()).unwrap_or("");
-                    let is_virtual = text.contains("virtual");
+                    let decl_text = child.utf8_text(content.as_bytes()).unwrap_or("");
+                    let is_virtual = decl_text.contains("virtual");
                     let mut fd: Option<Node> = None;
-                    let mut return_type = String::new();
+                    let mut ret_suffix = "";
+                    let mut decl_offset: Option<usize> = None;
                     for c in named_children_of(child) {
                         let ck = c.kind();
                         if ck == "function_declarator" {
                             fd = Some(c);
-                            continue;
+                            decl_offset = Some(c.start_byte().saturating_sub(child.start_byte()));
+                            break;
                         }
-                        // First non-declarator named child = the return type
-                        // (`bool`, `std::uint32_t`, …).
-                        if return_type.is_empty() {
-                            return_type = c.utf8_text(content.as_bytes()).unwrap_or("").trim().to_string();
+                        // `T&`/`T*`/`( … )` wrap the declarator; unwrap it and
+                        // remember the reference/pointer suffix for the type.
+                        if matches!(
+                            ck,
+                            "reference_declarator" | "pointer_declarator" | "parenthesized_declarator"
+                        ) {
+                            if let Some(inner) = find_function_declarator(c) {
+                                fd = Some(inner);
+                                decl_offset = Some(c.start_byte().saturating_sub(child.start_byte()));
+                                ret_suffix = if ck == "reference_declarator" {
+                                    "&"
+                                } else if ck == "pointer_declarator" {
+                                    "*"
+                                } else {
+                                    ""
+                                };
+                                break;
+                            }
                         }
                     }
                     let Some(fd) = fd else { continue };
+                    // Return type = the declaration text BEFORE the declarator,
+                    // minus the `virtual` keyword. Taking the raw prefix (rather
+                    // than the first named child) keeps multi-token types such as
+                    // `const char` / `unsigned long` intact.
+                    let mut return_type = decl_offset
+                        .map(|o| decl_text[..o.min(decl_text.len())].trim().to_string())
+                        .unwrap_or_default();
+                    if let Some(pos) = return_type.rfind("virtual") {
+                        return_type = return_type[pos + "virtual".len()..].trim().to_string();
+                    }
                     // Pure-virtual marker: `= 0` (with any spacing) in the text.
-                    let is_pure = text.contains("= 0") || text.contains("=0");
+                    let is_pure = decl_text.contains("= 0") || decl_text.contains("=0");
                     if !is_virtual || !is_pure || !is_public {
                         continue;
                     }
@@ -1453,7 +1504,7 @@ pub fn extract_contract_methods_cpp(content: &str) -> Vec<(String, Vec<HalContra
                     }
                     methods.push(HalContractMethod {
                         name,
-                        return_type,
+                        return_type: format!("{return_type}{ret_suffix}"),
                         params,
                     });
                 }
@@ -1566,6 +1617,14 @@ pub fn extract_cpp_method_definitions_ts(content: &str) -> Vec<HalImplMethod> {
                 .unwrap_or_default();
             let declarator = node.child_by_field_name("declarator");
             if let Some(d) = declarator {
+                // `T&`/`T*` live in the declarator, not the `type` field — so a
+                // method returning a reference/pointer would otherwise report a
+                // value return type and drift against its contract.
+                let ret_suffix = match d.kind() {
+                    "reference_declarator" => "&",
+                    "pointer_declarator" => "*",
+                    _ => "",
+                };
                 let fd = if d.kind() == "function_declarator" {
                     d
                 } else {
@@ -1592,7 +1651,7 @@ pub fn extract_cpp_method_definitions_ts(content: &str) -> Vec<HalImplMethod> {
                     if !name.is_empty() && !name.starts_with('~') && !is_ctor {
                         out.push(HalImplMethod {
                             name,
-                            return_type,
+                            return_type: format!("{return_type}{ret_suffix}"),
                             params,
                         });
                     }
@@ -3745,6 +3804,114 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
         // (signature comparison is type-based), whitespace collapsed.
         assert_eq!(normalize_params(&encode.params), "int, uint32_t, int");
     }
+
+    /// The aggregate HAL (`AiTrapHal` — the single injectable object) must be a
+    /// first-class contract: discovered from `hal/api/ai_trap_hal.hpp` because it
+    /// derives `hal::HalModule`, and attributed per platform from
+    /// `hal/implementations/<plat>/ai_trap_hal_<plat>.cpp` by stem matching.
+    #[test]
+    fn aggregate_hal_is_discovered_and_covered_per_platform() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("hal/api")).unwrap();
+        std::fs::create_dir_all(root.path().join("hal/implementations/rpi5")).unwrap();
+
+        // The aggregate contract (the ONE injectable HAL).
+        std::fs::write(
+            root.path().join("hal/api/ai_trap_hal.hpp"),
+            "#pragma once\n#include \"hal/api/hal_module.hpp\"\nnamespace hal {\n\
+             class AiTrapHal : public hal::HalModule {\npublic:\n\
+             \x20   virtual ~AiTrapHal() = default;\n\
+             \x20   virtual ICameraHAL& camera() = 0;\n\
+             \x20   virtual int inference() = 0;\n};\n} // namespace hal\n",
+        )
+        .unwrap();
+
+        // A component contract.
+        std::fs::write(
+            root.path().join("hal/api/camera_hal.hpp"),
+            "#pragma once\n#include \"hal/api/hal_module.hpp\"\nnamespace hal {\n\
+             struct ICameraHAL : public hal::HalModule {\n\
+             \x20   virtual ~ICameraHAL() = default;\n\
+             \x20   virtual bool init() = 0;\n};\n} // namespace hal\n",
+        )
+        .unwrap();
+
+        // rpi5's concrete aggregate + component.
+        std::fs::write(
+            root.path().join("hal/implementations/rpi5/ai_trap_hal_rpi5.cpp"),
+            "namespace hal {\nICameraHAL& AiTrapHalRpi5::camera() { return *camera_; }\n\
+             int AiTrapHalRpi5::inference() { return 0; }\n} // namespace hal\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("hal/implementations/rpi5/camera_hal_rpi5.cpp"),
+            "namespace hal { bool CameraHalRpi5::init() { return true; } }\n",
+        )
+        .unwrap();
+
+        let cov = hal_platform_coverage_map(root.path());
+        let rpi5 = cov.get("rpi5").expect("rpi5 platform dir discovered");
+
+        // The aggregate is discovered as a contract AND covered by rpi5.
+        let agg = rpi5.get("ai_trap_hal").expect("ai_trap_hal contract discovered");
+        assert!(
+            agg.implemented,
+            "the aggregate HAL must be covered per platform (missing={:?}, drifted={:?})",
+            agg.missing, agg.drifted
+        );
+
+        // The component contract is covered too — and not confused with the
+        // aggregate (different stems).
+        let cam = rpi5.get("camera_hal").expect("camera_hal contract discovered");
+        assert!(
+            cam.implemented,
+            "camera_hal covered (missing={:?}, drifted={:?})",
+            cam.missing, cam.drifted
+        );
+    }
+
+    /// Pure-virtual methods returning a REFERENCE or POINTER must be extracted:
+    /// the aggregate HAL (`AiTrapHal`'s `ICameraHAL& camera()` … accessors) is
+    /// entirely made of them, and dropping them made the whole aggregate
+    /// invisible to contract discovery, coverage, UI and fill.
+    #[test]
+    fn extract_contract_methods_handles_reference_and_pointer_returns() {
+        let src = "namespace hal { class X : public hal::HalModule {\npublic:\n\
+                   virtual bool a() = 0;\n\
+                   virtual int& b() = 0;\n\
+                   virtual int* c() = 0;\n\
+                   virtual const char* d() = 0;\n};\n}\n";
+        let classes = extract_contract_methods_cpp(src);
+        assert_eq!(classes.len(), 1, "the class must be discovered: {classes:?}");
+        let (name, methods) = &classes[0];
+        assert_eq!(name, "X");
+        let got: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(got, vec!["a", "b", "c", "d"], "reference/pointer methods kept");
+        assert_eq!(
+            methods.iter().find(|m| m.name == "b").unwrap().return_type,
+            "int&"
+        );
+        assert_eq!(
+            methods.iter().find(|m| m.name == "c").unwrap().return_type,
+            "int*"
+        );
+        assert_eq!(
+            methods.iter().find(|m| m.name == "d").unwrap().return_type,
+            "const char*"
+        );
+    }
+
+    /// The impl-side extractor must preserve the reference suffix too, so a
+    /// reference-returning override does not drift against its contract.
+    #[test]
+    fn extract_impl_methods_preserves_reference_return() {
+        let m = extract_cpp_method_definitions_ts("namespace hal { int& X::b() { return *p_; } }");
+        assert!(
+            m.iter().any(|m| m.name == "b" && m.return_type == "int&"),
+            "impl return type must keep the reference: {m:?}"
+        );
+    }
+
 
     /// `hal_interface_coverage` compares the contract's pure-virtual method set
     /// against a platform's stem-matching impl files (AST-level, class-name
