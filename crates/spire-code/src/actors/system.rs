@@ -27,6 +27,7 @@ use spire_core::subsystems::llm::llm::LlmMessage;
 use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use spire_core::actors::progress::ProgressMessage;
+use spire_core::actors::ActorSystem;
 use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
 use crate::subsystems::project::project_query::ProjectQueryMessage;
 use crate::subsystems::project::project_sync::ProjectSyncMessage;
@@ -73,6 +74,11 @@ pub enum SystemMessage {
     SetSystemTx {
         system_tx: mpsc::Sender<SystemMessage>,
     },
+    /// Set the host actor system (for spawning managed StartupTask children).
+    /// Must be sent before Initialize.
+    SetActorSystem {
+        system: std::sync::Arc<ActorSystem>,
+    },
 
     /// Start the full initialization sequence.
     /// The SystemActor will drive the state machine by delegating to startup phases.
@@ -91,8 +97,10 @@ pub enum SystemMessage {
         reply_to: oneshot::Sender<Result<(), ActorError>>,
     },
 
-    /// A phase has completed or needs attention.
-    PhaseEvent,
+    /// A sub-phase has completed; `phase` is the completed sub-phase's name.
+    PhaseEvent {
+        phase: String,
+    },
 
     /// Get system status.
     GetStatus { reply_to: oneshot::Sender<Value> },
@@ -127,6 +135,8 @@ pub struct SystemActor {
     init_reply: Option<oneshot::Sender<Result<(), ActorError>>>,
     /// Sender to self — used to send PhaseEvent messages.
     system_tx: Option<mpsc::Sender<SystemMessage>>,
+    /// Host actor system for spawning managed StartupTask children.
+    actor_system: Option<std::sync::Arc<ActorSystem>>,
 }
 
 impl SystemActor {
@@ -139,6 +149,7 @@ impl SystemActor {
             ctx: None,
             init_reply: None,
             system_tx: None,
+            actor_system: None,
         }
     }
 
@@ -190,11 +201,10 @@ impl SystemActor {
         }
     }
 
-    /// Handle a PhaseEvent — check if the current phase has completed.
-    /// Phases that spawn background tasks signal completion by sending
-    /// PhaseEvent through the system_tx channel. This method is called
-    /// when that message is received, avoiding any polling.
-    async fn handle_phase_event(&mut self) {
+    /// Handle a PhaseEvent for a completed sub-phase.
+    /// The named event lets the current PhaseGroup mark that sub-phase complete
+    /// without polling oneshot channels.
+    async fn handle_phase_event(&mut self, completed: String) {
         let ctx = match self.ctx.as_ref() {
             Some(ctx) => ctx.clone(),
             None => return,
@@ -205,9 +215,10 @@ impl SystemActor {
             None => return,
         };
 
-        // Forward the PhaseEvent to the current phase.
-        // PhaseGroup will check its sub-phases' oneshot completion channels.
-        let result = phase.handle_message(SystemMessage::PhaseEvent, &ctx).await;
+        // Forward the named PhaseEvent to the current phase.
+        let result = phase
+            .handle_message(SystemMessage::PhaseEvent { phase: completed }, &ctx)
+            .await;
         match result {
             PhaseResult::Complete => {
                 info!("SystemActor: phase '{}' complete", phase.name());
@@ -268,6 +279,10 @@ impl Actor for SystemActor {
                 self.system_tx = Some(system_tx);
             }
 
+            SystemMessage::SetActorSystem { system } => {
+                self.actor_system = Some(system);
+            }
+
             SystemMessage::Initialize {
                 coordinator_tx,
                 memory_graph_tx,
@@ -286,6 +301,10 @@ impl Actor for SystemActor {
                     .system_tx
                     .clone()
                     .expect("SystemActor: SetSystemTx must be sent before Initialize");
+                let actor_system = self
+                    .actor_system
+                    .clone()
+                    .expect("SystemActor: SetActorSystem must be sent before Initialize");
 
                 let ctx = PhaseContext {
                     coordinator_tx,
@@ -300,6 +319,7 @@ impl Actor for SystemActor {
                     data_dir,
                     project_root,
                     system_tx: system_tx.clone(),
+                    system: actor_system,
                 };
 
                 self.ctx = Some(ctx.clone());
@@ -310,8 +330,8 @@ impl Actor for SystemActor {
                 self.start_phase_chain().await;
             }
 
-            SystemMessage::PhaseEvent => {
-                self.handle_phase_event().await;
+            SystemMessage::PhaseEvent { phase } => {
+                self.handle_phase_event(phase).await;
             }
 
             SystemMessage::GetStatus { reply_to } => {

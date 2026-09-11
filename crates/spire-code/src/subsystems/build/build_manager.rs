@@ -342,6 +342,11 @@ pub enum BuildManagerMessage {
     SetLlm {
         llm_tx: mpsc::Sender<LlmMessage>,
     },
+    /// Attach the actor-owned build-event log (drain-safe while a streaming
+    /// build/lint/fix occupies this actor's mailbox).
+    SetEventLog {
+        event_log_tx: mpsc::Sender<BuildEventLogMessage>,
+    },
 }
 
 /// The BuildManager actor — routes build/analysis requests to static modules.
@@ -356,29 +361,24 @@ pub struct BuildManagerActor {
     memory_graph_tx: mpsc::Sender<MemoryGraphMessage>,
     /// Optional broadcast sender for pushing BuildEvents to the UI event stream.
     event_tx: Option<tokio::sync::broadcast::Sender<String>>,
-    /// Shared, pollable buffer of recent build events (for incremental UI output).
-    build_event_buffer: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-    /// Notifier signaled whenever a new build event is pushed, so the UI can
-    /// wake a waiter instead of polling on a timer.
-    build_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Actor-owned build-event log sender (set via `SetEventLog`). Streaming
+    /// forwarders push incremental lines to this log actor instead of a shared
+    /// `Arc<Mutex<Vec>>`, so the FFI can drain while builds/lints/fixes occupy
+    /// this actor's mailbox.
+    event_log_tx: Option<mpsc::Sender<BuildEventLogMessage>>,
     /// Optional LLM sender (Stage-1 implementation generation).
     llm_tx: Option<mpsc::Sender<LlmMessage>>,
 }
 
 impl BuildManagerActor {
-    pub fn new(
-        memory_graph_tx: mpsc::Sender<MemoryGraphMessage>,
-        build_event_buffer: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
-        build_notify: std::sync::Arc<tokio::sync::Notify>,
-    ) -> Self {
+    pub fn new(memory_graph_tx: mpsc::Sender<MemoryGraphMessage>) -> Self {
         Self {
             router: HashMap::new(),
             extension_router: HashMap::new(),
             capabilities: Vec::new(),
             memory_graph_tx,
             event_tx: None,
-            build_event_buffer,
-            build_notify,
+            event_log_tx: None,
             llm_tx: None,
         }
     }
@@ -388,13 +388,10 @@ impl BuildManagerActor {
         self.llm_tx = Some(llm_tx);
     }
 
-    /// Drain (remove + return) all accumulated build events. Used by the FFI to
-    /// stream incremental output to the UI while a tool is still running.
-    pub fn drain_build_events(&self) -> Vec<serde_json::Value> {
-        let mut buf = self.build_event_buffer.lock().unwrap();
-        std::mem::take(&mut *buf)
+    /// Attach the actor-owned build-event log.
+    pub fn set_event_log(&mut self, event_log_tx: mpsc::Sender<BuildEventLogMessage>) {
+        self.event_log_tx = Some(event_log_tx);
     }
-
 
     /// Attach the UI event broadcast sender so streaming build events can be pushed.
     pub fn set_event_tx(&mut self, event_tx: tokio::sync::broadcast::Sender<String>) {
@@ -1068,8 +1065,7 @@ impl BuildManagerActor {
         let (build_event_tx, mut build_event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::build::BuildEvent>();
         let events_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let shared_buf = self.build_event_buffer.clone();
-        let notify = self.build_notify.clone();
+        let event_log = self.event_log_tx.clone();
         {
             let events_buf = events_buf.clone();
             tokio::spawn(async move {
@@ -1084,11 +1080,11 @@ impl BuildManagerActor {
                         "detail": ev.detail,
                     });
                     events_buf.lock().unwrap().push(json.clone());
-                    // Incremental: push into the shared pollable buffer too.
-                    shared_buf.lock().unwrap().push(json);
-        // Wake a waiting FFI listener (async push, no polling).
-        notify.notify_one();
-        tracing::info!("build forwarder: pushed 1 event + notified (line={})", ev.line);
+                    // Incremental: forward to the actor-owned build-event log
+                    // (the FFI drains it while this actor's mailbox is busy).
+                    if let Some(event_log_tx) = event_log.as_ref() {
+                        let _ = event_log_tx.send(BuildEventLogMessage::Record(json)).await;
+                    }
                 }
             });
         }
@@ -1165,8 +1161,7 @@ impl BuildManagerActor {
         let (build_event_tx, mut build_event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::build::BuildEvent>();
         let events_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let shared_buf = self.build_event_buffer.clone();
-        let notify = self.build_notify.clone();
+        let event_log = self.event_log_tx.clone();
         {
             let events_buf = events_buf.clone();
             tokio::spawn(async move {
@@ -1181,9 +1176,11 @@ impl BuildManagerActor {
                         "detail": ev.detail,
                     });
                     events_buf.lock().unwrap().push(json.clone());
-                    shared_buf.lock().unwrap().push(json);
-        // Wake a waiting FFI listener (async push, no polling).
-        notify.notify_one();
+                    // Incremental: forward to the actor-owned build-event log
+                    // (the FFI drains it while this actor's mailbox is busy).
+                    if let Some(event_log_tx) = event_log.as_ref() {
+                        let _ = event_log_tx.send(BuildEventLogMessage::Record(json)).await;
+                    }
                 }
             });
         }
@@ -1230,8 +1227,7 @@ impl BuildManagerActor {
         let (build_event_tx, mut build_event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::build::BuildEvent>();
         let events_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let shared_buf = self.build_event_buffer.clone();
-        let notify = self.build_notify.clone();
+        let event_log = self.event_log_tx.clone();
         {
             let events_buf = events_buf.clone();
             tokio::spawn(async move {
@@ -1246,9 +1242,11 @@ impl BuildManagerActor {
                         "detail": ev.detail,
                     });
                     events_buf.lock().unwrap().push(json.clone());
-                    shared_buf.lock().unwrap().push(json);
-        // Wake a waiting FFI listener (async push, no polling).
-        notify.notify_one();
+                    // Incremental: forward to the actor-owned build-event log
+                    // (the FFI drains it while this actor's mailbox is busy).
+                    if let Some(event_log_tx) = event_log.as_ref() {
+                        let _ = event_log_tx.send(BuildEventLogMessage::Record(json)).await;
+                    }
                 }
             });
         }
@@ -2779,6 +2777,9 @@ impl Actor for BuildManagerActor {
                 self.llm_tx = Some(llm_tx);
             }
 
+            BuildManagerMessage::SetEventLog { event_log_tx } => {
+                self.event_log_tx = Some(event_log_tx);
+            }
 
             BuildManagerMessage::ScaffoldBuildConfig {
                 project_name,
@@ -2871,8 +2872,6 @@ mod tests {
     fn find_config_file_detects_known_names() {
         let mut manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         manager.add_module(
             ModuleCapability {
@@ -2903,8 +2902,6 @@ mod tests {
     fn find_config_file_prefers_cargo_over_makefile_deterministically() {
         let mut manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         let add = |manager: &mut BuildManagerActor, name: &str, config: &str| {
             manager.add_module(
@@ -2954,8 +2951,6 @@ mod tests {
         };
         let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
             mg_tx,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         ));
 
         // Register the module (as the FFI bootstrap would).
@@ -2988,8 +2983,6 @@ mod tests {
     async fn extension_router_registers_source_extensions() {
         let mut manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         manager.add_module(
             ModuleCapability {
@@ -3018,8 +3011,6 @@ mod tests {
     async fn hal_contract_tools_validate_generate_and_diff() {
         let manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
 
         // 1. Validate a valid abstract-class contract. Canonical HAL contracts
@@ -3091,8 +3082,6 @@ public:
         let root = dir.path();
         let manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
 
         // Valid canonical contract → written to hal/api/camera_hal.hpp.
@@ -3182,8 +3171,6 @@ public:
 
         let manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         let result = manager
             .call_tool(
@@ -3224,8 +3211,6 @@ public:
     async fn hal_generate_impl_requires_configured_llm() {
         let manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         let result = manager
             .call_tool(
@@ -3252,8 +3237,6 @@ public:
     async fn hal_missing_impls_returns_empty_queue_without_analysis() {
         let manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         let result = manager
             .call_tool(
@@ -3295,8 +3278,6 @@ public:
 
         let manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         let result = manager
             .call_tool(
@@ -3539,8 +3520,6 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
 
         let manager = BuildManagerActor::new(
             mpsc::channel(1).0,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         );
         let result = manager
             .call_tool(
@@ -3648,8 +3627,6 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         };
         let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
             mg_tx,
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            std::sync::Arc::new(tokio::sync::Notify::new()),
         ));
 
         // Register the module.
@@ -3692,3 +3669,57 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         assert_eq!(parse_result.content_hash.len(), 64);
     }
 }
+
+// ============================================================================
+// BuildEventLogActor — owns the incremental build-event log the FFI drains.
+// ============================================================================
+
+/// Messages for the actor-owned build-event log.
+pub enum BuildEventLogMessage {
+    /// Append one serialized build event.
+    Record(serde_json::Value),
+    /// Drain (remove + return) every accumulated event.
+    Drain {
+        reply_to: tokio::sync::oneshot::Sender<Vec<serde_json::Value>>,
+    },
+}
+
+/// Owns the accumulated build events that the Swift UI streams incrementally.
+///
+/// Replaces the previous shared `Arc<Mutex<Vec<Value>>>` + `Notify` that the
+/// streaming forwarders and the FFI both reached into directly. The
+/// BuildManagerActor is occupied for the whole duration of a streaming
+/// build/lint/fix, so event delivery cannot go through its mailbox; this small
+/// dedicated actor serializes appends and drains without a `Mutex` shared with
+/// the FFI (the FFI only holds this actor's sender + a `Notify`).
+pub struct BuildEventLogActor {
+    pending: Vec<serde_json::Value>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl BuildEventLogActor {
+    pub fn new(notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            pending: Vec::new(),
+            notify,
+        }
+    }
+}
+
+#[async_trait]
+impl Actor for BuildEventLogActor {
+    type Message = BuildEventLogMessage;
+
+    async fn handle(&mut self, msg: Self::Message) {
+        match msg {
+            BuildEventLogMessage::Record(json) => {
+                self.pending.push(json);
+                self.notify.notify_one();
+            }
+            BuildEventLogMessage::Drain { reply_to } => {
+                let _ = reply_to.send(std::mem::take(&mut self.pending));
+            }
+        }
+    }
+}
+

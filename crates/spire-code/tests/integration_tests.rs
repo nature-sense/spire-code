@@ -254,22 +254,59 @@ fn test_system_status() {
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 1);
-    // The SystemActor phase chain may still be `initializing` (embedder model,
-    // MCP connect, project sync run in background after the request handler
-    // registers) — accept either state.
+    // The phase chain runs in the background after the request handler
+    // registers, so this query usually lands while the system is still
+    // `initializing`; if the chain happens to have finished it is `ready`.
+    // Either is valid here — that the chain actually *completes* is asserted
+    // by `test_startup_phase_chain_completes` below.
     let status = response["result"]["status"].as_str().unwrap_or("");
     assert!(
-        status == "running" || status == "initializing",
+        status == "initializing" || status == "ready",
         "unexpected system status: {status}"
     );
     assert_eq!(response["result"]["version"], "0.1.0");
     assert!(response["result"]["uptime_seconds"].as_f64().unwrap() >= 0.0);
-    // The `actors` map is only populated once the full startup phase chain has
-    // completed; during `initializing` it may be absent/empty.
-    if status == "running" {
-        assert_eq!(response["result"]["actors"]["chat"], true);
-        assert_eq!(response["result"]["actors"]["system"], true);
+}
+
+/// Regression guard for the startup phase chain.
+///
+/// The chain advances only when every in-progress phase reports a NAMED
+/// `PhaseEvent` from its managed `StartupTask` child actor. A phase whose
+/// `Run` message is never enqueued (e.g. a dropped `send` future, as in the
+/// transient-actor → `StartupTask` migration) stalls the chain in
+/// `initializing` forever. `test_system_status` deliberately tolerates that
+/// intermediate state, so this test asserts the transition to a terminal one.
+#[test]
+fn test_startup_phase_chain_completes() {
+    let mut core = CoreProcess::spawn();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let response = core.request("system/status", serde_json::json!({}));
+        let status = response["result"]["status"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        if status == "ready" {
+            break;
+        }
+        assert!(
+            !status.starts_with("failed"),
+            "startup phase chain failed: {status}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup phase chain did not reach a terminal state within 60s \
+             (last status: {status})"
+        );
+        std::thread::sleep(Duration::from_millis(250));
     }
+
+    // Once `ready`, the `initializing` flag must be cleared.
+    let response = core.request("system/status", serde_json::json!({}));
+    assert_eq!(response["result"]["status"], "ready");
+    assert_eq!(response["result"]["initializing"], false);
 }
 
 #[test]

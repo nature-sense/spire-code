@@ -80,12 +80,8 @@ async fn multi_config_directory_analyzes_each_discovered_config() {
     let (swift_cap, swift_tx) = describe_module(&system, SwiftBuildModule::new()).await;
 
     // Real BuildManagerActor with the three modules registered.
-    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
         drain_sender::<MemoryGraphMessage>(),
-        buffer,
-        notify,
     ));
     for (cap, module_tx) in [(cargo_cap, cargo_tx), (make_cap, make_tx), (swift_cap, swift_tx)] {
         bm_tx

@@ -6,7 +6,9 @@ use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 
-use crate::subsystems::build::build_manager::{BuildManagerActor, BuildManagerMessage};
+use crate::subsystems::build::build_manager::{
+    BuildEventLogActor, BuildEventLogMessage, BuildManagerActor, BuildManagerMessage,
+};
 use crate::{
     BuildModuleMessage, CargoBuildModule, CmakeBuildModule, GoBuildModule, GradleBuildModule,
     MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability, NodeBuildModule,
@@ -78,9 +80,12 @@ struct AppState {
     coordinator_tx: tokio::sync::mpsc::Sender<CoordinatorMessage>,
     event_rx: std::sync::Mutex<Option<tokio::sync::broadcast::Receiver<String>>>,
     runtime: tokio::runtime::Runtime,
-    /// Shared buffer of streaming build events, drained directly by the FFI
-    /// (bypasses the actor message loop so output can be read during a build).
-    build_event_buffer: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// Actor-owned build-event log, drained by the FFI via `Drain` messages.
+    /// (Replaces the old static `Arc<Mutex<Vec>>` buffer shared with the
+    /// BuildManager's streaming forwarders.)
+    build_event_log: tokio::sync::mpsc::Sender<BuildEventLogMessage>,
+    /// Wakeup for `spire_wait_for_build_event` (signalled by the log actor).
+    build_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 unsafe impl Send for AppState {}
@@ -88,14 +93,6 @@ unsafe impl Sync for AppState {}
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static STATE: Lazy<Mutex<Option<AppState>>> = Lazy::new(|| Mutex::new(None));
-/// Shared buffer of streaming build events, drained directly by the FFI while
-/// a build is running (bypasses the actor message loop).
-static BUILD_EVENT_BUFFER: Lazy<std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>> =
-    Lazy::new(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-/// Notifier signaled whenever a build event is pushed, so the FFI wait function
-/// wakes immediately without polling. Same lifetime as BUILD_EVENT_BUFFER.
-static BUILD_NOTIFY: Lazy<std::sync::Arc<tokio::sync::Notify>> =
-    Lazy::new(|| std::sync::Arc::new(tokio::sync::Notify::new()));
 
 /// Lock the global STATE mutex without panicking on a poisoned lock.
 ///
@@ -190,19 +187,31 @@ fn init_actor_system() {
         Err(_) => std::sync::Arc::new(spire_core::embedder::NoopEmbedder) as std::sync::Arc<dyn Embedder>,
     };
 
-    let default_rag_domain: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let (coord_tx, event_rx) = runtime.block_on(async {
+    let build_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (coord_tx, event_rx, build_event_log_tx) = runtime.block_on(async {
         // Event broadcast channel: the file-watcher forwarder publishes
         // file-change events here; the UI consumes them via spire_wait_for_event.
         let (event_tx, event_rx) = tokio::sync::broadcast::channel::<String>(256);
-        let system = ActorSystem::new();
+        let system = std::sync::Arc::new(ActorSystem::new());
         
         // ── Core actors ──
         let (chat_tx, _) = system.spawn(ChatActor::new());
         let (progress_tx, _) = system.spawn(ProgressActor::new());
         let (mcp_client_tx, _) = system.spawn(McpClientActor::with_progress(progress_tx.clone()));
         let (system_tx, _) = system.spawn(SystemActor::new());
+        // Host actor system + self sender for the SystemActor's startup phases
+        // (it spawns managed StartupTask children only when Initialize runs).
+        let system_self_tx = system_tx.clone();
+        let _ = system_self_tx
+            .send(SystemMessage::SetSystemTx {
+                system_tx: system_self_tx.clone(),
+            })
+            .await;
+        let _ = system_self_tx
+            .send(SystemMessage::SetActorSystem {
+                system: system.clone(),
+            })
+            .await;
         let (memory_graph_tx, _) = system.spawn(MemoryGraphActor::new());
         // The embedder is a shared service: registered once, resolved by any
         // actor that needs it (RAG, graph semantic search, future tools).
@@ -290,16 +299,22 @@ fn init_actor_system() {
         // ── Static build modules + BuildManager ──
         // Spawn each module once at startup, query its capabilities, and
         // register it with the BuildManagerActor's router.
-        let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
-            memory_graph_tx.clone(),
-            BUILD_EVENT_BUFFER.clone(),
-            BUILD_NOTIFY.clone(),
-        ));
+        let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(memory_graph_tx.clone()));
         // Attach the UI event broadcast sender so build operations can stream
         // per-line events (e.g. "Compiling serde") to the Swift event stream.
         let _ = bm_tx
             .send(BuildManagerMessage::SetEventTx {
                 event_tx: event_tx.clone(),
+            })
+            .await;
+        // Actor-owned build-event log (replaces the static Arc<Mutex<Vec>> buffer
+        // the forwarders + FFI shared). Streaming forwarders push here; the FFI
+        // drains it via messages.
+        let (build_event_log_tx, _build_event_log_handle) =
+            system.spawn(BuildEventLogActor::new(build_notify.clone()));
+        let _ = bm_tx
+            .send(BuildManagerMessage::SetEventLog {
+                event_log_tx: build_event_log_tx.clone(),
             })
             .await;
         let _ = registry.register::<ProjectAnalyzerMessage>("project.analyzer", project_analyzer_tx.clone());
@@ -514,7 +529,6 @@ fn init_actor_system() {
             terminal_tx,
             bm_tx.clone(),
             rag_tx.clone(),
-            default_rag_domain.clone(),
         )
         .await
         .expect("build tool registry");
@@ -749,7 +763,6 @@ fn init_actor_system() {
         let ffi_state = std::sync::Arc::new(FfiSharedState {
             project_root: std::sync::Mutex::new(None),
             analysis: std::sync::Mutex::new(None),
-            default_rag_domain: default_rag_domain.clone(),
             watcher_out_tx: watcher_out_tx.clone(),
         });
         let _ = coord_tx
@@ -759,7 +772,7 @@ fn init_actor_system() {
             })
             .await;
 
-        (coord_tx, event_rx)
+        (coord_tx, event_rx, build_event_log_tx)
     });
 
     tracing::info!("Spire FFI: ready (analysis=unopened)");
@@ -767,7 +780,8 @@ fn init_actor_system() {
         coordinator_tx: coord_tx,
         event_rx: std::sync::Mutex::new(Some(event_rx)),
         runtime,
-        build_event_buffer: BUILD_EVENT_BUFFER.clone(),
+        build_event_log: build_event_log_tx,
+        build_notify,
     });
     INITIALIZED.store(true, Ordering::Release);
 }
@@ -1525,15 +1539,31 @@ pub unsafe extern "C" fn spire_wait_for_event(timeout_ms: u32) -> *mut std::ffi:
 #[no_mangle]
 pub unsafe extern "C" fn spire_drain_build_events() -> *mut std::ffi::c_char {
     init_actor_system();
-    // Lock and drain the shared buffer in place — no message sent to the actor,
-    // so events can be read WHILE a build is still running.
-    let drained: Vec<serde_json::Value> = {
-        let guard = lock_state();
-        let state = match guard.as_ref() { Some(s) => s, None => return std::ptr::null_mut() };
-        let mut locked = state.build_event_buffer.lock().unwrap();
-        std::mem::take(&mut *locked)
+    // Drain the actor-owned build-event log: clone the sender + a runtime
+    // handle under the lock, then drop the lock before blocking.
+    let payload = {
+        let (event_log_tx, runtime) = {
+            let guard = lock_state();
+            let state = match guard.as_ref() { Some(s) => s, None => return std::ptr::null_mut() };
+            (state.build_event_log.clone(), state.runtime.handle().clone())
+        };
+        runtime.block_on(async move {
+            let (t, r) = tokio::sync::oneshot::channel();
+            if event_log_tx
+                .send(BuildEventLogMessage::Drain { reply_to: t })
+                .await
+                .is_err()
+            {
+                return String::new();
+            }
+            let drained = r.await.unwrap_or_default();
+            if drained.is_empty() {
+                String::new()
+            } else {
+                serde_json::json!(drained).to_string()
+            }
+        })
     };
-    let payload = serde_json::json!(drained).to_string();
     if payload.is_empty() {
         std::ptr::null_mut()
     } else {
@@ -1541,38 +1571,47 @@ pub unsafe extern "C" fn spire_drain_build_events() -> *mut std::ffi::c_char {
     }
 }
 
-/// Wait for a build event to be pushed (blocking until BUILD_NOTIFY fires or
-/// timeout). Returns a JSON array of drained events, or null on timeout.
-/// This is an async push — no polling/timer on the Swift side.
+/// Wait for a build event (blocking until the log actor notifies or timeout).
+/// Returns a JSON array of drained events, or null on timeout. Async push — no
+/// polling/timer on the Swift side. The buffer itself lives in the
+/// BuildEventLogActor; the FFI holds only its sender + a Notify.
 #[no_mangle]
 pub unsafe extern "C" fn spire_wait_for_build_event(timeout_ms: u32) -> *mut std::ffi::c_char {
     init_actor_system();
     let timeout = std::time::Duration::from_millis(timeout_ms as u64);
-    let notify = BUILD_NOTIFY.clone();
-    let runtime = { lock_state().as_ref().map(|s| s.runtime.handle().clone()) };
-    if runtime.is_none() {
-        return std::ptr::null_mut();
-    }
-    let runtime = runtime.unwrap();
 
-    // Drain-first-then-wait loop. Checking the buffer BEFORE waiting means we
-    // can never miss a wakeup: burst notifications coalesce (Notify keeps one
-    // permit), and any events that arrived while we weren't waiting are caught
-    // on the next iteration.
-    let payload = runtime.block_on(async {
+    // Clone the sender, notify, and a runtime handle under the lock, then drop
+    // the lock before blocking (holding STATE while blocked deadlocks RPCs).
+    let (event_log_tx, notify, runtime) = {
+        let guard = lock_state();
+        let state = match guard.as_ref() { Some(s) => s, None => return std::ptr::null_mut() };
+        (
+            state.build_event_log.clone(),
+            state.build_notify.clone(),
+            state.runtime.handle().clone(),
+        )
+    };
+
+    // Drain-first-then-wait loop: check the log BEFORE waiting so a wakeup is
+    // never missed (Notify coalesces bursts into one permit; anything that
+    // arrived while we were not waiting is caught on the next iteration).
+    let payload = runtime.block_on(async move {
         loop {
-            // 1. Drain any events already buffered.
-            let drained = {
-                let guard = lock_state();
-                let state = match guard.as_ref() { Some(s) => s, None => return String::new() };
-                let mut locked = state.build_event_buffer.lock().unwrap();
-                std::mem::take(&mut *locked)
-            };
+            // 1. Drain any events already logged.
+            let (t, r) = tokio::sync::oneshot::channel();
+            if event_log_tx
+                .send(BuildEventLogMessage::Drain { reply_to: t })
+                .await
+                .is_err()
+            {
+                return String::new();
+            }
+            let drained = r.await.unwrap_or_default();
             if !drained.is_empty() {
                 tracing::info!("spire_wait_for_build_event: drained {} events", drained.len());
                 return serde_json::json!(drained).to_string();
             }
-            // 2. Nothing buffered — wait for a notification (or timeout).
+            // 2. Nothing buffered — wait for the log actor's notification.
             tokio::select! {
                 _ = notify.notified() => {
                     // Woken; loop drains whatever accumulated.

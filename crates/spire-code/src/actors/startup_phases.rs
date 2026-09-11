@@ -28,6 +28,8 @@ use crate::actors::{
     ProjectSyncMessage, SystemMessage,
 };
 use spire_core::models::embedding::Embedder;
+use spire_core::actors::ActorSystem;
+use spire_actor::{spawn_child_eager, ChildActor, ChildContext};
 use spire_core::models::memory_graph::{
     AttrNode, RelationshipInput, RelationshipType, StreamOp, StreamOpResult, TransactionRequest,
 };
@@ -78,6 +80,9 @@ pub struct PhaseContext {
     pub project_root: PathBuf,
     /// Sender to the SystemActor's mailbox — phases send completion messages here.
     pub system_tx: mpsc::Sender<SystemMessage>,
+    /// Host actor system: phases spawn managed child actors (StartupTask) for
+    /// long-running work so it is abortable and tracked by the runtime.
+    pub system: std::sync::Arc<ActorSystem>,
 }
 
 impl PhaseContext {
@@ -123,6 +128,79 @@ pub trait StartupPhase: Send {
 
     /// Name for logging/progress reporting.
     fn name(&self) -> &'static str;
+}
+
+// ============================================================================
+// StartupTask — managed, run-once startup work (a real child actor)
+// ============================================================================
+
+/// Single message a [`StartupTask`] accepts: run the wrapped phase body once.
+#[derive(Debug)]
+pub enum StartupTaskMessage {
+    Run,
+}
+
+/// A run-once startup task backed by a managed child actor.
+///
+/// Replaces the previous raw `tokio::spawn` "transient actors": the body runs
+/// inside a real `ChildActor` (abortable on drop, visible to the runtime), and
+/// completion is reported to the SystemActor as a NAMED `PhaseEvent`, so
+/// `PhaseGroup` no longer polls `oneshot` channels.
+pub struct StartupTask<F> {
+    body: Option<F>,
+    phase: &'static str,
+    completion: Option<oneshot::Receiver<()>>,
+    system_tx: mpsc::Sender<SystemMessage>,
+}
+
+impl<F> StartupTask<F>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    pub fn new(
+        phase: &'static str,
+        body: F,
+        completion: oneshot::Receiver<()>,
+        system_tx: mpsc::Sender<SystemMessage>,
+    ) -> Self {
+        Self {
+            body: Some(body),
+            phase,
+            completion: Some(completion),
+            system_tx,
+        }
+    }
+}
+
+#[async_trait]
+impl<F> ChildActor for StartupTask<F>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    type Message = StartupTaskMessage;
+
+    fn init(&mut self, _ctx: &mut ChildContext) {}
+
+    async fn handle(&mut self, _ctx: &ChildContext, msg: Self::Message) {
+        match msg {
+            StartupTaskMessage::Run => {
+                // Run the phase body; it fires the completion oneshot when it is
+                // finished (including its best-effort failure paths).
+                if let Some(body) = self.body.take() {
+                    body.await;
+                }
+                if let Some(rx) = self.completion.take() {
+                    let _ = rx.await;
+                }
+                let _ = self
+                    .system_tx
+                    .send(SystemMessage::PhaseEvent {
+                        phase: self.phase.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -200,58 +278,31 @@ impl StartupPhase for PhaseGroup {
         }
     }
 
-    async fn handle_message(&mut self, _msg: SystemMessage, ctx: &PhaseContext) -> PhaseResult {
-        let total = self.sub_phases.len();
-        let before = self.completed.len();
-
-        // Try each sub-phase that hasn't completed yet
-        let _self_name = self.name().to_string();
-        for phase in self.sub_phases.iter_mut() {
-            let name = phase.name().to_string();
-            if self.completed.contains(&name) {
-                continue;
-            }
-            let result = phase.handle_message(SystemMessage::PhaseEvent, ctx).await;
-            match result {
-                PhaseResult::Complete => {
-                    info!(
-                        "PhaseGroup[{}]: sub-phase '{}' completed ({}/{})",
-                        self.name,
-                        name,
-                        self.completed.len() + 1,
-                        total
-                    );
-                    self.completed.insert(name);
-                }
-                PhaseResult::Failed(e) => {
-                    warn!(
-                        "PhaseGroup[{}]: sub-phase '{}' failed: {}",
-                        self.name, name, e
-                    );
-                    self.completed.insert(name);
-                }
-                PhaseResult::InProgress => {
-                    // Still waiting
-                }
-            }
-        }
-
-        let completed = self.completed.len();
-        if completed == total {
-            info!(
-                "PhaseGroup[{}]: all {} sub-phases complete",
-                self.name, total
-            );
-            PhaseResult::Complete
-        } else {
-            if completed != before {
-                debug!(
-                    "PhaseGroup[{}]: progress {}/{} sub-phases complete",
-                    self.name, completed, total
+    async fn handle_message(&mut self, msg: SystemMessage, _ctx: &PhaseContext) -> PhaseResult {
+        // Sub-phases that returned InProgress report completion through a NAMED
+        // PhaseEvent from their managed StartupTask child; synchronous completions
+        // were recorded in `start()`. No oneshot polling.
+        if let SystemMessage::PhaseEvent { phase } = msg {
+            let was_new = self.completed.insert(phase.clone());
+            if was_new {
+                info!(
+                    "PhaseGroup[{}]: sub-phase '{}' completed ({}/{})",
+                    self.name,
+                    phase,
+                    self.completed.len(),
+                    self.sub_phases.len()
                 );
             }
-            PhaseResult::InProgress
+            if self.completed.len() == self.sub_phases.len() {
+                info!(
+                    "PhaseGroup[{}]: all {} sub-phases complete",
+                    self.name,
+                    self.sub_phases.len()
+                );
+                return PhaseResult::Complete;
+            }
         }
+        PhaseResult::InProgress
     }
 }
 
@@ -735,20 +786,17 @@ impl StartupPhase for McpConnectPhase {
 
 // ── ProjectSyncPhase ────────────────────────────────────────────────────────
 //
-// This phase spawns a transient actor (tokio task) to do the blocking
-// filesystem scan and graph operations. Completion is signaled via a
-// oneshot channel — no polling needed.
+// This phase delegates the blocking filesystem scan + graph work to a
+// managed `StartupTask` child actor. Completion is reported as a named
+// `PhaseEvent` to the containing `PhaseGroup` — no polling.
 
-pub struct ProjectSyncPhase {
-    /// Receiver for completion signal from the spawned task.
-    completion_rx: Option<oneshot::Receiver<()>>,
-}
+/// Delegates its work to a managed `StartupTask` child actor; completion is
+/// reported as a named `PhaseEvent` to the containing `PhaseGroup`.
+pub struct ProjectSyncPhase;
 
 impl ProjectSyncPhase {
     pub fn new() -> Self {
-        Self {
-            completion_rx: None,
-        }
+        Self
     }
 }
 
@@ -769,15 +817,16 @@ impl StartupPhase for ProjectSyncPhase {
             .await;
         info!("SystemActor: dispatching project sync to transient actor");
 
-        let (tx, rx) = oneshot::channel();
-        self.completion_rx = Some(rx);
-
         let memory_graph_tx = ctx.memory_graph_tx.clone();
         let project_sync_tx = ctx.project_sync_tx.clone();
         let project_root = ctx.project_root.clone();
         let system_tx = ctx.system_tx.clone();
 
-        tokio::spawn(async move {
+        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+            let (tx, rx) = oneshot::channel();
+            StartupTask::new(
+                "project_sync",
+                async move {
             // Check if a Project node already exists (warm start)
             let has_existing_project = {
                 let (qtx, qrx) = oneshot::channel();
@@ -862,38 +911,39 @@ impl StartupPhase for ProjectSyncPhase {
 
             info!("ProjectSyncPhase: project sync complete");
             let _ = tx.send(());
-            let _ = system_tx.send(SystemMessage::PhaseEvent).await;
+                },
+                rx,
+                system_tx,
+            )
         });
+        // `send` on a tokio mpsc sender is async: it MUST be awaited, or the
+        // `Run` message is never enqueued and the child body never executes
+        // (leaving the containing PhaseGroup waiting forever).
+        let _ = child_tx.send(StartupTaskMessage::Run).await;
 
         PhaseResult::InProgress
     }
 
     async fn handle_message(&mut self, _msg: SystemMessage, _ctx: &PhaseContext) -> PhaseResult {
-        if let Some(rx) = self.completion_rx.as_mut() {
-            if rx.try_recv().is_ok() {
-                self.completion_rx = None;
-                return PhaseResult::Complete;
-            }
-        }
+        // Completion is reported by the managed StartupTask child as a named
+        // PhaseEvent to the containing PhaseGroup — nothing to poll here.
         PhaseResult::InProgress
     }
 }
 
 // ── ProjectAnalysisPhase ────────────────────────────────────────────────────
 //
-// This phase spawns a transient actor (tokio task) to do the blocking
-// project analysis. Completion is signaled via a oneshot channel.
+// This phase delegates the blocking project analysis to a managed
+// `StartupTask` child actor; completion arrives as a named `PhaseEvent`.
+// (The analysis result is stored back into the graph by the child.)
 
-pub struct ProjectAnalysisPhase {
-    /// Receiver for completion signal from the spawned task.
-    completion_rx: Option<oneshot::Receiver<()>>,
-}
+/// Delegates its work to a managed `StartupTask` child actor; completion is
+/// reported as a named `PhaseEvent` to the containing `PhaseGroup`.
+pub struct ProjectAnalysisPhase;
 
 impl ProjectAnalysisPhase {
     pub fn new() -> Self {
-        Self {
-            completion_rx: None,
-        }
+        Self
     }
 }
 
@@ -914,15 +964,16 @@ impl StartupPhase for ProjectAnalysisPhase {
             .await;
         info!("SystemActor: dispatching project analysis to transient actor");
 
-        let (tx, rx) = oneshot::channel();
-        self.completion_rx = Some(rx);
-
         let project_analyzer_tx = ctx.project_analyzer_tx.clone();
         let project_root = ctx.project_root.clone();
         let system_tx = ctx.system_tx.clone();
         let memory_graph_tx = ctx.memory_graph_tx.clone();
 
-        tokio::spawn(async move {
+        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+            let (tx, rx) = oneshot::channel();
+            StartupTask::new(
+                "project_analysis",
+                async move {
             let (atx, arx) = oneshot::channel();
             if project_analyzer_tx
                 .send(ProjectAnalyzerMessage::Analyze {
@@ -963,38 +1014,36 @@ impl StartupPhase for ProjectAnalysisPhase {
             }
 
             let _ = tx.send(());
-            let _ = system_tx.send(SystemMessage::PhaseEvent).await;
+                },
+                rx,
+                system_tx,
+            )
         });
+        // Awaited: a dropped send future would never enqueue `Run`.
+        let _ = child_tx.send(StartupTaskMessage::Run).await;
 
         PhaseResult::InProgress
     }
 
     async fn handle_message(&mut self, _msg: SystemMessage, _ctx: &PhaseContext) -> PhaseResult {
-        if let Some(rx) = self.completion_rx.as_mut() {
-            if rx.try_recv().is_ok() {
-                self.completion_rx = None;
-                return PhaseResult::Complete;
-            }
-        }
+        // Completion is reported by the managed StartupTask child as a named
+        // PhaseEvent to the containing PhaseGroup — nothing to poll here.
         PhaseResult::InProgress
     }
 }
 
 // ── LlmConfigPhase ──────────────────────────────────────────────────────────
 //
-// This phase spawns a transient actor (tokio task) to load LLM config
-// from the graph. Completion is signaled via a oneshot channel.
+// This phase loads the persisted LLM config through a managed `StartupTask`
+// child actor (updating the LLM actor); completion is a named `PhaseEvent`.
 
-pub struct LlmConfigPhase {
-    /// Receiver for completion signal from the spawned task.
-    completion_rx: Option<oneshot::Receiver<()>>,
-}
+/// Delegates its work to a managed `StartupTask` child actor; completion is
+/// reported as a named `PhaseEvent` to the containing `PhaseGroup`.
+pub struct LlmConfigPhase;
 
 impl LlmConfigPhase {
     pub fn new() -> Self {
-        Self {
-            completion_rx: None,
-        }
+        Self
     }
 }
 
@@ -1015,14 +1064,15 @@ impl StartupPhase for LlmConfigPhase {
             .await;
         info!("SystemActor: dispatching LLM config load to transient actor");
 
-        let (tx, rx) = oneshot::channel();
-        self.completion_rx = Some(rx);
-
         let _memory_graph_tx = ctx.memory_graph_tx.clone();
         let llm_tx = ctx.llm_tx.clone();
         let system_tx = ctx.system_tx.clone();
 
-        tokio::spawn(async move {
+        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+            let (tx, rx) = oneshot::channel();
+            StartupTask::new(
+                "llm_config",
+                async move {
             // Load global LLM config from ~/.spire/llm-config.json (shared across all projects).
             let llm_config = spire_core::config::load_global_llm_config();
             if !llm_config.api_key.is_empty() {
@@ -1046,19 +1096,20 @@ impl StartupPhase for LlmConfigPhase {
             }
             info!("LlmConfigPhase: LLM config loaded");
             let _ = tx.send(());
-            let _ = system_tx.send(SystemMessage::PhaseEvent).await;
+                },
+                rx,
+                system_tx,
+            )
         });
+        // Awaited: a dropped send future would never enqueue `Run`.
+        let _ = child_tx.send(StartupTaskMessage::Run).await;
 
         PhaseResult::InProgress
     }
 
     async fn handle_message(&mut self, _msg: SystemMessage, _ctx: &PhaseContext) -> PhaseResult {
-        if let Some(rx) = self.completion_rx.as_mut() {
-            if rx.try_recv().is_ok() {
-                self.completion_rx = None;
-                return PhaseResult::Complete;
-            }
-        }
+        // Completion is reported by the managed StartupTask child as a named
+        // PhaseEvent to the containing PhaseGroup — nothing to poll here.
         PhaseResult::InProgress
     }
 }
@@ -1527,19 +1578,16 @@ impl StartupPhase for IntentsBootstrapInitPhase {
 
 // ── IntentsBootstrapPhase ───────────────────────────────────────────────────
 //
-// This phase spawns a transient actor (tokio task) to load intents from
-// config/intents.json and MCP server tools, then store them in the graph.
+// This phase bootstraps intents/tools into the graph through a managed
+// `StartupTask` child actor; completion is a named `PhaseEvent`.
 
-pub struct IntentsBootstrapPhase {
-    /// Receiver for completion signal from the spawned task.
-    completion_rx: Option<oneshot::Receiver<()>>,
-}
+/// Delegates its work to a managed `StartupTask` child actor; completion is
+/// reported as a named `PhaseEvent` to the containing `PhaseGroup`.
+pub struct IntentsBootstrapPhase;
 
 impl IntentsBootstrapPhase {
     pub fn new() -> Self {
-        Self {
-            completion_rx: None,
-        }
+        Self
     }
 }
 
@@ -1564,15 +1612,16 @@ impl StartupPhase for IntentsBootstrapPhase {
         .await;
         info!("SystemActor: dispatching intents bootstrap to transient actor");
 
-        let (tx, rx) = oneshot::channel();
-        self.completion_rx = Some(rx);
-
         let memory_graph_tx = ctx.memory_graph_tx.clone();
         let mcp_client_tx = ctx.mcp_client_tx.clone();
         let system_tx = ctx.system_tx.clone();
         let project_root = ctx.project_root.clone();
 
-        tokio::spawn(async move {
+        let child_tx = spawn_child_eager(&*ctx.system, ctx.system.registry().clone(), move |_c| {
+            let (tx, rx) = oneshot::channel();
+            StartupTask::new(
+                "intents_bootstrap",
+                async move {
             // Step 1: Bootstrap static intents from config/intents.json
             let config_path = project_root.join("config").join("intents.json");
             if config_path.exists() {
@@ -1639,19 +1688,20 @@ impl StartupPhase for IntentsBootstrapPhase {
 
             info!("IntentsBootstrapPhase: intents bootstrap complete");
             let _ = tx.send(());
-            let _ = system_tx.send(SystemMessage::PhaseEvent).await;
+                },
+                rx,
+                system_tx,
+            )
         });
+        // Awaited: a dropped send future would never enqueue `Run`.
+        let _ = child_tx.send(StartupTaskMessage::Run).await;
 
         PhaseResult::InProgress
     }
 
     async fn handle_message(&mut self, _msg: SystemMessage, _ctx: &PhaseContext) -> PhaseResult {
-        if let Some(rx) = self.completion_rx.as_mut() {
-            if rx.try_recv().is_ok() {
-                self.completion_rx = None;
-                return PhaseResult::Complete;
-            }
-        }
+        // Completion is reported by the managed StartupTask child as a named
+        // PhaseEvent to the containing PhaseGroup — nothing to poll here.
         PhaseResult::InProgress
     }
 }

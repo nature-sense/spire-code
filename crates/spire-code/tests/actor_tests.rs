@@ -2790,7 +2790,6 @@ async fn spawn_coordinator(
         let ffi_state = std::sync::Arc::new(FfiSharedState {
             project_root: std::sync::Mutex::new(None),
             analysis: std::sync::Mutex::new(None),
-            default_rag_domain: std::sync::Arc::new(std::sync::Mutex::new(None)),
             watcher_out_tx: watcher_tx,
         });
         coord_tx
@@ -2928,7 +2927,6 @@ async fn test_build_default_registry_registers_project_meta_tools() {
         mock_sender(), // terminal
         mock_sender(), // build_manager
         mock_sender(), // rag
-        std::sync::Arc::new(std::sync::Mutex::new(None)), // default rag domain
     )
     .await
     .expect("build tool registry");

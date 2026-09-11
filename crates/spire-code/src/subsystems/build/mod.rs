@@ -4,6 +4,8 @@
 //! Build subsystem — language-module router + orchestration.
 
 pub mod build_manager;
-pub use build_manager::{BuildManagerActor, BuildManagerMessage};
+pub use build_manager::{
+    BuildEventLogActor, BuildEventLogMessage, BuildManagerActor, BuildManagerMessage,
+};
 pub mod build_orchestrator;
 pub use build_orchestrator::{BuildOrchestrator, BuildOrchestratorMessage};

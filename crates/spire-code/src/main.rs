@@ -212,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
     // ── Create the actor system ──
-    let system = ActorSystem::new();
+    let system = std::sync::Arc::new(ActorSystem::new());
 
     // Spawn the chat actor
     let (chat_tx, _chat_handle) = system.spawn(ChatActor::new());
@@ -352,11 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the project_* meta-tools) flows through registered build modules. The
     // FFI spawns additional modules (node, swift, meson, …); the standalone
     // binary keeps Cargo as the primary supported runtime.
-    let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
-        memory_graph_tx.clone(),
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        std::sync::Arc::new(tokio::sync::Notify::new()),
-    ));
+    let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(memory_graph_tx.clone()));
     {
         // Stage-1 HAL implementation generation (hal_generate_impl) routes
         // through the LLM actor with the role Coding — wire the same llm_tx
@@ -436,8 +432,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dummy_terminal_tx, _) = tokio::sync::mpsc::channel::<TerminalMessage>(8);
     let (dummy_rag_tx, _) =
         tokio::sync::mpsc::channel::<spire_core::actors::rag::RagMessage>(8);
-    let dummy_rag_domain: std::sync::Arc<std::sync::Mutex<Option<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
     let tool_registry = build_default_registry(
         transport_tx.clone(),
         project_query_tx.clone(),
@@ -453,7 +447,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dummy_terminal_tx,
         bm_tx,
         dummy_rag_tx,
-        dummy_rag_domain,
     )
     .await
     .expect("build tool registry");
@@ -597,6 +590,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = system_tx_for_system
             .send(SystemMessage::SetSystemTx {
                 system_tx: system_tx_for_system.clone(),
+            })
+            .await;
+
+        // Step 1b: Set the host actor system (for spawning managed StartupTask
+        // children during the startup phases).
+        let _ = system_tx_for_system
+            .send(SystemMessage::SetActorSystem {
+                system: system.clone(),
             })
             .await;
 

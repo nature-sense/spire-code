@@ -26,7 +26,7 @@ use spire_core::modules::{
 };
 use spire_core::transport::socket::TransportMessage;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 /// Build the registry with the full tool set. Call once at startup.
@@ -48,7 +48,6 @@ pub async fn build_default_registry(
     terminal_tx: mpsc::Sender<TerminalMessage>,
     build_manager_tx: mpsc::Sender<BuildManagerMessage>,
     rag_tx: mpsc::Sender<RagMessage>,
-    default_domain: Arc<Mutex<Option<String>>>,
 ) -> Result<Arc<ToolRegistry>, String> {
     let registry = Arc::new(ToolRegistry::new());
 
@@ -150,7 +149,8 @@ pub async fn build_default_registry(
 
     // RAG tools (generic — the RAG framework lives in this crate). Their
     // definitions come from `vscode_tool_definitions()` (partitioned above).
-    register_rag_tools(&registry, rag_tx, default_domain, rag_defs)?;
+    // Default-domain resolution happens inside the RagActor (mailbox-serialized).
+    register_rag_tools(&registry, rag_tx, rag_defs)?;
 
     Ok(registry)
 }
@@ -278,23 +278,20 @@ fn web_search_handler(name: String) -> ToolHandler {
 }
 
 /// Register the RAG tools (`rag/search`, `rag/find-interfaces`,
-/// `rag/set-domain`, `rag/list-domains`) with the shared default-domain state.
-/// Their definitions come from `vscode_tool_definitions()` (they are listed as
-/// extension tools but routed to the RAG actor).
+/// `rag/set-domain`, `rag/list-domains`). Default-domain state is owned by the
+/// RagActor: search tools forward an (optionally empty) domain and the actor
+/// resolves its mailbox-serialized default.
 fn register_rag_tools(
     registry: &ToolRegistry,
     rag_tx: mpsc::Sender<RagMessage>,
-    default_domain: Arc<Mutex<Option<String>>>,
     defs: Vec<ToolInfo>,
 ) -> Result<(), String> {
     let mut tools = Vec::with_capacity(defs.len());
     for info in defs {
         let handler = match info.name.as_str() {
-            "rag/search" => rag_query_handler(rag_tx.clone(), default_domain.clone()),
-            "rag/find-interfaces" => {
-                rag_find_interfaces_handler(rag_tx.clone(), default_domain.clone())
-            }
-            "rag/set-domain" => rag_set_domain_handler(default_domain.clone()),
+            "rag/search" => rag_query_handler(rag_tx.clone()),
+            "rag/find-interfaces" => rag_find_interfaces_handler(rag_tx.clone()),
+            "rag/set-domain" => rag_set_domain_handler(rag_tx.clone()),
             "rag/list-domains" => rag_list_domains_handler(rag_tx.clone()),
             other => return Err(format!("unexpected rag tool definition: {other}")),
         };
@@ -303,27 +300,16 @@ fn register_rag_tools(
     registry.register_many(tools)
 }
 
-fn rag_query_handler(
-    rag_tx: mpsc::Sender<RagMessage>,
-    default_domain: Arc<Mutex<Option<String>>>,
-) -> ToolHandler {
+fn rag_query_handler(rag_tx: mpsc::Sender<RagMessage>) -> ToolHandler {
     Arc::new(move |args| {
         let tx = rag_tx.clone();
-        let default_domain = default_domain.clone();
         Box::pin(async move {
-            let mut domain = args
+            // An empty `domain` means "use the RAG actor's default domain".
+            let domain = args
                 .get("domain")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if domain.is_empty() {
-                if let Ok(guard) = default_domain.lock() {
-                    domain = guard.clone().unwrap_or_default();
-                }
-            }
-            if domain.is_empty() {
-                return Err("no RAG domain selected and no 'domain' supplied".to_string());
-            }
             let query = args
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -347,27 +333,16 @@ fn rag_query_handler(
     })
 }
 
-fn rag_find_interfaces_handler(
-    rag_tx: mpsc::Sender<RagMessage>,
-    default_domain: Arc<Mutex<Option<String>>>,
-) -> ToolHandler {
+fn rag_find_interfaces_handler(rag_tx: mpsc::Sender<RagMessage>) -> ToolHandler {
     Arc::new(move |args| {
         let tx = rag_tx.clone();
-        let default_domain = default_domain.clone();
         Box::pin(async move {
-            let mut domain = args
+            // An empty `domain` means "use the RAG actor's default domain".
+            let domain = args
                 .get("domain")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if domain.is_empty() {
-                if let Ok(guard) = default_domain.lock() {
-                    domain = guard.clone().unwrap_or_default();
-                }
-            }
-            if domain.is_empty() {
-                return Err("no RAG domain selected and no 'domain' supplied".to_string());
-            }
             let query = args
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -391,18 +366,18 @@ fn rag_find_interfaces_handler(
     })
 }
 
-fn rag_set_domain_handler(default_domain: Arc<Mutex<Option<String>>>) -> ToolHandler {
+fn rag_set_domain_handler(rag_tx: mpsc::Sender<RagMessage>) -> ToolHandler {
     Arc::new(move |args| {
-        let default_domain = default_domain.clone();
+        let tx = rag_tx.clone();
         Box::pin(async move {
             let domain = args
                 .get("domain")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if let Ok(mut guard) = default_domain.lock() {
-                *guard = if domain.is_empty() { None } else { Some(domain) };
-            }
+            let domain = if domain.is_empty() { None } else { Some(domain) };
+            // Forward to the RagActor: it owns the default-domain state.
+            let _ = tx.send(RagMessage::SetDefaultDomain { domain }).await;
             Ok(serde_json::json!({ "ok": true }))
         })
     })
@@ -423,5 +398,6 @@ fn rag_list_domains_handler(rag_tx: mpsc::Sender<RagMessage>) -> ToolHandler {
         })
     })
 }
+
 
 

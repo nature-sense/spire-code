@@ -70,9 +70,6 @@ pub struct FfiSharedState {
     pub project_root: std::sync::Mutex<Option<PathBuf>>,
     /// Latest project analysis (set by `project/open` / `AnalyzeProject`).
     pub analysis: std::sync::Mutex<Option<ProjectAnalysis>>,
-    /// Default RAG domain selected by the UI (`rag/set-domain`). Shared with
-    /// the RAG tool registry's `default_domain` handle.
-    pub default_rag_domain: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// File-watcher output channel (`project/open` StartWatching).
     pub watcher_out_tx: mpsc::Sender<FileChangeNotification>,
 }
@@ -158,18 +155,34 @@ impl CoordinatorActor {
             path, &content, &issues,
         );
         let mut proposed = String::new();
-        // Call the LLM directly (no actor loop): a missing/panicked actor can
-        // never break this path, and an unconfigured key returns a clear Err.
-        let llm = spire_core::subsystems::llm::llm::LlmActor::new(
-            spire_core::config::load_global_llm_config(),
-        );
+        // Route through the LLM actor's mailbox (self.llm_tx) so all LLM work
+        // shares the single actor-owned config/client. A missing actor returns
+        // a clear error; an unconfigured key surfaces as the actor's error.
+        let llm_tx = self.llm_tx.clone();
         for _attempt in 0..2 {
-            let text = match llm
-                .complete_prompt(&prompt, spire_core::subsystems::llm::llm::LlmModelRole::Coding)
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if llm_tx
+                .send(crate::actors::LlmMessage::Complete {
+                    prompt: prompt.clone(),
+                    role: spire_core::subsystems::llm::llm::LlmModelRole::Coding,
+                    reply_to: reply_tx,
+                })
                 .await
+                .is_err()
             {
-                Ok(t) => t,
-                Err(e) => return serde_json::json!({ "status": "error", "error": e.to_string() }),
+                return serde_json::json!({ "status": "error", "error": "LLM actor unavailable" });
+            }
+            let text = match reply_rx.await {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    return serde_json::json!({ "status": "error", "error": e.to_string() })
+                }
+                Err(e) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error": format!("LLM reply lost: {e}")
+                    })
+                }
             };
             proposed = crate::build::generic_helpers::strip_code_fences(&text);
             let check = crate::build::generic_helpers::cpp_syntax_check(&proposed);
@@ -3152,9 +3165,9 @@ impl CoordinatorActor {
     }
 
     /// `rag/*` RPCs — semantic search, interface lookup, domain/source listing,
-    /// ingest. Routed to the RAG actor; `rag/set-domain` writes shared state.
+    /// ingest. Routed to the RAG actor (which owns the default domain).
     async fn handle_rag(&self, method: &str, params: &serde_json::Value) -> serde_json::Value {
-        let (registry, ffi_state) = match self.ffi_deps() {
+        let (registry, _ffi_state) = match self.ffi_deps() {
             Ok(d) => d,
             Err(e) => return serde_json::json!({"error": e}),
         };
@@ -3249,9 +3262,9 @@ impl CoordinatorActor {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                if let Ok(mut guard) = ffi_state.default_rag_domain.lock() {
-                    *guard = if domain.is_empty() { None } else { Some(domain) };
-                }
+                let domain = if domain.is_empty() { None } else { Some(domain) };
+                // The RagActor owns the default domain (mailbox-serialized).
+                let _ = rag_tx.send(RagMessage::SetDefaultDomain { domain }).await;
                 serde_json::json!({"ok": true})
             }
             "rag/list-sources" => {
