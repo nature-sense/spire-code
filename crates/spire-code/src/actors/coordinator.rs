@@ -2493,10 +2493,17 @@ impl CoordinatorActor {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // `kind` selects which action's status to read: build (default) / lint /
+        // test / clean — each is stored under `<kind>.last.<path>[.<target>]`.
+        let status_kind = params
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "build".to_string());
         let key = if status_target.trim().is_empty() {
-            format!("build.last.{}", status_path)
+            format!("{}.last.{}", status_kind, status_path)
         } else {
-            format!("build.last.{}.{}", status_path, status_target)
+            format!("{}.last.{}.{}", status_kind, status_path, status_target)
         };
 
         let (t, r) = tokio::sync::oneshot::channel();

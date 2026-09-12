@@ -114,3 +114,32 @@ func trailingSlashesNormalised() {
     #expect(empty.absolutePath(in: "/Users/me/ai-traps/") == "/Users/me/ai-traps")
 }
 
+
+// MARK: - Git status parsing (uncommitted-changes indicator)
+
+/// The uncommitted-changes badge counts `git status --short` entries and
+/// separates untracked (`??`) ones. Getting this wrong would either hide a
+/// destructive change or cry wolf on a clean tree.
+@Test("git status porcelain is counted, untracked separated")
+func gitStatusCountsPorcelainLines() {
+    let porcelain = """
+     M Sources/App.swift
+    ?? new-file.txt
+    M  crates/spire-code/src/lib.rs
+    ?? another.txt
+    """
+    let s = SpireBridge.parseGitStatus(porcelain)
+    #expect(s.changedCount == 4)
+    #expect(s.untrackedCount == 2)
+    #expect(s.isDirty)
+    #expect(s.lines.count == 4)
+}
+
+@Test("clean working tree is not dirty")
+func gitStatusCleanTree() {
+    let s = SpireBridge.parseGitStatus("\n \n")
+    #expect(s.changedCount == 0)
+    #expect(s.untrackedCount == 0)
+    #expect(!s.isDirty)
+}
+

@@ -1714,29 +1714,25 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                             events.append(&mut Self::parse_clang_output(&o.output));
                         }
                         let _ = self.ingest_diagnostics(&events, "build").await;
-                        // Persist the build status (success/duration + raw output)
-                        // for the Build detail tab header, keyed PER TARGET so
-                        // building rock3c and rpi5 store separate results. When
-                        // the caller picked a PLATFORM (not a target) the raw
-                        // `target` arg is empty — resolve the target that
-                        // platform build actually compiled, otherwise the status
-                        // would land under a bare `build.last.<path>` key that no
-                        // per-target "last built" lookup can ever find.
-                        let mut status_target =
-                            opts.target.clone().filter(|t| !t.trim().is_empty());
-                        if status_target.is_none() {
-                            if let Some(plat) = opts.platform.as_deref() {
-                                if let Some(md) = self.get_analysis(&path).await {
-                                    status_target = md
-                                        .targets
-                                        .iter()
-                                        .find(|t| t.platform == plat)
-                                        .map(|t| t.name.clone());
-                                }
-                            }
-                        }
+                        // Persist the build status PER TARGET (success/duration +
+                        // raw output) so building rock3c and rpi5 store separate
+                        // results under the same key the platform list reads back.
+                        let status_target = self
+                            .resolve_status_target(
+                                path,
+                                opts.target.as_deref(),
+                                opts.platform.as_deref(),
+                            )
+                            .await;
                         let _ = self
-                            .store_build_status_with_output(path, status_target.as_deref(), o.success, o.duration_secs, &o.output)
+                            .store_action_status_with_output(
+                                "build",
+                                path,
+                                status_target.as_deref(),
+                                o.success,
+                                o.duration_secs,
+                                &o.output,
+                            )
                             .await;
                         let mut val = serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}));
                         if let serde_json::Value::Object(ref mut m) = val {
@@ -1761,11 +1757,25 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 let opts = TestOptions { filter };
+                let status_target = self
+                    .resolve_status_target(
+                        path,
+                        args.get("target").and_then(|v| v.as_str()),
+                        platform.as_deref(),
+                    )
+                    .await;
                 match self.test_project(Path::new(path), &opts, platform).await {
                     Ok(o) => {
-                        // Persist test status for the Build detail tab header.
+                        // Record the test result PER TARGET as well, so the
+                        // platform list shows the last test — not just builds.
                         let _ = self
-                            .store_build_status(path, None, o.success, o.duration_secs)
+                            .store_action_status(
+                                "test",
+                                path,
+                                status_target.as_deref(),
+                                o.success,
+                                o.duration_secs,
+                            )
                             .await;
                         serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}))
                     }
@@ -1778,8 +1788,28 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     .get("platform")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let status_target = self
+                    .resolve_status_target(
+                        path,
+                        args.get("target").and_then(|v| v.as_str()),
+                        platform.as_deref(),
+                    )
+                    .await;
                 match self.clean_project(Path::new(path), platform).await {
-                    Ok(o) => serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"})),
+                    Ok(o) => {
+                        // Clean is a per-platform action too (`meson compile
+                        // --clean -C build-<platform>`), so record it per target.
+                        let _ = self
+                            .store_action_status(
+                                "clean",
+                                path,
+                                status_target.as_deref(),
+                                o.success,
+                                o.duration_secs,
+                            )
+                            .await;
+                        serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}))
+                    }
                     Err(e) => serde_json::json!({ "error": e }),
                 }
             }
@@ -1787,6 +1817,13 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
                 tracing::info!("build_lint: path={:?} exists={}", path, std::path::Path::new(path).exists());
                 let platform = args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let status_target = self
+                    .resolve_status_target(
+                        path,
+                        args.get("target").and_then(|v| v.as_str()),
+                        platform.as_deref(),
+                    )
+                    .await;
                 match self.lint_project_streaming(Path::new(path), platform).await {
                     Ok((o, mut events)) => {
                         tracing::info!("build_lint OK: success={} out_len={} events={}", o.success, o.output.len(), events.len());
@@ -1803,7 +1840,13 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         // Build tab shows them after the lint run.
                         let _ = self.ingest_diagnostics(&events, "lint").await;
                         let _ = self
-                            .store_build_status(path, None, o.success, o.duration_secs)
+                            .store_action_status(
+                                "lint",
+                                path,
+                                status_target.as_deref(),
+                                o.success,
+                                o.duration_secs,
+                            )
                             .await;
                         let mut val = serde_json::to_value(&o).unwrap_or(serde_json::json!({"error": "serialize"}));
                         if let serde_json::Value::Object(ref mut m) = val {
@@ -2772,24 +2815,27 @@ executable('{project_name}-{platform}',
         }
     }
 
-    /// Persist the latest build/test/lint status under a per-target graph
-    /// config key `build.last.<path>.<target>` (or `build.last.<path>` when no
-    /// target was selected) so the Build detail tab can show
-    /// "Last build succeeded/failed" + duration per platform. Builds run per
-    /// platform (rpi5/rock3c), so results MUST NOT overwrite each other.
-    async fn store_build_status(
+    /// Persist the latest per-platform action status under a graph config key
+    /// `<kind>.last.<path>.<target>` (or `<kind>.last.<path>` when no target was
+    /// selected) so the platform list / Build tab can show "last <kind>
+    /// succeeded/failed" + duration PER PLATFORM. `kind` is one of
+    /// "build" | "lint" | "test" | "clean"; each action runs per platform
+    /// (rpi5/rock3c), so results MUST NOT overwrite each other.
+    async fn store_action_status(
         &self,
+        kind: &str,
         path: &str,
         target: Option<&str>,
         success: bool,
         duration_secs: f64,
     ) -> Result<(), String> {
-        self.store_build_status_with_output(path, target, success, duration_secs, "")
+        self.store_action_status_with_output(kind, path, target, success, duration_secs, "")
             .await
     }
 
-    async fn store_build_status_with_output(
+    async fn store_action_status_with_output(
         &self,
+        kind: &str,
         path: &str,
         target: Option<&str>,
         success: bool,
@@ -2797,11 +2843,12 @@ executable('{project_name}-{platform}',
         output: &str,
     ) -> Result<(), String> {
         let key = match target {
-            Some(t) if !t.trim().is_empty() => format!("build.last.{}.{}", path, t),
-            _ => format!("build.last.{}", path),
+            Some(t) if !t.trim().is_empty() => format!("{kind}.last.{path}.{t}"),
+            _ => format!("{kind}.last.{path}"),
         };
         let value = serde_json::json!({
             "path": path,
+            "kind": kind,
             "success": success,
             "duration_secs": duration_secs,
             "timestamp": Utc::now().to_rfc3339(),
@@ -2820,6 +2867,28 @@ executable('{project_name}-{platform}',
             .map_err(|e| format!("MemoryGraph response lost: {e}"))?
             .map_err(|e| format!("MemoryGraph store failed: {e}"))?;
         Ok(())
+    }
+
+    /// Resolve the target name an action actually ran for, so per-platform
+    /// status lands under the SAME per-target key the UI reads back:
+    ///   • the explicit `target` argument, when the caller selected a target;
+    ///   • otherwise the target matching the requested `platform` (a platform /
+    ///     domain selection still builds one specific executable).
+    async fn resolve_status_target(
+        &self,
+        path: &str,
+        target: Option<&str>,
+        platform: Option<&str>,
+    ) -> Option<String> {
+        if let Some(t) = target.filter(|t| !t.trim().is_empty()) {
+            return Some(t.to_string());
+        }
+        let plat = platform.filter(|p| !p.trim().is_empty())?;
+        let md = self.get_analysis(path).await?;
+        md.targets
+            .iter()
+            .find(|t| t.platform == plat)
+            .map(|t| t.name.clone())
     }
 
     /// Resolve the normalized `build_spec` for the selected build target from

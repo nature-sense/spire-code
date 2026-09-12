@@ -1,14 +1,15 @@
 import SwiftUI
 import Foundation
 
-/// Per-target ("per platform") last-build state for a subproject's build
-/// targets: success dot, target name, and WHEN it was last built.
+/// Per-target ("per platform") last-action state for a subproject's build
+/// targets: the last BUILD result (dot + when + duration) plus compact
+/// lint/test badges.
 ///
-/// The Rust build manager persists build status PER TARGET under
-/// `build.last.<absPath>.<target>` (and `build.last.<absPath>` when a build ran
-/// with no target selected), so this reads it back with exactly the same
-/// absolute path and target name the build action used — any mismatch silently
-/// shows "never built" for a target that has in fact been built.
+/// The Rust build manager persists every per-platform action under
+/// `<kind>.last.<absPath>.<target>` — `kind` being `build` / `lint` / `test` /
+/// `clean` — so this reads each kind back with exactly the same absolute path
+/// and target name the action used. A mismatch here would silently show
+/// "never built" for a target that has in fact been built.
 ///
 /// This is the left panel's answer to "what is the state and date of the last
 /// build for each platform?".
@@ -24,8 +25,10 @@ struct PlatformBuildStatusList: View {
     /// (Build / Clean / Lint …) then drives that platform.
     var onSelect: (BuildTarget) -> Void
 
-    /// Last-build status keyed by target name.
-    @State private var statuses: [String: BuildStatus] = [:]
+    /// Last-action status per target name, one map per action kind.
+    @State private var buildStatuses: [String: BuildStatus] = [:]
+    @State private var lintStatuses: [String: BuildStatus] = [:]
+    @State private var testStatuses: [String: BuildStatus] = [:]
     @State private var loading = false
 
     /// Absolute path of the subproject: build status is stored under the
@@ -70,6 +73,8 @@ struct PlatformBuildStatusList: View {
                     Text(subtitle(target))
                         .font(.caption2)
                         .foregroundStyle(theme.textSecondary)
+                    if let l = lintStatuses[target.name] { badge("lint", l) }
+                    if let t = testStatuses[target.name] { badge("test", t) }
                 }
                 Spacer()
                 if target.platform != "host" {
@@ -89,7 +94,18 @@ struct PlatformBuildStatusList: View {
 
     // MARK: - Presentation
 
-    private func status(_ target: BuildTarget) -> BuildStatus? { statuses[target.name] }
+    /// Compact "✓ lint" / "✗ test" chip for a secondary action result.
+    private func badge(_ label: String, _ s: BuildStatus) -> some View {
+        HStack(spacing: 2) {
+            Image(systemName: s.success == true ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .font(.system(size: 8))
+                .foregroundStyle(s.success == true ? Color.green : Color.red)
+            Text(label).font(.system(size: 9))
+        }
+        .foregroundStyle(theme.textSecondary)
+    }
+
+    private func status(_ target: BuildTarget) -> BuildStatus? { buildStatuses[target.name] }
 
     private func dotSymbol(_ target: BuildTarget) -> String {
         switch status(target)?.success {
@@ -116,12 +132,21 @@ struct PlatformBuildStatusList: View {
     }
 
     private func helpText(_ target: BuildTarget) -> String {
-        guard let s = status(target) else {
-            return "\(target.name) — no recorded build for platform '\(target.platform)'"
+        var lines = ["\(target.name) — platform '\(target.platform)'"]
+        for (label, s) in [
+            ("build", buildStatuses[target.name]),
+            ("lint", lintStatuses[target.name]),
+            ("test", testStatuses[target.name]),
+        ] {
+            guard let s else {
+                lines.append("  \(label): never run")
+                continue
+            }
+            let when = s.lastBuild.map { Self.absolute($0) } ?? "unknown time"
+            let dur = s.durationSecs.map { String(format: " (%.1fs)", $0) } ?? ""
+            lines.append("  \(label): \(s.success == true ? "succeeded" : "failed") \(when)\(dur)")
         }
-        let when = s.lastBuild.map { Self.absolute($0) } ?? "unknown time"
-        let dur = s.durationSecs.map { String(format: " (%.1fs)", $0) } ?? ""
-        return "\(target.name) — \(s.success == true ? "succeeded" : "failed") \(when)\(dur)"
+        return lines.joined(separator: "\n")
     }
 
     private static func relative(_ date: Date) -> String {
@@ -140,13 +165,23 @@ struct PlatformBuildStatusList: View {
 
     private func load() async {
         loading = true
-        var out: [String: BuildStatus] = [:]
+        var build: [String: BuildStatus] = [:]
+        var lint: [String: BuildStatus] = [:]
+        var test: [String: BuildStatus] = [:]
         for target in subproject.buildTargets {
             if let s = await bridge.fetchBuildStatus(path: absPath, target: target.name) {
-                out[target.name] = s
+                build[target.name] = s
+            }
+            if let s = await bridge.fetchBuildStatus(path: absPath, target: target.name, kind: "lint") {
+                lint[target.name] = s
+            }
+            if let s = await bridge.fetchBuildStatus(path: absPath, target: target.name, kind: "test") {
+                test[target.name] = s
             }
         }
-        statuses = out
+        buildStatuses = build
+        lintStatuses = lint
+        testStatuses = test
         loading = false
     }
 }

@@ -832,11 +832,15 @@ final class SpireBridge {
 
     // MARK: - MCP Server Commands
 
-    /// Read the last persisted build status (success/duration/timestamp) for
-    /// a subproject path from the knowledge graph config.
-    func fetchBuildStatus(path: String, target: String? = nil) async -> BuildStatus? {
+    /// Read the last persisted action status (success/duration/timestamp) for a
+    /// subproject path from the knowledge graph config.
+    ///
+    /// `kind` selects the action to read — `"build"` (default), `"lint"`,
+    /// `"test"` or `"clean"` — mirroring the `<kind>.last.<path>[.<target>]`
+    /// keys the backend writes when an action finishes.
+    func fetchBuildStatus(path: String, target: String? = nil, kind: String = "build") async -> BuildStatus? {
         do {
-            var params: [String: Any] = ["path": path]
+            var params: [String: Any] = ["path": path, "kind": kind]
             if let target, !target.isEmpty {
                 params["target"] = target
             }
@@ -870,6 +874,60 @@ final class SpireBridge {
         } catch {
             return nil
         }
+    }
+
+    // MARK: - Git working-tree state
+
+    /// Summary of uncommitted changes in a working tree.
+    struct GitSummary: Sendable {
+        /// Total `git status --short` entries (modified + staged + deleted + untracked).
+        let changedCount: Int
+        /// Untracked (`??`) entries.
+        let untrackedCount: Int
+        /// The raw porcelain lines (trimmed) for a details list.
+        let lines: [String]
+        var isDirty: Bool { changedCount > 0 }
+    }
+
+    /// Parse `git status --short` output into counts + raw lines.
+    ///
+    /// Porcelain short format is `<XY> <path>`; untracked entries start `??`.
+    /// Kept as a pure function so it is unit-testable without a backend.
+    static func parseGitStatus(_ output: String) -> GitSummary {
+        let lines = output
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let untracked = lines.filter { $0.hasPrefix("??") }.count
+        return GitSummary(changedCount: lines.count, untrackedCount: untracked, lines: lines)
+    }
+
+    /// `git status --short` for a working tree (nil when not a repo / no git).
+    /// This is the safety net that makes a destructive action visible.
+    func gitStatus(path: String) async -> GitSummary? {
+        guard let json = await callBuildTool("git_status", args: ["path": path]),
+              let output = json["output"] as? String else { return nil }
+        return Self.parseGitStatus(output)
+    }
+
+    /// Full `git diff` text for a working tree (nil when unavailable).
+    func gitDiff(path: String) async -> String? {
+        guard let json = await callBuildTool("git_diff", args: ["path": path]),
+              json["error"] == nil else { return nil }
+        return json["output"] as? String
+    }
+
+    /// Stage every working-tree change (`git add -A`).
+    func gitStage(path: String) async -> Bool {
+        guard let json = await callBuildTool("git_stage", args: ["path": path]) else { return false }
+        return json["error"] == nil
+    }
+
+    /// Commit the staged changes with `message`. Returns git's output on success.
+    func gitCommit(path: String, message: String) async -> String? {
+        guard let json = await callBuildTool("git_commit", args: ["path": path, "message": message]),
+              json["error"] == nil else { return nil }
+        return json["output"] as? String
     }
 
     // MARK: - RAG

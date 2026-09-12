@@ -147,6 +147,10 @@ struct MainView: View {
                     .font(.headline)
             }
             Spacer()
+            // Uncommitted-changes safety net: always visible in the header and
+            // refreshed after every action, so a destructive step (a formatter
+            // or a mis-aimed "fix") can never pass unnoticed.
+            GitChangesBadge(project: project)
         }
         .padding(.horizontal, 12)
     }
