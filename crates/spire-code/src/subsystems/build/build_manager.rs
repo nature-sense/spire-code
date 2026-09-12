@@ -567,6 +567,25 @@ impl BuildManagerActor {
         }
     }
 
+    /// The scope root diagnostics are recorded under: the nearest ancestor of
+    /// `path` that looks like a project (`.git` / `.spire`), else `path` itself.
+    ///
+    /// The UI passes a SUBPROJECT path to Build/Lint/Verify, while diagnostics are
+    /// stored with absolute file paths under the project root — so matching the
+    /// raw argument would leave the previous run's diagnostics behind and the
+    /// Build tab would keep showing errors that no longer reproduce.
+    fn diagnostics_scope_root(path: &Path) -> PathBuf {
+        let mut dir = path.to_path_buf();
+        loop {
+            if dir.join(".git").exists() || dir.join(".spire").exists() {
+                return dir;
+            }
+            if !dir.pop() {
+                return path.to_path_buf();
+            }
+        }
+    }
+
     /// Delete the previous run's Diagnostic nodes of `build_type` for
     /// `project_root`, inside the caller's open transaction stream.
     ///
@@ -597,7 +616,7 @@ impl BuildManagerActor {
             .map_err(|e| format!("MemoryGraph response lost: {e}"))?
             .map_err(|e| format!("Diagnostic query failed: {e}"))?;
 
-        let root = project_root
+        let root = Self::diagnostics_scope_root(project_root)
             .to_string_lossy()
             .trim_end_matches('/')
             .to_string();
@@ -3532,6 +3551,35 @@ mod tests {
             "must be idempotent"
         );
         assert_eq!(ensure_impl_header_include(model_output, ""), model_output);
+    }
+
+    /// Verify is invoked with a SUBPROJECT path, but diagnostics are stored under
+    /// the project root — the scope root must be resolved by walking up to the
+    /// project marker, or the previous run's diagnostics are never superseded and
+    /// the Build tab keeps showing errors that no longer reproduce.
+    #[test]
+    fn diagnostics_scope_root_walks_up_to_the_project_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("app");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        assert_eq!(
+            BuildManagerActor::diagnostics_scope_root(&sub),
+            root,
+            "a subproject path must resolve to the project root"
+        );
+        assert_eq!(
+            BuildManagerActor::diagnostics_scope_root(&root),
+            root,
+            "the root resolves to itself"
+        );
+        // No marker anywhere → fall back to the path we were given (so a match
+        // can still be attempted rather than silently scoping to nothing).
+        let loose = tmp.path().join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        assert_eq!(BuildManagerActor::diagnostics_scope_root(&loose), loose);
     }
 
     // Serializes tests that mutate the PROCESS-GLOBAL `SPIRE_PLATFORM_DIR`

@@ -18,6 +18,9 @@ use super::generic_helpers::run_cmd;
 use crate::Actor;
 use spire_core::build_types::{BuildMetadata, BuildTarget};
 
+/// Compile database entry map: source file → (compiler flags, compiler).
+type CompileDb = std::collections::HashMap<String, (Vec<String>, String)>;
+
 /// Strip ANSI SGR escape sequences from compiler output (e.g. `\x1b[31m`).
 fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -931,7 +934,7 @@ impl MesonBuildModule {
         platform: Option<&str>,
     ) -> (
         std::path::PathBuf,
-        std::collections::HashMap<String, (Vec<String>, String)>,
+        CompileDb,
         Vec<String>,
     ) {
         let db_dir = if let Some(plat) = platform {
@@ -1012,7 +1015,7 @@ impl MesonBuildModule {
     fn load_compile_commands(
         &self,
         path: &Path,
-    ) -> std::collections::HashMap<String, (Vec<String>, String)> {
+    ) -> CompileDb {
         let mut search = path.to_path_buf();
         loop {
             let map = self.load_compile_commands_in(&search);
@@ -1056,13 +1059,12 @@ impl MesonBuildModule {
                     | "-idirafter"
                     | "--sysroot"
                     | "--gcc-install-dir"
-            ) {
-                if i + 1 < toks.len() {
-                    flags.push(t.to_string());
-                    flags.push(toks[i + 1].to_string());
-                    i += 2;
-                    continue;
-                }
+            ) && i + 1 < toks.len()
+            {
+                flags.push(t.to_string());
+                flags.push(toks[i + 1].to_string());
+                i += 2;
+                continue;
             }
             let keep = t.starts_with("-I")
                 || t.starts_with("-D")
@@ -1099,7 +1101,7 @@ impl MesonBuildModule {
     fn load_compile_commands_from(
         &self,
         build_dir: std::path::PathBuf,
-    ) -> std::collections::HashMap<String, (Vec<String>, String)> {
+    ) -> CompileDb {
         if build_dir.as_os_str().is_empty() {
             return self.load_compile_commands(std::path::Path::new("/"));
         }
@@ -1176,7 +1178,7 @@ impl MesonBuildModule {
     fn load_compile_commands_in(
         &self,
         path: &Path,
-    ) -> std::collections::HashMap<String, (Vec<String>, String)> {
+    ) -> CompileDb {
         let mut map = std::collections::HashMap::new();
         let Ok(rd) = std::fs::read_dir(path) else { return map };
         for entry in rd.flatten() {
@@ -1236,7 +1238,7 @@ impl MesonBuildModule {
     fn analyzer_for_file(
         &self,
         file: &str,
-        db: &std::collections::HashMap<String, (Vec<String>, String)>,
+        db: &CompileDb,
         db_dir: &std::path::Path,
     ) -> (String, Vec<String>) {
         let mut flags: Vec<String> = Vec::new();
@@ -2478,10 +2480,13 @@ mod tests {
         // Drain the streamed progress events, or the sends block.
         tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
+        // The UI passes the SELECTED SUBPROJECT's absolute path (see
+        // MainView.runTool → sub.absolutePath(in: project.root)), not the project
+        // root — so exercise that exact calling convention.
         crate::Actor::handle(
             &mut module,
             BuildModuleMessage::LintStreaming {
-                path: root.clone(),
+                path: root.join("app"),
                 metadata,
                 platform: Some("rpi5".to_string()),
                 event_tx,
@@ -2513,7 +2518,7 @@ mod tests {
     #[test]
     fn analyzer_writes_no_plist_into_the_project() {
         let m = MesonBuildModule::new();
-        let db: std::collections::HashMap<String, (Vec<String>, String)> =
+        let db: CompileDb =
             [("a.cpp".to_string(), (vec!["-DA=1".to_string()], "c++".to_string()))]
                 .into_iter()
                 .collect();
