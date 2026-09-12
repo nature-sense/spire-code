@@ -4079,25 +4079,27 @@ void CameraHALR3::shutdown() { }
         let coverage = hal_platform_coverage_map(root);
         eprintln!("COVERAGE MAP: {coverage:#?}");
 
-        // Expected: rpi5 implements camera_hal, h264_encoder, jpeg_encoder
-        // (7 methods); missing classifier_hal (6) + inference_hal (6) +
-        // video_scaler (2) = 14 missing, 0 drifted.
+        // rpi5's HAL is now COMPLETE: all six interfaces (camera, h264_encoder,
+        // jpeg_encoder, classifier, inference, video_scaler) are implemented, so
+        // nothing is missing and nothing has drifted. (This expectation used to
+        // read 14 missing, back when classifier/inference/video_scaler were not
+        // yet implemented for rpi5.)
         let rpi5 = coverage.get("rpi5").expect("rpi5 coverage");
         let rpi5_missing: usize = rpi5.values().map(|c| c.missing.len()).sum();
         let rpi5_drifted: usize = rpi5.values().map(|c| c.drifted.len()).sum();
-        assert_eq!(rpi5_missing, 14, "rpi5 missing must be 14: {rpi5:#?}");
+        assert_eq!(rpi5_missing, 0, "rpi5 missing must be 0: {rpi5:#?}");
         assert_eq!(rpi5_drifted, 0, "rpi5 drifted must be 0: {rpi5:#?}");
 
-        // rock3c implements camera_hal, video_scaler, h264_encoder (via
-        // mpp_h264_encoder) and inference_hal (rknn/python/subprocess — but
-        // these impls define only init/detect/shutdown, NOT the getters
-        // last_inference_us/input_width/input_height). True gaps:
-        // classifier_hal (6) + inference_hal getters (3) + jpeg_encoder (1)
-        // = 10 missing, 0 drifted.
+        // rock3c's HAL is now COMPLETE as well: the files that used to be the
+        // gaps — classifier_hal_rock3c.cpp, jpeg_encoder_rock3c.cpp and
+        // inference_hal_rock3c.cpp (which supplies the
+        // last_inference_us/input_width/input_height getters) — now exist, so
+        // the old 10 missing (classifier 6 + inference getters 3 + jpeg 1) are
+        // filled: 0 missing, 0 drifted.
         let rock3c = coverage.get("rock3c").expect("rock3c coverage");
         let rock3c_missing: usize = rock3c.values().map(|c| c.missing.len()).sum();
         let rock3c_drifted: usize = rock3c.values().map(|c| c.drifted.len()).sum();
-        assert_eq!(rock3c_missing, 10, "rock3c missing must be 10: {rock3c:#?}");
+        assert_eq!(rock3c_missing, 0, "rock3c missing must be 0: {rock3c:#?}");
         assert_eq!(rock3c_drifted, 0, "rock3c drifted must be 0: {rock3c:#?}");
     }
 

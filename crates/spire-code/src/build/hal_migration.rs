@@ -851,9 +851,36 @@ fn rel_of(p: &Path, root: &Path) -> &'static str {
 
 /// Discovered target platforms: canonical `hal/implementations/*` subdirs,
 /// plus legacy-style top-level dirs that contain source files.
+///
+/// The legacy branch is deliberately conservative: shared code (`app/`),
+/// documentation, test harnesses and EVERY Meson build directory are not
+/// platforms. Reporting them produced a wall of bogus
+/// "Missing HAL implementation for platform 'build-rpi5'" errors that buried
+/// the real signal (the canonical `hal/implementations/*` branch still finds a
+/// genuine platform even if its name is skipped here).
 fn top_level_platforms(root: &Path) -> Vec<String> {
     let mut v = Vec::new();
-    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+    let skip = [
+        "toolkit",
+        "hal",
+        "subprojects",
+        ".git",
+        // Shared / non-platform top-level dirs.
+        "app",
+        "docs",
+        "doc",
+        "host",
+        "tests",
+        "test",
+        "examples",
+        "scripts",
+        "cmake",
+        "third_party",
+        "deps",
+        "data",
+        "include",
+        "src",
+    ];
 
     // Canonical: hal/implementations/<plat>/
     if let Ok(entries) = std::fs::read_dir(root.join("hal/implementations")) {
@@ -874,7 +901,16 @@ fn top_level_platforms(root: &Path) -> Vec<String> {
             let p = e.path();
             if !p.is_dir() { continue; }
             let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
-            if skip.contains(&name) || name.starts_with(".") || v.contains(&name.to_string()) { continue; }
+            // `build*` covers build/, build-native/ and every per-platform
+            // build dir (build-a7s, build-rpi5, build-rock3c, build-host, …):
+            // they are outputs, never platforms.
+            if skip.contains(&name)
+                || name.starts_with("build")
+                || name.starts_with('.')
+                || v.contains(&name.to_string())
+            {
+                continue;
+            }
             // Only directories that look like platform targets (contain sources).
             let looks_platform = std::fs::read_dir(&p)
                 .map(|rd| rd.filter_map(|x| x.ok()).any(|x| x.path().is_file()))
@@ -899,6 +935,33 @@ mod tests {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, content).unwrap();
+    }
+
+    /// Platform discovery must ignore build outputs and shared dirs: reporting
+    /// them produced a wall of bogus "Missing HAL implementation for platform
+    /// 'build-rpi5'" errors that buried the real signal.
+    #[test]
+    fn top_level_platforms_ignores_build_and_shared_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Real platform layout (canonical).
+        write(root, "hal/implementations/rpi5/camera_hal_rpi5.cpp", "int x;");
+        write(root, "hal/implementations/rock3c/camera_hal_rock3c.cpp", "int x;");
+        // Shared code and build outputs — none of these is a platform.
+        write(root, "app/main.cpp", "int main(){return 0;}");
+        write(root, "docs/README.md", "# docs");
+        write(root, "build-rpi5/compile_commands.json", "[]");
+        write(root, "build-host/notes.cpp", "int y;");
+
+        let plats = top_level_platforms(root);
+        assert!(plats.contains(&"rpi5".to_string()), "real platform kept: {plats:?}");
+        assert!(plats.contains(&"rock3c".to_string()), "real platform kept: {plats:?}");
+        for bad in ["app", "docs", "build-rpi5", "build-host"] {
+            assert!(
+                !plats.contains(&bad.to_string()),
+                "'{bad}' must not be reported as a HAL platform: {plats:?}"
+            );
+        }
     }
 
     const CONTRACT_HPP: &str = "class CameraHAL {\npublic:\n    virtual bool start() = 0;\n};\n";

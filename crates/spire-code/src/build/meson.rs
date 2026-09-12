@@ -919,7 +919,24 @@ impl MesonBuildModule {
             self.find_compile_db_dir(path)
         };
         let db = self.load_compile_commands_from(db_dir.clone());
-        let files = self.source_files(path);
+        // Only analyse the translation units THIS build compiles. `source_files`
+        // harvests the union of every `build*/compile_commands.json` in the tree,
+        // so a per-platform lint (e.g. rpi5) would otherwise also analyse the
+        // OTHER platforms' sources — which have no entry in this build's database
+        // and therefore no flags, producing bogus "file not found" errors.
+        // Keys of the compile DB are exactly the paths (and flag sets) the
+        // analyzer needs, so analysing them gives an exact flag match.
+        let files = if db.is_empty() {
+            self.source_files(path)
+        } else {
+            let mut files: Vec<String> = db
+                .keys()
+                .filter(|f| !Self::is_vendored(Path::new(f)) && Path::new(f).exists())
+                .cloned()
+                .collect();
+            files.sort();
+            files
+        };
         if files.is_empty() {
             return Ok(BuildOutput {
                 success: true,
@@ -990,6 +1007,74 @@ impl MesonBuildModule {
         std::collections::HashMap::new()
     }
 
+    /// Extract the compiler flags the static analyzer must reuse from a
+    /// `compile_commands.json` entry's command line.
+    ///
+    /// Besides the obvious include/define/warning flags this MUST keep the
+    /// cross-compilation DRIVER flags — `-target <triple>`, `--sysroot=<path>`,
+    /// `--gcc-install-dir=<path>` (two-token flags carry their value in the
+    /// NEXT token). Dropping them makes the analyzer compile the target's
+    /// sources as HOST code, so every cross header (`<cstdlib>`, the sysroot's
+    /// libc) fails to resolve and the run reports a wall of bogus
+    /// "file not found" errors even though the real build is green.
+    ///
+    /// Relative `-I` paths are made absolute against the entry's `directory` so
+    /// the analyzer works regardless of cwd.
+    fn analyzer_flags(cmd: &str, dir: &str) -> Vec<String> {
+        let toks: Vec<&str> = cmd.split_whitespace().collect();
+        let mut flags: Vec<String> = Vec::new();
+        let mut i = 1; // token 0 is the compiler (possibly behind sccache)
+        while i < toks.len() {
+            let t = toks[i];
+            // Driver flags whose VALUE is the next token — keep them paired.
+            if matches!(
+                t,
+                "-target"
+                    | "-isystem"
+                    | "-isysroot"
+                    | "-imacros"
+                    | "-include"
+                    | "-idirafter"
+                    | "--sysroot"
+                    | "--gcc-install-dir"
+            ) {
+                if i + 1 < toks.len() {
+                    flags.push(t.to_string());
+                    flags.push(toks[i + 1].to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            let keep = t.starts_with("-I")
+                || t.starts_with("-D")
+                || t.starts_with("-std=")
+                || t.starts_with("-W")
+                || t.starts_with("-f")
+                || t.starts_with("-m")
+                || t.starts_with("-isystem")
+                || t.starts_with("-isysroot")
+                || t.starts_with("-stdlib=")
+                || t.starts_with("--sysroot=")
+                || t.starts_with("--gcc-install-dir=")
+                || t.starts_with("-target=");
+            if keep {
+                if !dir.is_empty() && t.starts_with("-I") && t.len() > 2 {
+                    let p = &t[2..];
+                    if !p.starts_with('/') {
+                        let abs = std::path::Path::new(dir).join(p);
+                        flags.push(format!("-I{}", abs.to_string_lossy()));
+                    } else {
+                        flags.push(t.to_string());
+                    }
+                } else {
+                    flags.push(t.to_string());
+                }
+            }
+            i += 1;
+        }
+        flags
+    }
+
     /// Load compile_commands.json from a specific build dir (path = the dir
     /// containing the compile DB, or "" to use the legacy walk-up discovery).
     fn load_compile_commands_from(
@@ -1021,28 +1106,7 @@ impl MesonBuildModule {
             } else {
                 build_dir.join(file).to_string_lossy().to_string()
             };
-            let flags: Vec<String> = cmd
-                .split_whitespace()
-                .skip(1)
-                .filter(|t| {
-                    t.starts_with("-I") || t.starts_with("-D") || t.starts_with("-std=")
-                        || t.starts_with("-W") || t.starts_with("-f") || t.starts_with("-m")
-                        || t.starts_with("-isystem") || t.starts_with("-isysroot")
-                })
-                .map(|t| {
-                    if !dir.is_empty() && t.starts_with("-I") && t.len() > 2 {
-                        let p = &t[2..];
-                        if !p.starts_with('/') {
-                            let abs = std::path::Path::new(dir).join(p);
-                            format!("-I{}", abs.to_string_lossy())
-                        } else {
-                            t.to_string()
-                        }
-                    } else {
-                        t.to_string()
-                    }
-                })
-                .collect();
+            let flags = Self::analyzer_flags(cmd, dir);
             let comp_tokens: Vec<&str> = cmd.split_whitespace().collect();
             let compiler = if let Some(first) = comp_tokens.first() {
                 if first.ends_with("sccache") && comp_tokens.len() > 1 {
@@ -1125,30 +1189,7 @@ impl MesonBuildModule {
                 } else {
                     path.join(file).to_string_lossy().to_string()
                 };
-                let flags: Vec<String> = cmd
-                    .split_whitespace()
-                    .skip(1)
-                    .filter(|t| {
-                        t.starts_with("-I") || t.starts_with("-D") || t.starts_with("-std=")
-                            || t.starts_with("-W") || t.starts_with("-f") || t.starts_with("-m")
-                            || t.starts_with("-isystem") || t.starts_with("-isysroot")
-                    })
-                    .map(|t| {
-                        // -I paths are relative to the BUILD dir; make them
-                        // absolute so lint works regardless of the cwd.
-                        if !dir.is_empty() && t.starts_with("-I") && t.len() > 2 {
-                            let p = &t[2..];
-                            if !p.starts_with('/') {
-                                let abs = std::path::Path::new(dir).join(p);
-                                format!("-I{}", abs.to_string_lossy())
-                            } else {
-                                t.to_string()
-                            }
-                        } else {
-                            t.to_string()
-                        }
-                    })
-                    .collect();
+                let flags = Self::analyzer_flags(cmd, dir);
                 // The first token of the compile command is the compiler
                 // (often wrapped by sccache: "sccache c++ ..."). Resolve it so
                 // lint runs with the same compiler the build uses — otherwise
@@ -1208,6 +1249,12 @@ impl MesonBuildModule {
             // The compile DB has -fdiagnostics-color=always; disable so the
             // captured output (and the diagnostics parser) has no ANSI codes.
             "-fno-diagnostics-color".to_string(),
+            // Without -o clang dumps `<stem>.plist` into the CURRENT DIRECTORY —
+            // i.e. into the user's project root, where it lands as untracked
+            // junk and trips the git-dirty badge. All lint reads are the
+            // diagnostics on stderr, which are emitted either way.
+            "-o".to_string(),
+            "/dev/null".to_string(),
         ];
         // Prefer flags from the compile database (already absolutized).
         // Fall back to db_dir + libc++ stdlib so headers resolve.
@@ -2229,6 +2276,190 @@ mod tests {
             discovered.contains("build-"),
             "unexpected fallback build dir: {discovered}"
         );
+    }
+
+    /// The static analyzer MUST inherit the cross-compilation DRIVER flags from
+    /// `compile_commands.json`. Dropping `-target`/`--sysroot` made rpi5 "Verify"
+    /// report a wall of bogus errors (`'stdlib.h' file not found`) even though
+    /// the real build was green.
+    #[test]
+    fn analyzer_flags_keep_the_cross_toolchain_flags() {
+        let cmd = "/opt/cross/toolchain/bin/aarch64-linux-gnu-clang++ \
+                   -Ibuild/foo.p -I../app -I/opt/cross/sysroot/rpi5/usr/include \
+                   -DHAVE_RPI5 -std=c++2a -O2 -Wall \
+                   -target aarch64-linux-gnu \
+                   --sysroot=/opt/cross/sysroot/rpi5 \
+                   -march=armv8.2-a+crc \
+                   -c ../app/main.cpp";
+        let flags = MesonBuildModule::analyzer_flags(cmd, "/Users/me/ai-traps");
+
+        assert!(
+            flags
+                .windows(2)
+                .any(|w| w[0] == "-target" && w[1] == "aarch64-linux-gnu"),
+            "-target and its triple must stay paired: {flags:?}"
+        );
+        assert!(
+            flags.iter().any(|f| f == "--sysroot=/opt/cross/sysroot/rpi5"),
+            "--sysroot must be kept: {flags:?}"
+        );
+        assert!(
+            flags.iter().any(|f| f.starts_with("-march=")),
+            "-march kept: {flags:?}"
+        );
+        assert!(
+            flags.iter().any(|f| f == "-DHAVE_RPI5"),
+            "defines kept: {flags:?}"
+        );
+        // Output/source args must NOT leak into the analyzer command line.
+        assert!(!flags.iter().any(|f| f == "-c"), "-c must be dropped: {flags:?}");
+        assert!(
+            !flags.iter().any(|f| f.ends_with("main.cpp")),
+            "the source file must not appear as a flag: {flags:?}"
+        );
+    }
+
+    /// The two-token `--gcc-install-dir <path>` form (used by a7s) must survive.
+    #[test]
+    fn analyzer_flags_keep_gcc_install_dir() {
+        let cmd = "clang++ -target aarch64-linux-gnu --gcc-install-dir /opt/cross/lib/gcc \
+                   -I../hal/api -c ../hal/implementations/a7s/x.cpp";
+        let flags = MesonBuildModule::analyzer_flags(cmd, "");
+        assert!(
+            flags
+                .windows(2)
+                .any(|w| w[0] == "--gcc-install-dir" && w[1] == "/opt/cross/lib/gcc"),
+            "two-token --gcc-install-dir must stay paired: {flags:?}"
+        );
+    }
+
+    /// Relative `-I` paths are absolutized against the entry's directory so the
+    /// analyzer resolves headers regardless of cwd.
+    #[test]
+    fn analyzer_flags_absolutize_relative_includes() {
+        let flags = MesonBuildModule::analyzer_flags("clang++ -Iinclude -c a.cpp", "/proj/root");
+        assert!(
+            flags.iter().any(|f| f == "-I/proj/root/include"),
+            "relative -I must be made absolute: {flags:?}"
+        );
+    }
+
+    /// Opt-in guard against the REAL rpi5 compile database: every entry that
+    /// carries `--sysroot=` must keep `--sysroot` AND `-target <triple>` after
+    /// extraction. Cheap (no analyzer run).
+    ///
+    /// Run with: SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps cargo test …
+    #[test]
+    fn real_rpi5_compile_db_keeps_cross_toolchain_flags() {
+        let Ok(root) = std::env::var("SPIRE_AI_TRAPS_INTEGRATION") else {
+            eprintln!("skipped: set SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps");
+            return;
+        };
+        let db = std::path::Path::new(&root).join("build-rpi5/compile_commands.json");
+        let Ok(content) = std::fs::read_to_string(&db) else {
+            eprintln!("skipped: {} missing", db.display());
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&content).expect("valid compile db");
+        let arr = v.as_array().expect("compile db is an array");
+
+        let mut checked = 0;
+        for ent in arr {
+            let cmd = ent.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            let dir = ent.get("directory").and_then(|c| c.as_str()).unwrap_or("");
+            if !cmd.contains("--sysroot=") {
+                continue;
+            }
+            let flags = MesonBuildModule::analyzer_flags(cmd, dir);
+            assert!(
+                flags.iter().any(|f| f.starts_with("--sysroot=")),
+                "lost --sysroot: {flags:?}"
+            );
+            assert!(
+                flags.windows(2).any(|w| w[0] == "-target"),
+                "lost -target <triple>: {flags:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no cross-compile entries found in {}", db.display());
+    }
+
+    /// Opt-in END-TO-END guard for the user-facing symptom: `Verify` on rpi5
+    /// used to report a wall of `fatal error: 'stdlib.h' file not found` because
+    /// the analyzer lost the toolchain's `-target`/`--sysroot`, and it analysed
+    /// every platform's sources rather than the rpi5 build's. Linting the real
+    /// cross-compiled tree must now produce no errors at all (genuine analyzer
+    /// warnings from the project's own code are reported as warnings) — and leave
+    /// no analyzer reports behind in the project.
+    ///
+    /// Run with: SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps cargo test …
+    #[tokio::test]
+    async fn lint_real_ai_traps_rpi5_reports_no_issues() {
+        let Ok(root) = std::env::var("SPIRE_AI_TRAPS_INTEGRATION") else {
+            eprintln!("skipped: set SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        if !root.join("build-rpi5/compile_commands.json").exists() {
+            eprintln!("skipped: build-rpi5 is not configured");
+            return;
+        }
+        let out = MesonBuildModule::new()
+            .lint(&root, Some("rpi5"))
+            .await
+            .expect("lint runs");
+        let head: String = out.output.lines().take(8).collect::<Vec<_>>().join("\n");
+        assert!(
+            !out.output.contains("file not found"),
+            "cross headers must resolve — the analyzer needs -target/--sysroot:\n{head}"
+        );
+        assert!(
+            !out.output.contains("error generated"),
+            "the green rpi5 build must lint without compile errors:\n{head}"
+        );
+        assert!(out.success, "lint must report success:\n{head}");
+        // A per-platform lint analyses only that platform's translation units —
+        // never another platform's sources (they have no flags in this build's
+        // compile database).
+        assert!(
+            !out.output.contains("/build-a7s/") && !out.output.contains("/build-rock3c/"),
+            "a per-platform lint must not analyse other platforms' sources:\n{head}"
+        );
+        // …and no analyzer report may be dumped into the project root.
+        let stray: Vec<String> = std::fs::read_dir(&root)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.ends_with(".plist"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(stray.is_empty(), "analyzer left reports in the project: {stray:?}");
+    }
+
+    /// The analyzer must not drop `<stem>.plist` files into the working
+    /// directory (which is the user's project root): they land as untracked junk
+    /// and trip the git-dirty badge.
+    #[test]
+    fn analyzer_writes_no_plist_into_the_project() {
+        let m = MesonBuildModule::new();
+        let db: std::collections::HashMap<String, (Vec<String>, String)> =
+            [("a.cpp".to_string(), (vec!["-DA=1".to_string()], "c++".to_string()))]
+                .into_iter()
+                .collect();
+        let (_program, args) = m.analyzer_for_file("a.cpp", &db, std::path::Path::new("/tmp"));
+
+        let pos = args
+            .iter()
+            .position(|a| a == "-o")
+            .expect("-o must be passed so no plist is written: {args:?}");
+        assert_eq!(
+            args[pos + 1],
+            "/dev/null",
+            "the analysis report must be discarded: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--analyze"), "still analyzing: {args:?}");
+        assert!(args.iter().any(|a| a == "a.cpp"), "source still analysed: {args:?}");
     }
 
     /// Vendored / third-party code must never be linted, reformatted or
