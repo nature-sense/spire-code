@@ -1483,17 +1483,10 @@ struct ActionPanelView: View {
     private func runTool(_ tool: String) {
         guard let sub = selectedSubproject else { return }
 
-        // Resolve the subproject directory to an absolute path.
-        let cleanPath = sub.path.hasSuffix("/") ? String(sub.path.dropLast()) : sub.path
-        let absPath: String
-        if cleanPath.hasPrefix("/") {
-            absPath = cleanPath
-        } else if cleanPath.isEmpty {
-            absPath = project.root
-        } else {
-            let root = project.root.hasSuffix("/") ? String(project.root.dropLast()) : project.root
-            absPath = root + "/" + cleanPath
-        }
+        // Resolve the subproject directory to an absolute path — EXACTLY the
+        // form under which build status / diagnostics are keyed in the graph
+        // (see SubprojectInfo.absolutePath(in:)).
+        let absPath = sub.absolutePath(in: project.root)
 
         // DEBUG: log which subproject the tool is targeting.
         Logger(subsystem: "spire", category: "runTool").info("tool=\(tool) sub=\(sub.name) selectedTarget=\(selectedBuildTarget ?? "nil") path=\(sub.path) abs=\(absPath)")

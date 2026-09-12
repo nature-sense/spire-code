@@ -72,3 +72,45 @@ func deletedEventsDoNotAddNodes() {
     #expect(tree.directories.isEmpty)
     #expect(tree.files.isEmpty)
 }
+
+// MARK: - Subproject absolute-path resolution (build-status graph key)
+
+/// Build status is persisted under `build.last.<absoluteSubprojectPath>.<target>`.
+/// If the READER resolves a different string than the WRITER, every platform
+/// shows "never built" forever. The empty-path case (single-root projects like
+/// ai-traps, whose HAL subproject path is "") is the one that bit us: it must
+/// resolve to the project root with NO trailing slash.
+@Test("empty subproject path resolves to the project root without a trailing slash")
+func emptySubprojectPathResolvesToRoot() {
+    let sub = SubprojectInfo(name: "ai-traps", kind: .project, buildSystem: "Meson",
+                             path: "", language: "C/C++")
+    let abs = sub.absolutePath(in: "/Users/me/ai-traps")
+    #expect(abs == "/Users/me/ai-traps")
+    #expect(!abs.hasSuffix("/"), "a trailing slash breaks the build.last.<path> key")
+}
+
+@Test("relative subproject path is joined with exactly one slash")
+func relativeSubprojectPathJoinsRoot() {
+    let sub = SubprojectInfo(name: "hal", kind: .directory, buildSystem: "Meson",
+                             path: "hal", language: "C/C++")
+    #expect(sub.absolutePath(in: "/Users/me/ai-traps") == "/Users/me/ai-traps/hal")
+}
+
+@Test("absolute subproject path is used as-is")
+func absoluteSubprojectPathUnchanged() {
+    let sub = SubprojectInfo(name: "x", kind: .directory, buildSystem: "Meson",
+                             path: "/opt/elsewhere", language: "C/C++")
+    #expect(sub.absolutePath(in: "/Users/me/ai-traps") == "/opt/elsewhere")
+}
+
+@Test("trailing slashes on root and path are normalised away")
+func trailingSlashesNormalised() {
+    let sub = SubprojectInfo(name: "hal", kind: .directory, buildSystem: "Meson",
+                             path: "hal/", language: "C/C++")
+    #expect(sub.absolutePath(in: "/Users/me/ai-traps/") == "/Users/me/ai-traps/hal")
+
+    let empty = SubprojectInfo(name: "p", kind: .project, buildSystem: "Meson",
+                               path: "", language: "C/C++")
+    #expect(empty.absolutePath(in: "/Users/me/ai-traps/") == "/Users/me/ai-traps")
+}
+

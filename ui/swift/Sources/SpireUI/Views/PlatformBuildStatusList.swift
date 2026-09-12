@@ -30,10 +30,7 @@ struct PlatformBuildStatusList: View {
 
     /// Absolute path of the subproject: build status is stored under the
     /// ABSOLUTE path, so the read must use the same form the build used.
-    private var absPath: String {
-        let root = project.root.hasSuffix("/") ? project.root : project.root + "/"
-        return subproject.path.hasPrefix("/") ? subproject.path : root + subproject.path
-    }
+    private var absPath: String { subproject.absolutePath(in: project.root) }
 
     /// Reload trigger: project/subproject identity plus the tick the app bumps
     /// after every completed build action (so the dates refresh immediately).

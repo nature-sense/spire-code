@@ -1716,9 +1716,27 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         let _ = self.ingest_diagnostics(&events, "build").await;
                         // Persist the build status (success/duration + raw output)
                         // for the Build detail tab header, keyed PER TARGET so
-                        // building rock3c and rpi5 store separate results.
+                        // building rock3c and rpi5 store separate results. When
+                        // the caller picked a PLATFORM (not a target) the raw
+                        // `target` arg is empty — resolve the target that
+                        // platform build actually compiled, otherwise the status
+                        // would land under a bare `build.last.<path>` key that no
+                        // per-target "last built" lookup can ever find.
+                        let mut status_target =
+                            opts.target.clone().filter(|t| !t.trim().is_empty());
+                        if status_target.is_none() {
+                            if let Some(plat) = opts.platform.as_deref() {
+                                if let Some(md) = self.get_analysis(&path).await {
+                                    status_target = md
+                                        .targets
+                                        .iter()
+                                        .find(|t| t.platform == plat)
+                                        .map(|t| t.name.clone());
+                                }
+                            }
+                        }
                         let _ = self
-                            .store_build_status_with_output(path, opts.target.as_deref(), o.success, o.duration_secs, &o.output)
+                            .store_build_status_with_output(path, status_target.as_deref(), o.success, o.duration_secs, &o.output)
                             .await;
                         let mut val = serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}));
                         if let serde_json::Value::Object(ref mut m) = val {

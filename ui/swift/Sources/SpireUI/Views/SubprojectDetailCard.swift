@@ -19,8 +19,7 @@ struct SubprojectDetailCard: View {
     /// would miss the stored results (key mismatch).
     private var absPath: String {
         guard let root = bridge.projectInfo?.root else { return subproject.path }
-        let rootPath = root.hasSuffix("/") ? root : root + "/"
-        return subproject.path.hasPrefix("/") ? subproject.path : rootPath + subproject.path
+        return subproject.absolutePath(in: root)
     }
 
     @State private var selectedTab: String = "Sources"

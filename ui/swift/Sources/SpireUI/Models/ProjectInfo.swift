@@ -215,6 +215,28 @@ struct SubprojectInfo: Codable, Identifiable {
     }
 }
 
+/// Absolute path of this subproject on disk — EXACTLY the form the build tools
+/// receive, and therefore the form under which build status and diagnostics are
+/// keyed in the knowledge graph (`build.last.<abs>.<target>`).
+///
+/// Rules (must match the action runner's own resolution):
+///   • already-absolute `path` → used as-is
+///   • empty `path`            → the project root (NO trailing slash)
+///   • relative `path`         → `<projectRoot>/<path>` (no double slash)
+///
+/// A divergence here (e.g. a trailing slash when the path is empty) makes the
+/// build-status reader miss the key the writer produced, so every target shows
+/// "never built" even after a successful build.
+extension SubprojectInfo {
+    func absolutePath(in projectRoot: String) -> String {
+        let root = projectRoot.hasSuffix("/") ? String(projectRoot.dropLast()) : projectRoot
+        let p = path.hasSuffix("/") ? String(path.dropLast()) : path
+        if p.hasPrefix("/") { return p }
+        if p.isEmpty { return root }
+        return root + "/" + p
+    }
+}
+
 /// Editability constraint for LLM modifications inside a domain.
 enum DomainEditability: String, Codable {
     case readOnly = "read_only"
