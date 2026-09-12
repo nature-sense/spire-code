@@ -1286,7 +1286,12 @@ impl BuildManagerActor {
     }
 
     /// Test: same pattern as build.
-    async fn test_project(&self, path: &Path, opts: &TestOptions) -> Result<BuildOutput, String> {
+    async fn test_project(
+        &self,
+        path: &Path,
+        opts: &TestOptions,
+        platform: Option<String>,
+    ) -> Result<BuildOutput, String> {
         let path_str = path.to_string_lossy().to_string();
         let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
             format!(
@@ -1311,6 +1316,7 @@ impl BuildManagerActor {
                 path: path.to_path_buf(),
                 metadata,
                 opts: opts.clone(),
+                platform,
                 reply_to: tx,
             })
             .await
@@ -1321,7 +1327,7 @@ impl BuildManagerActor {
 
     /// Unified LLM tool entry point: routes build/* tools to handlers.
     /// Clean: same pattern as build — route to module via a proper message.
-    async fn clean_project(&self, path: &Path) -> Result<BuildOutput, String> {
+    async fn clean_project(&self, path: &Path, platform: Option<String>) -> Result<BuildOutput, String> {
         let metadata = self
             .get_analysis(path.to_string_lossy().as_ref())
             .await
@@ -1348,6 +1354,7 @@ impl BuildManagerActor {
             .send(BuildModuleMessage::Clean {
                 path: path.to_path_buf(),
                 metadata,
+                platform,
                 reply_to: tx,
             })
             .await
@@ -1731,8 +1738,12 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     .get("filter")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let opts = TestOptions { filter };
-                match self.test_project(Path::new(path), &opts).await {
+                match self.test_project(Path::new(path), &opts, platform).await {
                     Ok(o) => {
                         // Persist test status for the Build detail tab header.
                         let _ = self
@@ -1745,7 +1756,11 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
             }
             "build_clean" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-                match self.clean_project(Path::new(path)).await {
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                match self.clean_project(Path::new(path), platform).await {
                     Ok(o) => serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"})),
                     Err(e) => serde_json::json!({ "error": e }),
                 }
@@ -2849,7 +2864,32 @@ executable('{project_name}-{platform}',
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Project directory path" },
-                        "filter": { "type": "string", "description": "Optional test name filter" }
+                        "filter": { "type": "string", "description": "Optional test name filter" },
+                        "platform": { "type": "string", "description": "Optional cross-platform target (e.g. host/rpi5) selecting which build-<platform> Meson dir to test in" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "build_clean".to_string(),
+                description: "Clean a project directory using its detected build system (removes build artifacts, keeps the configured build dir). Requires prior build_analyze.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project directory path" },
+                        "platform": { "type": "string", "description": "Optional cross-platform target (e.g. host/rpi5) pinning the build-<platform> Meson dir to clean" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "build_lint".to_string(),
+                description: "Lint/analyze a project directory using its detected build system and return structured diagnostics. Requires prior build_analyze.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project directory path" },
+                        "platform": { "type": "string", "description": "Optional cross-platform target (e.g. host/rpi5) selecting which build-<platform> Meson dir's compile database to analyze" }
                     },
                     "required": ["path"]
                 }),
@@ -2871,6 +2911,18 @@ executable('{project_name}-{platform}',
                 name: "build_list_modules".to_string(),
                 description: "List the registered build modules and their capabilities (config files, languages).".to_string(),
                 input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "build_format".to_string(),
+                description: "Run the project's formatter (e.g. clang-format) via the language module.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project directory path" },
+                        "language": { "type": "string", "description": "Language/module to route to" }
+                    },
+                    "required": ["path"]
+                }),
             },
             spire_core::actors::ToolInfo {
                 name: "build_fix".to_string(),
@@ -3022,7 +3074,9 @@ impl Actor for BuildManagerActor {
                 opts,
                 reply_to,
             } => {
-                let result = self.test_project(&path, &opts).await;
+                // Legacy manager-level path (no platform context); the
+                // platform-aware entry point is the `build_test` tool.
+                let result = self.test_project(&path, &opts, None).await;
                 let _ = reply_to.send(result);
             }
 
@@ -3287,6 +3341,36 @@ mod tests {
             missing.contains("standard SDK and drivers"),
             "an absent platform yaml must fall back: {missing}"
         );
+    }
+
+    /// Every action the UI's action row can invoke MUST be advertised by
+    /// `list_tools()`: `build_default_registry` registers exactly the tools
+    /// `ListTools` returns, so a tool handled by `call_tool` but missing there
+    /// is silently unreachable through `tools/call` (it falls through to the
+    /// MCP catch-all and fails instantly, on every target).
+    ///
+    /// Regression guard for build_clean / build_lint / build_format.
+    #[test]
+    fn ui_build_actions_are_registered_tools() {
+        let names: Vec<String> = BuildManagerActor::list_tools()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        for name in [
+            "build_analyze",
+            "build_build",
+            "build_test",
+            "build_clean",
+            "build_lint",
+            "build_format",
+            "build_fix",
+        ] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "tool '{name}' is handled by call_tool but missing from list_tools(), \
+                 so tools/call cannot reach it. Registered: {names:?}"
+            );
+        }
     }
 
     #[test]

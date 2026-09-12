@@ -239,6 +239,17 @@ where
     let (t, r) = oneshot::channel();
     let _ = tx.send(list_ctor(t)).await;
     let defs = r.await.unwrap_or_default();
+    // Observability: the registry can only route the tools a backend advertises
+    // here. A tool a backend implements but omits from its `ListTools` response
+    // is silently unreachable through `tools/call` (it falls through to the MCP
+    // catch-all), so make the advertised set visible in the log.
+    if !defs.is_empty() {
+        tracing::info!(
+            "ToolRouter: registering {} tool(s) from message backend: {:?}",
+            defs.len(),
+            defs.iter().map(|d| d.name.as_str()).collect::<Vec<_>>()
+        );
+    }
     let tools = defs
         .into_iter()
         .map(|info| {

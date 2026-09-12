@@ -723,17 +723,44 @@ impl MesonBuildModule {
         run_cmd(path, "meson", &refs).await
     }
 
-    async fn test(&self, path: &Path, _opts: &TestOptions) -> Result<BuildOutput, String> {
-        let dir = self.build_dir(path, None);
+    async fn test(
+        &self,
+        path: &Path,
+        _opts: &TestOptions,
+        platform: Option<&str>,
+    ) -> Result<BuildOutput, String> {
+        // Honour the selected target's platform so `meson test` runs against
+        // the right build dir instead of an arbitrary discovered one.
+        let dir = self.build_dir(path, platform);
         run_cmd(path, "meson", &["test", "-C", &dir]).await
     }
 
-    async fn clean(&self, path: &Path) -> Result<BuildOutput, String> {
+    async fn clean(&self, path: &Path, platform: Option<&str>) -> Result<BuildOutput, String> {
         // NEVER delete a build dir we discovered via compile_commands.json —
         // that is typically a project-root shared build dir (e.g. build-native)
         // that both subprojects and the actual developer workflow use; deleting
         // it would destroy the real build state. Instead, invoke meson's own
         // clean on it (removes build artifacts, keeps the configured build dir).
+        //
+        // A selected platform pins the EXACT build dir (`build-<platform>`), so
+        // "Clean" on ai-trap-rock3c cleans build-rock3c and not whichever build
+        // dir happens to be found first. Without a platform we keep the previous
+        // discovery-based behaviour.
+        if let Some(plat) = platform.filter(|p| !p.is_empty()) {
+            let named = self.find_named_build_dir(path, &format!("build-{plat}"));
+            if named.as_os_str().is_empty() {
+                return Err(format!(
+                    "no configured build dir 'build-{plat}' found under {}",
+                    path.display()
+                ));
+            }
+            return run_cmd(
+                path,
+                "meson",
+                &["compile", "-C", named.to_str().unwrap_or(""), "--clean"],
+            )
+            .await;
+        }
         let build_dir = self.find_compile_db_dir(path);
         if !build_dir.as_os_str().is_empty() {
             return run_cmd(path, "meson", &["compile", "-C", build_dir.to_str().unwrap_or(""), "--clean"]).await;
@@ -1851,14 +1878,15 @@ impl Actor for MesonBuildModule {
             BuildModuleMessage::Test {
                 path,
                 opts,
+                platform,
                 reply_to,
                 ..
             } => {
-                let _ = reply_to.send(self.test(&path, &opts).await);
+                let _ = reply_to.send(self.test(&path, &opts, platform.as_deref()).await);
             }
 
-            BuildModuleMessage::Clean { path, reply_to, .. } => {
-                let _ = reply_to.send(self.clean(&path).await);
+            BuildModuleMessage::Clean { path, platform, reply_to, .. } => {
+                let _ = reply_to.send(self.clean(&path, platform.as_deref()).await);
             }
 
             BuildModuleMessage::Lint { path, platform, reply_to, .. } => {

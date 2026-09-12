@@ -115,12 +115,19 @@ pub enum BuildModuleMessage {
         path: PathBuf,
         metadata: BuildMetadata,
         opts: TestOptions,
+        /// Optional cross-platform target (e.g. "rpi5") selecting which build
+        /// dir the tests run from (Meson: `build-<platform>`).
+        platform: Option<String>,
         reply_to: oneshot::Sender<Result<BuildOutput, String>>,
     },
     /// Run the project's clean command (e.g. cargo clean).
     Clean {
         path: PathBuf,
         metadata: BuildMetadata,
+        /// Optional cross-platform target (e.g. "rpi5") pinning the build dir
+        /// (`build-<platform>`) to clean. Without it a module may pick any build
+        /// dir it discovers — ambiguous for multi-target projects.
+        platform: Option<String>,
         reply_to: oneshot::Sender<Result<BuildOutput, String>>,
     },
     /// Run the project's linter (e.g. cargo clippy).

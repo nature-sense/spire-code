@@ -1180,6 +1180,7 @@ impl Actor for CargoBuildModule {
                 metadata: _metadata,
                 opts,
                 reply_to,
+                ..
             } => {
                 let result = self.test(&path, &opts).await;
                 let _ = reply_to.send(result);
@@ -1189,6 +1190,7 @@ impl Actor for CargoBuildModule {
                 path,
                 metadata: _metadata,
                 reply_to,
+                ..
             } => {
                 let result = self.clean(&path).await;
                 let _ = reply_to.send(result);

@@ -516,6 +516,7 @@ impl Actor for NodeBuildModule {
                 metadata: _metadata,
                 opts,
                 reply_to,
+                ..
             } => {
                 let result = self.test(&path, &opts).await;
                 let _ = reply_to.send(result);
