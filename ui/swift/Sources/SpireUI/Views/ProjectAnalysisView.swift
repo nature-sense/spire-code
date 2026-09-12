@@ -223,6 +223,7 @@ struct ProjectAnalysisView: View {
                         Button {
                             selectedSubproject = sub
                             selectedBuildTarget = nil
+                            bridge.selectedBuildTarget = nil
                             bridge.selectSubproject(sub)
                         } label: {
                             HStack(spacing: 8) {
@@ -359,18 +360,21 @@ struct ProjectAnalysisView: View {
             selectedDomain = nil
             bridge.selectedDomain = nil
             selectedBuildTarget = nil
+            bridge.selectedBuildTarget = nil
             bridge.selectSubproject(hal)
         case .toolkit, .api, .platform:
             guard let d = domain(for: node) else { return }
             selectedDomain = d.id
             bridge.selectedDomain = d.id
             selectedBuildTarget = nil
+            bridge.selectedBuildTarget = nil
             bridge.selectSubproject(hal)
         case .target:
             guard let name = node.targetName else { return }
             selectedDomain = nil
             bridge.selectedDomain = nil
             selectedBuildTarget = name
+            bridge.selectedBuildTarget = name
             bridge.selectSubproject(hal)
         default:
             break
@@ -445,6 +449,7 @@ struct ProjectAnalysisView: View {
                 ForEach(targets) { target in
                     Button {
                         selectedBuildTarget = target.name
+                        bridge.selectedBuildTarget = target.name
                         selectedSubproject = sub
                         bridge.selectSubproject(sub)
                     } label: {

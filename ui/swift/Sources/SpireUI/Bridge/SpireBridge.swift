@@ -670,6 +670,10 @@ final class SpireBridge {
         currentMode = .project
         projectRoot = nil
         selectedSubproject = nil
+        // Clear the shared selection mirrors too — a stale target/domain would
+        // otherwise leak into the next opened project's right pane.
+        selectedBuildTarget = nil
+        selectedDomain = nil
         showHalContractLint = false
         messages = []
         activePlan = nil

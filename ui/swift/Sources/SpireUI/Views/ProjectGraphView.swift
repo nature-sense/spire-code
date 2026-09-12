@@ -157,6 +157,7 @@ struct ProjectGraphView: View {
             // The project root is the whole-project scope — clear target and
             // subproject selection so the panes show the project overview.
             selectedBuildTarget = nil
+            bridge.selectedBuildTarget = nil
             selectedSubproject = nil
             bridge.selectSubproject(nil)
         case .subproject:
@@ -175,6 +176,11 @@ struct ProjectGraphView: View {
             // (which gate on selectedSubproject) render content.
             if let target = node.buildTarget {
                 selectedBuildTarget = target.name
+                // Mirror to the shared bridge: the right-hand ContextActionPane
+                // reads `bridge.selectedBuildTarget` (the graph's @Binding is
+                // MainView-local), so without this the Build action never learns
+                // which target is selected and the row is hidden.
+                bridge.selectedBuildTarget = target.name
                 if let parentSub = node.subproject {
                     selectedSubproject = parentSub
                     bridge.selectSubproject(parentSub)
