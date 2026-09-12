@@ -594,6 +594,9 @@ impl BuildManagerActor {
     /// keep showing up in the Build tab. That is exactly how the bogus
     /// cross-header errors from pre-fix lint runs outlived the fix (the panel
     /// reads `project/diagnostics`, which has no "latest run" notion of its own).
+    ///
+    /// Membership is decided by `diagnostic_in_project`, which accepts the
+    /// build-dir-relative paths compilers actually print — see its note.
     async fn clear_previous_diagnostics(
         &self,
         stream: &mpsc::Sender<TransactionRequest>,
@@ -627,7 +630,7 @@ impl BuildManagerActor {
             let in_project = node
                 .get("file")
                 .and_then(|v| v.as_str())
-                .map(|f| f.starts_with(&root))
+                .map(|file| Self::diagnostic_in_project(file, &root))
                 .unwrap_or(false);
             if same_kind && in_project {
                 Self::send_stream_op(stream, StreamOp::DeleteNode(node.id().to_string())).await?;
@@ -1456,7 +1459,12 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
         }
         // Split at the first ": " that precedes error/warning/fatal.
         let lower = line.to_lowercase();
-        let markers = ["error:", "warning:", "fatal error:"];
+        // Longest marker first: "fatal error:" CONTAINS "error:", so matching
+        // "error:" first would leave the "fatal " prefix in the path part and
+        // swallow the line number — turning `../x.cpp:41:10: fatal error: …` into
+        // the unresolvable file `../x.cpp:41`, which is why missing-header errors
+        // could never be located (and so were silently skipped by the fix loop).
+        let markers = ["fatal error:", "error:", "warning:"];
         let Some(marker) = markers.iter().find(|m| lower.contains(**m)) else {
             continue;
         };
@@ -1464,12 +1472,36 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
         let Some(msg_idx) = lower.find(marker) else { continue };
         let path_part = &line[..msg_idx];
         let msg = line[msg_idx + marker.len()..].trim().to_string();
-        // path_part = "/abs/file.cpp:12:5: "
-        let mut segs = path_part.rsplitn(3, ':');
-        let col = segs.next().and_then(|c| c.trim().parse::<u64>().ok());
-        let line_no = segs.next().and_then(|l| l.trim().parse::<u64>().ok());
-        let file = segs.next().map(|f| f.trim().to_string()).unwrap_or_default();
-        let severity = if marker.starts_with("error") { "error" } else { "warning" };
+        // path_part is "<file>:<line>:<col>: " (column optional). Drop the
+        // trailing separator FIRST, then read the numbers off the right — splitting
+        // straight away glued the line number onto the file name, so every build
+        // diagnostic pointed at a path that cannot exist (`../x.cpp:41`) and the
+        // fix loop skipped all of them.
+        let mut loc = path_part.trim_end();
+        if let Some(stripped) = loc.strip_suffix(':') {
+            loc = stripped.trim_end();
+        }
+        let (head, tail) = loc.rsplit_once(':').unwrap_or(("", loc));
+        let (file, line_no, col) = match head.rsplit_once(':') {
+            // "<file>:<line>:<col>" — two numbers, so the pair is line:column.
+            Some((path, line)) if line.trim().parse::<u64>().is_ok() => (
+                path.trim().to_string(),
+                line.trim().parse::<u64>().ok(),
+                tail.trim().parse::<u64>().ok(),
+            ),
+            // "<file>:<line>" — a single number is the line.
+            _ => (
+                head.trim().to_string(),
+                tail.trim().parse::<u64>().ok(),
+                None,
+            ),
+        };
+        // "fatal error:" is an error, not a warning.
+        let severity = if marker.contains("error") {
+            "error"
+        } else {
+            "warning"
+        };
         events.push(serde_json::json!({
             "file": file,
             "level": severity,
@@ -1480,6 +1512,29 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
         }));
     }
     events
+}
+
+/// True when a diagnostic's recorded `file` belongs to `project_root`.
+///
+/// Compilers print paths the way they were invoked, and Meson/ninja invoke them
+/// RELATIVE to the build directory (`../app/main.cpp`), so a relative path is
+/// this project's by definition — the memory graph is per-project. An absolute
+/// path must still sit under the project root, so a shared graph can never have
+/// another project's diagnostics deleted by mistake.
+///
+/// Getting this wrong is what let ~137 stale BUILD errors (recorded with relative
+/// paths by an earlier platform-less build) survive every supersede and be
+/// re-reported by "Fix & Verify" as if the current rpi5 build produced them.
+fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
+    let file = file.trim();
+    if file.is_empty() {
+        return false;
+    }
+    if file.starts_with('/') {
+        file.starts_with(project_root.trim_end_matches('/'))
+    } else {
+        true
+    }
 }
 
 
@@ -3593,6 +3648,82 @@ mod tests {
         let loose = tmp.path().join("loose");
         std::fs::create_dir_all(&loose).unwrap();
         assert_eq!(BuildManagerActor::diagnostics_scope_root(&loose), loose);
+    }
+
+    /// Diagnostics recorded by a BUILD carry the compiler's verbatim path, and
+    /// ninja makes it relative to the build dir (`../app/main.cpp`). Those MUST be
+    /// treated as this project's: otherwise the supersede never clears them and
+    /// stale build errors get re-reported by "Fix & Verify" run after run.
+    #[test]
+    fn diagnostic_in_project_accepts_build_dir_relative_paths() {
+        let root = "/Users/me/ai-traps";
+        // Relative (ninja/clang): this project's by construction.
+        assert!(BuildManagerActor::diagnostic_in_project("../app/main.cpp", root));
+        assert!(BuildManagerActor::diagnostic_in_project(
+            "../hal/implementations/rock3c/camera_hal_rk.cpp",
+            root
+        ));
+        // Absolute under the project: ours.
+        assert!(BuildManagerActor::diagnostic_in_project(
+            "/Users/me/ai-traps/build-rpi5/../app/main.cpp",
+            root
+        ));
+        assert!(BuildManagerActor::diagnostic_in_project("/Users/me/ai-traps/app/main.cpp", root));
+        // Absolute elsewhere: never deleted from a (possibly shared) graph.
+        assert!(!BuildManagerActor::diagnostic_in_project(
+            "/Users/me/other-project/main.cpp",
+            root
+        ));
+        assert!(!BuildManagerActor::diagnostic_in_project("/usr/include/stdio.h", root));
+        // A trailing slash on the root must not matter.
+        assert!(BuildManagerActor::diagnostic_in_project(
+            "/Users/me/ai-traps/x.cpp",
+            "/Users/me/ai-traps/"
+        ));
+        // Empty paths are never a match.
+        assert!(!BuildManagerActor::diagnostic_in_project("", root));
+        assert!(!BuildManagerActor::diagnostic_in_project("   ", root));
+    }
+
+    /// A `fatal error:` line must yield a CLEAN path: a missing header is the most
+    /// common cross-build failure, and a file recorded as `../x.cpp:41` (line
+    /// number glued on) can never be located — so the fix loop silently skipped
+    /// exactly the errors it was built to repair.
+    #[test]
+    fn fatal_error_lines_parse_to_a_resolvable_relative_path() {
+        let output = "ninja: Entering directory `/proj/build-rpi5'\n\
+                      [1/3] Compiling C++ object rock3c/libfoo.a.p/x.cpp.o\n\
+                      ../hal/implementations/rock3c/camera_hal_rk.cpp:41:10: fatal error: 'rockchip/rk_mpi.h' file not found\n\
+                      1 error generated.\n";
+        let events = BuildManagerActor::parse_clang_output(output);
+        assert_eq!(events.len(), 1, "one diagnostic: {events:?}");
+
+        let event = &events[0];
+        assert_eq!(
+            event["file"], "../hal/implementations/rock3c/camera_hal_rk.cpp",
+            "the path must not carry the line number: {event:?}"
+        );
+        assert_eq!(event["line_number"], 41);
+        assert_eq!(event["column"], 10);
+        assert_eq!(
+            event["level"], "error",
+            "a fatal error is an error, never a warning"
+        );
+        assert!(
+            BuildManagerActor::diagnostic_in_project(
+                event["file"].as_str().unwrap_or_default(),
+                "/proj"
+            ),
+            "the recorded path must count as this project's, or the supersede skips it"
+        );
+
+        // The plain "error:" form must parse identically.
+        let plain = BuildManagerActor::parse_clang_output("../app/main.cpp:27:5: error: no member\n");
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        assert_eq!(plain[0]["file"], "../app/main.cpp");
+        assert_eq!(plain[0]["line_number"], 27);
+        assert_eq!(plain[0]["column"], 5);
+        assert_eq!(plain[0]["level"], "error");
     }
 
     // Serializes tests that mutate the PROCESS-GLOBAL `SPIRE_PLATFORM_DIR`
