@@ -567,13 +567,68 @@ impl BuildManagerActor {
         }
     }
 
+    /// Delete the previous run's Diagnostic nodes of `build_type` for
+    /// `project_root`, inside the caller's open transaction stream.
+    ///
+    /// Diagnostics are merged by a stable `file:line:message` name, so a finding
+    /// that no longer reproduces would otherwise stay in the graph forever and
+    /// keep showing up in the Build tab. That is exactly how the bogus
+    /// cross-header errors from pre-fix lint runs outlived the fix (the panel
+    /// reads `project/diagnostics`, which has no "latest run" notion of its own).
+    async fn clear_previous_diagnostics(
+        &self,
+        stream: &mpsc::Sender<TransactionRequest>,
+        build_type: &str,
+        project_root: &Path,
+    ) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.memory_graph_tx
+            .send(MemoryGraphMessage::QueryAttrNodes {
+                node_type: Some("Diagnostic".to_string()),
+                subtype: None,
+                name: None,
+                limit: Some(5000),
+                reply_to: tx,
+            })
+            .await
+            .map_err(|e| format!("MemoryGraph channel closed: {e}"))?;
+        let nodes = rx
+            .await
+            .map_err(|e| format!("MemoryGraph response lost: {e}"))?
+            .map_err(|e| format!("Diagnostic query failed: {e}"))?;
+
+        let root = project_root
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+        for node in nodes {
+            // Only this project's diagnostics of this kind — never another
+            // project's, and never another run kind (build vs lint vs fix).
+            let same_kind = node.get("build_type").and_then(|v| v.as_str()) == Some(build_type);
+            let in_project = node
+                .get("file")
+                .and_then(|v| v.as_str())
+                .map(|f| f.starts_with(&root))
+                .unwrap_or(false);
+            if same_kind && in_project {
+                Self::send_stream_op(stream, StreamOp::DeleteNode(node.id().to_string())).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Persist a run's BuildEvents as Diagnostic graph nodes linked to their
     /// SourceFile nodes via HasDiagnostic edges. Each run is tagged with a
-    /// build_run_id so stale diagnostics can be cleaned up later.
+    /// build_run_id.
+    ///
+    /// A run SUPERSEDES the previous run of the same kind for this project (see
+    /// [`Self::clear_previous_diagnostics`]), so the Build tab always reflects
+    /// the latest run rather than an accumulation of every past one.
     async fn ingest_diagnostics(
         &self,
         events: &[serde_json::Value],
         build_type: &str,
+        project_root: &Path,
     ) -> Result<(), String> {
         // Collect events that carry a file path — these become Diagnostic nodes.
         let diag_events: Vec<&serde_json::Value> = events
@@ -583,9 +638,6 @@ impl BuildManagerActor {
                     && ev.get("level").and_then(|l| l.as_str()).is_some()
             })
             .collect();
-        if diag_events.is_empty() {
-            return Ok(());
-        }
 
         let run_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
@@ -596,6 +648,16 @@ impl BuildManagerActor {
         let stream = rx
             .await
             .map_err(|e| format!("MemoryGraph response lost: {e}"))?;
+
+        // Supersede the previous run of this kind — deliberately BEFORE the
+        // "nothing to ingest" return, so a run that is now clean clears the
+        // findings it used to report instead of leaving them on screen.
+        self.clear_previous_diagnostics(&stream, build_type, project_root)
+            .await?;
+        if diag_events.is_empty() {
+            Self::send_stream_op(&stream, StreamOp::Commit).await?;
+            return Ok(());
+        }
 
         for ev in diag_events {
             let file = ev["file"].as_str().unwrap_or("").to_string();
@@ -1713,7 +1775,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         if !has_file_diags {
                             events.append(&mut Self::parse_clang_output(&o.output));
                         }
-                        let _ = self.ingest_diagnostics(&events, "build").await;
+                        let _ = self.ingest_diagnostics(&events, "build", Path::new(path)).await;
                         // Persist the build status PER TARGET (success/duration +
                         // raw output) so building rock3c and rpi5 store separate
                         // results under the same key the platform list reads back.
@@ -1838,7 +1900,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         }
                         // Persist lint findings as Diagnostic graph nodes so the
                         // Build tab shows them after the lint run.
-                        let _ = self.ingest_diagnostics(&events, "lint").await;
+                        let _ = self.ingest_diagnostics(&events, "lint", Path::new(path)).await;
                         let _ = self
                             .store_action_status(
                                 "lint",
@@ -1885,7 +1947,9 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                 if !has_file_diags {
                     build_events.append(&mut Self::parse_clang_output(&build_out.output));
                 }
-                let _ = self.ingest_diagnostics(&build_events, "build").await;
+                let _ = self
+                    .ingest_diagnostics(&build_events, "build", Path::new(path))
+                    .await;
                 let _ = self
                     .store_action_status_with_output(
                         "build",
@@ -1908,7 +1972,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                         if le.is_empty() {
                             le.append(&mut Self::parse_clang_output(&lo.output));
                         }
-                        let _ = self.ingest_diagnostics(&le, "lint").await;
+                        let _ = self.ingest_diagnostics(&le, "lint", Path::new(path)).await;
                         let _ = self
                             .store_action_status(
                                 "lint",
@@ -1974,7 +2038,7 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                             m.insert("buildEvents".to_string(), serde_json::json!(events.clone()));
                         }
                         // Persist post-fix diagnostics (usually no remaining events).
-                        let _ = self.ingest_diagnostics(&events, "fix").await;
+                        let _ = self.ingest_diagnostics(&events, "fix", Path::new(path)).await;
                         val
                     }
                     Err(e) => serde_json::json!({ "error": e }),

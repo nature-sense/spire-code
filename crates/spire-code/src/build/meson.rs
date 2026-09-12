@@ -912,20 +912,34 @@ impl MesonBuildModule {
     /// Uses any `build*/compile_commands.json` (Meson generates it) to supply
     /// real per-file include flags so project headers resolve; otherwise the
     /// analyzer logs missing-header errors instead of silently finding nothing.
-    async fn lint(&self, path: &Path, platform: Option<&str>) -> Result<BuildOutput, String> {
+    /// Resolve what a lint run should analyse: the compile database directory,
+    /// the database itself and the exact translation units to check.
+    ///
+    /// Shared by the buffered [`Self::lint`] and the streaming
+    /// `BuildModuleMessage::LintStreaming` path (what the UI's Build/Lint/
+    /// Verify buttons use) so the two can never diverge again.
+    ///
+    /// When a platform is selected the DB comes from `build-<platform>` and the
+    /// file set is restricted to the translation units THAT build compiles:
+    /// `source_files` harvests the union of every `build*/compile_commands.json`
+    /// in the tree, so analysing all of it here would also run the other
+    /// platforms' sources — which have no entry in this database, hence no flags,
+    /// hence a wall of bogus "file not found" errors.
+    fn lint_scope(
+        &self,
+        path: &Path,
+        platform: Option<&str>,
+    ) -> (
+        std::path::PathBuf,
+        std::collections::HashMap<String, (Vec<String>, String)>,
+        Vec<String>,
+    ) {
         let db_dir = if let Some(plat) = platform {
             self.find_named_build_dir(path, &format!("build-{plat}"))
         } else {
             self.find_compile_db_dir(path)
         };
         let db = self.load_compile_commands_from(db_dir.clone());
-        // Only analyse the translation units THIS build compiles. `source_files`
-        // harvests the union of every `build*/compile_commands.json` in the tree,
-        // so a per-platform lint (e.g. rpi5) would otherwise also analyse the
-        // OTHER platforms' sources — which have no entry in this build's database
-        // and therefore no flags, producing bogus "file not found" errors.
-        // Keys of the compile DB are exactly the paths (and flag sets) the
-        // analyzer needs, so analysing them gives an exact flag match.
         let files = if db.is_empty() {
             self.source_files(path)
         } else {
@@ -937,6 +951,11 @@ impl MesonBuildModule {
             files.sort();
             files
         };
+        (db_dir, db, files)
+    }
+
+    async fn lint(&self, path: &Path, platform: Option<&str>) -> Result<BuildOutput, String> {
+        let (db_dir, db, files) = self.lint_scope(path, platform);
         if files.is_empty() {
             return Ok(BuildOutput {
                 success: true,
@@ -2034,16 +2053,12 @@ impl Actor for MesonBuildModule {
             } => {
                 // Stream per-file analyzer results as they complete so the UI
                 // shows incremental progress (not a single late batch).
-                // Platform-aware compile DB: when a platform is selected (e.g.
-                // "rpi5"), prefer build-rpi5/compile_commands.json so lint uses
-                // the cross-compiled file set + flags.
-                let db_dir = if let Some(plat) = platform {
-                    self.find_named_build_dir(&path, &format!("build-{plat}"))
-                } else {
-                    self.find_compile_db_dir(&path)
-                };
-                let db = self.load_compile_commands_from(db_dir.clone());
-                let files = self.source_files(&path);
+                // Scope comes from the SHARED helper the buffered lint uses: this
+                // arm is what the UI's Build/Lint/Verify buttons drive, so it must
+                // not carry its own (previously stale) copy of the selection
+                // logic — that copy still analysed every platform's sources with
+                // one platform's flags, which is what made Verify on rpi5 noisy.
+                let (db_dir, db, files) = self.lint_scope(&path, platform.as_deref());
                 let mut success = true;
                 let mut output_lines: Vec<String> = Vec::new();
                 for file in &files {
@@ -2437,6 +2452,61 @@ mod tests {
         assert!(stray.is_empty(), "analyzer left reports in the project: {stray:?}");
     }
 
+    /// Opt-in END-TO-END guard for the path the UI's Verify/Lint buttons really
+    /// drive: `BuildModuleMessage::LintStreaming` — *not* the buffered `lint()`.
+    /// The two used to keep separate copies of the scope logic, and the streaming
+    /// copy still analysed every platform's sources with rpi5 flags, which is
+    /// where the "wall of lint errors" on Verify actually came from.
+    ///
+    /// Run with: SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps cargo test …
+    #[tokio::test]
+    async fn lint_streaming_real_ai_traps_rpi5_reports_no_errors() {
+        let Ok(root) = std::env::var("SPIRE_AI_TRAPS_INTEGRATION") else {
+            eprintln!("skipped: set SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        if !root.join("build-rpi5/compile_commands.json").exists() {
+            eprintln!("skipped: build-rpi5 is not configured");
+            return;
+        }
+        let mut module = MesonBuildModule::new();
+        let metadata = module.analyze(&root).expect("analyze");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_to, reply_rx) = tokio::sync::oneshot::channel();
+        // Drain the streamed progress events, or the sends block.
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+
+        crate::Actor::handle(
+            &mut module,
+            BuildModuleMessage::LintStreaming {
+                path: root.clone(),
+                metadata,
+                platform: Some("rpi5".to_string()),
+                event_tx,
+                reply_to,
+            },
+        )
+        .await;
+
+        let out = reply_rx.await.expect("reply sent").expect("lint ok");
+        let head: String = out.output.lines().take(8).collect::<Vec<_>>().join("\n");
+        assert!(
+            !out.output.contains("file not found"),
+            "cross headers must resolve:\n{head}"
+        );
+        assert!(
+            !out.output.contains("error generated"),
+            "the green rpi5 build must lint without compile errors:\n{head}"
+        );
+        assert!(out.success, "lint must report success:\n{head}");
+        assert!(
+            !out.output.contains("/build-a7s/") && !out.output.contains("/build-rock3c/"),
+            "only the rpi5 build's translation units may be analysed:\n{head}"
+        );
+    }
+
     /// The analyzer must not drop `<stem>.plist` files into the working
     /// directory (which is the user's project root): they land as untracked junk
     /// and trip the git-dirty badge.
@@ -2460,6 +2530,66 @@ mod tests {
         );
         assert!(args.iter().any(|a| a == "--analyze"), "still analyzing: {args:?}");
         assert!(args.iter().any(|a| a == "a.cpp"), "source still analysed: {args:?}");
+    }
+
+    /// A per-platform lint must analyse only that build's translation units.
+    /// Taking the union of every `build*/compile_commands.json` sent the other
+    /// platforms' sources through the analyzer with no flags at all — the "wall
+    /// of lint errors" on rpi5's Verify button.
+    #[test]
+    fn lint_scope_restricts_files_to_the_selected_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (dir, file) in [("build-alpha", "a.cpp"), ("build-beta", "b.cpp")] {
+            let bd = root.join(dir);
+            std::fs::create_dir_all(&bd).unwrap();
+            std::fs::write(bd.join(file), "int x;\n").unwrap();
+            std::fs::write(
+                bd.join("compile_commands.json"),
+                format!(
+                    r#"[{{"directory":"{}","file":"{file}","command":"c++ -DA=1 -c {file}"}}]"#,
+                    bd.display()
+                ),
+            )
+            .unwrap();
+        }
+        let m = MesonBuildModule::new();
+
+        let (db_dir, db, files) = m.lint_scope(root, Some("alpha"));
+        assert!(db_dir.ends_with("build-alpha"), "db dir: {db_dir:?}");
+        assert_eq!(db.len(), 1, "only build-alpha's DB: {db:?}");
+        assert_eq!(files.len(), 1, "only build-alpha's TU: {files:?}");
+        assert!(files[0].ends_with("a.cpp"), "files: {files:?}");
+
+        // Without a platform we use one build's DB, never the union.
+        let (_, _, all) = m.lint_scope(root, None);
+        assert_eq!(all.len(), 1, "no platform → the single DB we found: {all:?}");
+    }
+
+    /// Opt-in: the scope behind the UI's Verify button must contain ONLY the
+    /// selected platform's translation units.
+    ///
+    /// Run with: SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps cargo test …
+    #[test]
+    fn real_rpi5_lint_scope_excludes_other_platforms() {
+        let Ok(root) = std::env::var("SPIRE_AI_TRAPS_INTEGRATION") else {
+            eprintln!("skipped: set SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps");
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        if !root.join("build-rpi5/compile_commands.json").exists() {
+            eprintln!("skipped: build-rpi5 is not configured");
+            return;
+        }
+        let (db_dir, _db, files) = MesonBuildModule::new().lint_scope(&root, Some("rpi5"));
+        assert!(db_dir.ends_with("build-rpi5"), "db dir: {db_dir:?}");
+        assert!(!files.is_empty(), "rpi5 must have translation units");
+        for f in &files {
+            assert!(
+                f.contains("/build-rpi5/"),
+                "a per-platform lint must not include another build's sources: {f}"
+            );
+        }
     }
 
     /// Vendored / third-party code must never be linted, reformatted or
