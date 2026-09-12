@@ -221,9 +221,15 @@ struct ActionRailView: View {
                     chipButton("Format", systemImage: "text.alignleft") {
                         runTool("build_format", project: project, sub: sub)
                     }
-                    // Meson/C++ has no real auto-fixer (no clang-tidy), so
-                    // "Fix" is only offered where the build system provides one.
-                    if !sub.buildSystem.lowercased().contains("meson") {
+                    // Meson/C++ has no toolchain auto-fixer, so compile errors go
+                    // through the autonomous LLM loop ("Fix & Verify"): apply a
+                    // rewrite per error file, rebuild, keep what reduced the errors
+                    // and roll back what did not.
+                    if sub.buildSystem.lowercased().contains("meson") {
+                        chipButton("Fix & Verify", systemImage: "wand.and.stars") {
+                            runTool("build_autofix", project: project, sub: sub)
+                        }
+                    } else {
                         chipButton("Fix", systemImage: "wrench.and.screwdriver") {
                             runTool("build_fix", project: project, sub: sub)
                         }

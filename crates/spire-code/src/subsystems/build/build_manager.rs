@@ -3221,6 +3221,19 @@ executable('{project_name}-{platform}',
                 }),
             },
             spire_core::actors::ToolInfo {
+                name: "build_autofix".to_string(),
+                description: "Fix & Verify: apply LLM rewrites for the current compile errors, rebuild, keep what reduced the errors and roll back what did not, until the build is clean or the round cap is reached. Writes files; every write is compile-verified and reverted if it does not help.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project or subproject directory path" },
+                        "platform": { "type": "string", "description": "Cross-platform target (e.g. rpi5) whose build directory the fixes are verified against" },
+                        "target": { "type": "string", "description": "Specific build target within the project" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
                 name: "build_dependency_docs".to_string(),
                 description: "Fetch documentation (Markdown) for a dependency package via the language module (crates.io for Rust, npm registry, PyPI, etc.).".to_string(),
                 input_schema: serde_json::json!({

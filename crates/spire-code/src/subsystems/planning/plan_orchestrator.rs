@@ -315,7 +315,7 @@ impl PlanOrchestrator {
             "filesystem_read", "filesystem_write", "filesystem_list",
             "filesystem_delete", "filesystem_move", "filesystem_copy",
             "build_analyze", "build_build", "build_verify", "build_test", "build_clean", "build_lint",
-            "build_format", "build_fix", "build_list_modules",
+            "build_format", "build_fix", "build_autofix", "build_list_modules",
             "project/build", "project/test", "project/lint",
         ];
         context_parts.push(format!("Available tools: {}", curated_tools.join(", ")));

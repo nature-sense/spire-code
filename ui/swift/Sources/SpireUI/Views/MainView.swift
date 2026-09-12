@@ -748,6 +748,7 @@ struct ActionPanelView: View {
         switch runningAction {
         case "build_lint": return "Lint"
         case "build_verify": return "Verify"
+        case "build_autofix": return "Fix & Verify"
         case "build_fix": return "Fix warnings"
         case "build_format": return "Format"
         case "build_clean": return "Clean"
@@ -1223,17 +1224,24 @@ struct ActionPanelView: View {
                 // exactly this and could silently reformat the whole tree.
                 actionButton("Format", systemImage: "text.alignleft", tool: "build_format")
                 if selectionIsMeson {
-                    // No toolchain auto-fixer exists for C/C++, so fixing
-                    // compile errors is an LLM propose → review → apply loop
-                    // (each file is shown before it is written).
+                    // C/C++ has no toolchain auto-fixer, so compile errors are
+                    // fixed by the autonomous loop: apply an LLM rewrite per error
+                    // file, rebuild, keep what reduced the errors and roll back
+                    // what did not. "Fix Errors…" stays available for reviewing
+                    // each rewrite before it is written.
+                    actionButton(
+                        "Fix & Verify",
+                        systemImage: "wand.and.stars",
+                        tool: "build_autofix"
+                    )
                     Button {
                         showFixErrors = true
                     } label: {
-                        actionLabel("Fix Errors…", systemImage: "wand.and.stars")
+                        actionLabel("Fix Errors…", systemImage: "square.and.pencil")
                     }
                     .buttonStyle(.plain)
                     .disabled(runningAction != nil)
-                    .help("Propose a reviewed rewrite for each file with compiler errors")
+                    .help("Review each rewrite before it is written")
                 } else if selectionHasAutoFixer {
                     actionButton("Fix Warnings", systemImage: "wrench.and.screwdriver", tool: "build_fix")
                 }

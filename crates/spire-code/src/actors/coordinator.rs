@@ -210,48 +210,30 @@ impl CoordinatorActor {
     /// Current compiler/linter diagnostics for ONE file, rendered as
     /// `<path>:<line>:<col>: <message>` lines (severity error/warning only).
     async fn compile_diagnostics_for(&self, file: &str) -> Vec<String> {
-        let (registry, _ffi_state) = match self.ffi_deps() {
-            Ok(d) => d,
-            Err(_) => return Vec::new(),
-        };
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = registry
-            .get::<MemoryGraphMessage>("memory_graph")
-            .unwrap_or_else(dummy_tx)
-            .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Diagnostic".to_string()),
-                subtype: None,
-                name: None,
-                limit: Some(4000),
-                reply_to: t,
-            })
-            .await;
         let mut out = Vec::new();
-        if let Ok(Ok(nodes)) = r.await {
-            for node in nodes {
-                if node.get("file").and_then(|v| v.as_str()).unwrap_or("") != file {
-                    continue;
-                }
-                let sev = node.get("severity").and_then(|v| v.as_str()).unwrap_or("");
-                if sev != "error" && sev != "warning" {
-                    continue;
-                }
-                let msg = node
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                if msg.is_empty() {
-                    continue;
-                }
-                let line = node.get("line").and_then(|v| v.as_u64());
-                let col = node.get("column").and_then(|v| v.as_u64());
-                out.push(match (line, col) {
-                    (Some(l), Some(c)) => format!("{file}:{l}:{c}: {msg}"),
-                    (Some(l), None) => format!("{file}:{l}: {msg}"),
-                    _ => format!("{file}: {msg}"),
-                });
+        for node in self.diagnostic_nodes().await {
+            if node.get("file").and_then(|v| v.as_str()).unwrap_or("") != file {
+                continue;
             }
+            let sev = node.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+            if sev != "error" && sev != "warning" {
+                continue;
+            }
+            let msg = node
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if msg.is_empty() {
+                continue;
+            }
+            let line = node.get("line").and_then(|v| v.as_u64());
+            let col = node.get("column").and_then(|v| v.as_u64());
+            out.push(match (line, col) {
+                (Some(l), Some(c)) => format!("{file}:{l}:{c}: {msg}"),
+                (Some(l), None) => format!("{file}:{l}: {msg}"),
+                _ => format!("{file}: {msg}"),
+            });
         }
         out
     }
@@ -264,6 +246,21 @@ impl CoordinatorActor {
     /// NOTHING is written here — the caller reviews the proposal and writes it
     /// only on Accept, then rebuilds.
     async fn propose_compile_fix(&self, _root: &str, file: &str) -> serde_json::Value {
+        self.propose_compile_fix_for(file, std::path::Path::new(file))
+            .await
+    }
+
+    /// As [`Self::propose_compile_fix`], but with the on-disk path supplied
+    /// separately.
+    ///
+    /// Compilers report paths relative to the directory the build ran in, so the
+    /// autofix loop resolves the real file while the diagnostics stay keyed by the
+    /// raw string the compiler printed.
+    async fn propose_compile_fix_for(
+        &self,
+        file: &str,
+        path: &std::path::Path,
+    ) -> serde_json::Value {
         let lower = file.to_lowercase();
         let is_cpp = [".cpp", ".cc", ".cxx", ".c", ".hpp", ".h", ".hh"]
             .iter()
@@ -277,20 +274,26 @@ impl CoordinatorActor {
 
         let errors = self.compile_diagnostics_for(file).await;
         if errors.is_empty() {
-            return serde_json::json!({ "status": "clean", "path": file });
+            return serde_json::json!({
+                "status": "clean",
+                "path": path.to_string_lossy()
+            });
         }
-        let content = match std::fs::read_to_string(file) {
+        let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
                 return serde_json::json!({
                     "status": "error",
-                    "error": format!("cannot read {file}: {e}")
+                    "error": format!("cannot read {}: {e}", path.display())
                 })
             }
         };
 
-        let mut prompt =
-            crate::build::generic_helpers::compile_fix_prompt(file, &content, &errors);
+        let mut prompt = crate::build::generic_helpers::compile_fix_prompt(
+            &path.to_string_lossy(),
+            &content,
+            &errors,
+        );
         let mut proposed = String::new();
         let llm_tx = self.llm_tx.clone();
         for _attempt in 0..2 {
@@ -337,10 +340,177 @@ impl CoordinatorActor {
         }
         serde_json::json!({
             "status": "proposed",
-            "path": file,
+            "path": path.to_string_lossy(),
             "proposed_content": proposed,
             "errors": errors,
         })
+    }
+
+    /// Every Diagnostic node currently recorded for the project.
+    ///
+    /// The memory graph is per-project, so no path filtering is needed here.
+    async fn diagnostic_nodes(&self) -> Vec<spire_core::models::memory_graph::AttrNode> {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<MemoryGraphMessage>("memory_graph")
+            .unwrap_or_else(dummy_tx)
+            .send(MemoryGraphMessage::QueryAttrNodes {
+                node_type: Some("Diagnostic".to_string()),
+                subtype: None,
+                name: None,
+                limit: Some(4000),
+                reply_to: t,
+            })
+            .await;
+        match r.await {
+            Ok(Ok(nodes)) => nodes,
+            _ => Vec::new(),
+        }
+    }
+
+    /// ERROR diagnostics grouped by file — the input of the autofix loop.
+    async fn error_diagnostics_by_file(&self) -> crate::build::autofix::ErrorsByFile {
+        let mut out = crate::build::autofix::ErrorsByFile::new();
+        for node in self.diagnostic_nodes().await {
+            if node.get("severity").and_then(|v| v.as_str()) != Some("error") {
+                continue;
+            }
+            let Some(file) = node.get("file").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if file.is_empty() {
+                continue;
+            }
+            let message = node
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if message.is_empty() {
+                continue;
+            }
+            out.entry(file.to_string()).or_default().push(message);
+        }
+        out
+    }
+
+    /// Analyzer warnings currently recorded (reported, never auto-rewritten).
+    async fn warning_count(&self) -> usize {
+        self.diagnostic_nodes()
+            .await
+            .iter()
+            .filter(|n| n.get("severity").and_then(|v| v.as_str()) == Some("warning"))
+            .count()
+    }
+
+    /// Invoke an in-process build tool through the ToolRouter (the same path the
+    /// `tools/call` RPC uses).
+    async fn call_tool_json(&self, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .tool_router_tx
+            .send(ToolRouterMessage::CallTool {
+                tool_name: tool.to_string(),
+                args,
+                reply_to: tx,
+            })
+            .await
+            .is_err()
+        {
+            return serde_json::json!({ "error": "ToolRouter actor not available" });
+        }
+        match rx.await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => serde_json::json!({ "error": e }),
+            Err(_) => serde_json::json!({ "error": "ToolRouter actor response error" }),
+        }
+    }
+
+    /// `build/autofix` — the autonomous **Fix & Verify** loop: compile, ask the
+    /// model for a fix per error file, apply it, rebuild, keep what helped and
+    /// roll back what did not, until the project compiles or the cap is hit.
+    ///
+    /// Handled here rather than by the build manager because it needs the LLM
+    /// actor (which the build manager does not own). Nothing is written until a
+    /// compile error actually exists, and every write is compile-verified and
+    /// reversible, so this is safe to run unattended.
+    async fn handle_build_autofix(&self, args: &serde_json::Value) -> serde_json::Value {
+        let path = args
+            .get("path")
+            .or_else(|| args.get("root"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if path.is_empty() {
+            return serde_json::json!({ "error": "build/autofix needs a project path" });
+        }
+        let max_rounds = args
+            .get("maxRounds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 10) as usize;
+
+        // The UI passes the selected subproject's path; the build directories
+        // (and therefore the relative compiler paths) live at the project root.
+        let project_root = crate::build::autofix::find_project_root(std::path::Path::new(path));
+        let bases = crate::build::autofix::diagnostic_bases(&project_root);
+
+        let driver = CoordinatorAutofix {
+            coord: self,
+            path: path.to_string(),
+            platform: args
+                .get("platform")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            target: args
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+
+        tracing::info!(
+            "[COORDINATOR] build/autofix: path={path} root={} rounds<={max_rounds}",
+            project_root.display()
+        );
+
+        // Compile FIRST so the loop acts on the CURRENT errors rather than on
+        // whatever the previous build happened to leave in the graph. If the build
+        // cannot even start, stop before spending a single model call.
+        let built = self.call_tool_json("build_build", driver.build_args()).await;
+        if let Some(err) = built.get("error").and_then(|v| v.as_str()) {
+            return serde_json::json!({
+                "success": false,
+                "error": err,
+                "output": format!("Fix & Verify: the build could not run ({err}); nothing was changed."),
+            });
+        }
+
+        let report =
+            crate::build::autofix::run_autofix(&driver, &bases, max_rounds).await;
+        tracing::info!(
+            "[COORDINATOR] build/autofix done: success={} rounds={} fixed={} reverted={} errors {}→{}",
+            report.success,
+            report.rounds,
+            report.files_fixed.len(),
+            report.files_reverted.len(),
+            report.errors_before,
+            report.errors_after
+        );
+
+        let mut value =
+            serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        if let serde_json::Value::Object(ref mut m) = value {
+            m.insert("output".to_string(), serde_json::json!(report.summary()));
+            m.insert(
+                "command".to_string(),
+                serde_json::json!("meson compile + LLM fix loop"),
+            );
+        }
+        value
     }
 
     /// Send a tool event notification to the extension via the transport actor.
@@ -372,6 +542,65 @@ impl CoordinatorActor {
 
         rx.await
             .map_err(|e| format!("Transport response error: {}", e))?
+    }
+}
+
+/// Bridges the actor-free autofix loop ([`crate::build::autofix`]) to the real
+/// LLM and build actors.
+struct CoordinatorAutofix<'a> {
+    coord: &'a CoordinatorActor,
+    /// Path to build, exactly as the UI sent it (may be a subproject).
+    path: String,
+    platform: Option<String>,
+    target: Option<String>,
+}
+
+impl CoordinatorAutofix<'_> {
+    fn build_args(&self) -> serde_json::Value {
+        let mut args = serde_json::json!({ "path": self.path });
+        if let Some(platform) = &self.platform {
+            args["platform"] = serde_json::json!(platform);
+        }
+        if let Some(target) = &self.target {
+            args["target"] = serde_json::json!(target);
+        }
+        args
+    }
+}
+
+#[async_trait]
+impl crate::build::autofix::AutofixDriver for CoordinatorAutofix<'_> {
+    async fn errors(&self) -> crate::build::autofix::ErrorsByFile {
+        self.coord.error_diagnostics_by_file().await
+    }
+
+    async fn propose(&self, file: &str, path: &std::path::Path) -> Option<String> {
+        // Read-only: the loop decides whether the rewrite is written.
+        let proposal = self.coord.propose_compile_fix_for(file, path).await;
+        if proposal.get("status").and_then(|v| v.as_str()) != Some("proposed") {
+            return None;
+        }
+        proposal
+            .get("proposed_content")
+            .and_then(|v| v.as_str())
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| c.to_string())
+    }
+
+    async fn rebuild(&self) -> crate::build::autofix::ErrorsByFile {
+        let _ = self
+            .coord
+            .call_tool_json("build_build", self.build_args())
+            .await;
+        self.coord.error_diagnostics_by_file().await
+    }
+
+    async fn lint(&self) -> usize {
+        let _ = self
+            .coord
+            .call_tool_json("build_lint", self.build_args())
+            .await;
+        self.coord.warning_count().await
     }
 }
 
@@ -424,6 +653,25 @@ impl CoordinatorActor {
                     == Some("project/getBuildTarget"));
         if is_build_target_call {
             return self.handle_project_get_build_target(method, &params).await;
+        }
+
+        // "Fix & Verify" — the autonomous compile → fix → recompile loop. It needs
+        // the LLM actor, which the build manager does not own, so the coordinator
+        // answers it directly. The UI reaches it through the normal `tools/call`
+        // envelope; `build/autofix` also works as a raw method.
+        if method == "build/autofix"
+            || (method == "tools/call"
+                && params.get("tool").and_then(|v| v.as_str()) == Some("build_autofix"))
+        {
+            let args = if method == "tools/call" {
+                params
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                params.clone()
+            };
+            return self.handle_build_autofix(&args).await;
         }
 
         // All rag/* RPCs route to the RAG actor (shared dispatch deps).
@@ -646,29 +894,7 @@ impl CoordinatorActor {
                 .await;
 
                 let start = std::time::Instant::now();
-                let result = {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    if self
-                        .tool_router_tx
-                        .send(ToolRouterMessage::CallTool {
-                            tool_name: tool.to_string(),
-                            args: args.clone(),
-                            reply_to: tx,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        serde_json::json!({"error": "ToolRouter actor not available"})
-                    } else {
-                        match rx.await {
-                            Ok(Ok(res)) => res,
-                            Ok(Err(e)) => serde_json::json!({"error": e}),
-                            Err(_) => {
-                                serde_json::json!({"error": "ToolRouter actor response error"})
-                            }
-                        }
-                    }
-                };
+                let result = self.call_tool_json(tool, args.clone()).await;
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 if result.get("error").is_some() {
