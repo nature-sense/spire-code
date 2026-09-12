@@ -218,8 +218,15 @@ struct ActionRailView: View {
                     chipButton("Clean", systemImage: "trash") {
                         runTool("build_clean", project: project, sub: sub)
                     }
-                    chipButton("Fix", systemImage: "wrench.and.screwdriver") {
-                        runTool("build_fix", project: project, sub: sub)
+                    chipButton("Format", systemImage: "text.alignleft") {
+                        runTool("build_format", project: project, sub: sub)
+                    }
+                    // Meson/C++ has no real auto-fixer (no clang-tidy), so
+                    // "Fix" is only offered where the build system provides one.
+                    if !sub.buildSystem.lowercased().contains("meson") {
+                        chipButton("Fix", systemImage: "wrench.and.screwdriver") {
+                            runTool("build_fix", project: project, sub: sub)
+                        }
                     }
                     chipButton("Plan", systemImage: "map.fill") {
                         // Plan opens via the right pane's plan sheet if present;

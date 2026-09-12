@@ -780,6 +780,56 @@ impl MesonBuildModule {
         })
     }
 
+    /// Directory names holding third-party / vendored code. These must never be
+    /// linted, reformatted or auto-fixed by the platform tools.
+    const VENDORED_DIRS: &'static [&'static str] = &[
+        "vendor",
+        "vendored",
+        "third_party",
+        "thirdparty",
+        "third-party",
+        "external",
+        "extern",
+        "deps",
+        "subprojects",
+        "node_modules",
+    ];
+
+    /// Vendored *file* name prefixes — single-file amalgamations shipped inside
+    /// the repo (e.g. civetweb) that must not be touched by format/lint/fix.
+    const VENDORED_FILE_PREFIXES: &'static [&'static str] = &["civetweb"];
+
+    /// True when this path looks like third-party / vendored code.
+    fn is_vendored(p: &Path) -> bool {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        Self::VENDORED_DIRS.contains(&name.as_str())
+            || Self::VENDORED_FILE_PREFIXES
+                .iter()
+                .any(|pre| name.starts_with(pre))
+    }
+
+    /// Locate the project's `.clang-format` by walking up from `path`.
+    ///
+    /// Formatting MUST be driven by an explicit project style file: without one
+    /// clang-format silently falls back to its LLVM defaults and rewrites files
+    /// to a style the project never chose — which is how an accidental "fix"
+    /// once reformatted an entire tree.
+    fn find_clang_format(&self, path: &Path) -> Option<std::path::PathBuf> {
+        let mut dir = path.to_path_buf();
+        loop {
+            let candidate = dir.join(".clang-format");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
     /// Collect C/C++ source files for lint/format/fix. Prefers the files that
     /// appear in Meson's `compile_commands.json` (the canonical build set) so
     /// lint/analyze matches exactly what the build compiles — otherwise every
@@ -789,7 +839,11 @@ impl MesonBuildModule {
     fn source_files(&self, path: &Path) -> Vec<String> {
         let db = self.load_compile_commands(path);
         if !db.is_empty() {
-            let mut files: Vec<String> = db.keys().cloned().collect();
+            let mut files: Vec<String> = db
+                .keys()
+                .filter(|f| !Self::is_vendored(Path::new(f)))
+                .cloned()
+                .collect();
             files.sort();
             return files;
         }
@@ -805,12 +859,16 @@ impl MesonBuildModule {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    if nm == "builddir" || nm.starts_with("build") || nm.starts_with('.') {
+                    if nm == "builddir"
+                        || nm.starts_with("build")
+                        || nm.starts_with('.')
+                        || Self::is_vendored(&ep)
+                    {
                         continue;
                     }
                     stack.push(ep);
                 } else if let Some(ext) = ep.extension().and_then(|e| e.to_str()) {
-                    if EXTS.contains(&ext) {
+                    if EXTS.contains(&ext) && !Self::is_vendored(&ep) {
                         out.push(ep.to_string_lossy().to_string());
                     }
                 }
@@ -1157,7 +1215,19 @@ impl MesonBuildModule {
     }
 
     /// Check formatting with clang-format (--dry-run --Werror).
+    ///
+    /// Requires a project `.clang-format` (see [`Self::find_clang_format`]):
+    /// without one, clang-format's LLVM defaults would report the whole tree as
+    /// mis-formatted relative to a style the project never chose.
     async fn format(&self, path: &Path) -> Result<BuildOutput, String> {
+        if self.find_clang_format(path).is_none() {
+            return Err(format!(
+                "No .clang-format found for {}. Refusing to check formatting with \
+                 clang-format's LLVM defaults — add a .clang-format at the project \
+                 root first. Nothing was modified.",
+                path.display()
+            ));
+        }
         let files = self.source_files(path);
         if files.is_empty() {
             return Ok(BuildOutput {
@@ -1175,24 +1245,22 @@ impl MesonBuildModule {
         run_cmd(path, &tool, &args).await
     }
 
-    /// Auto-fix format issues by rewriting files in place with clang-format.
+    /// Auto-fix warnings/errors for a C/C++ (Meson) project.
+    ///
+    /// There is deliberately NO automatic fixer here. `clang-tidy --fix` is not
+    /// part of the toolchain, and the previous implementation reused
+    /// `clang-format -i` — which does not fix warnings or errors AT ALL, it
+    /// merely reformats every source file. That is `build_format`'s job (and it
+    /// is now gated on an explicit `.clang-format`). Failing loudly is what
+    /// stops a button labelled "Fix Warnings" from silently rewriting the tree.
     async fn fix(&self, path: &Path) -> Result<BuildOutput, String> {
-        let files = self.source_files(path);
-        if files.is_empty() {
-            return Ok(BuildOutput {
-                success: true,
-                command: "clang-tidy".to_string(),
-                duration_secs: 0.0,
-                output: "No C/C++ source files to fix".to_string(),
-                exit_code: Some(0),
-            });
-        }
-        let files_owned = files;
-        let refs: Vec<&str> = files_owned.iter().map(|s| s.as_str()).collect();
-        let mut args: Vec<&str> = vec!["-i"];
-        args.extend(refs);
-        let tool = self.tool_path("clang-format");
-        run_cmd(path, &tool, &args).await
+        Err(format!(
+            "C/C++ auto-fix is not available for {}: no clang-tidy in the \
+             toolchain. Run Build to see the compiler diagnostics, then edit the \
+             reported files (or use Format to apply the project's .clang-format). \
+             Nothing was modified.",
+            path.display()
+        ))
     }
 
     /// Scaffold a C/C++ Meson project, optionally as a multi-platform layout.
@@ -2149,6 +2217,97 @@ mod tests {
         assert!(
             discovered.contains("build-"),
             "unexpected fallback build dir: {discovered}"
+        );
+    }
+
+    /// Vendored / third-party code must never be linted, reformatted or
+    /// auto-fixed: doing so rewrites files the project does not own.
+    #[test]
+    fn source_files_skips_vendored_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/acme")).unwrap();
+        std::fs::create_dir_all(root.join("third_party")).unwrap();
+        for rel in [
+            "src/main.cpp",
+            "vendor/acme/lib.c",
+            "third_party/other.c",
+            "civetweb.c",
+        ] {
+            std::fs::write(root.join(rel), "int main(){return 0;}\n").unwrap();
+        }
+
+        let files = MesonBuildModule::new().source_files(root);
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.rsplit('/').next().unwrap_or(f).to_string())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "main.cpp"),
+            "own sources must be kept: {names:?}"
+        );
+        assert!(!names.iter().any(|n| n == "lib.c"), "vendor/ must be skipped: {names:?}");
+        assert!(
+            !names.iter().any(|n| n == "other.c"),
+            "third_party/ must be skipped: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "civetweb.c"),
+            "vendored amalgamation must be skipped: {names:?}"
+        );
+    }
+
+    /// `fix()` must NEVER reformat: there is no C/C++ auto-fixer available, so
+    /// it has to fail loudly instead of running `clang-format -i` over the whole
+    /// tree (which is how an innocent "Fix Warnings" once rewrote 54 files).
+    #[tokio::test]
+    async fn fix_refuses_and_does_not_modify_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = root.join("src/main.cpp");
+        let original = "int main(){return 0;}\n"; // deliberately unformatted
+        std::fs::write(&src, original).unwrap();
+
+        let result = MesonBuildModule::new().fix(root).await;
+
+        assert!(result.is_err(), "fix() must fail rather than reformat: {result:?}");
+        assert_eq!(
+            std::fs::read_to_string(&src).unwrap(),
+            original,
+            "fix() must not modify any file"
+        );
+    }
+
+    /// Formatting is gated on an explicit project `.clang-format` so clang-format
+    /// can never silently rewrite a project to LLVM defaults.
+    #[tokio::test]
+    async fn format_requires_a_project_clang_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("main.cpp"), "int main(){return 0;}\n").unwrap();
+        let module = MesonBuildModule::new();
+
+        assert!(
+            module.find_clang_format(root).is_none(),
+            "fresh temp dir must have no .clang-format above it"
+        );
+        assert!(
+            module.format(root).await.is_err(),
+            "format() must refuse without a .clang-format"
+        );
+
+        std::fs::write(root.join(".clang-format"), "BasedOnStyle: Google\n").unwrap();
+        assert!(module.find_clang_format(root).is_some());
+
+        // Discovery walks UP from a subdirectory, so a root-level style file
+        // also governs nested sources.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        assert!(
+            module.find_clang_format(&root.join("src")).is_some(),
+            "must find the parent .clang-format"
         );
     }
 

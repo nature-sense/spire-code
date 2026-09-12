@@ -284,6 +284,18 @@ struct ProjectAnalysisView: View {
     ///   • target → select the Meson build target
     private var platformsCard: some View {
         VStack(alignment: .leading, spacing: 8) {
+            // Per-platform last-build state + date: the "what has actually been
+            // built?" header for the platform list underneath.
+            if let sub = buildSubproject, !sub.buildTargets.isEmpty {
+                PlatformBuildStatusList(
+                    project: project,
+                    subproject: sub,
+                    selectedTarget: selectedBuildTarget,
+                    onSelect: { selectTarget($0, in: sub) }
+                )
+                Divider()
+            }
+
             ForEach(ProjectLayout(project: project).root.children) { section in
                 LayoutTreeNodeView(
                     node: section,
@@ -319,6 +331,23 @@ struct ProjectAnalysisView: View {
         .sheet(isPresented: $showAddPlatformSheet) {
             addPlatformSheet
         }
+    }
+
+    /// Subproject that owns the per-platform executables. In the HAL Meson
+    /// layout the platform targets (ai-trap-rpi5, ai-trap-rock3c, …) live in the
+    /// HAL subproject, so that is the one whose build targets the status list
+    /// shows.
+    private var buildSubproject: SubprojectInfo? {
+        selectedSubproject ?? project.subprojects.first { !$0.buildSystem.isEmpty }
+    }
+
+    /// Select a build target from a status row — mirrors exactly what the tree
+    /// rows do, including the bridge mirror the right-hand action pane reads.
+    private func selectTarget(_ target: BuildTarget, in sub: SubprojectInfo) {
+        selectedBuildTarget = target.name
+        bridge.selectedBuildTarget = target.name
+        selectedSubproject = sub
+        bridge.selectSubproject(sub)
     }
 
     /// The domain that a layout node selects (nil for non-domain rows).
@@ -445,33 +474,14 @@ struct ProjectAnalysisView: View {
 
             let sub = selectedSubproject ?? project.subprojects.first { $0.buildSystem.isEmpty == false }
             if let sub, !sub.buildTargets.isEmpty {
-                let targets = sub.buildTargets
-                ForEach(targets) { target in
-                    Button {
-                        selectedBuildTarget = target.name
-                        bridge.selectedBuildTarget = target.name
-                        selectedSubproject = sub
-                        bridge.selectSubproject(sub)
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "gearshape.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                            Text(target.name).font(.callout)
-                            Spacer()
-                            if target.platform != "host" {
-                                Text(target.platform)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .rowStyle(selected: selectedBuildTarget == target.name, theme: theme)
-                    }
-                    .buttonStyle(.plain)
-                }
+                // Per-target rows carry the last build state + date, and select
+                // the target when tapped.
+                PlatformBuildStatusList(
+                    project: project,
+                    subproject: sub,
+                    selectedTarget: selectedBuildTarget,
+                    onSelect: { selectTarget($0, in: sub) }
+                )
             } else if let sub {
                 Text("No targets — build the whole subproject")
                     .font(.caption)

@@ -62,6 +62,9 @@ final class SpireBridge {
     var isProcessing: Bool = false
     var selectedSubproject: SubprojectInfo?
     var selectedBuildTarget: String?
+    /// Bumped after every completed build action (build/lint/test/clean/fix) so
+    /// views that cache per-target build status refresh their state and dates.
+    var buildCompletionTick: Int = 0
     /// Selected HAL domain (nil = the project root). Set by the ProjectAnalysisView
     /// Domains card; drives the far-right Action panel's scope/platform.
     var selectedDomain: String?

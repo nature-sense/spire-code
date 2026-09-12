@@ -741,6 +741,7 @@ struct ActionPanelView: View {
         switch runningAction {
         case "build_lint": return "Lint"
         case "build_fix": return "Fix warnings"
+        case "build_format": return "Format"
         case "build_clean": return "Clean"
         case "build_test": return "Test"
         case "build_build": return "Build"
@@ -1181,6 +1182,15 @@ struct ActionPanelView: View {
         .padding(8)
     }
 
+    /// True when the selected subproject is built by a toolchain that HAS a real
+    /// automatic warning/error fixer. Meson/C++ does not (no clang-tidy), so
+    /// "Fix Warnings" is not offered there — the module refuses with an explicit
+    /// message instead of silently reformatting.
+    private var selectionHasAutoFixer: Bool {
+        let bs = (selectedSubproject?.buildSystem ?? "").lowercased()
+        return !bs.contains("meson")
+    }
+
     private var subprojectActions: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
@@ -1192,7 +1202,14 @@ struct ActionPanelView: View {
 
             }
             HStack(spacing: 6) {
-                actionButton("Fix Warnings", systemImage: "wrench.and.screwdriver", tool: "build_fix")
+                // Formatting is deliberately SEPARATE from fixing warnings: it
+                // only rewrites formatting (clang-format, gated on a project
+                // .clang-format) and never touches code. `build_fix` used to run
+                // exactly this and could silently reformat the whole tree.
+                actionButton("Format", systemImage: "text.alignleft", tool: "build_format")
+                if selectionHasAutoFixer {
+                    actionButton("Fix Warnings", systemImage: "wrench.and.screwdriver", tool: "build_fix")
+                }
             }
 
             // Full per-interface HAL analysis for the selected platform:
@@ -1509,6 +1526,9 @@ struct ActionPanelView: View {
                 let verb = actionVerb
                 runningAction = nil
                 lastActionVerb = verb
+                // Nudge the per-platform build-status views to re-read the
+                // status the backend just persisted for this target.
+                bridge.buildCompletionTick &+= 1
                 if let result = vm.state.value {
                     // Populate the build log with ALL collected lines from the build.
                     // For Meson lint/analyze the diagnostics live in `output`
