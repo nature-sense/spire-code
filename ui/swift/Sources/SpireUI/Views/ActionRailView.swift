@@ -283,9 +283,14 @@ struct ActionRailView: View {
             absPath = root + "/" + cleanPath
         }
         vm.startEventConsumer()
+        // This rail has no platform picker: pass the subproject's platform when it
+        // is unambiguous, otherwise leave it nil — the backend then either derives
+        // one or says that a platform must be selected. It never guesses between
+        // builds, so a run can't verify against the wrong target.
+        let platform: String? = sub.platformTargets.count == 1 ? sub.platformTargets.first : nil
         Task {
             await vm.runTool(tool, path: absPath, language: sub.language, package: sub.name,
-                             platform: nil, target: railBuildTarget)
+                             platform: platform, target: railBuildTarget)
         }
     }
 

@@ -24,6 +24,37 @@ use std::path::{Path, PathBuf};
 /// Diagnostic lines currently recorded for a file, keyed by that file.
 pub type ErrorsByFile = BTreeMap<String, Vec<String>>;
 
+/// A raw diagnostic as recorded in the project graph.
+pub struct RawDiagnostic<'a> {
+    pub build_type: &'a str,
+    pub severity: &'a str,
+    pub file: &'a str,
+    pub message: &'a str,
+}
+
+/// Group the loop's input: **only compile errors from the build qualify**.
+///
+/// The graph also holds diagnostics from other kinds (lint, fix, analyze). Those
+/// are not compile errors and must never be treated as fixable source problems:
+/// a stale lint pass had left hundreds of `file not found` entries for other
+/// platforms' sources, which made "Fix & Verify" claim errors on files the
+/// current build never compiles. Build diagnostics are superseded on every build,
+/// so this set is always the current platform's real errors.
+pub fn build_errors_from(diags: &[RawDiagnostic<'_>]) -> ErrorsByFile {
+    let mut out = ErrorsByFile::new();
+    for d in diags {
+        if d.build_type != "build" || d.severity != "error" {
+            continue;
+        }
+        let message = d.message.trim();
+        if d.file.is_empty() || message.is_empty() {
+            continue;
+        }
+        out.entry(d.file.to_string()).or_default().push(message.to_string());
+    }
+    out
+}
+
 /// Outcome of one autofix run.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +73,9 @@ pub struct AutofixReport {
     pub errors_after: usize,
     /// Analyzer warnings remaining after the final lint pass.
     pub warnings_after: usize,
+    /// Platform the run was verified against; None when it could not be resolved
+    /// (the build then used whichever directory discovery returned).
+    pub platform: Option<String>,
     /// Human-readable trace of what the loop did, line by line.
     pub log: Vec<String>,
 }
@@ -61,6 +95,11 @@ impl AutofixReport {
             self.files_reverted.len(),
             self.files_skipped.len()
         ));
+        out.push_str(&match &self.platform {
+            Some(platform) => format!("platform: {platform}\n"),
+            None => "platform: none selected — the build used the discovered build directory\n"
+                .to_string(),
+        });
         if !self.files_fixed.is_empty() {
             out.push_str(&format!("fixed:\n  {}\n", self.files_fixed.join("\n  ")));
         }
@@ -68,6 +107,12 @@ impl AutofixReport {
             out.push_str(&format!(
                 "reverted (the fix did not reduce the errors):\n  {}\n",
                 self.files_reverted.join("\n  ")
+            ));
+        }
+        if self.rounds == 0 && self.errors_before > 0 && !self.files_skipped.is_empty() {
+            out.push_str(&format!(
+                "nothing was written: {} file(s) had no usable rewrite (see the trace below).\n",
+                self.files_skipped.len()
             ));
         }
         if !self.log.is_empty() {
@@ -181,6 +226,79 @@ fn total(errors: &ErrorsByFile) -> usize {
     errors.values().map(|v| v.len()).sum()
 }
 
+/// Platform ids that have a `build-<id>` directory at the project root.
+///
+/// These are the platforms a run can be *verified against* — `build-a7s`,
+/// `build-rpi5`, … (`build`, `builddir` and `build-native` are not platforms, so
+/// only names of the form `build-<id>` count).
+pub fn platform_build_dirs(project_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(project_root)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.strip_prefix("build-")
+                        .filter(|id| !id.is_empty())
+                        .map(|id| id.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Best-effort platform for a run that did not name one.
+///
+/// The action rail has no platform context, so a run can arrive with no platform
+/// at all — and `build` then compiles whichever `build*` directory discovery
+/// returns first, which may be an entirely different target. Prefer the platform
+/// encoded in the build target name (`ai-trap-rpi5` → `rpi5`), then the only
+/// build directory, and otherwise admit we cannot tell (None) rather than guess.
+pub fn derive_platform(project_root: &Path, target: Option<&str>) -> Option<String> {
+    let platforms = platform_build_dirs(project_root);
+    if let Some(target) = target {
+        if let Some(hit) = platforms.iter().find(|p| target.ends_with(p.as_str())) {
+            return Some(hit.clone());
+        }
+    }
+    if platforms.len() == 1 {
+        return platforms.into_iter().next();
+    }
+    None
+}
+
+/// Decide which platform this run must verify against, or explain why we cannot.
+///
+/// An explicit selection always wins. Otherwise we try to derive one (target name,
+/// or a single build directory). With several candidate builds and nothing to
+/// choose between them we REFUSE rather than guess: `build` would otherwise
+/// compile whichever `build*` directory discovery returns first — a different
+/// target's sources — and the loop would try to "fix" that target instead.
+pub fn resolve_platform(
+    project_root: &Path,
+    requested: Option<&str>,
+    target: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(platform) = requested.filter(|p| !p.is_empty()) {
+        return Ok(Some(platform.to_string()));
+    }
+    if let Some(platform) = derive_platform(project_root, target) {
+        return Ok(Some(platform));
+    }
+    let platforms = platform_build_dirs(project_root);
+    if platforms.len() > 1 {
+        return Err(format!(
+            "no platform selected — Fix & Verify must compile and verify one target. \
+             Select a build target or platform first (available: {}). Nothing was changed.",
+            platforms.join(", ")
+        ));
+    }
+    // No configured builds (or exactly one): discovery is unambiguous enough.
+    Ok(None)
+}
+
 /// Run the autonomous loop: apply a fix per error file, rebuild, keep what
 /// helped and roll back what did not.
 ///
@@ -278,6 +396,34 @@ pub async fn run_autofix(
         // One rebuild per round, then a per-file verdict: diagnostics are
         // per-file, so a bad fix stays attributable even in a batch.
         let after = driver.rebuild().await;
+
+        // Whole-round guard first: a rewrite can reduce its own file's errors
+        // while breaking something else (a shared header, say). If the project got
+        // worse overall, undo everything this round wrote instead of trusting the
+        // per-file bookkeeping.
+        let before_total = total(&errors);
+        let after_total = total(&after);
+        if after_total > before_total {
+            for file in &wrote {
+                if let (Some(orig), Some(path)) =
+                    (backups.get(file), resolve_source_path(file, bases))
+                {
+                    let _ = std::fs::write(&path, orig);
+                }
+                tried.insert(file.clone());
+                if !report.files_reverted.contains(file) {
+                    report.files_reverted.push(file.clone());
+                }
+            }
+            report.log.push(format!(
+                "round {} made the project worse ({before_total} → {after_total} errors); rolled back {} file(s)",
+                round + 1,
+                wrote.len()
+            ));
+            errors = driver.rebuild().await;
+            continue;
+        }
+
         let mut rolled_back = false;
         for file in &wrote {
             let before = errors.get(file).map(|v| v.len()).unwrap_or(0);
@@ -589,5 +735,223 @@ mod tests {
         assert!(bases.iter().any(|b| b.ends_with("build-rpi5")));
         assert!(bases.iter().any(|b| b.ends_with("build-a7s")));
         assert!(!bases.iter().any(|b| b.ends_with("app")), "{bases:?}");
+    }
+
+    #[test]
+    fn derive_platform_prefers_the_target_name_then_the_only_build_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        for d in ["build-rpi5", "build-rock3c", "builddir", "build"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        // Only `build-<id>` names are platforms (`builddir`/`build` are not).
+        assert_eq!(
+            platform_build_dirs(&root),
+            vec!["rock3c".to_string(), "rpi5".to_string()]
+        );
+
+        // A target that names its platform resolves it…
+        assert_eq!(
+            derive_platform(&root, Some("ai-trap-rpi5")).as_deref(),
+            Some("rpi5")
+        );
+        assert_eq!(
+            derive_platform(&root, Some("ai-trap-rock3c")).as_deref(),
+            Some("rock3c")
+        );
+
+        // …but with several candidates and no usable target we refuse to guess.
+        assert_eq!(derive_platform(&root, Some("something-else")), None);
+        assert_eq!(derive_platform(&root, None), None);
+
+        // A project with exactly one build dir needs no target at all.
+        let only = tmp.path().join("only");
+        std::fs::create_dir_all(only.join("build-rpi5")).unwrap();
+        assert_eq!(derive_platform(&only, None).as_deref(), Some("rpi5"));
+    }
+
+    #[test]
+    fn resolve_platform_refuses_to_guess_between_several_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        for d in ["build-rpi5", "build-rock3c"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        // An explicit selection always wins…
+        assert_eq!(
+            resolve_platform(&root, Some("rpi5"), Some("ai-trap-rock3c"))
+                .unwrap()
+                .as_deref(),
+            Some("rpi5")
+        );
+        // …then the build target name…
+        assert_eq!(
+            resolve_platform(&root, None, Some("ai-trap-rock3c"))
+                .unwrap()
+                .as_deref(),
+            Some("rock3c")
+        );
+        // …and with several candidates and no usable hint we refuse, saying what
+        // the user can choose.
+        let err = resolve_platform(&root, None, None).expect_err("must refuse rather than guess");
+        assert!(err.contains("no platform selected"), "{err}");
+        assert!(err.contains("rpi5"), "must list the candidates: {err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+
+        // A single configured build needs no hint at all.
+        let only = tmp.path().join("only");
+        std::fs::create_dir_all(only.join("build-a7s")).unwrap();
+        assert_eq!(
+            resolve_platform(&only, None, None).unwrap().as_deref(),
+            Some("a7s")
+        );
+        // No configured builds: discovery handles it.
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(resolve_platform(&bare, None, None).unwrap(), None);
+    }
+
+    /// Opt-in: against the real project, a run with no platform must REFUSE rather
+    /// than verify against whichever build dir discovery returns first, and a
+    /// build-target name must resolve its platform.
+    ///
+    /// Run with: SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps cargo test …
+    #[test]
+    fn real_ai_traps_platform_resolution() {
+        let Ok(root) = std::env::var("SPIRE_AI_TRAPS_INTEGRATION") else {
+            eprintln!("skipped: set SPIRE_AI_TRAPS_INTEGRATION=/abs/path/ai-traps");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let platforms = platform_build_dirs(&root);
+        if platforms.len() > 1 {
+            let err = resolve_platform(&root, None, None)
+                .expect_err("several configured builds must refuse, not guess");
+            assert!(err.contains("no platform selected"), "{err}");
+        }
+        // The rpi5 executable target names its platform (ai-trap-rpi5 → rpi5).
+        assert_eq!(
+            resolve_platform(&root, None, Some("ai-trap-rpi5"))
+                .unwrap()
+                .as_deref(),
+            Some("rpi5")
+        );
+        assert_eq!(
+            resolve_platform(&root, Some("rpi5"), None)
+                .unwrap()
+                .as_deref(),
+            Some("rpi5")
+        );
+    }
+
+    /// The loop's input is COMPILE errors only.
+    ///
+    /// A stale lint pass had left hundreds of `file not found` entries for other
+    /// platforms' sources; reading them made "Fix & Verify" claim errors on files
+    /// the build never compiles (and then reported them as unfixable).
+    #[test]
+    fn build_errors_from_ignores_everything_but_build_errors() {
+        let diags = [
+            RawDiagnostic {
+                build_type: "build",
+                severity: "error",
+                file: "a.cpp",
+                message: "boom",
+            },
+            // Stale lint findings for another platform's sources: never fix targets.
+            RawDiagnostic {
+                build_type: "lint",
+                severity: "error",
+                file: "../hal/implementations/rock3c/x.cpp",
+                message: "fatal error: 'x' file not found",
+            },
+            RawDiagnostic {
+                build_type: "lint",
+                severity: "warning",
+                file: "a.cpp",
+                message: "dead store",
+            },
+            RawDiagnostic {
+                build_type: "fix",
+                severity: "error",
+                file: "b.cpp",
+                message: "leftover",
+            },
+            RawDiagnostic {
+                build_type: "analyze",
+                severity: "error",
+                file: "c.cpp",
+                message: "leftover",
+            },
+            // Build warnings and contentless entries are not fixable errors either.
+            RawDiagnostic {
+                build_type: "build",
+                severity: "warning",
+                file: "w.cpp",
+                message: "unused",
+            },
+            RawDiagnostic {
+                build_type: "build",
+                severity: "error",
+                file: "",
+                message: "no file",
+            },
+            RawDiagnostic {
+                build_type: "build",
+                severity: "error",
+                file: "e.cpp",
+                message: "   ",
+            },
+            // A second error in the same file is grouped, not duplicated.
+            RawDiagnostic {
+                build_type: "build",
+                severity: "error",
+                file: "a.cpp",
+                message: "boom2",
+            },
+        ];
+
+        let errors = build_errors_from(&diags);
+        assert_eq!(errors.len(), 1, "only build errors qualify: {errors:?}");
+        assert_eq!(errors["a.cpp"].len(), 2, "grouped per file: {errors:?}");
+        assert!(
+            !errors.contains_key("../hal/implementations/rock3c/x.cpp"),
+            "another platform's stale lint errors must never be fix targets: {errors:?}"
+        );
+    }
+
+    /// A round that makes the project worse overall is rolled back completely,
+    /// even though the file it rewrote looks "improved" on its own.
+    #[tokio::test]
+    async fn rolls_back_the_whole_round_when_the_project_gets_worse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.cpp");
+        let original = "int broken( ;\n";
+        std::fs::write(&file, original).unwrap();
+
+        // a.cpp itself improves (1 → 0), but the round introduces 3 errors elsewhere.
+        let driver = FakeDriver::new(vec![
+            errs(&[("a.cpp", 1)]),
+            errs(&[("b.cpp", 3)]),
+            errs(&[("a.cpp", 1)]),
+        ])
+        .proposing("a.cpp", "int a() { return 0; }\n");
+
+        let report = run_autofix(&driver, &[tmp.path().to_path_buf()], 5).await;
+
+        assert_eq!(report.files_reverted, vec!["a.cpp"]);
+        assert!(report.files_fixed.is_empty(), "no net gain: {report:?}");
+        assert_eq!(report.rounds, 1);
+        assert_eq!(report.errors_after, 1);
+        assert!(!report.success);
+        assert!(
+            report
+                .log
+                .iter()
+                .any(|l| l.contains("made the project worse")),
+            "the rollback must be explained: {report:?}"
+        );
+        // The pre-run bytes are back.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
     }
 }

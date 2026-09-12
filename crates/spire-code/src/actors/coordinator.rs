@@ -372,31 +372,21 @@ impl CoordinatorActor {
         }
     }
 
-    /// ERROR diagnostics grouped by file — the input of the autofix loop.
-    async fn error_diagnostics_by_file(&self) -> crate::build::autofix::ErrorsByFile {
-        let mut out = crate::build::autofix::ErrorsByFile::new();
-        for node in self.diagnostic_nodes().await {
-            if node.get("severity").and_then(|v| v.as_str()) != Some("error") {
-                continue;
-            }
-            let Some(file) = node.get("file").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if file.is_empty() {
-                continue;
-            }
-            let message = node
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if message.is_empty() {
-                continue;
-            }
-            out.entry(file.to_string()).or_default().push(message);
-        }
-        out
+    /// Compile ERROR diagnostics from the **build** run, grouped by file — the
+    /// input of the autofix loop. The scoping policy lives in
+    /// [`crate::build::autofix::build_errors_from`] so it is unit-tested.
+    async fn build_error_diagnostics_by_file(&self) -> crate::build::autofix::ErrorsByFile {
+        let nodes = self.diagnostic_nodes().await;
+        let diags: Vec<crate::build::autofix::RawDiagnostic<'_>> = nodes
+            .iter()
+            .map(|n| crate::build::autofix::RawDiagnostic {
+                build_type: n.get("build_type").and_then(|v| v.as_str()).unwrap_or(""),
+                severity: n.get("severity").and_then(|v| v.as_str()).unwrap_or(""),
+                file: n.get("file").and_then(|v| v.as_str()).unwrap_or(""),
+                message: n.get("message").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+            .collect();
+        crate::build::autofix::build_errors_from(&diags)
     }
 
     /// Analyzer warnings currently recorded (reported, never auto-rewritten).
@@ -459,22 +449,42 @@ impl CoordinatorActor {
         let project_root = crate::build::autofix::find_project_root(std::path::Path::new(path));
         let bases = crate::build::autofix::diagnostic_bases(&project_root);
 
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .map(|s| s.to_string());
+        // A run can arrive with no platform selected. Resolve one, or refuse with
+        // something actionable: without it `build` compiles whichever build
+        // directory discovery returns first, which may be a different target — the
+        // loop would then be "fixing" the wrong platform.
+        let platform = match crate::build::autofix::resolve_platform(
+            &project_root,
+            args.get("platform").and_then(|v| v.as_str()),
+            target.as_deref(),
+        ) {
+            Ok(platform) => platform,
+            Err(reason) => {
+                tracing::warn!("[COORDINATOR] build/autofix refused: {reason}");
+                return serde_json::json!({
+                    "success": false,
+                    "error": reason,
+                    "output": format!("Fix & Verify: {reason}"),
+                });
+            }
+        };
+
         let driver = CoordinatorAutofix {
             coord: self,
             path: path.to_string(),
-            platform: args
-                .get("platform")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            target: args
-                .get("target")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            platform: platform.clone(),
+            target,
         };
 
         tracing::info!(
-            "[COORDINATOR] build/autofix: path={path} root={} rounds<={max_rounds}",
-            project_root.display()
+            "[COORDINATOR] build/autofix: path={path} root={} platform={:?} rounds<={max_rounds}",
+            project_root.display(),
+            platform
         );
 
         // Compile FIRST so the loop acts on the CURRENT errors rather than on
@@ -489,8 +499,9 @@ impl CoordinatorActor {
             });
         }
 
-        let report =
+        let mut report =
             crate::build::autofix::run_autofix(&driver, &bases, max_rounds).await;
+        report.platform = platform;
         tracing::info!(
             "[COORDINATOR] build/autofix done: success={} rounds={} fixed={} reverted={} errors {}→{}",
             report.success,
@@ -571,7 +582,7 @@ impl CoordinatorAutofix<'_> {
 #[async_trait]
 impl crate::build::autofix::AutofixDriver for CoordinatorAutofix<'_> {
     async fn errors(&self) -> crate::build::autofix::ErrorsByFile {
-        self.coord.error_diagnostics_by_file().await
+        self.coord.build_error_diagnostics_by_file().await
     }
 
     async fn propose(&self, file: &str, path: &std::path::Path) -> Option<String> {
@@ -592,7 +603,7 @@ impl crate::build::autofix::AutofixDriver for CoordinatorAutofix<'_> {
             .coord
             .call_tool_json("build_build", self.build_args())
             .await;
-        self.coord.error_diagnostics_by_file().await
+        self.coord.build_error_diagnostics_by_file().await
     }
 
     async fn lint(&self) -> usize {
