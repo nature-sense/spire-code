@@ -792,6 +792,37 @@ struct ActionPanelView: View {
         return hal.domains.first { $0.id == id }?.name
     }
 
+    /// True when the current selection is something that can actually be built:
+    /// a build target, a HAL **platform** domain, or a non-HAL subproject.
+    ///
+    /// The HAL subproject itself, the `common` domain (shared toolkit +
+    /// contracts) and the `hal/api` contract rows are NOT buildable — they have
+    /// no executable — so the Build/Test/Clean/Lint/Fix row is hidden for them.
+    private var isBuildableSelection: Bool {
+        if selectedBuildTarget != nil { return true }
+        guard let sub = selectedSubproject else { return false }
+        // A HAL project's buildability is per-platform-domain.
+        if sub.structure == "hal" {
+            return selectedDomainKind == "platform"
+        }
+        // Non-HAL subprojects (Cargo / npm / …) build directly.
+        return true
+    }
+
+    /// The platform a selected BUILD TARGET builds for (nil when it is a host
+    /// target). Used so building a target selects the right Meson build dir
+    /// (`build-<plat>`) + cross file — the target knows its own platform.
+    private func platformForSelectedTarget() -> String? {
+        guard let name = selectedBuildTarget else { return nil }
+        for sub in project.subprojects {
+            if let bt = sub.buildTargets.first(where: { $0.name == name }),
+               !bt.platform.isEmpty, bt.platform != "host" {
+                return bt.platform
+            }
+        }
+        return nil
+    }
+
     // ── Semantic one-shot generation (Fix → plan → approval → apply) ──
     /// Proposed LLM module pair awaiting approval in the viewer.
     @State private var generatedPlan: HalGenerateImplPlan?
@@ -830,13 +861,14 @@ struct ActionPanelView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .padding(8)
-            } else if selectedSubproject != nil && selectedDomainKind != "common" {
-                // Build/Test/Lint are shown only for a buildable selection:
-                // a subproject, or a HAL platform domain. Selecting `common`
-                // (or clearing the domain → project root) shows project-wide
-                // actions instead — no per-target build buttons. While the
-                // hal/api contracts fail the format lint, implementation
-                // actions are blocked in favor of the correction plan.
+            } else if selectedSubproject != nil && isBuildableSelection {
+                // Build/Test/Lint are shown only for a BUILDABLE selection: a
+                // build target, a HAL platform domain, or a non-HAL subproject.
+                // The HAL subproject / `common` domain / hal-api contracts are
+                // not binaries — "building the HAL" has no meaning, so the
+                // per-target action row is hidden for them. While the hal/api
+                // contracts fail the format lint, implementation actions are
+                // blocked in favor of the correction plan.
                 if halImplementationActionsBlocked {
                     halContractBlockedView
                 } else {
@@ -1454,12 +1486,17 @@ struct ActionPanelView: View {
         guard let vm = buildViewModel else { return }
         runningAction = tool
         flashResult("\(tool) started\n\(absPath)")
-        // Platform resolution: when a HAL platform domain is selected, build
-        // that platform (selects build-<platform> Meson dir); otherwise fall
+        // Platform resolution: a HAL platform domain → that platform; otherwise
+        // derive it from the selected BUILD TARGET (each target knows its own
+        // platform, e.g. ai-trap-rpi5 → rpi5) so the build selects the right
+        // Meson dir (`build-rpi5`) and provisions its cross file; finally fall
         // back to the first platform target when the subproject is multi-target.
         let platform: String? = {
             if let domain = selectedDomainName, selectedDomainKind == "platform" {
                 return domain
+            }
+            if let fromTarget = platformForSelectedTarget() {
+                return fromTarget
             }
             let targets = sub.platformTargets
             return targets.count > 1 ? targets.first : nil
