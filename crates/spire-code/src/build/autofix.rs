@@ -25,11 +25,11 @@ use std::path::{Path, PathBuf};
 pub type ErrorsByFile = BTreeMap<String, Vec<String>>;
 
 /// A raw diagnostic as recorded in the project graph.
-pub struct RawDiagnostic<'a> {
-    pub build_type: &'a str,
-    pub severity: &'a str,
-    pub file: &'a str,
-    pub message: &'a str,
+pub struct RawDiagnostic {
+    pub build_type: String,
+    pub severity: String,
+    pub file: String,
+    pub message: String,
 }
 
 /// Group the loop's input: **only compile errors from the build qualify**.
@@ -40,7 +40,7 @@ pub struct RawDiagnostic<'a> {
 /// platforms' sources, which made "Fix & Verify" claim errors on files the
 /// current build never compiles. Build diagnostics are superseded on every build,
 /// so this set is always the current platform's real errors.
-pub fn build_errors_from(diags: &[RawDiagnostic<'_>]) -> ErrorsByFile {
+pub fn build_errors_from(diags: &[RawDiagnostic]) -> ErrorsByFile {
     let mut out = ErrorsByFile::new();
     for d in diags {
         if d.build_type != "build" || d.severity != "error" {
@@ -55,7 +55,98 @@ pub fn build_errors_from(diags: &[RawDiagnostic<'_>]) -> ErrorsByFile {
     out
 }
 
-/// Outcome of one autofix run.
+/// Warning lines grouped by file (same shape as [`ErrorsByFile`]).
+pub type WarningsByFile = ErrorsByFile;
+
+/// Warning tags that are mechanically safe to fix automatically.
+///
+/// Only dead stores / dead initialisations / unused values / self-assignments
+/// qualify: removing them cannot change behaviour. Everything else the tools
+/// report (`core.*` analyser findings such as null dereferences, `-Wsign-compare`,
+/// `-Wformat`, …) needs human judgement, so those warnings are REPORTED and never
+/// rewritten.
+pub const SAFE_WARNING_TAGS: &[&str] = &[
+    "deadcode.DeadStores",
+    "deadcode.DeadInitialization",
+    "-Wunused-variable",
+    "-Wunused-but-set-variable",
+    "-Wunused-parameter",
+    "-Wunused-value",
+    "-Wunused-local-typedef",
+    "-Wself-assign",
+];
+
+/// True when a warning can be fixed without changing behaviour.
+pub fn warning_is_safe(message: &str) -> bool {
+    SAFE_WARNING_TAGS.iter().any(|tag| message.contains(tag))
+}
+
+/// Warning diagnostics grouped by file (both compiler `-W…` warnings and analyser
+/// findings are recorded with `severity = "warning"`).
+pub fn warnings_from(diags: &[RawDiagnostic]) -> WarningsByFile {
+    let mut out = WarningsByFile::new();
+    for d in diags {
+        if d.severity != "warning" {
+            continue;
+        }
+        let message = d.message.trim();
+        if d.file.is_empty() || message.is_empty() {
+            continue;
+        }
+        out.entry(d.file.to_string())
+            .or_default()
+            .push(message.to_string());
+    }
+    out
+}
+
+/// The subset of `warnings` that may be fixed automatically.
+pub fn safe_warnings(warnings: &WarningsByFile) -> WarningsByFile {
+    warnings
+        .iter()
+        .filter_map(|(file, lines)| {
+            let safe: Vec<String> = lines
+                .iter()
+                .filter(|line| warning_is_safe(line))
+                .cloned()
+                .collect();
+            if safe.is_empty() {
+                None
+            } else {
+                Some((file.clone(), safe))
+            }
+        })
+        .collect()
+}
+
+/// The subset that must be left to a human (reported, never rewritten).
+pub fn held_warnings(warnings: &WarningsByFile) -> WarningsByFile {
+    warnings
+        .iter()
+        .filter_map(|(file, lines)| {
+            let held: Vec<String> = lines
+                .iter()
+                .filter(|line| !warning_is_safe(line))
+                .cloned()
+                .collect();
+            if held.is_empty() {
+                None
+            } else {
+                Some((file.clone(), held))
+            }
+        })
+        .collect()
+}
+
+/// Flatten a per-file map into readable `file: line` entries.
+fn flatten(warnings: &WarningsByFile) -> Vec<String> {
+    warnings
+        .iter()
+        .flat_map(|(file, lines)| lines.iter().map(move |l| format!("{file}: {l}")))
+        .collect()
+}
+
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutofixReport {
@@ -73,6 +164,20 @@ pub struct AutofixReport {
     pub errors_after: usize,
     /// Analyzer warnings remaining after the final lint pass.
     pub warnings_after: usize,
+    /// Rounds spent on the safe-warning phase.
+    pub warning_rounds: usize,
+    /// Files whose automatic warning fix was kept.
+    pub warnings_fixed: Vec<String>,
+    /// Files whose warning fix was rolled back.
+    pub warnings_reverted: Vec<String>,
+    /// Safely-fixable warnings present when the warning phase started.
+    pub safe_warnings_before: usize,
+    /// Safely-fixable warnings still present at the end.
+    pub safe_warnings_after: usize,
+    /// Warnings deliberately left for review (not safe to auto-fix).
+    pub warnings_held: Vec<String>,
+    /// Built executable, when the final build succeeded and it can be named.
+    pub artifact: Option<String>,
     /// Platform the run was verified against; None when it could not be resolved
     /// (the build then used whichever directory discovery returned).
     pub platform: Option<String>,
@@ -84,30 +189,59 @@ impl AutofixReport {
     /// Short, human summary for the UI's result pane.
     pub fn summary(&self) -> String {
         let mut out = String::new();
+        out.push_str("Fix & Verify: build → fix errors → lint → fix warnings → verify\n");
         out.push_str(&format!(
-            "Fix & Verify: {} error(s) before → {} after · {} warning(s) remaining\n",
-            self.errors_before, self.errors_after, self.warnings_after
+            "errors:   {} → {}\n",
+            self.errors_before, self.errors_after
         ));
         out.push_str(&format!(
-            "rounds used: {} · fixed: {} · reverted: {} · skipped: {}\n",
-            self.rounds,
-            self.files_fixed.len(),
-            self.files_reverted.len(),
-            self.files_skipped.len()
+            "warnings: {} safely-fixable → {} · {} left for review\n",
+            self.safe_warnings_before,
+            self.safe_warnings_after,
+            self.warnings_held.len()
+        ));
+        out.push_str(&format!(
+            "rounds:   {} error · {} warning\n",
+            self.rounds, self.warning_rounds
         ));
         out.push_str(&match &self.platform {
             Some(platform) => format!("platform: {platform}\n"),
             None => "platform: none selected — the build used the discovered build directory\n"
                 .to_string(),
         });
+        match &self.artifact {
+            Some(artifact) => out.push_str(&format!("built:    {artifact}\n")),
+            None => out.push_str("built:    no artifact (the build did not succeed)\n"),
+        }
         if !self.files_fixed.is_empty() {
-            out.push_str(&format!("fixed:\n  {}\n", self.files_fixed.join("\n  ")));
+            out.push_str(&format!(
+                "error fixes kept:\n  {}\n",
+                self.files_fixed.join("\n  ")
+            ));
         }
         if !self.files_reverted.is_empty() {
             out.push_str(&format!(
-                "reverted (the fix did not reduce the errors):\n  {}\n",
+                "error fixes reverted (no net gain):\n  {}\n",
                 self.files_reverted.join("\n  ")
             ));
+        }
+        if !self.warnings_fixed.is_empty() {
+            out.push_str(&format!(
+                "warning fixes kept:\n  {}\n",
+                self.warnings_fixed.join("\n  ")
+            ));
+        }
+        if !self.warnings_reverted.is_empty() {
+            out.push_str(&format!(
+                "warning fixes reverted:\n  {}\n",
+                self.warnings_reverted.join("\n  ")
+            ));
+        }
+        if !self.warnings_held.is_empty() {
+            out.push_str("warnings left for review (not safe to auto-fix):\n");
+            for entry in &self.warnings_held {
+                out.push_str(&format!("  {entry}\n"));
+            }
         }
         if self.rounds == 0 && self.errors_before > 0 && !self.files_skipped.is_empty() {
             out.push_str(&format!(
@@ -120,12 +254,17 @@ impl AutofixReport {
             out.push_str(&self.log.join("\n"));
             out.push('\n');
         }
-        if self.success {
-            out.push_str("Result: the project compiles with no errors.");
-        } else {
+        if !self.success {
             out.push_str(&format!(
                 "Result: {} error(s) still reported — see the Build tab for the files that need attention.",
                 self.errors_after
+            ));
+        } else if self.safe_warnings_after == 0 && self.warnings_held.is_empty() {
+            out.push_str("Result: clean — no errors, no warnings.");
+        } else {
+            out.push_str(&format!(
+                "Result: compiles cleanly. {} warning(s) left for review.",
+                self.warnings_held.len()
             ));
         }
         out
@@ -146,6 +285,17 @@ pub trait AutofixDriver: Send + Sync {
     async fn rebuild(&self) -> ErrorsByFile;
     /// Run the linter once, returning the number of warnings it reports.
     async fn lint(&self) -> usize;
+    /// Warning diagnostics currently recorded for the project, grouped by file
+    /// (fresh after [`Self::lint`]).
+    async fn warnings(&self) -> WarningsByFile;
+    /// A replacement for `file` aimed at clearing `warnings` (None when the model
+    /// has nothing usable). Only called for warnings classified as safe.
+    async fn propose_warning_fix(
+        &self,
+        file: &str,
+        path: &Path,
+        warnings: &[String],
+    ) -> Option<String>;
 }
 
 /// Resolve a diagnostic's file path to something writable.
@@ -314,12 +464,9 @@ pub async fn run_autofix(
     let mut errors = driver.errors().await;
     report.errors_before = total(&errors);
     if report.errors_before == 0 {
-        report.warnings_after = driver.lint().await;
-        report.success = true;
         report
             .log
-            .push("nothing to fix: no compile errors reported".to_string());
-        return report;
+            .push("no compile errors reported — skipping the error phase".to_string());
     }
 
     let mut tried: BTreeSet<String> = BTreeSet::new();
@@ -457,7 +604,132 @@ pub async fn run_autofix(
     }
 
     report.errors_after = total(&errors);
-    report.warnings_after = driver.lint().await;
+
+    // ── Phase 2: safely-fixable warnings ─────────────────────────────────────
+    // Runs only on a clean compile (fixing warnings on a broken build proves
+    // nothing) and only for warnings classified as behaviour-preserving. The gate
+    // mirrors phase 1: keep the edits only if the project did not get worse —
+    // no error appeared AND the safe-warning count actually fell.
+    let mut measured: Option<WarningsByFile> = None;
+    if report.errors_after == 0 {
+        let _ = driver.lint().await;
+        let mut warnings = driver.warnings().await;
+        report.safe_warnings_before = total(&safe_warnings(&warnings));
+        let mut tried_warn: BTreeSet<String> = BTreeSet::new();
+
+        for round in 0..max_rounds.max(1) {
+            let candidates: Vec<(String, Vec<String>)> = safe_warnings(&warnings)
+                .into_iter()
+                .filter(|(file, _)| !tried_warn.contains(file))
+                .collect();
+            if candidates.is_empty() {
+                break;
+            }
+            report.log.push(format!(
+                "warning round {}: {} file(s) with safely-fixable warnings",
+                round + 1,
+                candidates.len()
+            ));
+
+            let mut wrote: Vec<String> = Vec::new();
+            for (file, lines) in &candidates {
+                let Some(path) = resolve_source_path(file, bases) else {
+                    report.log.push(format!("skip {file}: not found on disk"));
+                    tried_warn.insert(file.clone());
+                    continue;
+                };
+                if !backups.contains_key(file) {
+                    match std::fs::read_to_string(&path) {
+                        Ok(orig) => {
+                            backups.insert(file.clone(), orig);
+                        }
+                        Err(e) => {
+                            report.log.push(format!("skip {file}: cannot read ({e})"));
+                            tried_warn.insert(file.clone());
+                            continue;
+                        }
+                    }
+                }
+                let Some(content) = driver.propose_warning_fix(file, &path, lines).await else {
+                    report.log.push(format!("skip {file}: no warning fix proposed"));
+                    tried_warn.insert(file.clone());
+                    continue;
+                };
+                if content.trim().is_empty() {
+                    report.log.push(format!("skip {file}: empty proposal"));
+                    tried_warn.insert(file.clone());
+                    continue;
+                }
+                if let Err(e) = std::fs::write(&path, &content) {
+                    report.log.push(format!("skip {file}: write failed ({e})"));
+                    tried_warn.insert(file.clone());
+                    continue;
+                }
+                report.log.push(format!(
+                    "applied warning fix to {file} ({} warning(s) reported)",
+                    lines.len()
+                ));
+                wrote.push(file.clone());
+            }
+            if wrote.is_empty() {
+                break; // nothing written — no point looping
+            }
+            report.warning_rounds += 1;
+
+            // Re-measure: rebuild (errors must stay at zero), re-lint, re-read.
+            let errors_after_round = total(&driver.rebuild().await);
+            let _ = driver.lint().await;
+            let warnings_after_round = driver.warnings().await;
+            let safe_after = total(&safe_warnings(&warnings_after_round));
+
+            if errors_after_round > 0 || safe_after >= report.safe_warnings_before {
+                for file in &wrote {
+                    if let (Some(orig), Some(path)) =
+                        (backups.get(file), resolve_source_path(file, bases))
+                    {
+                        let _ = std::fs::write(&path, orig);
+                    }
+                    tried_warn.insert(file.clone());
+                    if !report.warnings_reverted.contains(file) {
+                        report.warnings_reverted.push(file.clone());
+                    }
+                }
+                report.log.push(format!(
+                    "warning round {} rolled back ({} → {} safe warning(s), {} error(s))",
+                    round + 1, report.safe_warnings_before, safe_after, errors_after_round
+                ));
+                // Re-measure without the reverted edits.
+                let _ = driver.rebuild().await;
+                let _ = driver.lint().await;
+                warnings = driver.warnings().await;
+                continue;
+            }
+
+            for file in &wrote {
+                if !report.warnings_fixed.contains(file) {
+                    report.warnings_fixed.push(file.clone());
+                }
+            }
+            report.log.push(format!(
+                "warning round {} kept: {} → {} safe warning(s)",
+                round + 1, report.safe_warnings_before, safe_after
+            ));
+            warnings = warnings_after_round;
+        }
+        measured = Some(warnings);
+    }
+
+    // Final measurement — a lint already ran whenever phase 2 did.
+    let warnings_final = match measured {
+        Some(warnings) => warnings,
+        None => {
+            let _ = driver.lint().await;
+            driver.warnings().await
+        }
+    };
+    report.warnings_after = total(&warnings_final);
+    report.safe_warnings_after = total(&safe_warnings(&warnings_final));
+    report.warnings_held = flatten(&held_warnings(&warnings_final));
     report.success = report.errors_after == 0;
     report
 }
@@ -467,6 +739,77 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    fn diag(build_type: &str, severity: &str, file: &str, message: &str) -> RawDiagnostic {
+        RawDiagnostic {
+            build_type: build_type.to_string(),
+            severity: severity.to_string(),
+            file: file.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// Warnings are split into "safe to fix automatically" vs "leave for review".
+    #[test]
+    fn warning_classification_separates_safe_from_judgement() {
+        // Safe: removing these cannot change behaviour.
+        assert!(warning_is_safe(
+            "Value stored to 'dst_uv_h' is never read [deadcode.DeadStores]"
+        ));
+        assert!(warning_is_safe("unused variable 'x' [-Wunused-variable]"));
+        assert!(warning_is_safe("unused parameter 'n' [-Wunused-parameter]"));
+        assert!(warning_is_safe(
+            "explicitly assigning value of variable to itself [-Wself-assign]"
+        ));
+        // Judgement calls: reported, never rewritten automatically.
+        assert!(!warning_is_safe(
+            "Dereference of null pointer [core.NullDereference]"
+        ));
+        assert!(!warning_is_safe(
+            "comparison of integers of different signs [-Wsign-compare]"
+        ));
+        assert!(!warning_is_safe(
+            "format specifies type 'int' but the argument has type 'long' [-Wformat]"
+        ));
+        assert!(!warning_is_safe(""));
+    }
+
+    #[test]
+    fn warnings_are_grouped_and_split_by_safety() {
+        let diags = [
+            diag("build", "error", "a.cpp", "boom"),
+            diag(
+                "lint",
+                "warning",
+                "a.cpp",
+                "dead store [deadcode.DeadStores]",
+            ),
+            diag("lint", "warning", "a.cpp", "null deref [core.NullDereference]"),
+            diag(
+                "lint",
+                "warning",
+                "b.cpp",
+                "unused variable [-Wunused-variable]",
+            ),
+            diag("lint", "warning", "", "no file"),
+        ];
+
+        let warnings = warnings_from(&diags);
+        assert_eq!(warnings.len(), 2, "errors are not warnings: {warnings:?}");
+        assert_eq!(warnings["a.cpp"].len(), 2);
+
+        let safe = safe_warnings(&warnings);
+        assert_eq!(total(&safe), 2, "{safe:?}");
+        assert!(safe.contains_key("a.cpp") && safe.contains_key("b.cpp"));
+
+        let held = held_warnings(&warnings);
+        assert_eq!(total(&held), 1, "{held:?}");
+        assert!(held.contains_key("a.cpp") && !held.contains_key("b.cpp"));
+        assert!(
+            flatten(&held).iter().any(|l| l.contains("NullDereference")),
+            "the held list names the finding: {held:?}"
+        );
+    }
+
     /// Canned driver: `errors()` reports the current state and `rebuild()`
     /// advances to the next scripted state, so convergence and regressions are
     /// exact.
@@ -475,7 +818,12 @@ mod tests {
         /// file -> replacement the model would return (absent = nothing to offer).
         proposals: Mutex<BTreeMap<String, Option<String>>>,
         rebuilds: Mutex<usize>,
-        warnings: usize,
+        /// Scripted warning state: `warnings()` reports the front and a `rebuild()`
+        /// (the build+lint re-measure) advances it, so a fix that clears a warning
+        /// becomes visible exactly as it would in a real run.
+        warning_states: Mutex<std::collections::VecDeque<WarningsByFile>>,
+        warning_proposals: Mutex<BTreeMap<String, Option<String>>>,
+        lints: Mutex<usize>,
     }
 
     impl FakeDriver {
@@ -484,12 +832,28 @@ mod tests {
                 states: Mutex::new(states.into()),
                 proposals: Mutex::new(BTreeMap::new()),
                 rebuilds: Mutex::new(0),
-                warnings: 0,
+                warning_states: Mutex::new(std::collections::VecDeque::new()),
+                warning_proposals: Mutex::new(BTreeMap::new()),
+                lints: Mutex::new(0),
             }
         }
 
         fn proposing(self, file: &str, content: &str) -> Self {
             self.proposals
+                .lock()
+                .unwrap()
+                .insert(file.to_string(), Some(content.to_string()));
+            self
+        }
+
+        /// Script the warnings the tools report, in order.
+        fn with_warnings(self, states: Vec<WarningsByFile>) -> Self {
+            *self.warning_states.lock().unwrap() = states.into();
+            self
+        }
+
+        fn proposing_warning_fix(self, file: &str, content: &str) -> Self {
+            self.warning_proposals
                 .lock()
                 .unwrap()
                 .insert(file.to_string(), Some(content.to_string()));
@@ -512,6 +876,14 @@ mod tests {
         }
         async fn rebuild(&self) -> ErrorsByFile {
             *self.rebuilds.lock().unwrap() += 1;
+            // A rebuild IS the build+lint re-measure, so scripted warnings advance
+            // together with the scripted errors.
+            {
+                let mut warnings = self.warning_states.lock().unwrap();
+                if warnings.len() > 1 {
+                    warnings.pop_front();
+                }
+            }
             let mut states = self.states.lock().unwrap();
             if states.len() > 1 {
                 states.pop_front();
@@ -519,7 +891,29 @@ mod tests {
             states.front().cloned().unwrap_or_default()
         }
         async fn lint(&self) -> usize {
-            self.warnings
+            *self.lints.lock().unwrap() += 1;
+            total(&self.warnings().await)
+        }
+        async fn warnings(&self) -> WarningsByFile {
+            self.warning_states
+                .lock()
+                .unwrap()
+                .front()
+                .cloned()
+                .unwrap_or_default()
+        }
+        async fn propose_warning_fix(
+            &self,
+            file: &str,
+            _path: &Path,
+            _warnings: &[String],
+        ) -> Option<String> {
+            self.warning_proposals
+                .lock()
+                .unwrap()
+                .get(file)
+                .cloned()
+                .flatten()
         }
     }
 
@@ -533,6 +927,17 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Warnings map with one warning per `(file, tag)` pair.
+    fn warns(entries: &[(&str, &str)]) -> WarningsByFile {
+        let mut out = WarningsByFile::new();
+        for (file, tag) in entries {
+            out.entry(file.to_string())
+                .or_default()
+                .push(format!("{file}:1:1: warning: something [{tag}]"));
+        }
+        out
     }
 
     /// A fix that clears the file's errors is kept, and the loop stops as soon as
@@ -647,6 +1052,93 @@ mod tests {
         assert_eq!(report.rounds, 0);
         assert_eq!(*driver.rebuilds.lock().unwrap(), 0);
         assert!(report.files_fixed.is_empty());
+    }
+
+    /// A safe warning is fixed automatically, verified by a re-measure, and kept.
+    #[tokio::test]
+    async fn fixes_a_safe_warning_and_keeps_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.cpp");
+        std::fs::write(&file, "void f() { int x = 1; }\n").unwrap();
+
+        let driver = FakeDriver::new(vec![errs(&[])])
+            .with_warnings(vec![
+                warns(&[("a.cpp", "deadcode.DeadStores")]),
+                warns(&[]),
+            ])
+            .proposing_warning_fix("a.cpp", "void f() {}\n");
+
+        let report = run_autofix(&driver, &[tmp.path().to_path_buf()], 5).await;
+
+        assert!(report.success, "{report:?}");
+        assert_eq!(report.safe_warnings_before, 1);
+        assert_eq!(report.safe_warnings_after, 0);
+        assert_eq!(report.warning_rounds, 1);
+        assert_eq!(report.warnings_fixed, vec!["a.cpp"]);
+        assert!(report.warnings_reverted.is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "void f() {}\n");
+    }
+
+    /// A warning fix that breaks the build is rolled back and reported.
+    #[tokio::test]
+    async fn rolls_back_a_warning_fix_that_breaks_the_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.cpp");
+        let original = "void f() { int x = 1; }\n";
+        std::fs::write(&file, original).unwrap();
+
+        let warned = warns(&[("a.cpp", "deadcode.DeadStores")]);
+        // The re-measure after the fix reports an ERROR → the edit must be undone.
+        let driver = FakeDriver::new(vec![errs(&[]), errs(&[("a.cpp", 1)])])
+            .with_warnings(vec![warned.clone(), warned.clone()])
+            .proposing_warning_fix("a.cpp", "void f() { int ; }\n");
+
+        let report = run_autofix(&driver, &[tmp.path().to_path_buf()], 5).await;
+
+        assert!(report.warnings_fixed.is_empty(), "{report:?}");
+        assert_eq!(report.warnings_reverted, vec!["a.cpp"]);
+        assert_eq!(report.safe_warnings_after, 1, "the warning is still there");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            original,
+            "the pre-run bytes must be back"
+        );
+    }
+
+    /// Warnings that need judgement are reported, never rewritten.
+    #[tokio::test]
+    async fn leaves_judgement_warnings_for_review() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.cpp");
+        let original = "void f(int *p) { *p = 1; }\n";
+        std::fs::write(&file, original).unwrap();
+
+        let driver = FakeDriver::new(vec![errs(&[])]).with_warnings(vec![warns(&[
+            ("a.cpp", "core.NullDereference"),
+            ("b.cpp", "-Wsign-compare"),
+        ])]);
+
+        let report = run_autofix(&driver, &[tmp.path().to_path_buf()], 5).await;
+
+        assert_eq!(report.safe_warnings_before, 0);
+        assert_eq!(report.safe_warnings_after, 0);
+        assert_eq!(report.warning_rounds, 0, "nothing may be attempted: {report:?}");
+        assert!(report.warnings_fixed.is_empty());
+        assert_eq!(report.warnings_held.len(), 2, "{:?}", report.warnings_held);
+        assert!(report
+            .warnings_held
+            .iter()
+            .any(|w| w.contains("NullDereference")));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            original,
+            "the file must be untouched"
+        );
+        assert!(
+            report.summary().contains("left for review"),
+            "the summary must surface them: {}",
+            report.summary()
+        );
     }
 
     #[test]
@@ -852,63 +1344,23 @@ mod tests {
     #[test]
     fn build_errors_from_ignores_everything_but_build_errors() {
         let diags = [
-            RawDiagnostic {
-                build_type: "build",
-                severity: "error",
-                file: "a.cpp",
-                message: "boom",
-            },
+            diag("build", "error", "a.cpp", "boom"),
             // Stale lint findings for another platform's sources: never fix targets.
-            RawDiagnostic {
-                build_type: "lint",
-                severity: "error",
-                file: "../hal/implementations/rock3c/x.cpp",
-                message: "fatal error: 'x' file not found",
-            },
-            RawDiagnostic {
-                build_type: "lint",
-                severity: "warning",
-                file: "a.cpp",
-                message: "dead store",
-            },
-            RawDiagnostic {
-                build_type: "fix",
-                severity: "error",
-                file: "b.cpp",
-                message: "leftover",
-            },
-            RawDiagnostic {
-                build_type: "analyze",
-                severity: "error",
-                file: "c.cpp",
-                message: "leftover",
-            },
+            diag(
+                "lint",
+                "error",
+                "../hal/implementations/rock3c/x.cpp",
+                "fatal error: 'x' file not found",
+            ),
+            diag("lint", "warning", "a.cpp", "dead store"),
+            diag("fix", "error", "b.cpp", "leftover"),
+            diag("analyze", "error", "c.cpp", "leftover"),
             // Build warnings and contentless entries are not fixable errors either.
-            RawDiagnostic {
-                build_type: "build",
-                severity: "warning",
-                file: "w.cpp",
-                message: "unused",
-            },
-            RawDiagnostic {
-                build_type: "build",
-                severity: "error",
-                file: "",
-                message: "no file",
-            },
-            RawDiagnostic {
-                build_type: "build",
-                severity: "error",
-                file: "e.cpp",
-                message: "   ",
-            },
+            diag("build", "warning", "w.cpp", "unused"),
+            diag("build", "error", "", "no file"),
+            diag("build", "error", "e.cpp", "   "),
             // A second error in the same file is grouped, not duplicated.
-            RawDiagnostic {
-                build_type: "build",
-                severity: "error",
-                file: "a.cpp",
-                message: "boom2",
-            },
+            diag("build", "error", "a.cpp", "boom2"),
         ];
 
         let errors = build_errors_from(&diags);

@@ -3277,7 +3277,7 @@ executable('{project_name}-{platform}',
             },
             spire_core::actors::ToolInfo {
                 name: "build_autofix".to_string(),
-                description: "Fix & Verify: apply LLM rewrites for the current compile errors, rebuild, keep what reduced the errors and roll back what did not, until the build is clean or the round cap is reached. Writes files; every write is compile-verified and reverted if it does not help.".to_string(),
+                description: "Fix & Verify pipeline: compile, fix compile errors with LLM rewrites, lint, fix safely-fixable warnings (dead stores/unused code), and re-verify — keeping only edits that measurably help and rolling back any that do not, until the project builds cleanly or the round cap is reached. Every write is compile-verified; warnings that need judgement are reported, never rewritten.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

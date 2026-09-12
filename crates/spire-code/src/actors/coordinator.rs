@@ -289,13 +289,36 @@ impl CoordinatorActor {
             }
         };
 
-        let mut prompt = crate::build::generic_helpers::compile_fix_prompt(
+        let prompt = crate::build::generic_helpers::compile_fix_prompt(
             &path.to_string_lossy(),
             &content,
             &errors,
         );
-        let mut proposed = String::new();
+        // One shared LLM + structural-check path (see `llm_rewrite`).
+        let (proposed, _syntax_ok) = match self.llm_rewrite(prompt).await {
+            Ok(result) => result,
+            Err(e) => return serde_json::json!({ "status": "error", "error": e }),
+        };
+        serde_json::json!({
+            "status": "proposed",
+            "path": path.to_string_lossy(),
+            "proposed_content": proposed,
+            "errors": errors,
+        })
+    }
+
+    /// Ask the model for a WHOLE-FILE rewrite of `prompt`, then validate the
+    /// result structurally: a tree-sitter parse of the C++ catches truncated or
+    /// garbled output before it can ever be written, and one retry feeds the
+    /// syntax errors back so the model can correct itself.
+    ///
+    /// Returns `(proposed_content, passed_structural_check)`. A `false` second
+    /// element means the model produced something that does not parse — callers
+    /// that write files autonomously must refuse it; the interactive review flow
+    /// may still show it.
+    async fn llm_rewrite(&self, mut prompt: String) -> Result<(String, bool), String> {
         let llm_tx = self.llm_tx.clone();
+        let mut proposed = String::new();
         for _attempt in 0..2 {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             if llm_tx
@@ -307,26 +330,17 @@ impl CoordinatorActor {
                 .await
                 .is_err()
             {
-                return serde_json::json!({ "status": "error", "error": "LLM actor unavailable" });
+                return Err("LLM actor unavailable".to_string());
             }
             let text = match reply_rx.await {
-                Ok(Ok(t)) => t,
-                Ok(Err(e)) => {
-                    return serde_json::json!({ "status": "error", "error": e.to_string() })
-                }
-                Err(e) => {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error": format!("LLM reply lost: {e}")
-                    })
-                }
+                Ok(Ok(text)) => text,
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(e) => return Err(format!("LLM reply lost: {e}")),
             };
             proposed = crate::build::generic_helpers::strip_code_fences(&text);
-            // A structural syntax check catches truncated/garbled rewrites
-            // before the user ever sees them.
             let check = crate::build::generic_helpers::cpp_syntax_check(&proposed);
             if check.ok {
-                break;
+                return Ok((proposed, true));
             }
             let hint: Vec<String> = check
                 .errors
@@ -338,12 +352,26 @@ impl CoordinatorActor {
                 hint.join("; ")
             ));
         }
-        serde_json::json!({
-            "status": "proposed",
-            "path": path.to_string_lossy(),
-            "proposed_content": proposed,
-            "errors": errors,
-        })
+        Ok((proposed, false))
+    }
+
+    /// Warning-fix proposal for the autonomous safe-warning phase.
+    ///
+    /// Writes nothing. Unlike the interactive flow this refuses a rewrite that
+    /// failed the structural check, because the loop applies it unattended.
+    async fn propose_warning_fix_for(
+        &self,
+        path: &std::path::Path,
+        warnings: &[String],
+    ) -> Option<String> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let prompt = crate::build::generic_helpers::warning_fix_prompt(
+            &path.to_string_lossy(),
+            &content,
+            warnings,
+        );
+        let (proposed, syntax_ok) = self.llm_rewrite(prompt).await.ok()?;
+        (syntax_ok && !proposed.trim().is_empty()).then_some(proposed)
     }
 
     /// Every Diagnostic node currently recorded for the project.
@@ -372,21 +400,46 @@ impl CoordinatorActor {
         }
     }
 
-    /// Compile ERROR diagnostics from the **build** run, grouped by file — the
-    /// input of the autofix loop. The scoping policy lives in
-    /// [`crate::build::autofix::build_errors_from`] so it is unit-tested.
-    async fn build_error_diagnostics_by_file(&self) -> crate::build::autofix::ErrorsByFile {
-        let nodes = self.diagnostic_nodes().await;
-        let diags: Vec<crate::build::autofix::RawDiagnostic<'_>> = nodes
+    /// Project the graph's Diagnostic nodes onto the loop's raw view.
+    async fn raw_diagnostics(&self) -> Vec<crate::build::autofix::RawDiagnostic> {
+        self.diagnostic_nodes()
+            .await
             .iter()
             .map(|n| crate::build::autofix::RawDiagnostic {
-                build_type: n.get("build_type").and_then(|v| v.as_str()).unwrap_or(""),
-                severity: n.get("severity").and_then(|v| v.as_str()).unwrap_or(""),
-                file: n.get("file").and_then(|v| v.as_str()).unwrap_or(""),
-                message: n.get("message").and_then(|v| v.as_str()).unwrap_or(""),
+                build_type: n
+                    .get("build_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                severity: n
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                file: n
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                message: n
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             })
-            .collect();
-        crate::build::autofix::build_errors_from(&diags)
+            .collect()
+    }
+
+    /// Compile ERROR diagnostics from the **build** run, grouped by file — the
+    /// error phase's input. The scoping policy lives in
+    /// [`crate::build::autofix::build_errors_from`] so it is unit-tested.
+    async fn build_error_diagnostics_by_file(&self) -> crate::build::autofix::ErrorsByFile {
+        crate::build::autofix::build_errors_from(&self.raw_diagnostics().await)
+    }
+
+    /// WARNING diagnostics grouped by file — the safe-warning phase's input.
+    async fn warning_diagnostics_by_file(&self) -> crate::build::autofix::WarningsByFile {
+        crate::build::autofix::warnings_from(&self.raw_diagnostics().await)
     }
 
     /// Analyzer warnings currently recorded (reported, never auto-rewritten).
@@ -478,7 +531,7 @@ impl CoordinatorActor {
             coord: self,
             path: path.to_string(),
             platform: platform.clone(),
-            target,
+            target: target.clone(),
         };
 
         tracing::info!(
@@ -502,6 +555,20 @@ impl CoordinatorActor {
         let mut report =
             crate::build::autofix::run_autofix(&driver, &bases, max_rounds).await;
         report.platform = platform;
+
+        // Name the built executable: Meson places it at <build-<platform>>/<target>,
+        // so report it only when the run ended compiling cleanly AND the file is
+        // really there (never a guessed path).
+        if report.errors_after == 0 {
+            if let (Some(platform), Some(target)) = (report.platform.as_ref(), target.as_ref()) {
+                let candidate = project_root
+                    .join(format!("build-{platform}"))
+                    .join(target);
+                if candidate.is_file() {
+                    report.artifact = Some(candidate.to_string_lossy().to_string());
+                }
+            }
+        }
         tracing::info!(
             "[COORDINATOR] build/autofix done: success={} rounds={} fixed={} reverted={} errors {}→{}",
             report.success,
@@ -598,12 +665,26 @@ impl crate::build::autofix::AutofixDriver for CoordinatorAutofix<'_> {
             .map(|c| c.to_string())
     }
 
+    async fn warnings(&self) -> crate::build::autofix::WarningsByFile {
+        self.coord.warning_diagnostics_by_file().await
+    }
+
     async fn rebuild(&self) -> crate::build::autofix::ErrorsByFile {
         let _ = self
             .coord
             .call_tool_json("build_build", self.build_args())
             .await;
         self.coord.build_error_diagnostics_by_file().await
+    }
+
+    async fn propose_warning_fix(
+        &self,
+        _file: &str,
+        path: &std::path::Path,
+        warnings: &[String],
+    ) -> Option<String> {
+        // Only ever called for warnings classified as safe.
+        self.coord.propose_warning_fix_for(path, warnings).await
     }
 
     async fn lint(&self) -> usize {

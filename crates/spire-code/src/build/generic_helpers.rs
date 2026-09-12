@@ -2853,6 +2853,35 @@ pub fn compile_fix_prompt(path: &str, content: &str, errors: &[String]) -> Strin
     out
 }
 
+/// Prompt for the safe-warning phase: clear exactly the listed warnings without
+/// changing behaviour.
+///
+/// The warnings that reach this prompt are only the ones classified as safe
+/// (`deadcode.*`, unused values, self-assignment). The instruction to preserve
+/// side effects is deliberate: a "dead" store to a volatile or otherwise
+/// observable location must not lose its effect.
+pub fn warning_fix_prompt(path: &str, content: &str, warnings: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "Resolve the ANALYZER warnings in this C/C++ file by rewriting the WHOLE file.\n",
+    );
+    out.push_str(&format!("File: {path}\n\nWarnings:\n"));
+    for (i, w) in warnings.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, w));
+    }
+    out.push_str(&format!("\nCurrent content:\n```cpp\n{content}\n```\n\n"));
+    out.push_str(
+        "Return ONLY the complete corrected file inside a single ```cpp block.\n\
+         Address each reported warning (e.g. remove a value that is stored but never read, \
+         or drop an unused variable/parameter) and change NOTHING else: keep every other \
+         line, signature, include and behaviour byte-identical. Preserve any side effect of \
+         the code you remove — if removing it would change behaviour, leave that code as it \
+         is. Do NOT reformat, do NOT reorder includes, do NOT rename anything, and add no \
+         commentary outside the code block.",
+    );
+    out
+}
+
 /// Build the ordered per-file fix plan from a lint report (dirty files only).
 pub fn hal_fix_plan_from_lint(lint: &HalDocLintReport) -> HalFixPlan {
     let mut steps = Vec::new();

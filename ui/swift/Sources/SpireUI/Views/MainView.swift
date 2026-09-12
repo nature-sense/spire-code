@@ -1224,15 +1224,19 @@ struct ActionPanelView: View {
                 // exactly this and could silently reformat the whole tree.
                 actionButton("Format", systemImage: "text.alignleft", tool: "build_format")
                 if selectionIsMeson {
-                    // C/C++ has no toolchain auto-fixer, so compile errors are
-                    // fixed by the autonomous loop: apply an LLM rewrite per error
-                    // file, rebuild, keep what reduced the errors and roll back
-                    // what did not. "Fix Errors…" stays available for reviewing
-                    // each rewrite before it is written.
+                    // The whole pipeline in one action: compile → fix compile
+                    // errors → lint → fix safely-fixable warnings → verify. Every
+                    // edit is compile-verified and rolled back when it does not
+                    // help; warnings that need judgement are reported, not
+                    // rewritten. "Fix Errors…" stays available for reviewing each
+                    // rewrite before it is written.
                     actionButton(
                         "Fix & Verify",
                         systemImage: "wand.and.stars",
                         tool: "build_autofix"
+                    )
+                    .help(
+                        "Build, fix compile errors, lint, fix safe warnings, verify — ends with a built binary"
                     )
                     Button {
                         showFixErrors = true
