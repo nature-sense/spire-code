@@ -207,6 +207,142 @@ impl CoordinatorActor {
         })
     }
 
+    /// Current compiler/linter diagnostics for ONE file, rendered as
+    /// `<path>:<line>:<col>: <message>` lines (severity error/warning only).
+    async fn compile_diagnostics_for(&self, file: &str) -> Vec<String> {
+        let (registry, _ffi_state) = match self.ffi_deps() {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = registry
+            .get::<MemoryGraphMessage>("memory_graph")
+            .unwrap_or_else(dummy_tx)
+            .send(MemoryGraphMessage::QueryAttrNodes {
+                node_type: Some("Diagnostic".to_string()),
+                subtype: None,
+                name: None,
+                limit: Some(4000),
+                reply_to: t,
+            })
+            .await;
+        let mut out = Vec::new();
+        if let Ok(Ok(nodes)) = r.await {
+            for node in nodes {
+                if node.get("file").and_then(|v| v.as_str()).unwrap_or("") != file {
+                    continue;
+                }
+                let sev = node.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+                if sev != "error" && sev != "warning" {
+                    continue;
+                }
+                let msg = node
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if msg.is_empty() {
+                    continue;
+                }
+                let line = node.get("line").and_then(|v| v.as_u64());
+                let col = node.get("column").and_then(|v| v.as_u64());
+                out.push(match (line, col) {
+                    (Some(l), Some(c)) => format!("{file}:{l}:{c}: {msg}"),
+                    (Some(l), None) => format!("{file}:{l}: {msg}"),
+                    _ => format!("{file}: {msg}"),
+                });
+            }
+        }
+        out
+    }
+
+    /// Compile-error fix proposal (file-by-file LLM flow): current diagnostics
+    /// for ONE file -> whole-file rewrite prompt -> LLM -> strip fences ->
+    /// structural syntax check (retry once) -> {status, path, proposed_content,
+    /// errors} for Accept/Reject in the UI.
+    ///
+    /// NOTHING is written here — the caller reviews the proposal and writes it
+    /// only on Accept, then rebuilds.
+    async fn propose_compile_fix(&self, _root: &str, file: &str) -> serde_json::Value {
+        let lower = file.to_lowercase();
+        let is_cpp = [".cpp", ".cc", ".cxx", ".c", ".hpp", ".h", ".hh"]
+            .iter()
+            .any(|ext| lower.ends_with(ext));
+        if !is_cpp {
+            return serde_json::json!({
+                "status": "error",
+                "error": format!("auto-fix is only available for C/C++ sources (got '{file}')")
+            });
+        }
+
+        let errors = self.compile_diagnostics_for(file).await;
+        if errors.is_empty() {
+            return serde_json::json!({ "status": "clean", "path": file });
+        }
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error": format!("cannot read {file}: {e}")
+                })
+            }
+        };
+
+        let mut prompt =
+            crate::build::generic_helpers::compile_fix_prompt(file, &content, &errors);
+        let mut proposed = String::new();
+        let llm_tx = self.llm_tx.clone();
+        for _attempt in 0..2 {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if llm_tx
+                .send(crate::actors::LlmMessage::Complete {
+                    prompt: prompt.clone(),
+                    role: spire_core::subsystems::llm::llm::LlmModelRole::Coding,
+                    reply_to: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                return serde_json::json!({ "status": "error", "error": "LLM actor unavailable" });
+            }
+            let text = match reply_rx.await {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    return serde_json::json!({ "status": "error", "error": e.to_string() })
+                }
+                Err(e) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error": format!("LLM reply lost: {e}")
+                    })
+                }
+            };
+            proposed = crate::build::generic_helpers::strip_code_fences(&text);
+            // A structural syntax check catches truncated/garbled rewrites
+            // before the user ever sees them.
+            let check = crate::build::generic_helpers::cpp_syntax_check(&proposed);
+            if check.ok {
+                break;
+            }
+            let hint: Vec<String> = check
+                .errors
+                .iter()
+                .map(|e| format!("line {} col {}: {}", e.line, e.col, e.kind))
+                .collect();
+            prompt.push_str(&format!(
+                "\n\nYour previous attempt had C++ syntax errors: {}. Fix them and return the complete corrected file again.",
+                hint.join("; ")
+            ));
+        }
+        serde_json::json!({
+            "status": "proposed",
+            "path": file,
+            "proposed_content": proposed,
+            "errors": errors,
+        })
+    }
+
     /// Send a tool event notification to the extension via the transport actor.
     async fn send_tool_event(&self, event: &str, payload: &serde_json::Value) {
         let _ = self
@@ -2108,6 +2244,18 @@ impl CoordinatorActor {
                 let root = params.get("root").and_then(|v| v.as_str()).unwrap_or("");
                 let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 self.propose_hal_fix(root, path).await
+            }
+
+            // Compile-error fix proposal for ONE file (driver of the UI's
+            // "Fix Errors" review flow). Read-only: writes nothing.
+            "build/fixPropose" => {
+                let root = params.get("root").and_then(|v| v.as_str()).unwrap_or("");
+                let file = params
+                    .get("file")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| params.get("path").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                self.propose_compile_fix(root, file).await
             }
 
             // ── Unknown method ──

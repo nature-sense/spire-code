@@ -1249,6 +1249,17 @@ final class SpireBridge {
         return result
     }
 
+    /// Ask the backend to propose a WHOLE-FILE rewrite that fixes the current
+    /// compiler diagnostics for one C/C++ file (`build/fixPropose`).
+    ///
+    /// Read-only: nothing is written until the user accepts the proposal.
+    func proposeCompileFix(root: String, file: String) async -> HalFixProposeResult? {
+        guard let json = await callRawMethod("build/fixPropose", args: ["root": root, "file": file]) else { return nil }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let result = try? JSONDecoder().decode(HalFixProposeResult.self, from: data) else { return nil }
+        return result
+    }
+
     /// Per-file lint + whole-file rewrite prompt for one HAL header.
     func halFixPrompt(root: String, path: String) async -> HalFixPromptResult? {
         guard let json = await callBuildTool("hal_fix_prompt", args: ["root": root, "path": path]) else { return nil }

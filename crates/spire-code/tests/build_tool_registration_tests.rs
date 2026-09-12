@@ -100,6 +100,7 @@ async fn ui_build_actions_are_routable_through_tools_call() {
     for name in [
         "build_analyze",
         "build_build",
+        "build_verify",
         "build_test",
         "build_clean",
         "build_lint",

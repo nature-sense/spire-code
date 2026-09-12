@@ -732,7 +732,18 @@ impl MesonBuildModule {
         // Honour the selected target's platform so `meson test` runs against
         // the right build dir instead of an arbitrary discovered one.
         let dir = self.build_dir(path, platform);
-        run_cmd(path, "meson", &["test", "-C", &dir]).await
+        let mut out = run_cmd(path, "meson", &["test", "-C", &dir]).await?;
+        // Meson exits 0 with "No tests defined." when the project declares no
+        // `test()` targets — which would otherwise be reported as a green test
+        // run and imply the code was verified. Say so explicitly instead.
+        if out.output.to_lowercase().contains("no tests defined") {
+            out.output = format!(
+                "No tests defined for this target — `meson test` ran NOTHING, so this is \
+                 not a test result. Add `test()` targets to the project to verify code \
+                 here. (Ran in {dir}.)"
+            );
+        }
+        Ok(out)
     }
 
     async fn clean(&self, path: &Path, platform: Option<&str>) -> Result<BuildOutput, String> {

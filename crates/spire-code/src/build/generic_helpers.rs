@@ -2827,6 +2827,32 @@ pub fn hal_doc_fix_prompt_whole(path: &str, content: &str, issues: &[HalDocLintI
     out
 }
 
+/// Prompt an LLM to fix COMPILER diagnostics in one C/C++ source file by
+/// rewriting the WHOLE file — the same shape as the HAL doc-fix flow, which is
+/// already reviewed (Accept/Reject) before anything is written.
+///
+/// Whole-file rewrite is deliberate: applying a unified diff correctly is far
+/// riskier than returning the complete file. The prompt explicitly forbids
+/// reformatting/reordering — an earlier "fix" that ran clang-format over the
+/// tree rewrote 28k lines without fixing a single diagnostic.
+pub fn compile_fix_prompt(path: &str, content: &str, errors: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str("Fix the COMPILER diagnostics in this C/C++ file by rewriting the WHOLE file.\n");
+    out.push_str(&format!("File: {path}\n\nDiagnostics:\n"));
+    for (i, e) in errors.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, e));
+    }
+    out.push_str(&format!("\nCurrent content:\n```cpp\n{content}\n```\n\n"));
+    out.push_str(
+        "Return ONLY the complete corrected file inside a single ```cpp block.\n\
+         Change ONLY what is required to resolve the reported diagnostics. Keep every \
+         other line, signature, include and behaviour byte-identical: do NOT reformat, \
+         do NOT reorder includes, do NOT rename anything, and add no commentary outside \
+         the code block.",
+    );
+    out
+}
+
 /// Build the ordered per-file fix plan from a lint report (dirty files only).
 pub fn hal_fix_plan_from_lint(lint: &HalDocLintReport) -> HalFixPlan {
     let mut steps = Vec::new();

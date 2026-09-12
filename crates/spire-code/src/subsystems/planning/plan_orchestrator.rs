@@ -314,7 +314,7 @@ impl PlanOrchestrator {
         let curated_tools = [
             "filesystem_read", "filesystem_write", "filesystem_list",
             "filesystem_delete", "filesystem_move", "filesystem_copy",
-            "build_analyze", "build_build", "build_test", "build_clean", "build_lint",
+            "build_analyze", "build_build", "build_verify", "build_test", "build_clean", "build_lint",
             "build_format", "build_fix", "build_list_modules",
             "project/build", "project/test", "project/lint",
         ];

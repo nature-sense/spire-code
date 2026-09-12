@@ -1857,6 +1857,107 @@ fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
                     Err(e) => serde_json::json!({ "error": e }),
                 }
             }
+            "build_verify" => {
+                // Build, then (only if the build compiled) lint — the two
+                // checks a developer runs together. Both results are persisted
+                // per target under their own kind so the platform list shows
+                // them independently.
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                let opts = BuildOptions {
+                    mode: args.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    package: args.get("package").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    platform: args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    target: args.get("target").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                };
+                let status_target = self
+                    .resolve_status_target(path, opts.target.as_deref(), opts.platform.as_deref())
+                    .await;
+
+                // ── 1. Build ─────────────────────────────────────────────────
+                let (build_out, mut build_events) =
+                    match self.build_project_with_events(Path::new(path), &opts).await {
+                        Ok(v) => v,
+                        Err(e) => return serde_json::json!({ "error": e }),
+                    };
+                let has_file_diags = build_events
+                    .iter()
+                    .any(|e| e.get("file").and_then(|f| f.as_str()).is_some());
+                if !has_file_diags {
+                    build_events.append(&mut Self::parse_clang_output(&build_out.output));
+                }
+                let _ = self.ingest_diagnostics(&build_events, "build").await;
+                let _ = self
+                    .store_action_status_with_output(
+                        "build",
+                        path,
+                        status_target.as_deref(),
+                        build_out.success,
+                        build_out.duration_secs,
+                        &build_out.output,
+                    )
+                    .await;
+
+                // ── 2. Lint (only meaningful once the code compiles) ─────────
+                let mut lint_out: Option<BuildOutput> = None;
+                let mut lint_events: Vec<serde_json::Value> = Vec::new();
+                if build_out.success {
+                    if let Ok((lo, mut le)) = self
+                        .lint_project_streaming(Path::new(path), opts.platform.clone())
+                        .await
+                    {
+                        if le.is_empty() {
+                            le.append(&mut Self::parse_clang_output(&lo.output));
+                        }
+                        let _ = self.ingest_diagnostics(&le, "lint").await;
+                        let _ = self
+                            .store_action_status(
+                                "lint",
+                                path,
+                                status_target.as_deref(),
+                                lo.success,
+                                lo.duration_secs,
+                            )
+                            .await;
+                        lint_events = le;
+                        lint_out = Some(lo);
+                    }
+                }
+
+                let success =
+                    build_out.success && lint_out.as_ref().map(|l| l.success).unwrap_or(true);
+                let mut sections = vec![format!(
+                    "=== Build ({}) ===\n{}",
+                    if build_out.success { "ok" } else { "FAILED" },
+                    build_out.output
+                )];
+                match &lint_out {
+                    Some(lo) => sections.push(format!(
+                        "=== Lint ({}) ===\n{}",
+                        if lo.success { "ok" } else { "FAILED" },
+                        lo.output
+                    )),
+                    None => sections.push(
+                        "=== Lint ===\nskipped — the build failed, so there is no compile \
+                         database to analyse"
+                            .to_string(),
+                    ),
+                }
+                let mut events = build_events;
+                events.extend(lint_events);
+                serde_json::json!({
+                    "success": success,
+                    "output": sections.join("\n\n"),
+                    "command": "meson compile + lint",
+                    "duration_secs": build_out.duration_secs
+                        + lint_out.as_ref().map(|l| l.duration_secs).unwrap_or(0.0),
+                    "exit_code": if success { 0 } else { 1 },
+                    "buildEvents": events,
+                    "steps": [
+                        { "name": "build", "success": build_out.success },
+                        { "name": "lint", "success": lint_out.as_ref().map(|l| l.success) },
+                    ],
+                })
+            }
             "build_format" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
                 match self.format_project(Path::new(path)).await {
@@ -2958,6 +3059,19 @@ executable('{project_name}-{platform}',
                 }),
             },
             spire_core::actors::ToolInfo {
+                name: "build_verify".to_string(),
+                description: "Build a project and, when it compiles, lint it — the combined check a developer runs together. Requires prior build_analyze.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project directory path" },
+                        "platform": { "type": "string", "description": "Optional cross-platform target (e.g. host/rpi5) selecting the build-<platform> Meson dir" },
+                        "target": { "type": "string", "description": "Optional specific build target (e.g. Meson executable name)" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
                 name: "build_clean".to_string(),
                 description: "Clean a project directory using its detected build system (removes build artifacts, keeps the configured build dir). Requires prior build_analyze.".to_string(),
                 input_schema: serde_json::json!({
@@ -3446,6 +3560,7 @@ mod tests {
         for name in [
             "build_analyze",
             "build_build",
+            "build_verify",
             "build_test",
             "build_clean",
             "build_lint",

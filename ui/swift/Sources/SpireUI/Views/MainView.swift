@@ -708,6 +708,9 @@ struct ActionPanelView: View {
     /// True while a hardcoded action is running.
     @State private var runningAction: String?
 
+    /// Compile-error fix sheet (LLM propose → review → apply).
+    @State private var showFixErrors = false
+
     /// The verb of the most recently completed action ("Build", "Test",
     /// "Lint", "Clean", "Fix warnings") — used by the log header once the
     /// running action is cleared.
@@ -744,6 +747,7 @@ struct ActionPanelView: View {
     private var actionVerb: String {
         switch runningAction {
         case "build_lint": return "Lint"
+        case "build_verify": return "Verify"
         case "build_fix": return "Fix warnings"
         case "build_format": return "Format"
         case "build_clean": return "Clean"
@@ -1195,10 +1199,17 @@ struct ActionPanelView: View {
         return !bs.contains("meson")
     }
 
+    /// True when the selection is Meson/C++ — the toolchain with no reliable
+    /// auto-fixer, so compile errors are fixed through the LLM review loop.
+    private var selectionIsMeson: Bool {
+        (selectedSubproject?.buildSystem ?? "").lowercased().contains("meson")
+    }
+
     private var subprojectActions: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 actionButton("Build", systemImage: "hammer.fill", tool: "build_build")
+                actionButton("Verify", systemImage: "checkmark.seal", tool: "build_verify")
                 actionButton("Test", systemImage: "checkmark.circle", tool: "build_test")
                 actionButton("Clean", systemImage: "trash", tool: "build_clean")
                 actionButton("Lint", systemImage: "exclamationmark.triangle", tool: "build_lint")
@@ -1211,7 +1222,19 @@ struct ActionPanelView: View {
                 // .clang-format) and never touches code. `build_fix` used to run
                 // exactly this and could silently reformat the whole tree.
                 actionButton("Format", systemImage: "text.alignleft", tool: "build_format")
-                if selectionHasAutoFixer {
+                if selectionIsMeson {
+                    // No toolchain auto-fixer exists for C/C++, so fixing
+                    // compile errors is an LLM propose → review → apply loop
+                    // (each file is shown before it is written).
+                    Button {
+                        showFixErrors = true
+                    } label: {
+                        actionLabel("Fix Errors…", systemImage: "wand.and.stars")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(runningAction != nil)
+                    .help("Propose a reviewed rewrite for each file with compiler errors")
+                } else if selectionHasAutoFixer {
                     actionButton("Fix Warnings", systemImage: "wrench.and.screwdriver", tool: "build_fix")
                 }
             }
@@ -1225,6 +1248,18 @@ struct ActionPanelView: View {
             }
         }
         .padding(8)
+        .sheet(isPresented: $showFixErrors) {
+            if let sub = selectedSubproject {
+                FixErrorsSheet(
+                    project: project,
+                    subproject: sub,
+                    target: selectedBuildTarget,
+                    onRebuild: { runTool("build_verify") }
+                )
+                .environment(bridge)
+                .environment(theme)
+            }
+        }
     }
 
     private var fileActions: some View {
