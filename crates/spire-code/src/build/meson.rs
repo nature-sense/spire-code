@@ -2111,6 +2111,47 @@ mod tests {
         assert_eq!(meta.project_name.as_deref(), Some("ai-traps"));
     }
 
+    /// `Clean`/`Test` must honour the selected target's platform: with several
+    /// configured build dirs present, a platform selection pins `build-<plat>`
+    /// instead of using whichever dir happens to be discovered first (which
+    /// would let "Clean" on ai-trap-rock3c wipe build-a7s).
+    #[test]
+    fn build_dir_honours_the_selected_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for d in ["build-rock3c", "build-a7s", "build-native"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+            std::fs::File::create(root.join(d).join("compile_commands.json")).unwrap();
+        }
+        let module = MesonBuildModule::new();
+
+        let rock3c = module.build_dir(root, Some("rock3c"));
+        assert!(
+            rock3c.ends_with("build-rock3c"),
+            "platform 'rock3c' must pin build-rock3c, got {rock3c}"
+        );
+        let a7s = module.build_dir(root, Some("a7s"));
+        assert!(
+            a7s.ends_with("build-a7s"),
+            "platform 'a7s' must pin build-a7s, got {a7s}"
+        );
+
+        // A requested-but-unconfigured platform yields the conventional name
+        // rather than silently falling back to another platform's build dir.
+        let rpi5 = module.build_dir(root, Some("rpi5"));
+        assert!(
+            rpi5.ends_with("build-rpi5"),
+            "unconfigured platform must not fall back to another dir, got {rpi5}"
+        );
+
+        // Without a platform the discovery-based behaviour is unchanged.
+        let discovered = module.build_dir(root, None);
+        assert!(
+            discovered.contains("build-"),
+            "unexpected fallback build dir: {discovered}"
+        );
+    }
+
     /// Dependencies must be PER-TARGET like source files: rock3c links
     /// rknnrt/mpp/rga, rpi5 links libcamera/tflite/edgetpu — never merged.
     #[test]
