@@ -132,3 +132,45 @@ the dylib over the JSON FFI, and `build/assemble-app.sh`/`Makefile` glue.
   `spire-quicknotes` scaffold, `cargo build --release` + `swift build` +
   dlopen + `assemble-app.sh` + app launch all succeeded.
 
+## 7. Target-hardware testing: device MCP server + prompt→generate→verify
+
+A device-side MCP server runs on each board, controls the trap binary and runs
+tests over the network; Spire talks to it as an MCP server over Streamable HTTP.
+This is the first place the "prompt → generate → verify" workflow lands (generate
+a test → cross-build → deploy → run on hardware → feed failures back to the LLM
+fix loop). The server itself lives in the separate `spire-target-mcp` repo; this
+entry tracks the work end to end.
+
+- [x] 1. M1 — done (2026-09-13, `spire-target-mcp @ fd00719`, separate repo).
+      Rebuilt on `rust-mcp-sdk` + `rust-mcp-axum` — the same crates and version as
+      the host client (`spire-core`'s `ClientStreamableTransport`), so both ends
+      share one protocol implementation and one version (2025-11-25, negotiated
+      down for older clients). The scaffold did not compile (`tokio_stream` /
+      `async_stream` used but undeclared) and spoke the legacy HTTP+SSE split
+      (`POST /mcp` + `GET /sse`, 2024-11-05); it now serves Streamable HTTP on
+      `POST /mcp` (+ `/health`), with `BIND_HOST` / `BIND_PORT` and an `info`
+      tool. `tests/roundtrip.rs` spawns the real binary and drives it with the
+      same client Spire uses — `initialize → tools/list → tools/call("info")`
+      passes — and a curl-driven check of the same sequence passes too.
+- [ ] 2. M2 — registry `device:` block + auto-connect. Add
+      `device: { mcp: { url, token }, deploy: { dest } }` to the platform YAML
+      schema/model (`~/.spire/platforms/*.yaml`) and register the server as an
+      MCP server on project open / platform select.
+- [ ] 3. M3 — Test action over the device. For a platform with `device.mcp`:
+      cross-build the test binary → upload it over HTTP → MCP `run_test` →
+      report exit code + output. No `meson`/`test()` machinery is needed on the
+      device — it just runs the ELF. Needs the cross toolchain pinned first: this
+      Mac has only the `aarch64-apple-darwin` target and no aarch64 Linux
+      cross-linker, so `aarch64-unknown-linux-gnu` (+ linker) has to be added
+      before the build→upload→run step can be wired up.
+- [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
+      loop (rebuild → redeploy → re-run), bounded and revert-safe — the
+      first-class prompt→generate→verify slice.
+- [ ] 5. M5 — trap control + all boards. Tools `run` / `start` / `stop` /
+      `status` / `logs`; generalize across rpi5 / rock3c / a7s.
+- [ ] 6. Backlog — first-class prompt→generate→verify everywhere. Wire the
+      generate tools (`createProject/*`, `hal_*`) into the verify spine so new
+      code is compile-verified as it is generated; covers brand-new HAL
+      contracts, new toolkits, and from-scratch projects (not yet exercised —
+      all work so far has been on the pre-existing ai-traps project).
+
