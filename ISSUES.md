@@ -166,6 +166,13 @@ entry tracks the work end to end.
       `CONNECT_TIMEOUT_SECS` so one dead endpoint can't park the MCP client's
       mailbox. Covered by `platform::tests` (mapping, blank token, host-only) and
       `test_device_servers_come_from_the_platform_registry` (actor level).
+      Interop was also proven against the real board server (M1) over Streamable
+      HTTP: a registry `device:` block connects and lists the board's `info` tool.
+      That check surfaced — and fixed — a bug on the host side: Spire's HTTP MCP
+      client used `standalone = true`, i.e. it opened a session-less GET SSE
+      stream and treated any status for it as fatal, so *any* spec-compliant
+      Streamable HTTP server (the GET endpoint is optional; 400/405 is allowed)
+      was unusable with `HTTP error: 400 Bad Request`.
 - [ ] 3. M3 — Test action over the device. For a platform with `device.mcp`:
       cross-build the test binary → upload it over HTTP → MCP `run_test` →
       report exit code + output. No `meson`/`test()` machinery is needed on the
