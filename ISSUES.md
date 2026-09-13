@@ -205,10 +205,22 @@ entry tracks the work end to end.
         `device/test { platform: "rpi5", path: "build-rpi5/rpi5/ai-traps-rpi5-tests",
         timeout_secs: 120 }` (a7s → `build-a7s/a7s/ai-traps-a7s-tests`,
         rock3c → `build-rock3c/rock3c/ai-traps-rock3c-tests`).
-  - [ ] 3d. Toolchain — this Mac has only the `aarch64-apple-darwin` target and no
-        aarch64 Linux cross-linker, so `spire-target-mcp` itself cannot yet be
-        built static for a board (`aarch64-unknown-linux-musl` + linker, or build
-        on the board). Needed before any real-hardware run.
+  - [x] 3d. Toolchain — done (2026-09-13, `spire-target-mcp @ d0b9a3c`). The board
+        binary is a **static musl** aarch64 ELF (9.0 MB): `make device-toolchain`
+        (rustup target + the cross toolchain into `~/toolchains`, checksum-verified)
+        and `make device-binary` reproduce it. Two environment gotchas are
+        documented in the README: `brew install` refuses when the Command Line
+        Tools are outdated, so the toolchain comes straight from the upstream
+        release; and the build must run through the **rustup** toolchain, because
+        the ambient `cargo` is Homebrew's Rust, which ships only the host std
+        (`can't find crate for core`).
+  - [ ] 3e. Follow-up — `tests/device_tools.rs` can hang when run with the
+        default (high) test parallelism: 5/5 passes with `--test-threads=2`
+        (5.7s) and again in the same form, but a full run showed 4/5 with
+        `passes_arguments_and_kills_a_hung_binary` never finishing. Suspect the
+        orphaned grandchild holding the capture pipes together with several
+        concurrent device-server processes; needs a proper diagnosis (and
+        possibly `--test-threads` for that file) before the M3.4 hardware run.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.
