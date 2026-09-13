@@ -3602,7 +3602,7 @@ mod tests {
     use crate::build::generic_helpers::hal_platform_library_hints;
     use crate::build::CargoBuildModule;
     use crate::Actor;
-    
+
     use spire_actor::ServiceRegistry;
     use std::sync::Arc;
 

@@ -193,7 +193,7 @@ fn init_actor_system() {
         // file-change events here; the UI consumes them via spire_wait_for_event.
         let (event_tx, event_rx) = tokio::sync::broadcast::channel::<String>(256);
         let system = std::sync::Arc::new(ActorSystem::new());
-        
+
         // ── Core actors ──
         let (chat_tx, _) = system.spawn(ChatActor::new());
         let (progress_tx, _) = system.spawn(ProgressActor::new());

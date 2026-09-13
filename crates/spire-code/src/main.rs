@@ -225,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         system.spawn(McpClientActor::with_progress(progress_tx.clone()));
 
     // Spawn the LLM actor
-    let (llm_tx, _llm_handle) = system.spawn(LlmActor::new(LlmConfig { 
+    let (llm_tx, _llm_handle) = system.spawn(LlmActor::new(LlmConfig {
         planning_model: LlmConfig::default().planning_model,
         coding_model: LlmConfig::default().coding_model,
         ..LlmConfig::default()
