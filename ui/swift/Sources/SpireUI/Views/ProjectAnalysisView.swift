@@ -576,14 +576,17 @@ private struct LayoutTreeNodeView: View {
             leafRow
                 .padding(.leading, CGFloat(depth) * 14)
         } else {
-            DisclosureGroup {
+            // A flat, always-visible section — deliberately NOT a
+            // DisclosureGroup: the tree is three short layers, and collapsing
+            // them only hid the rows this pane exists to show.
+            VStack(alignment: .leading, spacing: 2) {
+                sectionLabel
+                    .padding(.leading, CGFloat(depth) * 14)
                 ForEach(node.children) { child in
                     LayoutTreeNodeView(node: child, depth: depth + 1,
                                        isSelected: isSelected, onSelect: onSelect,
                                        domainLookup: domainLookup, apiLint: apiLint)
                 }
-            } label: {
-                sectionLabel
             }
         }
     }

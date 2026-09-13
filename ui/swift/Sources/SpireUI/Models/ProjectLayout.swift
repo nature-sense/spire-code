@@ -87,7 +87,15 @@ struct ProjectLayout {
             // used to be two rows with different parents that looked alike,
             // which is what made this pane confusing.
             let platformDomains = halSub.domains.filter { $0.kind == "platform" }
-            let targets = halSub.buildTargets.filter { $0.platform != "host" }
+            // Each platform builds TWO Meson targets: the app executable
+            // (ai-trap-rpi5) and its test harness (ai-traps-rpi5-tests). Both
+            // carry the same `platform`, so listing every target gave two rows
+            // per platform. A platform row is the APP; the test harness is what
+            // the Device group's "Run tests on board" uploads and runs, so it is
+            // not a second platform.
+            let targets = halSub.buildTargets.filter {
+                $0.platform != "host" && !$0.name.hasSuffix("-tests")
+            }
             if !targets.isEmpty {
                 let targetRows = targets.map { t -> Node in
                     // Label = the platform (rpi5/rock3c); targetName keeps the
