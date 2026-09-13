@@ -284,24 +284,14 @@ struct ProjectAnalysisView: View {
     ///   • target → select the Meson build target
     private var platformsCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Per-platform last-build state + date: the "what has actually been
-            // built?" header for the platform list underneath.
-            if let sub = buildSubproject, !sub.buildTargets.isEmpty {
-                PlatformBuildStatusList(
-                    project: project,
-                    subproject: sub,
-                    selectedTarget: selectedBuildTarget,
-                    onSelect: { selectTarget($0, in: sub) }
-                )
-                Divider()
-            }
-
-            // The layout tree is for NAVIGATION (project / common / HAL / api).
-            // Its `Targets` section lists the same per-platform executables the
-            // "Platform builds" list above already selects and reports state for
-            // — showing them twice made two selectors fight over one selection,
-            // so the tree skips that section.
-            ForEach(ProjectLayout(project: project).root.children.filter { $0.kind != .target }) { section in
+            // One tree, one selection per layer:
+            //   Project                         → the whole project
+            //   Common → Toolkit / Hal Contract → the shared source + contracts
+            //   Targets → rpi5 / rock3c / a7s   → THE platform
+            // There is deliberately no second per-platform list: a platform used
+            // to be selectable twice (as a build target *and* as a HAL domain),
+            // which is exactly what made this pane confusing.
+            ForEach(ProjectLayout(project: project).root.children) { section in
                 LayoutTreeNodeView(
                     node: section,
                     depth: 0,
@@ -336,14 +326,6 @@ struct ProjectAnalysisView: View {
         .sheet(isPresented: $showAddPlatformSheet) {
             addPlatformSheet
         }
-    }
-
-    /// Subproject that owns the per-platform executables. In the HAL Meson
-    /// layout the platform targets (ai-trap-rpi5, ai-trap-rock3c, …) live in the
-    /// HAL subproject, so that is the one whose build targets the status list
-    /// shows.
-    private var buildSubproject: SubprojectInfo? {
-        selectedSubproject ?? project.subprojects.first { !$0.buildSystem.isEmpty }
     }
 
     /// Select a build target from a status row — mirrors exactly what the tree
@@ -404,11 +386,14 @@ struct ProjectAnalysisView: View {
             bridge.selectedBuildTarget = nil
             bridge.selectSubproject(hal)
         case .target:
+            // A platform row selects the PLATFORM: its build target *and* its
+            // HAL domain, so build/lint/test, the board's Device group and the
+            // HAL actions all key off this one selection.
             guard let name = node.targetName else { return }
-            selectedDomain = nil
-            bridge.selectedDomain = nil
             selectedBuildTarget = name
             bridge.selectedBuildTarget = name
+            selectedDomain = node.domainId
+            bridge.selectedDomain = node.domainId
             bridge.selectSubproject(hal)
         default:
             break
@@ -672,47 +657,13 @@ private struct LayoutTreeNodeView: View {
                     .foregroundStyle(.secondary)
             }
         case .platform:
-            // Per-platform HAL MATURITY (AST-level). The core keys coverage by
-            // the PLATFORM ID which equals the domain's `name` (rpi5/rock3c);
-            // the Swift `id` is the synthetic "domain-platform-rpi5" and would
-            // miss. Each interface is classified implemented / stub / partial /
-            // missing; the chips show the aggregate at a glance.
-            if let domain = domainLookup(node) {
-                let gaps = bridge.halFunctionGaps[domain.name] ?? [:]
-                HStack(spacing: 4) {
-                    let maturities = gaps.values.map(\.maturity)
-                    let implCount = maturities.filter { $0 == "implemented" }.count
-                    let stubCount = maturities.filter { $0 == "stub" }.count
-                    let partialCount = maturities.filter { $0 == "partial" }.count
-                    let missingCount = maturities.filter { $0 == "missing" }.count
-                    if implCount > 0 {
-                        Text("\(implCount)✓")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.green)
-                    }
-                    if stubCount > 0 {
-                        Text("\(stubCount) stub")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.blue)
-                    }
-                    if partialCount > 0 {
-                        Text("\(partialCount) partial")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.orange)
-                    }
-                    if missingCount > 0 {
-                        Text("\(missingCount) missing")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.red)
-                    }
-                }
-                if !domain.dependencies.isEmpty {
-                    Text("· \(domain.dependencies.count) deps")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            // Kept for completeness; the platform layer now renders on the
+            // Targets rows (`.target`), which carry both halves of a platform.
+            maturityChips(for: domainLookup(node)?.name)
         case .target:
+            // The platform row carries both halves: its HAL maturity (the chips
+            // the separate platform rows used to show) and its Meson target.
+            maturityChips(for: domainLookup(node)?.name)
             if let targetName = node.targetName {
                 Text(targetName)
                     .font(.caption2)
@@ -721,6 +672,44 @@ private struct LayoutTreeNodeView: View {
             }
         default:
             EmptyView()
+        }
+    }
+
+    /// Per-platform HAL maturity chips (implemented / stub / partial / missing).
+    ///
+    /// Keyed by PLATFORM ID, which equals the domain's `name` (rpi5/rock3c) —
+    /// the Swift `id` is the synthetic "domain-platform-rpi5" and would miss.
+    @ViewBuilder
+    private func maturityChips(for platformName: String?) -> some View {
+        if let platformName {
+            let gaps = bridge.halFunctionGaps[platformName] ?? [:]
+            HStack(spacing: 4) {
+                let maturities = gaps.values.map(\.maturity)
+                let implCount = maturities.filter { $0 == "implemented" }.count
+                let stubCount = maturities.filter { $0 == "stub" }.count
+                let partialCount = maturities.filter { $0 == "partial" }.count
+                let missingCount = maturities.filter { $0 == "missing" }.count
+                if implCount > 0 {
+                    Text("\(implCount)✓")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.green)
+                }
+                if stubCount > 0 {
+                    Text("\(stubCount) stub")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.blue)
+                }
+                if partialCount > 0 {
+                    Text("\(partialCount) partial")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+                if missingCount > 0 {
+                    Text("\(missingCount) missing")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+            }
         }
     }
 

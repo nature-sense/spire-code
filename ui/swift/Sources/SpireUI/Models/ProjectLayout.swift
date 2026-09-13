@@ -1,12 +1,11 @@
 import Foundation
 
-/// Directory-faithful project layout, derived from the analyzer's flat
-/// `ProjectInfo` so the UI follows the real tree shape of a HAL/Meson project:
+/// The left pane's project tree, derived from the analyzer's flat `ProjectInfo`.
+/// Three layers, one selection each:
 ///
-///   Project   ai-traps
-///   Common    toolkit
-///   HAL       api (contracts) · rpi5 · rock3c
-///   Targets   rpi5 · rock3c
+///   Project                          → the whole project
+///   Common  → Toolkit · Hal Contract → the shared source + the contracts
+///   Targets → rpi5 · rock3c · a7s    → THE platform (build + HAL + device)
 ///
 /// Pure Swift derivation — no Rust/transport changes.
 struct ProjectLayout {
@@ -51,59 +50,59 @@ struct ProjectLayout {
             children.append(Node(kind: .project, label: "Project",
                                  children: [Node(kind: .project, label: project.name)]))
 
-            // ── Common: shared toolkit source slice ──
+            // ── Common: the shared layer — toolkit source + contract headers ──
+            // Both are shared by every platform, so they sit under one heading:
+            // `Toolkit` is the reusable source slice, `Hal Contract` is the
+            // interface every platform implements against.
             let common = halSub.domains.first { $0.kind == "common" }
+            var commonChildren: [Node] = []
             if let common {
                 // The analyzer names the shared slice "Common"; the real
                 // directory is `toolkit/`. Prefer the directory name when
                 // the common domain actually lists the toolkit path.
-                let label = common.files.contains { $0.contains("toolkit") }
-                    ? "toolkit" : common.name
+                let toolkitLabel = common.files.contains { $0.contains("toolkit") }
+                    ? "Toolkit" : common.name
                 let toolkitDir = common.files.first { $0.contains("toolkit") }
                     ?? "toolkit"
-                let toolkit = Node(kind: .toolkit, label: label,
-                                   files: common.files, contracts: common.contracts,
-                                   domainId: common.id, directory: toolkitDir)
-                children.append(Node(kind: .common, label: "Common", children: [toolkit]))
+                commonChildren.append(Node(kind: .toolkit, label: toolkitLabel,
+                                           files: common.files, contracts: common.contracts,
+                                           domainId: common.id, directory: toolkitDir))
+                if !common.contracts.isEmpty {
+                    commonChildren.append(Node(kind: .api, label: "Hal Contract",
+                                               files: common.contracts,
+                                               contracts: common.contracts,
+                                               domainId: common.id,
+                                               directory: "hal/api"))
+                }
+            }
+            if !commonChildren.isEmpty {
+                children.append(Node(kind: .common, label: "Common", children: commonChildren))
             }
 
-            // ── HAL: api (contract headers) + one platform per domain ──
-            let platforms = halSub.domains.filter { $0.kind == "platform" }
-            if !platforms.isEmpty || !(common?.contracts.isEmpty ?? true) {
-                var halChildren: [Node] = []
-                // api = the contract headers (hal/api/*.hpp) carried by the
-                // common domain. Selecting it scopes to the shared slice that
-                // owns the contracts, exactly like selecting `common`.
-                if let common, !common.contracts.isEmpty {
-                    halChildren.append(Node(kind: .api, label: "api",
-                                            files: common.contracts,
-                                            contracts: common.contracts,
-                                            domainId: common.id,
-                                            directory: "hal/api"))
-                }
-                for p in platforms {
-                    let implDir = p.files.first { $0.contains("implementations/") }
-                        ?? "hal/implementations/\(p.name)"
-                    halChildren.append(Node(kind: .platform, label: p.name,
-                                            files: p.files, contracts: p.contracts,
-                                            domainId: p.id, directory: implDir))
-                }
-                children.append(Node(kind: .hal, label: "HAL", children: halChildren))
-            }
-
-            // ── Targets: one row per composite platform executable ──
-            let targets = halSub.buildTargets.isEmpty
-                ? halSub.buildTargets
-                : halSub.buildTargets.filter { $0.platform != "host" }
+            // ── Targets: the platform layer — one row per platform ──
+            //
+            // That row IS the platform selection, so it carries both halves:
+            // the Meson build target (build/lint/test, and the board's MCP
+            // group) and the platform's HAL domain (its implementation). They
+            // used to be two rows with different parents that looked alike,
+            // which is what made this pane confusing.
+            let platformDomains = halSub.domains.filter { $0.kind == "platform" }
+            let targets = halSub.buildTargets.filter { $0.platform != "host" }
             if !targets.isEmpty {
                 let targetRows = targets.map { t -> Node in
-                    // Label = the platform directory (rpi5/rock3c); targetName
-                    // keeps the real Meson target (ai-trap-rpi5) for builds.
-                    // The directory is the TOP-LEVEL platform dir the target
-                    // compiles its app sources from (NOT the HAL impls).
-                    let dir = t.platform.isEmpty ? t.name : t.platform
-                    return Node(kind: .target, label: dir,
-                                targetName: t.name, directory: dir)
+                    // Label = the platform (rpi5/rock3c); targetName keeps the
+                    // real Meson target (ai-trap-rpi5) for builds.
+                    let platform = t.platform.isEmpty ? t.name : t.platform
+                    let domain = platformDomains.first { $0.name == platform }
+                    // Browse the platform's HAL implementation: that is the work
+                    // a platform selection leads to. The app glue under
+                    // `<plat>/` is Meson wiring, reachable from the project row.
+                    let implDir = domain?.files.first { $0.contains("implementations/") }
+                        ?? (domain.map { "hal/implementations/\($0.name)" } ?? platform)
+                    return Node(kind: .target, label: platform,
+                                targetName: t.name,
+                                domainId: domain?.id,
+                                directory: implDir)
                 }
                 children.append(Node(kind: .target, label: "Targets", children: targetRows))
             }
