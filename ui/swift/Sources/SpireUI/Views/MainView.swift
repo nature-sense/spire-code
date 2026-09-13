@@ -1013,17 +1013,7 @@ struct ActionPanelView: View {
                     .overlay(theme.divider)
             }
 
-            // ── Device (on-hardware) ──
-            // Appears only when the selection maps to a platform that declares a
-            // board. Connect is deliberate (a board is usually powered off) and
-            // the two board actions wait for it.
-            if let devicePlatform = selectedDevicePlatform {
-                deviceActions(devicePlatform)
-                Divider()
-                    .overlay(theme.divider)
-            }
-
-            // ── Action buttons ──
+            // ── Action cards ──
             // Empty project (only .spire metadata): show the scaffolding
             // wizard so the user can create the initial build structure.
             if project.isEmpty {
@@ -1050,7 +1040,14 @@ struct ActionPanelView: View {
                 if halImplementationActionsBlocked {
                     halContractBlockedView
                 } else {
-                    subprojectActions
+                    // Two cards, because these are two different jobs: the APP
+                    // (build/test the target, run it on its board) and the HAL
+                    // (create/modify the implementation). The app card is first
+                    // — it is the one that produces a binary.
+                    appCard
+                    if selectedDomainKind == "platform" {
+                        halCard
+                    }
                 }
             } else if selectedFilePath != nil {
                 fileActions
@@ -1374,23 +1371,32 @@ struct ActionPanelView: View {
         (selectedSubproject?.buildSystem ?? "").lowercased().contains("meson")
     }
 
-    private var subprojectActions: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                actionButton("Build", systemImage: "hammer.fill", tool: "build_build")
-                actionButton("Verify", systemImage: "checkmark.seal", tool: "build_verify")
-                actionButton("Test", systemImage: "checkmark.circle", tool: "build_test")
-                actionButton("Clean", systemImage: "trash", tool: "build_clean")
-                actionButton("Lint", systemImage: "exclamationmark.triangle", tool: "build_lint")
-                planButton
+    /// Card 1 — the APP: what has been built, the buttons that build/test it, and
+    /// the board it runs on. Everything here is about the target binary.
+    private var appCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            appCardHeader
 
+            // Square tiles: the primary actions get real estate, so they read as
+            // actions rather than as body text.
+            HStack(spacing: 8) {
+                squareActionButton("Build", systemImage: "hammer.fill",
+                                   tool: "build_build", blockedByHAL: true)
+                squareActionButton("Test", systemImage: "checkmark.circle",
+                                   tool: "build_test", blockedByHAL: true)
+                squareActionButton("Verify", systemImage: "checkmark.seal",
+                                   tool: "build_verify", blockedByHAL: true)
+                squareActionButton("Lint", systemImage: "exclamationmark.triangle",
+                                   tool: "build_lint")
+                Spacer()
             }
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
+                squareActionButton("Clean", systemImage: "trash", tool: "build_clean")
                 // Formatting is deliberately SEPARATE from fixing warnings: it
                 // only rewrites formatting (clang-format, gated on a project
                 // .clang-format) and never touches code. `build_fix` used to run
                 // exactly this and could silently reformat the whole tree.
-                actionButton("Format", systemImage: "text.alignleft", tool: "build_format")
+                squareActionButton("Format", systemImage: "text.alignleft", tool: "build_format")
                 if selectionIsMeson {
                     // The whole pipeline in one action: compile → fix compile
                     // errors → lint → fix safely-fixable warnings → verify. Every
@@ -1398,14 +1404,8 @@ struct ActionPanelView: View {
                     // help; warnings that need judgement are reported, not
                     // rewritten. "Fix Errors…" stays available for reviewing each
                     // rewrite before it is written.
-                    actionButton(
-                        "Fix & Verify",
-                        systemImage: "wand.and.stars",
-                        tool: "build_autofix"
-                    )
-                    .help(
-                        "Build, fix compile errors, lint, fix safe warnings, verify — ends with a built binary"
-                    )
+                    squareActionButton("Fix & Verify", systemImage: "wand.and.stars",
+                                       tool: "build_autofix", blockedByHAL: true)
                     Button {
                         showFixErrors = true
                     } label: {
@@ -1415,19 +1415,31 @@ struct ActionPanelView: View {
                     .disabled(runningAction != nil)
                     .help("Review each rewrite before it is written")
                 } else if selectionHasAutoFixer {
-                    actionButton("Fix Warnings", systemImage: "wrench.and.screwdriver", tool: "build_fix")
+                    squareActionButton("Fix Warnings", systemImage: "wrench.and.screwdriver",
+                                       tool: "build_fix")
                 }
+                Spacer()
+                planButton
             }
 
-            // Full per-interface HAL analysis for the selected platform:
-            // every contract interface, with its implementation status
-            // (Implemented / Partial / Missing) and the missing/drifted
-            // functions for that interface.
-            if selectedDomainKind == "platform" {
-                halInterfacesCard
+            // Context: a target whose HAL is not implemented cannot be built in
+            // any meaningful sense, so the build actions say why they are off.
+            if halIncomplete {
+                Label(halIncompleteNotice, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // The board this target runs on (only for a platform that declares one).
+            if let devicePlatform = selectedDevicePlatform {
+                Divider().overlay(theme.divider)
+                deviceActions(devicePlatform)
             }
         }
-        .padding(8)
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(theme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
         .sheet(isPresented: $showFixErrors) {
             if let sub = selectedSubproject {
                 FixErrorsSheet(
@@ -1440,6 +1452,17 @@ struct ActionPanelView: View {
                 .environment(theme)
             }
         }
+        // Refresh the build readout on selection change and after every action.
+        .task(id: "\(project.root)|\(selectedBuildTarget ?? "")|\(bridge.buildCompletionTick)") {
+            await loadLastBuild()
+        }
+    }
+
+    /// Card 2 — the HAL itself: per-interface implementation status and the
+    /// generate/fix action for each one. This is where HAL work happens; the app
+    /// card above only cares whether it is finished.
+    private var halCard: some View {
+        halInterfacesCard
     }
 
     private var fileActions: some View {
@@ -1671,6 +1694,117 @@ struct ActionPanelView: View {
         }
         .buttonStyle(.plain)
         .disabled(runningAction != nil)
+    }
+
+    // MARK: - App card pieces
+
+    /// Last recorded build for the selected target (nil = unknown / never built).
+    @State private var lastBuild: BuildStatus?
+
+    /// Title row of the app card: what this card is, and how the last build went.
+    private var appCardHeader: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "hammer.fill").foregroundStyle(theme.accent)
+            Text("App").font(.callout.weight(.semibold))
+            if let target = selectedBuildTarget {
+                Text(target).font(.caption).foregroundStyle(theme.textSecondary)
+            }
+            Spacer()
+            if let text = lastBuildText {
+                Text(text)
+                    .font(.caption2)
+                    .foregroundStyle(lastBuildColor)
+            }
+        }
+    }
+
+    /// "built · 2 min ago · 12.3s", from the build manager's stored status.
+    private var lastBuildText: String? {
+        guard let status = lastBuild else { return nil }
+        var parts: [String] = []
+        switch status.success {
+        case .some(true): parts.append("built")
+        case .some(false): parts.append("build failed")
+        default: parts.append("never built")
+        }
+        if let when = status.lastBuild {
+            let fmt = RelativeDateTimeFormatter()
+            fmt.unitsStyle = .short
+            parts.append(fmt.localizedString(for: when, relativeTo: Date()))
+        }
+        if let secs = status.durationSecs { parts.append(String(format: "%.1fs", secs)) }
+        return parts.joined(separator: " · ")
+    }
+
+    private var lastBuildColor: Color {
+        switch lastBuild?.success {
+        case .some(true): return .green
+        case .some(false): return .red
+        default: return theme.textSecondary
+        }
+    }
+
+    /// Load the selected target's last build state. Re-run whenever the selection
+    /// changes or an action completes (`buildCompletionTick`).
+    private func loadLastBuild() async {
+        guard let sub = selectedSubproject, let target = selectedBuildTarget else {
+            lastBuild = nil
+            return
+        }
+        lastBuild = await bridge.fetchBuildStatus(
+            path: sub.absolutePath(in: project.root), target: target
+        )
+    }
+
+    /// Interfaces of the selected platform that are NOT fully implemented.
+    ///
+    /// Empty when the selection is not a platform, and empty when coverage has not
+    /// been analysed yet — "unknown" must never silently disable the build.
+    private var halIncompleteInterfaces: [String] {
+        guard selectedDomainKind == "platform", let platform = selectedDomainName else { return [] }
+        let gaps = bridge.halFunctionGaps[platform] ?? [:]
+        guard !gaps.isEmpty else { return [] }
+        return gaps.filter { $0.value.maturity != "implemented" }.keys.sorted()
+    }
+
+    private var halIncomplete: Bool { !halIncompleteInterfaces.isEmpty }
+
+    /// Why the build actions are off, in the user's terms.
+    private var halIncompleteNotice: String {
+        let n = halIncompleteInterfaces.count
+        let platform = selectedDomainName ?? "this platform"
+        return "HAL incomplete — \(n) interface\(n == 1 ? "" : "s") not implemented for \(platform). "
+            + "Build stays disabled until the HAL card below is green."
+    }
+
+    /// A square action tile: icon over a short caption, sized so the primary
+    /// actions read as actions rather than as body text.
+    ///
+    /// `blockedByHAL` marks the actions that only make sense once the platform's
+    /// HAL is implemented. They are disabled with a reason rather than hidden, so
+    /// the card still shows what it will be able to do.
+    private func squareActionButton(_ title: String, systemImage: String, tool: String,
+                                    blockedByHAL: Bool = false) -> some View {
+        let enabled = !(blockedByHAL && halIncomplete)
+        return Button {
+            runTool(tool)
+        } label: {
+            VStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 15, weight: .medium))
+                Text(title)
+                    .font(.caption2.weight(.medium))
+                    .lineLimit(1)
+            }
+            .frame(width: 64, height: 50)
+            .foregroundStyle(enabled ? theme.textPrimary : theme.textSecondary)
+            .background(RoundedRectangle(cornerRadius: 8).fill(theme.buttonBackground))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
+            .opacity(enabled ? 1 : 0.4)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled || runningAction != nil)
+        .help(blockedByHAL && halIncomplete ? halIncompleteNotice : title)
     }
 
     private var planButton: some View {
