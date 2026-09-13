@@ -21,24 +21,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use spire_code::subsystems::build::build_manager::{BuildManagerActor, BuildManagerMessage};
-use spire_code::build::CargoBuildModule;
-use spire_core::modules::{
-    FilesystemMessage, GitMessage, ProcessMessage, SearchMessage, TerminalMessage,
-};
-use spire_core::actors::tool_providers::ToolRouterActor;
 use spire_code::actors::tool_providers::build_default_registry;
+use spire_code::actors::{
+    CoordinatorActor, CoordinatorMessage, IntentRouterActor, PlanOrchestrator,
+    ProjectAnalyzerActor, ProjectBuildActor, ProjectInstallActor, ProjectLintActor,
+    ProjectQueryActor, ProjectSyncActor, ProjectTestActor, SystemActor, SystemMessage,
+};
+use spire_code::build::CargoBuildModule;
+use spire_code::subsystems::build::build_manager::{BuildManagerActor, BuildManagerMessage};
+use spire_core::actors::tool_providers::ToolRouterActor;
 use spire_core::actors::{
     ActorSystem, ChatActor, LlmActor, LlmConfig, McpClientActor, MemoryGraphActor, ProgressActor,
     SystemPromptActor, ToolOrchestrator, ToolsActor,
 };
-use spire_code::actors::{
-    CoordinatorActor, CoordinatorMessage, IntentRouterActor,
-    PlanOrchestrator, ProjectAnalyzerActor, ProjectBuildActor, ProjectInstallActor, ProjectLintActor,
-    ProjectQueryActor, ProjectSyncActor, ProjectTestActor, SystemActor, SystemMessage,
-};
 use spire_core::embedder::candle_embedder::CandleEmbedder;
 use spire_core::models::embedding::Embedder;
+use spire_core::modules::{
+    FilesystemMessage, GitMessage, ProcessMessage, SearchMessage, TerminalMessage,
+};
 use spire_core::transport::socket::{
     IncomingNotification, IncomingRequestMessage, TransportActor, TransportMessage,
 };
@@ -269,7 +269,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         return serde_json::json!({"error": "ProjectQuery channel closed"});
                     }
-                    reply_rx.await
+                    reply_rx
+                        .await
                         .unwrap_or(serde_json::json!({"error": "ProjectQuery response error"}))
                 })
             });
@@ -370,9 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CargoBuildModule::new().spawn(cargo_rx);
         let (t, r) = tokio::sync::oneshot::channel();
         let _ = cargo_tx
-            .send(spire_code::build::BuildModuleMessage::DescribeCapabilities {
-                reply_to: t,
-            })
+            .send(spire_code::build::BuildModuleMessage::DescribeCapabilities { reply_to: t })
             .await;
         if let Ok(cap) = r.await {
             let _ = bm_tx
@@ -430,8 +429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dummy_process_tx, _) = tokio::sync::mpsc::channel::<ProcessMessage>(8);
     let (dummy_search_tx, _) = tokio::sync::mpsc::channel::<SearchMessage>(8);
     let (dummy_terminal_tx, _) = tokio::sync::mpsc::channel::<TerminalMessage>(8);
-    let (dummy_rag_tx, _) =
-        tokio::sync::mpsc::channel::<spire_core::actors::rag::RagMessage>(8);
+    let (dummy_rag_tx, _) = tokio::sync::mpsc::channel::<spire_core::actors::rag::RagMessage>(8);
     let tool_registry = build_default_registry(
         transport_tx.clone(),
         project_query_tx.clone(),
@@ -552,39 +550,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // does blocking I/O via hf_hub to load model weights from cache/network).
         // Timeout so a slow/hanging model download degrades to the no-op
         // embedder instead of blocking startup forever.
-        let embedder: Arc<dyn Embedder> =
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(45),
-                tokio::task::spawn_blocking(CandleEmbedder::new),
-            )
-            .await
-            {
-                Ok(Ok(Ok(embedder))) => {
-                    info!("CandleEmbedder created successfully");
-                    Arc::new(embedder)
-                }
-                Ok(Ok(Err(e))) => {
-                    error!(
-                        "Failed to create CandleEmbedder: {}. Running without embeddings.",
-                        e
-                    );
-                    // Use a no-op embedder so the system can still start
-                    Arc::new(spire_core::embedder::NoopEmbedder)
-                }
-                Ok(Err(e)) => {
-                    error!(
-                        "CandleEmbedder creation task panicked: {}. Running without embeddings.",
-                        e
-                    );
-                    Arc::new(spire_core::embedder::NoopEmbedder)
-                }
-                Err(_elapsed) => {
-                    error!(
-                        "CandleEmbedder creation timed out after 45s. Running without embeddings."
-                    );
-                    Arc::new(spire_core::embedder::NoopEmbedder)
-                }
-            };
+        let embedder: Arc<dyn Embedder> = match tokio::time::timeout(
+            std::time::Duration::from_secs(45),
+            tokio::task::spawn_blocking(CandleEmbedder::new),
+        )
+        .await
+        {
+            Ok(Ok(Ok(embedder))) => {
+                info!("CandleEmbedder created successfully");
+                Arc::new(embedder)
+            }
+            Ok(Ok(Err(e))) => {
+                error!(
+                    "Failed to create CandleEmbedder: {}. Running without embeddings.",
+                    e
+                );
+                // Use a no-op embedder so the system can still start
+                Arc::new(spire_core::embedder::NoopEmbedder)
+            }
+            Ok(Err(e)) => {
+                error!(
+                    "CandleEmbedder creation task panicked: {}. Running without embeddings.",
+                    e
+                );
+                Arc::new(spire_core::embedder::NoopEmbedder)
+            }
+            Err(_elapsed) => {
+                error!("CandleEmbedder creation timed out after 45s. Running without embeddings.");
+                Arc::new(spire_core::embedder::NoopEmbedder)
+            }
+        };
 
         // Step 1: Set the system actor's own sender (for PhaseEvent messages)
         let _ = system_tx_for_system

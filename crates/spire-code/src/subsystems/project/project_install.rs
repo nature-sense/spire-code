@@ -16,10 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::subsystems::build::build_manager::BuildManagerMessage;
-use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use crate::subsystems::project::project_query::ProjectQueryMessage;
 use spire_core::actors::Actor;
 use spire_core::actors::ToolInfo;
+use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 
 // ============================================================================
 // ProjectInstallMessage
@@ -209,10 +209,7 @@ impl ProjectInstallActor {
             let build_manager_tx = self.build_manager_tx.clone();
             let args = args.clone();
             handles.push(tokio::spawn(async move {
-                let node_family = matches!(
-                    dispatch.build_type.as_str(),
-                    "npm" | "pnpm" | "yarn"
-                );
+                let node_family = matches!(dispatch.build_type.as_str(), "npm" | "pnpm" | "yarn");
                 let result = if node_family {
                     let mut mcp_args = serde_json::Map::new();
                     mcp_args.insert("path".into(), Value::String(dispatch.path.clone()));

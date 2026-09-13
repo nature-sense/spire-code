@@ -14,15 +14,14 @@ use std::time::Instant;
 use tokio::process::Command;
 
 use super::{AstEdgeData, AstNodeData, AstParseResult, BuildOutput};
-use spire_core::build_types::{BuildMetadata, BuildSpec};
 use regex::Regex;
 use sha2::{Digest, Sha256};
+use spire_core::build_types::{BuildMetadata, BuildSpec};
 use std::collections::HashSet;
 
 /// Execute a program in a project dir and capture structured output.
 pub async fn run_cmd(path: &Path, program: &str, args: &[&str]) -> Result<BuildOutput, String> {
-    run_cmd_with_env(path, program, args, &[])
-        .await
+    run_cmd_with_env(path, program, args, &[]).await
 }
 
 /// Execute a program in a project dir with an optional env overrides list,
@@ -319,10 +318,8 @@ fn extract_cpp_methods(content: &str) -> Vec<(String, AstNodeData)> {
 
     // Class/struct header with an opening brace on the same logical line:
     //   class CameraHAL {   /   struct Foo : public Bar {
-    let class_re = Regex::new(
-        r"(?m)^\s*(?:class|struct)\s+([A-Za-z_][A-Za-z0-9_]*)\b[^{]*\{",
-    )
-    .unwrap();
+    let class_re =
+        Regex::new(r"(?m)^\s*(?:class|struct)\s+([A-Za-z_][A-Za-z0-9_]*)\b[^{]*\{").unwrap();
 
     // Member-function declaration regex with named groups. The return-type
     // group is greedy but followed by a method-name token + `(`, so it stops
@@ -336,7 +333,9 @@ fn extract_cpp_methods(content: &str) -> Vec<(String, AstNodeData)> {
     for cap in class_re.captures_iter(content) {
         let Some(cname) = cap.get(1) else { continue };
         let class_name = cname.as_str().to_string();
-        let Some(body_start_match) = cap.get(0) else { continue };
+        let Some(body_start_match) = cap.get(0) else {
+            continue;
+        };
         // The match ends exactly at the class body's `{`.
         let body_open = body_start_match.end() - 1;
         let Some(body_close) = match_closing_brace(content, body_open) else {
@@ -365,13 +364,20 @@ fn extract_cpp_methods(content: &str) -> Vec<(String, AstNodeData)> {
         }
 
         for m in method_re.captures_iter(body) {
-            let Some(mname) = m.name("name") else { continue };
+            let Some(mname) = m.name("name") else {
+                continue;
+            };
             let name = mname.as_str().trim();
             // Reject control-flow / statement keywords that a `(…)` could
             // otherwise capture (e.g. `if (…) {` inside an inline body).
             if name.is_empty()
-                || name == "if" || name == "for" || name == "while" || name == "switch"
-                || name == "return" || name == "catch" || name == "sizeof"
+                || name == "if"
+                || name == "for"
+                || name == "while"
+                || name == "switch"
+                || name == "return"
+                || name == "catch"
+                || name == "sizeof"
             {
                 continue;
             }
@@ -386,7 +392,10 @@ fn extract_cpp_methods(content: &str) -> Vec<(String, AstNodeData)> {
                 let raw = name;
                 if let Some(ret) = m.name("ret") {
                     let ret_last_ws = ret.as_str().trim_end();
-                    let last_word = ret_last_ws.rsplit(|c: char| c.is_whitespace() || c == ':' || c == '<' || c == ',').next().unwrap_or("");
+                    let last_word = ret_last_ws
+                        .rsplit(|c: char| c.is_whitespace() || c == ':' || c == '<' || c == ',')
+                        .next()
+                        .unwrap_or("");
                     if !last_word.is_empty() && raw.starts_with(last_word) {
                         // `ret` already contains the last segment — combine:
                         // qualified name = `<ret stripped of trailing ws> + raw`.
@@ -400,7 +409,10 @@ fn extract_cpp_methods(content: &str) -> Vec<(String, AstNodeData)> {
                 }
             };
 
-            let full = m.get(0).map(|g| g.as_str().trim().to_string()).unwrap_or_default();
+            let full = m
+                .get(0)
+                .map(|g| g.as_str().trim().to_string())
+                .unwrap_or_default();
             if full.is_empty() {
                 continue;
             }
@@ -412,7 +424,11 @@ fn extract_cpp_methods(content: &str) -> Vec<(String, AstNodeData)> {
                 match m.name("ret") {
                     Some(ret) => {
                         let r = ret.as_str().trim();
-                        if r.is_empty() { None } else { Some(r.to_string()) }
+                        if r.is_empty() {
+                            None
+                        } else {
+                            Some(r.to_string())
+                        }
                     }
                     None => None,
                 }
@@ -529,9 +545,11 @@ pub enum HalHeaderKind {
 /// Returns `true` when any declared class in the header derives the HAL module
 /// marker base (`HalModule`, possibly qualified `hal::HalModule`).
 fn derives_hal_module(content: &str) -> bool {
-    extract_cpp_base_classes(content)
-        .iter()
-        .any(|(_, bases)| bases.iter().any(|b| b == "HalModule" || b == "hal::HalModule"))
+    extract_cpp_base_classes(content).iter().any(|(_, bases)| {
+        bases
+            .iter()
+            .any(|b| b == "HalModule" || b == "hal::HalModule")
+    })
 }
 
 pub fn classify_hal_header(path: &Path) -> HalHeaderKind {
@@ -683,7 +701,9 @@ pub fn parse_hal_contract_summary(summary: &str) -> Vec<(String, Vec<HalContract
         if line.is_empty() {
             continue;
         }
-        let Some(colon) = line.find(':') else { continue };
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
         let class_name = line[..colon].trim().to_string();
         let mut methods: Vec<HalContractMethod> = Vec::new();
         for part in line[colon + 1..].split(';') {
@@ -692,7 +712,9 @@ pub fn parse_hal_contract_summary(summary: &str) -> Vec<(String, Vec<HalContract
                 continue;
             }
             let Some(po) = part.find('(') else { continue };
-            let Some(close_rel) = part[po..].find(')') else { continue };
+            let Some(close_rel) = part[po..].find(')') else {
+                continue;
+            };
             let bare_params = &part[po + 1..po + close_rel];
             // Strip default-argument values: `int timeout_ms = 100` → `int timeout_ms`.
             let params: String = bare_params
@@ -812,7 +834,9 @@ pub fn generate_hal_module_header(
     );
     h.push_str(&format!("#include \"hal/api/{header_stem}.hpp\"\n\n"));
     h.push_str("namespace hal {\n\n");
-    h.push_str(&format!("/// {impl_class} — {platform} implementation of {base_class}.\n"));
+    h.push_str(&format!(
+        "/// {impl_class} — {platform} implementation of {base_class}.\n"
+    ));
     h.push_str(&format!("class {impl_class} : public {base_class} {{\n"));
     h.push_str("public:\n");
     h.push_str(&format!("    {impl_class}() = default;\n"));
@@ -949,7 +973,9 @@ pub fn generate_hal_module_header_clean(
 ) -> String {
     let mut h = format!("#include \"hal/api/{header_stem}.hpp\"\n\n");
     h.push_str("namespace hal {\n\n");
-    h.push_str(&format!("/// {impl_class} — {platform} implementation of {base_class}.\n"));
+    h.push_str(&format!(
+        "/// {impl_class} — {platform} implementation of {base_class}.\n"
+    ));
     h.push_str(&format!("class {impl_class} : public {base_class} {{\n"));
     h.push_str("public:\n");
     h.push_str(&format!("    {impl_class}() = default;\n"));
@@ -988,13 +1014,7 @@ pub fn generate_hal_module_pair(
     methods: &[HalContractMethod],
     platform: &str,
 ) -> (String, String) {
-    let header = generate_hal_module_header(
-        header_stem,
-        impl_class,
-        base_class,
-        methods,
-        platform,
-    );
+    let header = generate_hal_module_header(header_stem, impl_class, base_class, methods, platform);
     let source = generate_hal_placeholder_source(header_stem, impl_class, methods, platform);
     (header, source)
 }
@@ -1117,7 +1137,9 @@ pub fn generate_aggregate_hal_header(
     h.push_str(&format!(
         "/// {platform} aggregate HAL — constructs and owns the platform's components.\n"
     ));
-    h.push_str(&format!("class {class_name} : public AiTrapHal {{\npublic:\n"));
+    h.push_str(&format!(
+        "class {class_name} : public AiTrapHal {{\npublic:\n"
+    ));
     h.push_str(&format!("    {class_name}();\n"));
     h.push_str(&format!("    ~{class_name}() override;\n\n"));
     for (ret, name) in accessors {
@@ -1362,7 +1384,10 @@ fn function_declarator_name_params<'t>(
         .unwrap_or_default();
     let params = fd
         .child_by_field_name("parameters")
-        .or_else(|| fd.named_children(&mut fd.walk()).find(|c| c.kind() == "parameter_list"))
+        .or_else(|| {
+            fd.named_children(&mut fd.walk())
+                .find(|c| c.kind() == "parameter_list")
+        })
         .and_then(|p| p.utf8_text(content.as_bytes()).ok())
         .map(|t| {
             let t = t.trim();
@@ -1466,11 +1491,14 @@ pub fn extract_contract_methods_cpp(content: &str) -> Vec<(String, Vec<HalContra
                         // remember the reference/pointer suffix for the type.
                         if matches!(
                             ck,
-                            "reference_declarator" | "pointer_declarator" | "parenthesized_declarator"
+                            "reference_declarator"
+                                | "pointer_declarator"
+                                | "parenthesized_declarator"
                         ) {
                             if let Some(inner) = find_function_declarator(c) {
                                 fd = Some(inner);
-                                decl_offset = Some(c.start_byte().saturating_sub(child.start_byte()));
+                                decl_offset =
+                                    Some(c.start_byte().saturating_sub(child.start_byte()));
                                 ret_suffix = if ck == "reference_declarator" {
                                     "&"
                                 } else if ck == "pointer_declarator" {
@@ -1569,9 +1597,10 @@ pub fn extract_cpp_base_classes(content: &str) -> Vec<(String, Vec<String>)> {
                                 && name != "private"
                                 && name != "protected"
                                 && name != "virtual"
-                                && !bases.contains(&name) {
-                                    bases.push(name);
-                                }
+                                && !bases.contains(&name)
+                            {
+                                bases.push(name);
+                            }
                         }
                     }
                 }
@@ -1760,8 +1789,12 @@ pub fn hal_interface_coverage(
     if impl_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(impl_dir) {
             for e in entries.flatten() {
-                let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) else { continue };
-                let Some(file_stem) = fname.split('.').next() else { continue };
+                let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                let Some(file_stem) = fname.split('.').next() else {
+                    continue;
+                };
                 if !file_implements_stem(file_stem, stem) {
                     continue;
                 }
@@ -1798,8 +1831,16 @@ pub fn hal_interface_coverage(
         let impl_params = normalize_params(&im.params);
         let ret_mismatch = !cm.return_type.trim().is_empty()
             && !im.return_type.trim().is_empty()
-            && cm.return_type.split_whitespace().collect::<Vec<_>>().join(" ")
-                != im.return_type.split_whitespace().collect::<Vec<_>>().join(" ");
+            && cm
+                .return_type
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                != im
+                    .return_type
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
         if contract_params != impl_params || ret_mismatch {
             cov.drifted.push(format!(
                 "{}: contract `{}` → impl `{}`",
@@ -1829,8 +1870,10 @@ pub fn hal_platform_coverage_map(
     // with `;`-heavy multi-line params).
     let mut contracts: BTreeMap<String, Vec<HalContractMethod>> = BTreeMap::new();
     let mut header_dirs: Vec<std::path::PathBuf> = Vec::new();
-    for dir in [root.join("hal").join("api"), root.join("toolkit").join("src").join("hal").join("api")]
-    {
+    for dir in [
+        root.join("hal").join("api"),
+        root.join("toolkit").join("src").join("hal").join("api"),
+    ] {
         if dir.is_dir() {
             header_dirs.push(dir);
         }
@@ -1839,11 +1882,15 @@ pub fn hal_platform_coverage_map(
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let ep = e.path();
-                let Some(ext) = ep.extension().and_then(|x| x.to_str()) else { continue };
+                let Some(ext) = ep.extension().and_then(|x| x.to_str()) else {
+                    continue;
+                };
                 if ext != "hpp" && ext != "h" {
                     continue;
                 }
-                let Ok(content) = std::fs::read_to_string(&ep) else { continue };
+                let Ok(content) = std::fs::read_to_string(&ep) else {
+                    continue;
+                };
                 let classes = extract_contract_methods_cpp(&content);
                 // Flatten all abstract classes' methods (a header usually has one).
                 let mut methods: Vec<HalContractMethod> = Vec::new();
@@ -1853,7 +1900,9 @@ pub fn hal_platform_coverage_map(
                 if methods.is_empty() {
                     continue;
                 }
-                let Some(stem) = ep.file_stem().and_then(|s| s.to_str()) else { continue };
+                let Some(stem) = ep.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
                 contracts.entry(stem.to_string()).or_insert(methods);
             }
         }
@@ -1878,14 +1927,23 @@ pub fn hal_platform_coverage_map(
             }
         }
     }
-    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+    let skip = [
+        "toolkit",
+        "hal",
+        "build",
+        "build-native",
+        "subprojects",
+        ".git",
+    ];
     if let Ok(entries) = std::fs::read_dir(root) {
         for e in entries.flatten() {
             let p = e.path();
             if !p.is_dir() {
                 continue;
             }
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             // Skip hidden dirs AND meson build dirs (`build-a7s`, `build-rpi5`):
             // a build dir contains a generated `<build>/hal` subdir, which would
             // otherwise be picked up as a bogus "platform".
@@ -1920,17 +1978,17 @@ pub fn hal_platform_coverage_map(
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HalDocTag {
     pub name: String,
-    pub key: String,   // "@brief" → "brief"; "@param cfg" → "param"
+    pub key: String, // "@brief" → "brief"; "@param cfg" → "param"
     pub value: String,
 }
 
 /// A structured doc comment attached to a contract, datatype, method or field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HalDoc {
-    pub target: String,     // declaration name (class, method, field)
-    pub kind: String,       // "contract" | "type" | "method" | "field" | "module"
+    pub target: String, // declaration name (class, method, field)
+    pub kind: String,   // "contract" | "type" | "method" | "field" | "module"
     pub tags: Vec<HalDocTag>,
-    pub prose: String,      // non-tag comment text (the LLM guidance)
+    pub prose: String, // non-tag comment text (the LLM guidance)
 }
 
 /// Parse Doxygen-style structured comments from a C/C++ header.
@@ -1979,8 +2037,7 @@ pub fn parse_hal_docs(content: &str) -> Vec<HalDoc> {
         // lines of U+2500 (─) are dropped as noise.
         if t.starts_with("//") && !t.starts_with("///") {
             let body = t.trim_start_matches('/').trim();
-            let is_sep = body.is_empty()
-                || body.contains("\u{2500}\u{2500}\u{2500}");
+            let is_sep = body.is_empty() || body.contains("\u{2500}\u{2500}\u{2500}");
             if !is_sep {
                 pending.push(body.to_string());
             }
@@ -1998,8 +2055,16 @@ pub fn parse_hal_docs(content: &str) -> Vec<HalDoc> {
             .unwrap_or_else(|| trimmed.to_string());
         if !pending.is_empty() && !t.is_empty() && !t.starts_with('#') {
             let kind = if trimmed.starts_with("class ") || trimmed.starts_with("struct ") {
-                if trimmed.contains("= 0") || trimmed.contains(":") { "contract" } else { "type" }
-            } else if trimmed.contains('(') { "method" } else { "field" };
+                if trimmed.contains("= 0") || trimmed.contains(":") {
+                    "contract"
+                } else {
+                    "type"
+                }
+            } else if trimmed.contains('(') {
+                "method"
+            } else {
+                "field"
+            };
             let name = if trimmed.starts_with("class ") || trimmed.starts_with("struct ") {
                 // Class name = the token AFTER `class`/`struct` (not a base class).
                 trimmed
@@ -2021,7 +2086,8 @@ pub fn parse_hal_docs(content: &str) -> Vec<HalDoc> {
                 // follows it). Numeric/pointer literal values are never names.
                 let head_eq = stripped_line.split('=').next().unwrap_or(&stripped_line);
                 head_eq
-                    .split([' ', '\t', ';', ',', '{']).rfind(|s| !s.is_empty())
+                    .split([' ', '\t', ';', ',', '{'])
+                    .rfind(|s| !s.is_empty())
                     .unwrap_or("")
                     .trim_end_matches([';', ','])
                     .to_string()
@@ -2038,7 +2104,12 @@ pub fn parse_hal_docs(content: &str) -> Vec<HalDoc> {
                     prose.push_str(inline);
                 }
             }
-            out.push(HalDoc { target: name, kind: kind.to_string(), tags, prose });
+            out.push(HalDoc {
+                target: name,
+                kind: kind.to_string(),
+                tags,
+                prose,
+            });
             pending.clear();
         } else if t.is_empty() {
             // blank line: only spaces between doc and decl? keep pending.
@@ -2069,7 +2140,11 @@ fn parse_doc_tags(lines: &[String]) -> (Vec<HalDocTag>, String) {
             } else {
                 (name.trim_start_matches('@').to_string(), rest)
             };
-            tags.push(HalDocTag { name: name.clone(), key, value });
+            tags.push(HalDocTag {
+                name: name.clone(),
+                key,
+                value,
+            });
         } else {
             if !prose.is_empty() {
                 prose.push(' ');
@@ -2143,12 +2218,18 @@ pub fn hal_graph(root: &std::path::Path) -> HalGraph {
         if let Ok(es) = std::fs::read_dir(dir) {
             for e in es.flatten() {
                 let p = e.path();
-                let Some(ext) = p.extension().and_then(|x| x.to_str()) else { continue };
+                let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+                    continue;
+                };
                 if ext != "hpp" && ext != "h" {
                     continue;
                 }
-                let Ok(content) = std::fs::read_to_string(&p) else { continue };
-                let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
+                let Ok(content) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+                    continue;
+                };
                 let docs = parse_hal_docs(&content);
                 let classes = extract_contract_methods_cpp(&content);
                 let _kind = if derives_hal_module(&content) || !classes.is_empty() {
@@ -2209,8 +2290,16 @@ pub fn hal_graph(root: &std::path::Path) -> HalGraph {
     });
     // Impls + missing/drifted edges from coverage.
     for plat_dir in &impl_dirs {
-        let Some(plat) = plat_dir.file_name().and_then(|s| s.to_str()).map(String::from) else { continue };
-        let Some(ifaces) = cov.get(&plat) else { continue };
+        let Some(plat) = plat_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+        else {
+            continue;
+        };
+        let Some(ifaces) = cov.get(&plat) else {
+            continue;
+        };
         for (stem, c) in ifaces {
             if c.has_impl {
                 g.nodes.push(HalGraphNode {
@@ -2251,7 +2340,12 @@ pub fn hal_query(graph: &HalGraph, query: &str) -> (Vec<HalGraphNode>, Vec<HalGr
     let nodes: Vec<HalGraphNode> = graph
         .nodes
         .iter()
-        .filter(|n| q.is_empty() || n.kind.to_lowercase().contains(&q) || n.name.to_lowercase().contains(&q) || n.platform.to_lowercase().contains(&q))
+        .filter(|n| {
+            q.is_empty()
+                || n.kind.to_lowercase().contains(&q)
+                || n.name.to_lowercase().contains(&q)
+                || n.platform.to_lowercase().contains(&q)
+        })
         .cloned()
         .collect();
     let ids: std::collections::HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
@@ -2271,7 +2365,11 @@ pub fn hal_doc_block(docs: &[HalDoc]) -> String {
         out.push_str(&format!("--- {} ({}) ---\n", d.target, d.kind));
         for t in &d.tags {
             if t.value.is_empty() {
-                out.push_str(&format!("{}{}\n", t.name, if t.key == "param" { " <name>" } else { "" }));
+                out.push_str(&format!(
+                    "{}{}\n",
+                    t.name,
+                    if t.key == "param" { " <name>" } else { "" }
+                ));
             } else {
                 out.push_str(&format!("{} {}\n", t.name, t.value));
             }
@@ -2335,7 +2433,9 @@ fn inline_field_docs(content: &str) -> Vec<HalFieldDoc> {
             let type_name = tokens[..tokens.len() - 1].join(" ");
             out.entry((name.clone(), type_name.clone()))
                 .and_modify(|e| {
-                    if !e.prose.is_empty() { e.prose.push(' '); }
+                    if !e.prose.is_empty() {
+                        e.prose.push(' ');
+                    }
                     e.prose.push_str(comment);
                 })
                 .or_insert(HalFieldDoc {
@@ -2461,8 +2561,18 @@ pub struct HalDocLintReport {
 
 /// Known HAL doc tags (whitelist): anything else is flagged.
 const HAL_DOC_TAGS: &[&str] = &[
-    "@brief", "@id", "@param", "@return", "@lifespan", "@ownership", "@zero-copy",
-    "@platform-note", "@thread-safety", "@performance", "@error", "@note",
+    "@brief",
+    "@id",
+    "@param",
+    "@return",
+    "@lifespan",
+    "@ownership",
+    "@zero-copy",
+    "@platform-note",
+    "@thread-safety",
+    "@performance",
+    "@error",
+    "@note",
 ];
 
 /// Lint `hal/api/*.hpp` doc completeness against what the HAL graph actually
@@ -2471,14 +2581,20 @@ const HAL_DOC_TAGS: &[&str] = &[
 pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
     let mut report = HalDocLintReport::default();
     let api = root.join("hal").join("api");
-    let Ok(es) = ::std::fs::read_dir(&api) else { return report };
+    let Ok(es) = ::std::fs::read_dir(&api) else {
+        return report;
+    };
     for e in es.flatten() {
         let p = e.path();
-        let Some(ext) = p.extension().and_then(|x| x.to_str()) else { continue };
+        let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+            continue;
+        };
         if ext != "hpp" && ext != "h" {
             continue;
         }
-        let Ok(content) = ::std::fs::read_to_string(&p) else { continue };
+        let Ok(content) = ::std::fs::read_to_string(&p) else {
+            continue;
+        };
         let rel = p.to_string_lossy().to_string();
         let docs = parse_hal_docs(&content);
         let classes = extract_contract_methods_cpp(&content);
@@ -2488,8 +2604,13 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
         let mut issues: Vec<HalDocLintIssue> = Vec::new();
 
         // Rule 1: contract class has @brief + @id.
-        let cdoc = docs.iter().find(|d| classes.iter().any(|(c, _)| *c == d.target));
-        if !cdoc.map(|d| d.tags.iter().any(|t| t.name == "@brief")).unwrap_or(false) {
+        let cdoc = docs
+            .iter()
+            .find(|d| classes.iter().any(|(c, _)| *c == d.target));
+        if !cdoc
+            .map(|d| d.tags.iter().any(|t| t.name == "@brief"))
+            .unwrap_or(false)
+        {
             issues.push(HalDocLintIssue {
                 severity: "error".into(),
                 title: "contract missing @brief".into(),
@@ -2499,7 +2620,10 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
                 fix_prompt: "Write a one-line `/// @brief` describing this HAL contract.".into(),
             });
         }
-        if !cdoc.map(|d| d.tags.iter().any(|t| t.name == "@id")).unwrap_or(false) {
+        if !cdoc
+            .map(|d| d.tags.iter().any(|t| t.name == "@id"))
+            .unwrap_or(false)
+        {
             issues.push(HalDocLintIssue {
                 severity: "error".into(),
                 title: "contract missing @id".into(),
@@ -2515,7 +2639,9 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
             for m in ms {
                 let mdoc = docs.iter().find(|d| d.target == m.name);
                 let sym = format!("{}::{}", cname, m.name);
-                let has_abrief = mdoc.map(|d| d.tags.iter().any(|t| t.name == "@brief")).unwrap_or(false);
+                let has_abrief = mdoc
+                    .map(|d| d.tags.iter().any(|t| t.name == "@brief"))
+                    .unwrap_or(false);
                 if !has_abrief {
                     issues.push(HalDocLintIssue {
                         severity: "error".into(),
@@ -2526,23 +2652,38 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
                         fix_prompt: format!(
                             "Write a one-line `/// @brief` for `{}` (returns {}).",
                             m.name,
-                            if m.return_type.is_empty() { "void".into() } else { m.return_type.clone() }
+                            if m.return_type.is_empty() {
+                                "void".into()
+                            } else {
+                                m.return_type.clone()
+                            }
                         ),
                     });
                 }
                 // Params: name list from the signature string.
-                let param_names: Vec<String> = m.params
+                let param_names: Vec<String> = m
+                    .params
                     .split(',')
                     .filter_map(|part| {
                         // Strip any default (`= <value>`) BEFORE the name, so
                         // `int quality = 85` -> "quality", not "85".
                         let head = part.split('=').next().unwrap_or(part);
-                        head.split_whitespace().last()
-                            .filter(|w| !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                        head.split_whitespace()
+                            .last()
+                            .filter(|w| {
+                                !w.is_empty() && w.chars().all(|c| c.is_alphanumeric() || c == '_')
+                            })
                             .map(|w| w.to_string())
                     })
                     .collect();
-                let have = mdoc.map(|d| d.tags.iter().filter(|t| t.name == "@param").collect::<Vec<_>>()).unwrap_or_default();
+                let have = mdoc
+                    .map(|d| {
+                        d.tags
+                            .iter()
+                            .filter(|t| t.name == "@param")
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 for pn in &param_names {
                     if !have.iter().any(|t| t.key == *pn) {
                         issues.push(HalDocLintIssue {
@@ -2558,7 +2699,9 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
                     }
                 }
                 if !m.return_type.is_empty() && m.return_type != "void" {
-                    let has_return = mdoc.map(|d| d.tags.iter().any(|t| t.name == "@return")).unwrap_or(false);
+                    let has_return = mdoc
+                        .map(|d| d.tags.iter().any(|t| t.name == "@return"))
+                        .unwrap_or(false);
                     if !has_return {
                         issues.push(HalDocLintIssue {
                             severity: "error".into(),
@@ -2591,7 +2734,9 @@ pub fn hal_doc_lint(root: &std::path::Path) -> HalDocLintReport {
                                 path: rel.clone(),
                                 symbol: tag.to_string(),
                                 message: format!("unknown tag `{tag}`"),
-                                fix_prompt: format!("Replace `{tag}` with a whitelisted HAL tag or remove it."),
+                                fix_prompt: format!(
+                                    "Replace `{tag}` with a whitelisted HAL tag or remove it."
+                                ),
                             });
                             break; // one per line is enough
                         }
@@ -2628,19 +2773,34 @@ pub struct CppSyntaxReport {
 pub fn cpp_syntax_check(content: &str) -> CppSyntaxReport {
     let mut parser = cpp_parser();
     let Some(tree) = parser.parse(content, None) else {
-        return CppSyntaxReport { ok: false, errors: Vec::new() };
+        return CppSyntaxReport {
+            ok: false,
+            errors: Vec::new(),
+        };
     };
     let root = tree.root_node();
     if !root.has_error() {
-        return CppSyntaxReport { ok: true, errors: Vec::new() };
+        return CppSyntaxReport {
+            ok: true,
+            errors: Vec::new(),
+        };
     }
     let mut errors = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.is_error() || node.is_missing() {
             let (row, col) = (node.start_position().row, node.start_position().column);
-            let context = content.lines().nth(row).map(|l| l.trim().to_string()).unwrap_or_default();
-            errors.push(CppSyntaxError { line: row as u32 + 1, col: col as u32 + 1, kind: node.kind().to_string(), context });
+            let context = content
+                .lines()
+                .nth(row)
+                .map(|l| l.trim().to_string())
+                .unwrap_or_default();
+            errors.push(CppSyntaxError {
+                line: row as u32 + 1,
+                col: col as u32 + 1,
+                kind: node.kind().to_string(),
+                context,
+            });
             continue; // don't descend into erroneous nodes
         }
         let mut cursor = node.walk();
@@ -2675,7 +2835,13 @@ pub fn hal_doc_fix_prompt_all(path: &str, issues: &[HalDocLintIssue]) -> String 
     out.push_str("Fix the HAL documentation issues in this C++ header.\n");
     out.push_str(&format!("File: {path}\n\n"));
     for (i, issue) in issues.iter().enumerate() {
-        out.push_str(&format!("{}. Symbol: {}   Issue: {}   {} \n", i + 1, issue.symbol, issue.title, issue.message));
+        out.push_str(&format!(
+            "{}. Symbol: {}   Issue: {}   {} \n",
+            i + 1,
+            issue.symbol,
+            issue.title,
+            issue.message
+        ));
     }
     out.push_str("Return ONLY the corrected `/// @...` comment block(s) for the symbols listed, ready to paste into the file.");
     out
@@ -2692,11 +2858,15 @@ pub fn compute_hal_state(root: &std::path::Path) -> HalStateSnapshot {
     if let Ok(es) = ::std::fs::read_dir(&api) {
         for e in es.flatten() {
             let p = e.path();
-            let Some(ext) = p.extension().and_then(|x| x.to_str()) else { continue };
+            let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+                continue;
+            };
             if ext != "hpp" && ext != "h" {
                 continue;
             }
-            let Ok(content) = ::std::fs::read_to_string(&p) else { continue };
+            let Ok(content) = ::std::fs::read_to_string(&p) else {
+                continue;
+            };
             if extract_cpp_base_classes(&content)
                 .iter()
                 .any(|(_, bs)| bs.iter().any(|b| b == "HalModule"))
@@ -2722,7 +2892,9 @@ pub fn compute_hal_state(root: &std::path::Path) -> HalStateSnapshot {
     }
     snap.syntax_errors = syntax_errors;
     if syntax_errors > 0 {
-        snap.contract = HalContractState::InvalidSyntax { errors: syntax_errors };
+        snap.contract = HalContractState::InvalidSyntax {
+            errors: syntax_errors,
+        };
         snap.implementations = hal_impl_rows(root);
         return snap;
     }
@@ -2739,7 +2911,9 @@ pub fn compute_hal_state(root: &std::path::Path) -> HalStateSnapshot {
     }
     snap.lint_issues = issues_count;
     snap.contract = if issues_count > 0 {
-        HalContractState::LintDirty { issues: issues_count }
+        HalContractState::LintDirty {
+            issues: issues_count,
+        }
     } else {
         HalContractState::LintClean
     };
@@ -2753,7 +2927,11 @@ fn hal_impl_rows(root: &std::path::Path) -> Vec<HalImplRow> {
     let impl_root = root.join("hal").join("implementations");
     let mut rows = Vec::new();
     for (plat, ifaces) in &coverage {
-        let mut row = HalImplRow { platform: plat.clone(), state: HalImplState::Missing, contracts: Vec::new() };
+        let mut row = HalImplRow {
+            platform: plat.clone(),
+            state: HalImplState::Missing,
+            contracts: Vec::new(),
+        };
         let mut stub = false;
         if let Ok(fs) = ::std::fs::read_dir(impl_root.join(plat)) {
             for f in fs.flatten() {
@@ -2791,9 +2969,13 @@ fn hal_impl_rows(root: &std::path::Path) -> Vec<HalImplRow> {
         } else if !has_impl_any && missing_all.is_empty() {
             HalImplState::Missing
         } else if !missing_all.is_empty() {
-            HalImplState::Incomplete { missing: missing_all }
+            HalImplState::Incomplete {
+                missing: missing_all,
+            }
         } else if !drifted_all.is_empty() {
-            HalImplState::Drifted { drifted: drifted_all }
+            HalImplState::Drifted {
+                drifted: drifted_all,
+            }
         } else {
             HalImplState::Complete
         };
@@ -2817,10 +2999,18 @@ pub fn hal_doc_lint_file(root: &std::path::Path, path: &str) -> Vec<HalDocLintIs
 /// header (all `/// @…` docs fixed), keeping the code identical.
 pub fn hal_doc_fix_prompt_whole(path: &str, content: &str, issues: &[HalDocLintIssue]) -> String {
     let mut out = String::new();
-    out.push_str("Fix the HAL documentation lints in this C++ header by rewriting the WHOLE file.\n");
+    out.push_str(
+        "Fix the HAL documentation lints in this C++ header by rewriting the WHOLE file.\n",
+    );
     out.push_str(&format!("File: {path}\n\nIssues:\n"));
     for (i, issue) in issues.iter().enumerate() {
-        out.push_str(&format!("{}. [{}] {} — {}\n", i + 1, issue.symbol, issue.title, issue.message));
+        out.push_str(&format!(
+            "{}. [{}] {} — {}\n",
+            i + 1,
+            issue.symbol,
+            issue.title,
+            issue.message
+        ));
     }
     out.push_str(&format!("\nCurrent content:\n```cpp\n{content}\n```\n\n"));
     out.push_str("Return ONLY the complete corrected header inside a ```cpp``` block. Keep all code and signatures identical; add/fix only the `/// @...` doc comments.");
@@ -2862,9 +3052,7 @@ pub fn compile_fix_prompt(path: &str, content: &str, errors: &[String]) -> Strin
 /// observable location must not lose its effect.
 pub fn warning_fix_prompt(path: &str, content: &str, warnings: &[String]) -> String {
     let mut out = String::new();
-    out.push_str(
-        "Resolve the ANALYZER warnings in this C/C++ file by rewriting the WHOLE file.\n",
-    );
+    out.push_str("Resolve the ANALYZER warnings in this C/C++ file by rewriting the WHOLE file.\n");
     out.push_str(&format!("File: {path}\n\nWarnings:\n"));
     for (i, w) in warnings.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, w));
@@ -2903,8 +3091,12 @@ pub fn hal_fix_plan_from_lint(lint: &HalDocLintReport) -> HalFixPlan {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum HalContractState {
     NoContract,
-    InvalidSyntax { errors: usize },
-    LintDirty { issues: usize },
+    InvalidSyntax {
+        errors: usize,
+    },
+    LintDirty {
+        issues: usize,
+    },
     #[default]
     LintClean,
     Fixing,
@@ -2917,8 +3109,12 @@ pub enum HalImplState {
     #[default]
     Missing,
     StubPending,
-    Incomplete { missing: Vec<String> },
-    Drifted { drifted: Vec<String> },
+    Incomplete {
+        missing: Vec<String>,
+    },
+    Drifted {
+        drifted: Vec<String>,
+    },
     Complete,
     SyntaxError,
 }
@@ -2986,14 +3182,20 @@ pub fn hal_report(root: &std::path::Path) -> HalDocReport {
     if let Ok(es) = std::fs::read_dir(&scan_dir) {
         for e in es.flatten() {
             let p = e.path();
-            let Some(ext) = p.extension().and_then(|x| x.to_str()) else { continue };
+            let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+                continue;
+            };
             if ext != "hpp" && ext != "h" {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&p) else { continue };
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             let classes = extract_contract_methods_cpp(&content);
             let docs = parse_hal_docs(&content);
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+                continue;
+            };
 
             if classes.is_empty() {
                 // Data-only header → a HalTypeDoc.
@@ -3002,7 +3204,12 @@ pub fn hal_report(root: &std::path::Path) -> HalDocReport {
                     let brief = docs
                         .iter()
                         .find(|d| d.target == cname)
-                        .and_then(|d| d.tags.iter().find(|t| t.name == "@brief").map(|t| t.value.clone()))
+                        .and_then(|d| {
+                            d.tags
+                                .iter()
+                                .find(|t| t.name == "@brief")
+                                .map(|t| t.value.clone())
+                        })
                         .unwrap_or_default();
                     let type_doc = docs.iter().find(|d| d.target == cname);
                     let tags = type_doc.map(|d| d.tags.clone()).unwrap_or_default();
@@ -3021,7 +3228,9 @@ pub fn hal_report(root: &std::path::Path) -> HalDocReport {
                     for inline in inline_field_docs(&content) {
                         if let Some(f) = fields.iter_mut().find(|f| f.name == inline.name) {
                             if !inline.prose.is_empty() {
-                                if !f.prose.is_empty() { f.prose.push(' '); }
+                                if !f.prose.is_empty() {
+                                    f.prose.push(' ');
+                                }
                                 f.prose.push_str(&inline.prose);
                             }
                         } else {
@@ -3050,8 +3259,22 @@ pub fn hal_report(root: &std::path::Path) -> HalDocReport {
                 continue;
             };
             let cdoc = docs.iter().find(|d| d.target == class_name);
-            let id = cdoc.and_then(|d| d.tags.iter().find(|t| t.name == "@id").map(|t| t.value.clone())).unwrap_or_default();
-            let brief = cdoc.and_then(|d| d.tags.iter().find(|t| t.name == "@brief").map(|t| t.value.clone())).unwrap_or_default();
+            let id = cdoc
+                .and_then(|d| {
+                    d.tags
+                        .iter()
+                        .find(|t| t.name == "@id")
+                        .map(|t| t.value.clone())
+                })
+                .unwrap_or_default();
+            let brief = cdoc
+                .and_then(|d| {
+                    d.tags
+                        .iter()
+                        .find(|t| t.name == "@brief")
+                        .map(|t| t.value.clone())
+                })
+                .unwrap_or_default();
 
             let mut methods = Vec::new();
             for (_, ms) in &classes {
@@ -3115,17 +3338,23 @@ pub fn hal_verify(root: &std::path::Path) -> Vec<HalIssue> {
     if let Ok(es) = std::fs::read_dir(&api) {
         for e in es.flatten() {
             let p = e.path();
-            let Some(ext) = p.extension().and_then(|x| x.to_str()) else { continue };
+            let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+                continue;
+            };
             if ext != "hpp" && ext != "h" {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&p) else { continue };
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             let classes = extract_contract_methods_cpp(&content);
             if classes.is_empty() {
                 continue; // data-only; not verified here
             }
             let rel = p.to_string_lossy().to_string();
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else { continue };
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+                continue;
+            };
             contract_stems.insert(stem);
 
             if !content.contains("namespace hal") {
@@ -3138,7 +3367,10 @@ pub fn hal_verify(root: &std::path::Path) -> Vec<HalIssue> {
                 });
             }
             let bases = extract_cpp_base_classes(&content);
-            if !bases.iter().any(|(_, bs)| bs.iter().any(|b| b == "HalModule")) {
+            if !bases
+                .iter()
+                .any(|(_, bs)| bs.iter().any(|b| b == "HalModule"))
+            {
                 issues.push(HalIssue {
                     severity: "error".into(),
                     title: "contract does not derive hal::HalModule".into(),
@@ -3148,8 +3380,15 @@ pub fn hal_verify(root: &std::path::Path) -> Vec<HalIssue> {
                 });
             }
             let docs = parse_hal_docs(&content);
-            let cdoc = docs.iter().find(|d| classes.iter().any(|(c, _)| *c == d.target));
-            let mid = cdoc.and_then(|d| d.tags.iter().find(|t| t.name == "@id").map(|t| t.value.clone()));
+            let cdoc = docs
+                .iter()
+                .find(|d| classes.iter().any(|(c, _)| *c == d.target));
+            let mid = cdoc.and_then(|d| {
+                d.tags
+                    .iter()
+                    .find(|t| t.name == "@id")
+                    .map(|t| t.value.clone())
+            });
             if mid.is_none() {
                 issues.push(HalIssue {
                     severity: "warning".into(),
@@ -3182,7 +3421,10 @@ pub fn hal_verify(root: &std::path::Path) -> Vec<HalIssue> {
                             severity: "info".into(),
                             title: "method missing @brief".into(),
                             path: rel.clone(),
-                            message: format!("{cname}::{}({}) — add a one-line @brief", m.name, m.params),
+                            message: format!(
+                                "{cname}::{}({}) — add a one-line @brief",
+                                m.name, m.params
+                            ),
                             suggested_fix: format!("document `{}` with `/// @brief …`", m.name),
                         });
                     }
@@ -3224,7 +3466,10 @@ pub fn hal_verify(root: &std::path::Path) -> Vec<HalIssue> {
                         continue;
                     }
                     let file_stem = fname.trim_end_matches(".cpp").to_string();
-                    if !contract_stems.iter().any(|s| file_implements_stem(&file_stem, s)) {
+                    if !contract_stems
+                        .iter()
+                        .any(|s| file_implements_stem(&file_stem, s))
+                    {
                         issues.push(HalIssue {
                             severity: "info".into(),
                             title: "orphan HAL implementation".into(),
@@ -3259,16 +3504,36 @@ pub fn generate_hal_impl_prompt_rich(
     capability_matrix: &str,
 ) -> String {
     let base = generate_hal_impl_prompt(
-        contract_summary, header_stem, class_name,
-        platform_id, platform_name, hardware_profile, library_hints, build_target_name,
+        contract_summary,
+        header_stem,
+        class_name,
+        platform_id,
+        platform_name,
+        hardware_profile,
+        library_hints,
+        build_target_name,
     );
     let mut r = String::new();
     r.push_str("## CONTRACT STRUCTURED DOCS\n");
-    r.push_str(if contract_docs.trim().is_empty() { "(none)\n" } else { contract_docs });
+    r.push_str(if contract_docs.trim().is_empty() {
+        "(none)\n"
+    } else {
+        contract_docs
+    });
     r.push_str("\n## DATATYPE DOCS\n");
-    r.push_str(if datatype_docs.trim().is_empty() { "(none)\n" } else { datatype_docs });
-    r.push_str(&format!("\n## PLATFORM CAPABILITY MATRIX ({platform_name})\n"));
-    r.push_str(if capability_matrix.trim().is_empty() { "(unavailable)\n" } else { capability_matrix });
+    r.push_str(if datatype_docs.trim().is_empty() {
+        "(none)\n"
+    } else {
+        datatype_docs
+    });
+    r.push_str(&format!(
+        "\n## PLATFORM CAPABILITY MATRIX ({platform_name})\n"
+    ));
+    r.push_str(if capability_matrix.trim().is_empty() {
+        "(unavailable)\n"
+    } else {
+        capability_matrix
+    });
     r.push_str(&format!("\n{base}"));
     r
 }
@@ -3299,11 +3564,15 @@ pub fn datatype_docs_to_prompt_text(root: &std::path::Path) -> String {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             let p = e.path();
-            let Some(ext) = p.extension().and_then(|x| x.to_str()) else { continue };
+            let Some(ext) = p.extension().and_then(|x| x.to_str()) else {
+                continue;
+            };
             if ext != "hpp" && ext != "h" {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(&p) else { continue };
+            let Ok(content) = std::fs::read_to_string(&p) else {
+                continue;
+            };
             let text = hal_docs_to_prompt_text(&parse_hal_docs(&content));
             if text.is_empty() {
                 continue;
@@ -3345,11 +3614,25 @@ pub fn generate_hal_impl_prompt_pair(
 ) -> String {
     let mut r = String::new();
     r.push_str("## CONTRACT STRUCTURED DOCS\n");
-    r.push_str(if contract_docs.trim().is_empty() { "(none)\n" } else { contract_docs });
+    r.push_str(if contract_docs.trim().is_empty() {
+        "(none)\n"
+    } else {
+        contract_docs
+    });
     r.push_str("\n## DATATYPE DOCS\n");
-    r.push_str(if datatype_docs.trim().is_empty() { "(none)\n" } else { datatype_docs });
-    r.push_str(&format!("\n## PLATFORM CAPABILITY MATRIX ({platform_name})\n"));
-    r.push_str(if capability_matrix.trim().is_empty() { "(unavailable)\n" } else { capability_matrix });
+    r.push_str(if datatype_docs.trim().is_empty() {
+        "(none)\n"
+    } else {
+        datatype_docs
+    });
+    r.push_str(&format!(
+        "\n## PLATFORM CAPABILITY MATRIX ({platform_name})\n"
+    ));
+    r.push_str(if capability_matrix.trim().is_empty() {
+        "(unavailable)\n"
+    } else {
+        capability_matrix
+    });
     r.push_str(&format!(
         r#"Implement the .cpp definition file for ONE HAL module pair.
 
@@ -3457,7 +3740,9 @@ pub fn hal_meson_upsert_sources(
             let Some(stub_stem) = basename.strip_suffix("_stub.cpp") else {
                 return true;
             };
-            !interface_stems.iter().any(|iface| file_implements_stem(stub_stem, iface))
+            !interface_stems
+                .iter()
+                .any(|iface| file_implements_stem(stub_stem, iface))
         })
         .collect();
     for f in cpp_file_names {
@@ -3467,12 +3752,14 @@ pub fn hal_meson_upsert_sources(
         }
     }
     merged.sort();
-    let entries: Vec<String> = merged
-        .iter()
-        .map(|e| format!("        '{e}',"))
-        .collect();
+    let entries: Vec<String> = merged.iter().map(|e| format!("        '{e}',")).collect();
     let replacement = format!("{var} = files(\n{}\n    )", entries.join("\n"));
-    format!("{}{}{}", &meson_content[..start], replacement, &meson_content[end + 1..])
+    format!(
+        "{}{}{}",
+        &meson_content[..start],
+        replacement,
+        &meson_content[end + 1..]
+    )
 }
 
 /// Remove every stem-matching file for an interface that still carries the
@@ -3486,7 +3773,9 @@ pub fn remove_stale_hal_stubs(impl_dir: &std::path::Path, iface: &str) -> Vec<St
     if let Ok(entries) = std::fs::read_dir(impl_dir) {
         for e in entries.flatten() {
             let fname = e.file_name().to_string_lossy().to_string();
-            let Some(file_stem) = fname.split('.').next().map(String::from) else { continue };
+            let Some(file_stem) = fname.split('.').next().map(String::from) else {
+                continue;
+            };
             if !file_implements_stem(&file_stem, iface) {
                 continue;
             }
@@ -3517,8 +3806,14 @@ pub fn flatten_hal_coverage(
     for (plat, ifaces) in coverage {
         for (iface, cov) in ifaces {
             if !cov.implemented {
-                by_platform.entry(plat.clone()).or_default().push(iface.clone());
-                by_interface.entry(iface.clone()).or_default().push(plat.clone());
+                by_platform
+                    .entry(plat.clone())
+                    .or_default()
+                    .push(iface.clone());
+                by_interface
+                    .entry(iface.clone())
+                    .or_default()
+                    .push(plat.clone());
             }
         }
     }
@@ -3614,10 +3909,7 @@ private:
             .iter()
             .filter(|n| n.node_type == "method")
             .collect();
-        let names: Vec<&str> = methods
-            .iter()
-            .filter_map(|m| m.name.as_deref())
-            .collect();
+        let names: Vec<&str> = methods.iter().filter_map(|m| m.name.as_deref()).collect();
         assert!(
             names.contains(&"~CameraHAL"),
             "expected destructor method, got: {names:?}"
@@ -3625,7 +3917,10 @@ private:
         assert!(names.contains(&"start"), "methods: {names:?}");
         assert!(names.contains(&"capture"), "methods: {names:?}");
         // The private member `int fd_ = -1;` has no parens → NOT a method.
-        assert!(!names.contains(&"fd_"), "fd_ must not be a method: {names:?}");
+        assert!(
+            !names.contains(&"fd_"),
+            "fd_ must not be a method: {names:?}"
+        );
 
         // Pure-virtual markers preserved in the signature.
         let start = methods
@@ -3685,7 +3980,10 @@ public:
         assert!(summary.contains("CameraHAL"), "summary: {summary}");
         assert!(summary.contains("start"), "summary: {summary}");
         assert!(summary.contains("capture"), "summary: {summary}");
-        assert!(summary.contains("= 0"), "summary must expose pure-virtual: {summary}");
+        assert!(
+            summary.contains("= 0"),
+            "summary must expose pure-virtual: {summary}"
+        );
 
         // A header with only concrete methods (no `= 0`) is not a contract.
         let bad = r#"#pragma once
@@ -3727,8 +4025,14 @@ public:
         let src = generate_hal_placeholder_source("camera_hal", class_name, methods, "rpi5");
         assert!(src.contains("#include \"camera_hal.hpp\""));
         assert!(src.contains("bool CameraHAL::start()"), "src:\n{src}");
-        assert!(src.contains("std::uint32_t CameraHAL::capture(int timeout_ms)"), "src:\n{src}");
-        assert!(src.contains("/* TODO: implement for rpi5 */"), "src:\n{src}");
+        assert!(
+            src.contains("std::uint32_t CameraHAL::capture(int timeout_ms)"),
+            "src:\n{src}"
+        );
+        assert!(
+            src.contains("/* TODO: implement for rpi5 */"),
+            "src:\n{src}"
+        );
         // Non-void methods return a value-initialized object.
         assert!(src.contains("return {};"), "src:\n{src}");
     }
@@ -3801,8 +4105,7 @@ public:
     /// implementations can be flagged for reconcile.
     #[test]
     fn hal_contract_diff_detects_signature_changes() {
-        let old_summary =
-            "CameraHAL: bool start() = 0; std::uint32_t capture(int timeout_ms) = 0";
+        let old_summary = "CameraHAL: bool start() = 0; std::uint32_t capture(int timeout_ms) = 0";
         let new_summary = "CameraHAL: bool start() = 0; bool teardown() = 0; \
                            std::uint32_t capture(int timeout_ms, int mode) = 0";
         let change = diff_hal_contracts(old_summary, new_summary);
@@ -3851,10 +4154,20 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
         assert!(names.contains(&"release_frames"), "names: {names:?}");
         assert!(names.contains(&"encode_crop"), "names: {names:?}");
         // Constructors/destructors are NOT contract methods.
-        assert!(!names.contains(&"CameraHalRpi5"), "ctor must be skipped: {names:?}");
-        assert!(!names.contains(&"~CameraHalRpi5"), "dtor must be skipped: {names:?}");
+        assert!(
+            !names.contains(&"CameraHalRpi5"),
+            "ctor must be skipped: {names:?}"
+        );
+        assert!(
+            !names.contains(&"~CameraHalRpi5"),
+            "dtor must be skipped: {names:?}"
+        );
         // Commented prototype must NOT match (comments stripped first).
-        assert_eq!(names.iter().filter(|n| **n == "init").count(), 1, "no comment match: {names:?}");
+        assert_eq!(
+            names.iter().filter(|n| **n == "init").count(),
+            1,
+            "no comment match: {names:?}"
+        );
 
         let encode = methods.iter().find(|m| m.name == "encode_crop").unwrap();
         assert_eq!(encode.return_type, "std::vector<uint8_t>");
@@ -3896,13 +4209,15 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
 
         // rpi5's concrete aggregate + component.
         std::fs::write(
-            root.path().join("hal/implementations/rpi5/ai_trap_hal_rpi5.cpp"),
+            root.path()
+                .join("hal/implementations/rpi5/ai_trap_hal_rpi5.cpp"),
             "namespace hal {\nICameraHAL& AiTrapHalRpi5::camera() { return *camera_; }\n\
              int AiTrapHalRpi5::inference() { return 0; }\n} // namespace hal\n",
         )
         .unwrap();
         std::fs::write(
-            root.path().join("hal/implementations/rpi5/camera_hal_rpi5.cpp"),
+            root.path()
+                .join("hal/implementations/rpi5/camera_hal_rpi5.cpp"),
             "namespace hal { bool CameraHalRpi5::init() { return true; } }\n",
         )
         .unwrap();
@@ -3911,7 +4226,9 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
         let rpi5 = cov.get("rpi5").expect("rpi5 platform dir discovered");
 
         // The aggregate is discovered as a contract AND covered by rpi5.
-        let agg = rpi5.get("ai_trap_hal").expect("ai_trap_hal contract discovered");
+        let agg = rpi5
+            .get("ai_trap_hal")
+            .expect("ai_trap_hal contract discovered");
         assert!(
             agg.implemented,
             "the aggregate HAL must be covered per platform (missing={:?}, drifted={:?})",
@@ -3920,7 +4237,9 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
 
         // The component contract is covered too — and not confused with the
         // aggregate (different stems).
-        let cam = rpi5.get("camera_hal").expect("camera_hal contract discovered");
+        let cam = rpi5
+            .get("camera_hal")
+            .expect("camera_hal contract discovered");
         assert!(
             cam.implemented,
             "camera_hal covered (missing={:?}, drifted={:?})",
@@ -3940,11 +4259,19 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
                    virtual int* c() = 0;\n\
                    virtual const char* d() = 0;\n};\n}\n";
         let classes = extract_contract_methods_cpp(src);
-        assert_eq!(classes.len(), 1, "the class must be discovered: {classes:?}");
+        assert_eq!(
+            classes.len(),
+            1,
+            "the class must be discovered: {classes:?}"
+        );
         let (name, methods) = &classes[0];
         assert_eq!(name, "X");
         let got: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(got, vec!["a", "b", "c", "d"], "reference/pointer methods kept");
+        assert_eq!(
+            got,
+            vec!["a", "b", "c", "d"],
+            "reference/pointer methods kept"
+        );
         assert_eq!(
             methods.iter().find(|m| m.name == "b").unwrap().return_type,
             "int&"
@@ -3989,20 +4316,23 @@ std::vector<uint8_t> Rpi5JpegEncoder::encode_crop(int src_dma_fd,
         )
         .unwrap();
         std::fs::write(
-            root.path().join("hal/implementations/rpi5/camera_hal_rpi5.cpp"),
+            root.path()
+                .join("hal/implementations/rpi5/camera_hal_rpi5.cpp"),
             "namespace hal { bool CameraHalRpi5::init() { return true; } }\n",
         )
         .unwrap();
 
         let cov = hal_platform_coverage_map(root.path());
         let keys: Vec<&String> = cov.keys().collect();
-        assert!(cov.contains_key("rpi5"), "real platform must be present: {keys:?}");
+        assert!(
+            cov.contains_key("rpi5"),
+            "real platform must be present: {keys:?}"
+        );
         assert!(
             !cov.contains_key("build-rpi5"),
             "the meson build dir must not be a platform: {keys:?}"
         );
     }
-
 
     /// `hal_interface_coverage` compares the contract's pure-virtual method set
     /// against a platform's stem-matching impl files (AST-level, class-name
@@ -4036,7 +4366,11 @@ void CameraHalRpi5::shutdown() { }
         let contract_methods = contract_methods;
         let complete = hal_interface_coverage(&contract_methods, "camera_hal", dir.path());
         assert!(complete.implemented, "all methods present: {complete:?}");
-        assert!(complete.missing.is_empty(), "missing: {:?}", complete.missing);
+        assert!(
+            complete.missing.is_empty(),
+            "missing: {:?}",
+            complete.missing
+        );
 
         // Drifted impl: wrong return type and a drifted param.
         std::fs::write(
@@ -4051,12 +4385,26 @@ void CameraHALR3::shutdown() { }
         )
         .unwrap();
         let drifted = hal_interface_coverage(&contract_methods, "camera_hal", dir.path());
-        assert!(!drifted.implemented, "param/arity drift must fail: {drifted:?}");
+        assert!(
+            !drifted.implemented,
+            "param/arity drift must fail: {drifted:?}"
+        );
         // acquire_frames has 2 params vs contract 3 → drifted, not missing.
-        assert!(!drifted.missing.contains(&"acquire_frames".to_string()), "drift not missing: {drifted:?}");
-        assert!(drifted.drifted.iter().any(|d| d.contains("acquire_frames")), "drifted: {:?}", drifted.drifted);
+        assert!(
+            !drifted.missing.contains(&"acquire_frames".to_string()),
+            "drift not missing: {drifted:?}"
+        );
+        assert!(
+            drifted.drifted.iter().any(|d| d.contains("acquire_frames")),
+            "drifted: {:?}",
+            drifted.drifted
+        );
         // release_frames has an extra param → drifted.
-        assert!(drifted.drifted.iter().any(|d| d.contains("release_frames")), "drifted: {:?}", drifted.drifted);
+        assert!(
+            drifted.drifted.iter().any(|d| d.contains("release_frames")),
+            "drifted: {:?}",
+            drifted.drifted
+        );
 
         // Missing impl file → every contract method missing.
         let missing = hal_interface_coverage(&contract_methods, "h264_encoder", dir.path());
@@ -4073,7 +4421,10 @@ void CameraHALR3::shutdown() { }
             return;
         };
         let root = std::path::Path::new(&root);
-        assert!(root.join("hal/api/camera_hal.hpp").exists(), "ai-traps hal/api missing");
+        assert!(
+            root.join("hal/api/camera_hal.hpp").exists(),
+            "ai-traps hal/api missing"
+        );
 
         // Debug: extract the out-of-class methods per file + the CONTRACT
         // methods per header, so a trivially-"implemented" interface (zero
@@ -4157,8 +4508,11 @@ struct FrameBuffer { uint32_t width = 0; };
         let c = camera.unwrap();
         assert_eq!(c.kind, "contract");
         assert!(
-            c.tags.iter().any(|t| t.name == "@id" && t.value == "hal.camera"),
-            "id tag parsed: {:?}", c.tags
+            c.tags
+                .iter()
+                .any(|t| t.name == "@id" && t.value == "hal.camera"),
+            "id tag parsed: {:?}",
+            c.tags
         );
         assert!(c.tags.iter().any(|t| t.name == "@brief"), "brief parsed");
         assert!(!c.prose.is_empty(), "prose kept");
@@ -4180,8 +4534,11 @@ struct FrameBuffer { uint32_t width = 0; };
             "namespace hal { struct H264Encoder : hal::HalModule { virtual int init(int w) = 0; }; }\n",
         )
         .unwrap();
-        std::fs::write(root.join("hal/types/frame_buffer.hpp"), "namespace hal { struct FrameBuffer {}; }\n")
-            .unwrap();
+        std::fs::write(
+            root.join("hal/types/frame_buffer.hpp"),
+            "namespace hal { struct FrameBuffer {}; }\n",
+        )
+        .unwrap();
         std::fs::write(
             root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"),
             "bool Rpi5Cam::capture(int timeout_ms) { return true; }\n",
@@ -4191,19 +4548,32 @@ struct FrameBuffer { uint32_t width = 0; };
         let graph = hal_graph(root);
         assert!(
             graph.nodes.iter().any(|n| n.kind == "HalModule"),
-            "HalModule node: {:?}", graph.nodes
+            "HalModule node: {:?}",
+            graph.nodes
         );
         assert!(
-            graph.nodes.iter().any(|n| n.kind == "HalContract" && n.name == "ICameraHAL"),
-            "contract node: {:?}", graph.nodes
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == "HalContract" && n.name == "ICameraHAL"),
+            "contract node: {:?}",
+            graph.nodes
         );
         assert!(
-            graph.nodes.iter().any(|n| n.kind == "HalType" && n.name == "frame_buffer"),
-            "type node: {:?}", graph.nodes
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == "HalType" && n.name == "frame_buffer"),
+            "type node: {:?}",
+            graph.nodes
         );
         assert!(
-            graph.nodes.iter().any(|n| n.kind == "HalImpl" && n.platform == "rpi5"),
-            "impl node: {:?}", graph.nodes
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == "HalImpl" && n.platform == "rpi5"),
+            "impl node: {:?}",
+            graph.nodes
         );
         assert!(
             graph.edges.iter().any(|e| e.kind == "derives"),
@@ -4211,13 +4581,17 @@ struct FrameBuffer { uint32_t width = 0; };
         );
         assert!(
             graph.edges.iter().any(|e| e.kind == "missing"),
-            "h264 missing edge (rpi5 has only camera): {:?}", graph.edges
+            "h264 missing edge (rpi5 has only camera): {:?}",
+            graph.edges
         );
 
         let (nodes, _edges) = hal_query(&graph, "rpi5");
         assert!(!nodes.is_empty(), "platform query matches impl");
         let (nodes2, _) = hal_query(&graph, "HalType");
-        assert!(nodes2.iter().any(|n| n.name == "frame_buffer"), "kind query: {nodes2:?}");
+        assert!(
+            nodes2.iter().any(|n| n.name == "frame_buffer"),
+            "kind query: {nodes2:?}"
+        );
     }
 
     /// Phase 6: `hal_report` builds the documentation payload (contracts +
@@ -4252,7 +4626,8 @@ struct FrameBuffer { int w = 0; // width in pixels
  int dma_fd = -1; // zero-copy handle (dma-buf)
 };
 }",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             root.join("hal/api/frame_buffer.hpp"),
             "namespace hal {\n/// @brief Shared frame buffer.\nstruct FrameBuffer { int w = 0; };\n}",
@@ -4260,17 +4635,32 @@ struct FrameBuffer { int w = 0; // width in pixels
         std::fs::write(
             root.join("hal/implementations/rpi5/camera_hal_rpi5.cpp"),
             "bool Rpi5Cam::init() { return true; }\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let report = hal_report(root);
         assert_eq!(report.contracts.len(), 1, "contracts: {report:#?}");
         // Plain `//` prose now lands in the contract doc prose.
-        let cam = report.contracts.iter().find(|c| c.stem == "camera_hal").expect("camera");
-        assert!(!cam.prose.is_empty(), "plain // prose must be captured: {cam:#?}");
-        assert!(cam.tags.iter().any(|t| t.name == "@id"), "id tag kept: {cam:#?}");
+        let cam = report
+            .contracts
+            .iter()
+            .find(|c| c.stem == "camera_hal")
+            .expect("camera");
+        assert!(
+            !cam.prose.is_empty(),
+            "plain // prose must be captured: {cam:#?}"
+        );
+        assert!(
+            cam.tags.iter().any(|t| t.name == "@id"),
+            "id tag kept: {cam:#?}"
+        );
         // Inline/trailing field comments land on the datatype's fields.
         // Untagged `//` prose in the data-type header is captured as type prose.
-        let fb = report.types.iter().find(|t| t.name == "FrameBuffer").expect("FrameBuffer");
+        let fb = report
+            .types
+            .iter()
+            .find(|t| t.name == "FrameBuffer")
+            .expect("FrameBuffer");
         assert!(!fb.brief.is_empty(), "type brief populated: {fb:#?}");
         let c = &report.contracts[0];
         assert_eq!(c.id, "hal.camera");
@@ -4278,7 +4668,9 @@ struct FrameBuffer { int w = 0; // width in pixels
         assert_eq!(c.methods.len(), 1);
         assert_eq!(c.methods[0].name, "init");
         assert!(
-            c.platforms.iter().any(|p| p.platform == "rpi5" && p.implemented),
+            c.platforms
+                .iter()
+                .any(|p| p.platform == "rpi5" && p.implemented),
             "rpi5 implemented: {c:#?}"
         );
         assert!(
@@ -4312,10 +4704,13 @@ struct ICameraHAL : hal::HalModule {
         std::fs::write(
             root.join("hal/implementations/rpi5/audio_hal_rpi5.cpp"),
             "bool Rpi5Audio::init() { return true; }\n",
-        ).unwrap();
+        )
+        .unwrap();
         let issues = hal_verify(root);
         assert!(
-            issues.iter().any(|i| i.title == "orphan HAL implementation"),
+            issues
+                .iter()
+                .any(|i| i.title == "orphan HAL implementation"),
             "orphan: {issues:#?}"
         );
     }
@@ -4430,8 +4825,11 @@ struct ICameraHAL : hal::HalModule {
 
         // Datatype: structs, no pure-virtual, no HalModule base ⇒ DataOnly.
         let data = tmp.path().join("frame_buffer.hpp");
-        std::fs::write(&data, "namespace hal { struct FrameBuffer { int w = 0; int h = 0; }; }")
-            .unwrap();
+        std::fs::write(
+            &data,
+            "namespace hal { struct FrameBuffer { int w = 0; int h = 0; }; }",
+        )
+        .unwrap();
         assert_eq!(
             classify_hal_header(&data),
             HalHeaderKind::DataOnly,
@@ -4450,8 +4848,16 @@ struct ICameraHAL : hal::HalModule {
         // the sentinel + a `#pragma message` and has signature-identical
         // methods.
         let methods = vec![
-            HalContractMethod { name: "start".into(), return_type: "bool".into(), params: "".into() },
-            HalContractMethod { name: "capture".into(), return_type: "std::uint32_t".into(), params: "int timeout_ms".into() },
+            HalContractMethod {
+                name: "start".into(),
+                return_type: "bool".into(),
+                params: "".into(),
+            },
+            HalContractMethod {
+                name: "capture".into(),
+                return_type: "std::uint32_t".into(),
+                params: "int timeout_ms".into(),
+            },
         ];
         let src = generate_hal_placeholder_source("camera_hal", "CameraHAL", &methods, "a7s");
         assert!(
@@ -4465,10 +4871,24 @@ struct ICameraHAL : hal::HalModule {
         // signatures match the contract exactly.
         let cov = hal_interface_coverage(&methods, "camera_hal", dir.path());
         assert!(!cov.implemented, "stub must not be implemented: {cov:?}");
-        assert!(cov.has_impl, "stub exists → has_impl false would wrongly mean no class to fill");
-        assert_eq!(cov.missing.len(), 2, "every contract method must be missing: {cov:?}");
-        assert_eq!(cov.missing_sigs.len(), 2, "fill planner needs full signatures: {cov:?}");
-        assert!(cov.drifted.is_empty(), "no drift for a pending stub: {cov:?}");
+        assert!(
+            cov.has_impl,
+            "stub exists → has_impl false would wrongly mean no class to fill"
+        );
+        assert_eq!(
+            cov.missing.len(),
+            2,
+            "every contract method must be missing: {cov:?}"
+        );
+        assert_eq!(
+            cov.missing_sigs.len(),
+            2,
+            "fill planner needs full signatures: {cov:?}"
+        );
+        assert!(
+            cov.drifted.is_empty(),
+            "no drift for a pending stub: {cov:?}"
+        );
 
         // A real implementation without the sentinel still counts as implemented.
         std::fs::remove_file(dir.path().join("camera_hal_stub.cpp")).unwrap();
@@ -4542,12 +4962,25 @@ struct ICameraHAL : hal::HalModule {
 
     #[test]
     fn module_pair_names_agree_with_fill_scaffolding() {
-        assert_eq!(hal_impl_class_name("camera_hal", "rock3c"), "CameraHalRock3c");
-        assert_eq!(hal_impl_class_name("video_scaler", "rpi5"), "VideoScalerRpi5");
-        assert_eq!(hal_impl_class_name("mpp_h264_encoder", "imx219"), "MppH264EncoderImx219");
+        assert_eq!(
+            hal_impl_class_name("camera_hal", "rock3c"),
+            "CameraHalRock3c"
+        );
+        assert_eq!(
+            hal_impl_class_name("video_scaler", "rpi5"),
+            "VideoScalerRpi5"
+        );
+        assert_eq!(
+            hal_impl_class_name("mpp_h264_encoder", "imx219"),
+            "MppH264EncoderImx219"
+        );
 
         let dir = tempfile::tempdir().unwrap();
-        let impl_dir = dir.path().join("hal").join("implementations").join("rock3c");
+        let impl_dir = dir
+            .path()
+            .join("hal")
+            .join("implementations")
+            .join("rock3c");
         std::fs::create_dir_all(&impl_dir).unwrap();
         let (class, cpp, hpp) = resolve_hal_impl_names("camera_hal", "rock3c", &impl_dir);
         assert_eq!(class, "CameraHalRock3c");
@@ -4568,23 +5001,41 @@ struct ICameraHAL : hal::HalModule {
         std::fs::create_dir_all(&impl_dir).unwrap();
 
         // No files → base pair.
-        let (class, cpp, hpp) = resolve_semantic_hal_impl_names("classifier_hal", "rpi5", &impl_dir);
+        let (class, cpp, hpp) =
+            resolve_semantic_hal_impl_names("classifier_hal", "rpi5", &impl_dir);
         assert_eq!(class, "ClassifierHalRpi5");
         assert_eq!(cpp, "classifier_hal_rpi5.cpp");
         assert_eq!(hpp, "classifier_hal_rpi5.hpp");
 
         // A pending STUB pair (SPIRE-HAL-STUB sentinel) is REPLACED, not
         // disambiguated — semantic generation reuses the name.
-        std::fs::write(impl_dir.join("classifier_hal_rpi5.cpp"), format!("// {SPIRE_HAL_STUB_SENTINEL}\n")).unwrap();
-        std::fs::write(impl_dir.join("classifier_hal_rpi5.hpp"), format!("// {SPIRE_HAL_STUB_SENTINEL}\n")).unwrap();
-        let (class2, cpp2, _) = resolve_semantic_hal_impl_names("classifier_hal", "rpi5", &impl_dir);
-        assert_eq!(class2, "ClassifierHalRpi5", "stub pair must be reused, not suffixed");
+        std::fs::write(
+            impl_dir.join("classifier_hal_rpi5.cpp"),
+            format!("// {SPIRE_HAL_STUB_SENTINEL}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            impl_dir.join("classifier_hal_rpi5.hpp"),
+            format!("// {SPIRE_HAL_STUB_SENTINEL}\n"),
+        )
+        .unwrap();
+        let (class2, cpp2, _) =
+            resolve_semantic_hal_impl_names("classifier_hal", "rpi5", &impl_dir);
+        assert_eq!(
+            class2, "ClassifierHalRpi5",
+            "stub pair must be reused, not suffixed"
+        );
         assert_eq!(cpp2, "classifier_hal_rpi5.cpp");
 
         // A REAL implementation occupies the name → disambiguate, never
         // overwrite working code.
-        std::fs::write(impl_dir.join("classifier_hal_rpi5.cpp"), "bool ClassifierHalRpi5::init(const std::string&, float) { return true; }\n").unwrap();
-        let (class3, cpp3, _) = resolve_semantic_hal_impl_names("classifier_hal", "rpi5", &impl_dir);
+        std::fs::write(
+            impl_dir.join("classifier_hal_rpi5.cpp"),
+            "bool ClassifierHalRpi5::init(const std::string&, float) { return true; }\n",
+        )
+        .unwrap();
+        let (class3, cpp3, _) =
+            resolve_semantic_hal_impl_names("classifier_hal", "rpi5", &impl_dir);
         assert_eq!(class3, "ClassifierHalRpi52");
         assert_eq!(cpp3, "classifier_hal_rpi5_2.cpp");
     }
@@ -4592,17 +5043,40 @@ struct ICameraHAL : hal::HalModule {
     #[test]
     fn clean_module_header_has_no_stub_sentinel() {
         let methods = vec![
-            HalContractMethod { name: "start".into(), return_type: "bool".into(), params: String::new() },
-            HalContractMethod { name: "capture".into(), return_type: "std::uint32_t".into(), params: "int timeout_ms".into() },
+            HalContractMethod {
+                name: "start".into(),
+                return_type: "bool".into(),
+                params: String::new(),
+            },
+            HalContractMethod {
+                name: "capture".into(),
+                return_type: "std::uint32_t".into(),
+                params: "int timeout_ms".into(),
+            },
         ];
-        let h = generate_hal_module_header_clean("camera_hal", "CameraHalRock3c", "CameraHAL", &methods, "rock3c");
+        let h = generate_hal_module_header_clean(
+            "camera_hal",
+            "CameraHalRock3c",
+            "CameraHAL",
+            &methods,
+            "rock3c",
+        );
         assert!(!h.contains(SPIRE_HAL_STUB_SENTINEL), "clean header: {h}");
         assert!(!h.contains("#pragma message"), "clean header: {h}");
-        assert!(h.contains("class CameraHalRock3c : public CameraHAL {"), "clean header: {h}");
+        assert!(
+            h.contains("class CameraHalRock3c : public CameraHAL {"),
+            "clean header: {h}"
+        );
         assert!(h.contains("bool start() override;"), "clean header: {h}");
-        assert!(h.contains("std::uint32_t capture(int timeout_ms) override;"), "clean header: {h}");
+        assert!(
+            h.contains("std::uint32_t capture(int timeout_ms) override;"),
+            "clean header: {h}"
+        );
         assert!(h.contains("struct Impl;"), "PIMPL state slot: {h}");
-        assert!(h.contains("#include \"hal/api/camera_hal.hpp\""), "clean header: {h}");
+        assert!(
+            h.contains("#include \"hal/api/camera_hal.hpp\""),
+            "clean header: {h}"
+        );
     }
 
     #[test]
@@ -4611,47 +5085,97 @@ struct ICameraHAL : hal::HalModule {
         // the real file; an unrelated interface's stub is preserved.
         let meson = "hal_impl_rock3c_sources = files(\n        'implementations/rock3c/camera_hal_stub.cpp',\n        'implementations/rock3c/h264_encoder_stub.cpp',\n    )\n";
         let updated = hal_meson_upsert_sources(
-            meson, "rock3c",
+            meson,
+            "rock3c",
             &["camera_hal".to_string()],
             &["camera_hal_rock3c.cpp".to_string()],
         );
-        assert!(updated.contains("'implementations/rock3c/camera_hal_rock3c.cpp'"), "updated: {updated}");
-        assert!(!updated.contains("camera_hal_stub.cpp"), "stub must be dropped: {updated}");
-        assert!(updated.contains("h264_encoder_stub.cpp"), "unrelated stub kept: {updated}");
+        assert!(
+            updated.contains("'implementations/rock3c/camera_hal_rock3c.cpp'"),
+            "updated: {updated}"
+        );
+        assert!(
+            !updated.contains("camera_hal_stub.cpp"),
+            "stub must be dropped: {updated}"
+        );
+        assert!(
+            updated.contains("h264_encoder_stub.cpp"),
+            "unrelated stub kept: {updated}"
+        );
         // Idempotent: running again changes nothing.
         let updated2 = hal_meson_upsert_sources(
-            &updated, "rock3c",
+            &updated,
+            "rock3c",
             &["camera_hal".to_string()],
             &["camera_hal_rock3c.cpp".to_string()],
         );
         assert_eq!(updated, updated2, "upsert must be idempotent");
         // Absent variable → a fresh section is appended.
         let fresh = hal_meson_upsert_sources(
-            "project('x', 'cpp')\n", "rpi5",
+            "project('x', 'cpp')\n",
+            "rpi5",
             &["camera_hal".to_string()],
             &["camera_hal_rpi5.cpp".to_string()],
         );
-        assert!(fresh.contains("hal_impl_rpi5_sources = files("), "fresh: {fresh}");
-        assert!(fresh.contains("'implementations/rpi5/camera_hal_rpi5.cpp'"), "fresh: {fresh}");
+        assert!(
+            fresh.contains("hal_impl_rpi5_sources = files("),
+            "fresh: {fresh}"
+        );
+        assert!(
+            fresh.contains("'implementations/rpi5/camera_hal_rpi5.cpp'"),
+            "fresh: {fresh}"
+        );
     }
 
     #[test]
     fn semantic_impl_prompt_targets_module_pair() {
-        let methods = vec![
-            HalContractMethod { name: "start".into(), return_type: "bool".into(), params: String::new() },
-        ];
-        let header = generate_hal_module_header_clean("camera_hal", "CameraHalRpi5", "CameraHAL", &methods, "rpi5");
-        let prompt = generate_hal_impl_prompt_pair(
-            "CameraHAL: bool start() = 0", "camera_hal", "CameraHalRpi5", "CameraHAL",
-            "rpi5", "Raspberry Pi 5", "cpu_family: aarch64\ncpu: armv8", "libcamera / V4L2",
-            "camera_hal-rpi5", &header,
-            "@brief Starts the camera.", "(none)", "",
+        let methods = vec![HalContractMethod {
+            name: "start".into(),
+            return_type: "bool".into(),
+            params: String::new(),
+        }];
+        let header = generate_hal_module_header_clean(
+            "camera_hal",
+            "CameraHalRpi5",
+            "CameraHAL",
+            &methods,
+            "rpi5",
         );
-        assert!(prompt.contains("CameraHalRpi5 : public CameraHAL"), "pair target: {prompt}");
-        assert!(prompt.contains("CameraHalRpi5::Impl"), "PIMPL state: {prompt}");
-        assert!(prompt.contains("class CameraHalRpi5 : public CameraHAL"), "header embedded: {prompt}");
-        assert!(prompt.contains("meson compile -C build-rpi5 camera_hal-rpi5"), "gate: {prompt}");
-        assert!(prompt.contains("@brief Starts the camera."), "contract docs: {prompt}");
+        let prompt = generate_hal_impl_prompt_pair(
+            "CameraHAL: bool start() = 0",
+            "camera_hal",
+            "CameraHalRpi5",
+            "CameraHAL",
+            "rpi5",
+            "Raspberry Pi 5",
+            "cpu_family: aarch64\ncpu: armv8",
+            "libcamera / V4L2",
+            "camera_hal-rpi5",
+            &header,
+            "@brief Starts the camera.",
+            "(none)",
+            "",
+        );
+        assert!(
+            prompt.contains("CameraHalRpi5 : public CameraHAL"),
+            "pair target: {prompt}"
+        );
+        assert!(
+            prompt.contains("CameraHalRpi5::Impl"),
+            "PIMPL state: {prompt}"
+        );
+        assert!(
+            prompt.contains("class CameraHalRpi5 : public CameraHAL"),
+            "header embedded: {prompt}"
+        );
+        assert!(
+            prompt.contains("meson compile -C build-rpi5 camera_hal-rpi5"),
+            "gate: {prompt}"
+        );
+        assert!(
+            prompt.contains("@brief Starts the camera."),
+            "contract docs: {prompt}"
+        );
         assert!(
             prompt.contains("Do NOT emit `SPIRE-HAL-STUB`"),
             "prompt must forbid the sentinel: {prompt}"
@@ -4660,8 +5184,14 @@ struct ICameraHAL : hal::HalModule {
 
     #[test]
     fn strip_code_fences_removes_cpp_block() {
-        assert_eq!(strip_code_fences("```cpp\nint main() {}\n```"), "int main() {}");
-        assert_eq!(strip_code_fences("```\nint main() {}\n```"), "int main() {}");
+        assert_eq!(
+            strip_code_fences("```cpp\nint main() {}\n```"),
+            "int main() {}"
+        );
+        assert_eq!(
+            strip_code_fences("```\nint main() {}\n```"),
+            "int main() {}"
+        );
         assert_eq!(strip_code_fences("int main() {}"), "int main() {}");
     }
 

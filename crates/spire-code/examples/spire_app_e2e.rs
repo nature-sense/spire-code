@@ -168,8 +168,8 @@ fn main() {
     let spec = match std::env::args().nth(2) {
         Some(path) => {
             let raw = std::fs::read_to_string(&path).expect("read spec.json");
-            let spec: AppSpec = serde_json::from_str(&raw)
-                .expect("spec.json must deserialize as an AppSpec");
+            let spec: AppSpec =
+                serde_json::from_str(&raw).expect("spec.json must deserialize as an AppSpec");
             assert!(spec.is_valid(), "spec.json must validate");
             println!(
                 "spire_app_e2e: loaded external spec from {path} ({} types, {} actors, {} methods, {} screens)",
@@ -214,4 +214,3 @@ fn main() {
     println!("  wrote .spire/appspec.json");
     println!("spire_app_e2e: done — run `cargo build` and `swift build` in the repo to validate.");
 }
-

@@ -126,7 +126,6 @@ impl Default for PythonBuildModule {
 impl Actor for PythonBuildModule {
     type Message = BuildModuleMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             BuildModuleMessage::DescribeCapabilities { reply_to } => {
@@ -136,11 +135,11 @@ impl Actor for PythonBuildModule {
                     build_system: "Python".to_string(),
                     language: "Python".to_string(),
                     source_extensions: vec!["py".to_string()],
-                supports_clean: true,
-                supports_lint: true,
-                supports_format: true,
-                supports_fix: true,
-                mcp_servers: vec![McpServerDependency {
+                    supports_clean: true,
+                    supports_lint: true,
+                    supports_format: true,
+                    supports_fix: true,
+                    mcp_servers: vec![McpServerDependency {
                         name: "pypi-mcp".to_string(),
                         package: "pypi-mcp-server".to_string(),
                         install_command: "cargo install pypi-mcp-server".to_string(),
@@ -177,7 +176,11 @@ impl Actor for PythonBuildModule {
                 // and emit a single synthetic "finished" event.
                 let result = self.build(&path, &opts).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -242,7 +245,11 @@ impl Actor for PythonBuildModule {
                 // Batch lint + a synthetic finished event (no per-line streaming yet).
                 let result = self.lint(&path, &metadata, platform.as_deref()).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished lint {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished lint {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -263,7 +270,11 @@ impl Actor for PythonBuildModule {
                 // Batch fix + a synthetic finished event.
                 let result = self.fix(&path, &metadata).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished fix {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -273,7 +284,6 @@ impl Actor for PythonBuildModule {
                 });
                 let _ = reply_to.send(result);
             }
-
 
             BuildModuleMessage::ParseSourceFile {
                 file_path,
@@ -300,13 +310,15 @@ dependencies = []
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let sc = r#"def main():
     print("Hello from __P__!")
 
 if __name__ == "__main__":
     main()
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let _ = reply_to.send(Ok(super::ScaffoldOutput {
                     build_file: "pyproject.toml".to_string(),
                     build_content: bc,
@@ -375,4 +387,3 @@ mod tests {
         assert!(cap.supports_fix);
     }
 }
-

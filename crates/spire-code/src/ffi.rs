@@ -6,40 +6,40 @@ use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
 
+use crate::actors::tool_providers::build_default_registry;
+use crate::actors::{
+    CoordinatorActor, CoordinatorMessage, FfiSharedState, IntentRouterActor, IntentRouterMessage,
+    ProjectAnalyzerActor, ProjectAnalyzerMessage, ProjectQueryActor, ProjectQueryMessage,
+    ProjectSyncActor, ProjectSyncMessage, SystemActor, SystemMessage,
+};
 use crate::subsystems::build::build_manager::{
     BuildEventLogActor, BuildEventLogMessage, BuildManagerActor, BuildManagerMessage,
 };
+use crate::subsystems::planning::plan_orchestrator::PlanOrchestrator;
+use crate::subsystems::planning::plan_orchestrator::PlanOrchestratorMessage;
+use crate::subsystems::project::project_build::{ProjectBuildActor, ProjectBuildMessage};
+use crate::subsystems::project::project_creation::{ProjectCreationActor, ProjectCreationMessage};
+use crate::subsystems::project::project_install::{ProjectInstallActor, ProjectInstallMessage};
+use crate::subsystems::project::project_lint::{ProjectLintActor, ProjectLintMessage};
+use crate::subsystems::project::project_test::{ProjectTestActor, ProjectTestMessage};
 use crate::{
     BuildModuleMessage, CargoBuildModule, CmakeBuildModule, GoBuildModule, GradleBuildModule,
     MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability, NodeBuildModule,
     PythonBuildModule, RubyBuildModule, SwiftBuildModule,
 };
-use spire_core::modules::{
-    FilesystemMessage, FilesystemModule, GitMessage, GitModule, ProcessMessage, ProcessModule,
-    SearchMessage, SearchModule, TerminalMessage, TerminalModule,
-};
-use spire_core::actors::tool_providers::ToolRouterActor;
-use crate::actors::tool_providers::build_default_registry;
-use crate::subsystems::project::project_creation::{ProjectCreationActor, ProjectCreationMessage};
-use crate::subsystems::project::project_build::{ProjectBuildActor, ProjectBuildMessage};
-use crate::subsystems::project::project_install::{ProjectInstallActor, ProjectInstallMessage};
-use crate::subsystems::project::project_lint::{ProjectLintActor, ProjectLintMessage};
-use crate::subsystems::project::project_test::{ProjectTestActor, ProjectTestMessage};
-use crate::subsystems::planning::plan_orchestrator::PlanOrchestrator;
-use crate::subsystems::planning::plan_orchestrator::PlanOrchestratorMessage;
 use spire_core::actors::rag::{RagActor, RagMessage};
-use spire_core::subsystems::tools::tool_orchestrator::ToolOrchestrator;
+use spire_core::actors::tool_providers::ToolRouterActor;
 use spire_core::actors::{
     ActorSystem, ChatActor, ChatMessage, LlmActor, LlmConfig, LlmMessage, McpClientActor,
     McpClientMessage, MemoryGraphActor, MemoryGraphMessage, ProgressActor, ProgressMessage,
     SystemPromptActor, SystemPromptMessage, ToolsActor,
 };
-use crate::actors::{
-    CoordinatorActor, CoordinatorMessage, FfiSharedState, IntentRouterActor,
-    IntentRouterMessage, ProjectAnalyzerActor, ProjectAnalyzerMessage, ProjectQueryActor,
-    ProjectQueryMessage, ProjectSyncActor, ProjectSyncMessage, SystemActor, SystemMessage,
-};
 use spire_core::models::embedding::Embedder;
+use spire_core::modules::{
+    FilesystemMessage, FilesystemModule, GitMessage, GitModule, ProcessMessage, ProcessModule,
+    SearchMessage, SearchModule, TerminalMessage, TerminalModule,
+};
+use spire_core::subsystems::tools::tool_orchestrator::ToolOrchestrator;
 
 use spire_actor::registry::ServiceRegistry;
 
@@ -101,7 +101,9 @@ static STATE: Lazy<Mutex<Option<AppState>>> = Lazy::new(|| Mutex::new(None));
 /// panic with `PoisonError` and take down the whole UI process (SIGABRT).
 /// Recover the guard from the poison instead so the app keeps running.
 fn lock_state() -> std::sync::MutexGuard<'static, Option<AppState>> {
-    STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn init_tracing() {
@@ -124,7 +126,6 @@ fn init_tracing() {
         .try_init();
 }
 
-
 /// Query a build module's capabilities via DescribeCapabilities, register it
 /// with the BuildManager, and return the capability (so MCP server deps can
 /// be collected). Plain async fn (no closure lifetime issues).
@@ -140,7 +141,10 @@ async fn register_build_module(
     let cap = match r.await {
         Ok(cap) => cap,
         Err(_) => {
-            tracing::warn!("register_build_module: no capability response from '{}'", cap_name);
+            tracing::warn!(
+                "register_build_module: no capability response from '{}'",
+                cap_name
+            );
             ModuleCapability {
                 name: cap_name.to_string(),
                 config_files: vec![],
@@ -182,10 +186,12 @@ fn init_actor_system() {
     // Hugging Face fallback uses hf-hub's blocking client (HFClientSync), which
     // spins up its own runtime and panics with "Cannot start a runtime from
     // within a runtime" when called from inside ours (observed at startup).
-    let rag_embedder: std::sync::Arc<dyn Embedder> = match spire_core::embedder::CandleEmbedder::new() {
-        Ok(e) => std::sync::Arc::new(e),
-        Err(_) => std::sync::Arc::new(spire_core::embedder::NoopEmbedder) as std::sync::Arc<dyn Embedder>,
-    };
+    let rag_embedder: std::sync::Arc<dyn Embedder> =
+        match spire_core::embedder::CandleEmbedder::new() {
+            Ok(e) => std::sync::Arc::new(e),
+            Err(_) => std::sync::Arc::new(spire_core::embedder::NoopEmbedder)
+                as std::sync::Arc<dyn Embedder>,
+        };
 
     let build_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let (coord_tx, event_rx, build_event_log_tx) = runtime.block_on(async {
@@ -815,7 +821,10 @@ pub(crate) async fn populate_target_graph(
 ) -> anyhow::Result<()> {
     use spire_core::models::memory_graph::{RelationshipInput, RelationshipType};
 
-    let mg_tx = registry.get::<MemoryGraphMessage>("memory_graph").unwrap_or_else(dummy_tx).clone();
+    let mg_tx = registry
+        .get::<MemoryGraphMessage>("memory_graph")
+        .unwrap_or_else(dummy_tx)
+        .clone();
 
     // Map config_file → BuildSystem node id (from the bootstrap).
     let (t, r) = tokio::sync::oneshot::channel();
@@ -829,7 +838,8 @@ pub(crate) async fn populate_target_graph(
         })
         .await;
     let bs_nodes = r.await.ok().and_then(|r| r.ok()).unwrap_or_default();
-    let mut bs_by_config: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut bs_by_config: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for n in &bs_nodes {
         if let Some(cfg) = n.get("config_file").and_then(|v| v.as_str()) {
             bs_by_config.insert(cfg.to_string(), n.id().to_string());
@@ -842,10 +852,13 @@ pub(crate) async fn populate_target_graph(
             .first()
             .cloned()
             .unwrap_or_else(|| "meson.build".to_string());
-        let Some(bs_id) = bs_by_config.get(&config_file).cloned() else { continue };
+        let Some(bs_id) = bs_by_config.get(&config_file).cloned() else {
+            continue;
+        };
 
         // BuildTarget nodes
-        let mut target_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut target_ids: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for tgt in &meta.targets {
             let (t, r) = tokio::sync::oneshot::channel();
             let _ = mg_tx
@@ -857,8 +870,10 @@ pub(crate) async fn populate_target_graph(
                         {
                             let mut m = std::collections::HashMap::new();
                             m.insert("name".to_string(), serde_json::json!(tgt.name));
-                            m.insert("kind".to_string(),
-                                serde_json::json!(tgt.kind.first().cloned().unwrap_or_default()));
+                            m.insert(
+                                "kind".to_string(),
+                                serde_json::json!(tgt.kind.first().cloned().unwrap_or_default()),
+                            );
                             m.insert("config_file".to_string(), serde_json::json!(config_file));
                             m
                         },
@@ -995,12 +1010,13 @@ pub(crate) fn resolve_project_root(root: &std::path::Path) -> std::path::PathBuf
     loop {
         // If the candidate already contains a Cargo.toml at its own root,
         // it IS the project — stop descending.
-        let has_own_build = std::fs::read_dir(&candidate).ok().map(|rd| {
-            rd.flatten().any(|e| {
-                e.path().is_file()
-                    && e.file_name().to_string_lossy() == "Cargo.toml"
+        let has_own_build = std::fs::read_dir(&candidate)
+            .ok()
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| e.path().is_file() && e.file_name().to_string_lossy() == "Cargo.toml")
             })
-        }).unwrap_or(false);
+            .unwrap_or(false);
         if has_own_build {
             break;
         }
@@ -1011,8 +1027,7 @@ pub(crate) fn resolve_project_root(root: &std::path::Path) -> std::path::PathBuf
             .map(|rd| {
                 rd.flatten()
                     .filter(|e| {
-                        e.path().is_dir()
-                            && !e.file_name().to_string_lossy().starts_with('.')
+                        e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.')
                     })
                     .map(|e| e.path())
                     .collect()
@@ -1050,7 +1065,10 @@ pub(crate) fn find_tree_dir<'a>(
 }
 
 /// Recursively collect all files under a directory as Swift `FileEntry` JSON.
-pub(crate) fn collect_tree_files(dir: &spire_core::analyzer::models::DirectoryNode, out: &mut Vec<serde_json::Value>) {
+pub(crate) fn collect_tree_files(
+    dir: &spire_core::analyzer::models::DirectoryNode,
+    out: &mut Vec<serde_json::Value>,
+) {
     for f in &dir.files {
         out.push(serde_json::json!({
             "path": f.path,
@@ -1064,7 +1082,9 @@ pub(crate) fn collect_tree_files(dir: &spire_core::analyzer::models::DirectoryNo
     }
 }
 
-pub(crate) fn serialize_analysis(analysis: &crate::subsystems::project::project_analyzer::ProjectAnalysis) -> serde_json::Value {
+pub(crate) fn serialize_analysis(
+    analysis: &crate::subsystems::project::project_analyzer::ProjectAnalysis,
+) -> serde_json::Value {
     let build_systems: Vec<String> = analysis
         .build_systems
         .iter()
@@ -1097,8 +1117,7 @@ pub(crate) fn serialize_analysis(analysis: &crate::subsystems::project::project_
             // first-class subproject. Only the LEGACY multi-platform workspace
             // (core/rpi5/rock3c members) is an aggregate whose members are
             // expanded below instead.
-            let is_spire_app =
-                bs.structure == spire_core::build_types::ProjectStructure::SpireApp;
+            let is_spire_app = bs.structure == spire_core::build_types::ProjectStructure::SpireApp;
             if bs.is_workspace
                 && !bs.workspace_members.is_empty()
                 && rel_path0.is_empty()
@@ -1247,7 +1266,11 @@ pub(crate) fn serialize_analysis(analysis: &crate::subsystems::project::project_
             // Attach the member's own sub-build-system metadata when the
             // analyzer populated it (e.g. targets from the member Cargo.toml).
             for sub_bs in &analysis.build_systems {
-                let sub_path = sub_bs.project_path.as_deref().unwrap_or("").trim_matches('/');
+                let sub_path = sub_bs
+                    .project_path
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim_matches('/');
                 if sub_path == member_path {
                     build_targets = sub_bs
                         .targets
@@ -1540,26 +1563,40 @@ pub unsafe extern "C" fn spire_wait_for_event(timeout_ms: u32) -> *mut std::ffi:
     // (e.g. project/open) that needs the same lock.
     let (mut receiver, runtime_handle) = {
         let guard = lock_state();
-        let state = match guard.as_ref() { Some(s) => s, None => return std::ptr::null_mut() };
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
         let mut rx_guard = state.event_rx.lock().unwrap();
-        let rx = match rx_guard.take() { Some(rx) => rx, None => return std::ptr::null_mut() };
+        let rx = match rx_guard.take() {
+            Some(rx) => rx,
+            None => return std::ptr::null_mut(),
+        };
         (rx, state.runtime.handle().clone())
     }; // STATE lock dropped here
 
     let payload = runtime_handle.block_on(async {
-        match tokio::time::timeout(timeout, receiver.recv()).await { Ok(Ok(m)) => Some(m), _ => None }
+        match tokio::time::timeout(timeout, receiver.recv()).await {
+            Ok(Ok(m)) => Some(m),
+            _ => None,
+        }
     });
 
     // Put the receiver back for the next call (re-acquire the lock briefly).
     {
         let guard = lock_state();
-        let state = match guard.as_ref() { Some(s) => s, None => return std::ptr::null_mut() };
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
         *state.event_rx.lock().unwrap() = Some(receiver);
     }
 
-    match payload { Some(m) => CString::new(m).unwrap().into_raw(), None => std::ptr::null_mut() }
+    match payload {
+        Some(m) => CString::new(m).unwrap().into_raw(),
+        None => std::ptr::null_mut(),
+    }
 }
-
 
 /// Drain the accumulated build events without blocking.
 ///
@@ -1576,8 +1613,14 @@ pub unsafe extern "C" fn spire_drain_build_events() -> *mut std::ffi::c_char {
     let payload = {
         let (event_log_tx, runtime) = {
             let guard = lock_state();
-            let state = match guard.as_ref() { Some(s) => s, None => return std::ptr::null_mut() };
-            (state.build_event_log.clone(), state.runtime.handle().clone())
+            let state = match guard.as_ref() {
+                Some(s) => s,
+                None => return std::ptr::null_mut(),
+            };
+            (
+                state.build_event_log.clone(),
+                state.runtime.handle().clone(),
+            )
         };
         runtime.block_on(async move {
             let (t, r) = tokio::sync::oneshot::channel();
@@ -1622,7 +1665,10 @@ pub unsafe extern "C" fn spire_wait_for_build_event(timeout_ms: u32) -> *mut std
     // the lock before blocking (holding STATE while blocked deadlocks RPCs).
     let (event_log_tx, notify, runtime) = {
         let guard = lock_state();
-        let state = match guard.as_ref() { Some(s) => s, None => return std::ptr::null_mut() };
+        let state = match guard.as_ref() {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
         (
             state.build_event_log.clone(),
             state.build_notify.clone(),
@@ -1646,7 +1692,10 @@ pub unsafe extern "C" fn spire_wait_for_build_event(timeout_ms: u32) -> *mut std
             }
             let drained = r.await.unwrap_or_default();
             if !drained.is_empty() {
-                tracing::info!("spire_wait_for_build_event: drained {} events", drained.len());
+                tracing::info!(
+                    "spire_wait_for_build_event: drained {} events",
+                    drained.len()
+                );
                 return serde_json::json!(drained).to_string();
             }
             // 2. Nothing buffered — wait for the log actor's notification.
@@ -1873,4 +1922,3 @@ mod serialize_analysis_tests {
         assert!(names.contains(&"rpi5"), "member rpi5 missing: {names:?}");
     }
 }
-

@@ -30,13 +30,12 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use spire_core::actors::Actor;
 use spire_core::actors::ToolInfo;
 use spire_core::models::memory_graph::{
-    AttrNode, RelationshipType, TraversalDirection,
-    TraversalOptions,
+    AttrNode, RelationshipType, TraversalDirection, TraversalOptions,
 };
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 
 // ============================================================================
 // ProjectQueryMessage
@@ -312,7 +311,9 @@ impl ProjectQueryActor {
 
         let target_attr = match self.get_attr_node(symbol_id).await {
             Ok(Some(a)) => a,
-            Ok(None) => return serde_json::json!({"error": format!("symbol not found: {symbol_id}")}),
+            Ok(None) => {
+                return serde_json::json!({"error": format!("symbol not found: {symbol_id}")})
+            }
             Err(e) => return serde_json::json!({"error": format!("lookup failed: {e}")}),
         };
 
@@ -329,10 +330,18 @@ impl ProjectQueryActor {
         // Resolve deterministic call sites from graph edges.
         let mut call_sites: Vec<(String, u32, u32, u32, u32)> = Vec::new(); // (file, sl, sc, el, ec)
         let edges = self.get_relationships(symbol_id).await.unwrap_or_default();
-        let interesting = ["calls", "references", "imports", "calledby", "semanticallyrelated"];
+        let interesting = [
+            "calls",
+            "references",
+            "imports",
+            "calledby",
+            "semanticallyrelated",
+        ];
         for edge in edges {
             let rel = match &edge.edge_type {
-                spire_core::models::memory_graph::RelationshipType::Custom(name) => name.to_lowercase(),
+                spire_core::models::memory_graph::RelationshipType::Custom(name) => {
+                    name.to_lowercase()
+                }
                 other => format!("{:?}", other).to_lowercase(),
             };
             if interesting.iter().any(|i| rel.contains(i)) {
@@ -349,7 +358,10 @@ impl ProjectQueryActor {
         // project with the envelope accessor view.
         let mut symbols: Vec<spire_core::models::analysis::GraphSymbol> = Vec::new();
         for nt in ["astFunction", "astClass", "astVariable", "astImport"] {
-            if let Ok(nodes) = self.query_attr_nodes(Some(nt.to_string()), None, None, None).await {
+            if let Ok(nodes) = self
+                .query_attr_nodes(Some(nt.to_string()), None, None, None)
+                .await
+            {
                 symbols.extend(
                     nodes
                         .iter()
@@ -366,7 +378,8 @@ impl ProjectQueryActor {
             .filter(|id| id != symbol_id)
             .collect();
         // Edge-resolved ids are "handled"; the rest are possible.
-        let handled: std::collections::HashSet<String> = call_sites.iter().map(|s| s.0.clone()).collect();
+        let handled: std::collections::HashSet<String> =
+            call_sites.iter().map(|s| s.0.clone()).collect();
         let possible: Vec<String> = cross_candidates
             .into_iter()
             .filter(|id| !handled.contains(id))
@@ -405,7 +418,10 @@ impl ProjectQueryActor {
         let mut by_file: std::collections::HashMap<String, Vec<(u32, u32, u32, u32)>> =
             std::collections::HashMap::new();
         for (f, sl, sc, el, ec) in &call_sites {
-            by_file.entry(f.clone()).or_default().push((*sl, *sc, *el, *ec));
+            by_file
+                .entry(f.clone())
+                .or_default()
+                .push((*sl, *sc, *el, *ec));
         }
         for (file, spans) in by_file {
             let mut text = match Self::read_project_file(&file, self.project_root.as_ref()) {
@@ -479,7 +495,9 @@ impl ProjectQueryActor {
     /// Best-effort (line, col) span of an AST node's first line — the actual
     /// name token is on `start_line`; we use start/end to bound the search.
     /// Envelope view: reads the flattened AST fields via typed accessors.
-    fn attr_node_span(attr: &spire_core::models::memory_graph::AttrNode) -> Option<(String, u32, u32, u32, u32)> {
+    fn attr_node_span(
+        attr: &spire_core::models::memory_graph::AttrNode,
+    ) -> Option<(String, u32, u32, u32, u32)> {
         if !(attr.is("astFunction") || attr.is("astClass") || attr.is("astVariable")) {
             return None;
         }
@@ -493,10 +511,7 @@ impl ProjectQueryActor {
     }
 
     /// Resolve a project file path (accepts absolute or project-relative).
-    fn project_path(
-        file: &str,
-        root: Option<&PathBuf>,
-    ) -> Option<PathBuf> {
+    fn project_path(file: &str, root: Option<&PathBuf>) -> Option<PathBuf> {
         let p = PathBuf::from(file);
         if p.is_absolute() {
             Some(p)
@@ -685,12 +700,22 @@ impl ProjectQueryActor {
 
         // Count files and directories
         let file_nodes = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("File".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("File".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
         let dir_nodes = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("Directory".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("Directory".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
@@ -712,7 +737,12 @@ impl ProjectQueryActor {
 
         // Find build system nodes
         let build_systems = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("BuildSystem".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("BuildSystem".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
@@ -789,7 +819,12 @@ impl ProjectQueryActor {
 
         // Get all directory nodes
         let dir_nodes = match self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("Directory".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("Directory".to_string()),
+                None,
+                None,
+            )
             .await
         {
             Ok(nodes) => nodes,
@@ -800,7 +835,12 @@ impl ProjectQueryActor {
 
         // Get all file nodes
         let file_nodes = match self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("File".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("File".to_string()),
+                None,
+                None,
+            )
             .await
         {
             Ok(nodes) => nodes,
@@ -834,10 +874,7 @@ impl ProjectQueryActor {
 
             // Apply filters
             if let Some(role) = role_filter {
-                let file_role = file
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let file_role = file.get("role").and_then(|v| v.as_str()).unwrap_or("");
                 if file_role != role {
                     continue;
                 }
@@ -879,7 +916,12 @@ impl ProjectQueryActor {
 
         // Find the file node by path
         let file_nodes = match self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("File".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("File".to_string()),
+                None,
+                None,
+            )
             .await
         {
             Ok(nodes) => nodes,
@@ -953,7 +995,12 @@ impl ProjectQueryActor {
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
         let file_nodes = match self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("File".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("File".to_string()),
+                None,
+                None,
+            )
             .await
         {
             Ok(nodes) => nodes,
@@ -963,18 +1010,9 @@ impl ProjectQueryActor {
         let results: Vec<serde_json::Value> = file_nodes
             .into_iter()
             .filter(|f| {
-                let path = f
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let language = f
-                    .get("language")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let role = f
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let language = f.get("language").and_then(|v| v.as_str()).unwrap_or("");
+                let role = f.get("role").and_then(|v| v.as_str()).unwrap_or("");
 
                 // Name filter (substring match on filename)
                 if let Some(name) = name_filter {
@@ -1032,7 +1070,12 @@ impl ProjectQueryActor {
     /// `project/getBuildConfig` — parsed build configuration.
     async fn handle_get_build_config(&self) -> serde_json::Value {
         let build_systems = match self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("BuildSystem".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("BuildSystem".to_string()),
+                None,
+                None,
+            )
             .await
         {
             Ok(nodes) => nodes,
@@ -1127,9 +1170,7 @@ impl ProjectQueryActor {
             });
 
             // Simple heuristic: if the target node has a version property, it's external
-            let is_external = to_node
-                .and_then(|n| n.get("version"))
-                .is_some();
+            let is_external = to_node.and_then(|n| n.get("version")).is_some();
 
             match dep_type {
                 "external" => {
@@ -1163,7 +1204,12 @@ impl ProjectQueryActor {
     /// `project/getEntryPoints` — main entry points.
     async fn handle_get_entry_points(&self) -> serde_json::Value {
         let file_nodes = match self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("File".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("File".to_string()),
+                None,
+                None,
+            )
             .await
         {
             Ok(nodes) => nodes,
@@ -1215,7 +1261,12 @@ impl ProjectQueryActor {
 
         // Get directory structure with roles
         let dir_nodes = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("Directory".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("Directory".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
@@ -1237,13 +1288,23 @@ impl ProjectQueryActor {
 
         // Get build systems
         let build_systems = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("BuildSystem".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("BuildSystem".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
         // Get entry points
         let file_nodes = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("File".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("File".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
@@ -1362,10 +1423,7 @@ impl ProjectQueryActor {
 
                 // File filter
                 if let Some(file) = file_filter {
-                    let entity_file = e
-                        .get("file")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let entity_file = e.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     if entity_file != file {
                         return false;
                     }
@@ -1570,7 +1628,12 @@ impl ProjectQueryActor {
 
         // Find the BuildTarget node by name.
         let targets = match self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("BuildTarget".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("BuildTarget".to_string()),
+                None,
+                None,
+            )
             .await
         {
             Ok(nodes) => nodes,
@@ -1687,10 +1750,7 @@ impl ProjectQueryActor {
                 nodes
                     .into_iter()
                     .filter(|f| {
-                        let path = f
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
                         scope_dir.is_empty() || path == scope_dir || path.starts_with(&prefix)
                     })
                     .map(|f| {
@@ -1761,19 +1821,34 @@ impl ProjectQueryActor {
 
         // Query file nodes
         let file_nodes = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("File".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("File".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
         // Query directory nodes
         let dir_nodes = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("Directory".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("Directory".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
         // Query build system nodes
         let build_systems = self
-            .query_attr_nodes(Some("Unknown".to_string()), Some("BuildSystem".to_string()), None, None)
+            .query_attr_nodes(
+                Some("Unknown".to_string()),
+                Some("BuildSystem".to_string()),
+                None,
+                None,
+            )
             .await
             .unwrap_or_default();
 
@@ -1844,10 +1919,7 @@ impl ProjectQueryActor {
             .iter()
             .filter_map(|d| {
                 let path = d.get("path").and_then(|v| v.as_str())?;
-                let name = d
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(d.name());
+                let name = d.get("role").and_then(|v| v.as_str()).unwrap_or(d.name());
                 Some(serde_json::json!({
                     "name": name,
                     "path": path,
@@ -1950,7 +2022,9 @@ impl ProjectQueryActor {
             }));
         }
         diagnostics.sort_by(|a, b| {
-            a["file"].as_str().cmp(&b["file"].as_str())
+            a["file"]
+                .as_str()
+                .cmp(&b["file"].as_str())
                 .then_with(|| a["line"].as_u64().cmp(&b["line"].as_u64()))
         });
         diagnostics.truncate(limit);
@@ -1965,7 +2039,11 @@ impl ProjectQueryActor {
     fn module_of(file_path: &str) -> String {
         let mut parts: Vec<&str> = file_path.split('/').collect();
         // Strip leading "." / "" segments.
-        while parts.first().map(|p| *p == "." || p.is_empty()).unwrap_or(false) {
+        while parts
+            .first()
+            .map(|p| *p == "." || p.is_empty())
+            .unwrap_or(false)
+        {
             parts.remove(0);
         }
         // If under a language source dir (src/, Sources/, crates/<m>/src), walk
@@ -2001,7 +2079,10 @@ impl ProjectQueryActor {
     /// per-file walker only links callees within the same file). Enumerating
     /// references by name across modules is what makes rename-safe tools
     /// possible ("rename never misses a usage").
-    fn build_symbol_index(&self, symbols: &[spire_core::models::analysis::GraphSymbol]) -> HashMap<(String, String), Vec<String>> {
+    fn build_symbol_index(
+        &self,
+        symbols: &[spire_core::models::analysis::GraphSymbol],
+    ) -> HashMap<(String, String), Vec<String>> {
         let mut index: HashMap<(String, String), Vec<String>> = HashMap::new();
         for sym in symbols {
             let module = Self::module_of(&sym.file_path);
@@ -2025,10 +2106,15 @@ impl ProjectQueryActor {
 
         let mut symbols: Vec<spire_core::models::analysis::GraphSymbol> = Vec::new();
         for nt in ["astFunction", "astClass", "astVariable", "astImport"] {
-            match self.query_attr_nodes(Some(nt.to_string()), None, None, None).await {
+            match self
+                .query_attr_nodes(Some(nt.to_string()), None, None, None)
+                .await
+            {
                 Ok(nodes) => {
                     for attr in nodes {
-                        if let Some(sym) = spire_core::models::analysis::GraphSymbol::from_attr_node(&attr) {
+                        if let Some(sym) =
+                            spire_core::models::analysis::GraphSymbol::from_attr_node(&attr)
+                        {
                             let kind_hit = kind_filter
                                 .map(|k| sym.kind.to_lowercase().contains(&k.to_lowercase()))
                                 .unwrap_or(true);
@@ -2071,11 +2157,16 @@ impl ProjectQueryActor {
             Some(id) => id,
             None => return serde_json::json!({"error": "missing 'symbolId'"}),
         };
-        let include_body = args.get("includeBody").and_then(|v| v.as_bool()).unwrap_or(true);
+        let include_body = args
+            .get("includeBody")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let attr = match self.get_attr_node(symbol_id).await {
             Ok(Some(a)) => a,
-            Ok(None) => return serde_json::json!({"error": format!("symbol not found: {symbol_id}")}),
+            Ok(None) => {
+                return serde_json::json!({"error": format!("symbol not found: {symbol_id}")})
+            }
             Err(e) => return serde_json::json!({"error": format!("lookup failed: {e}")}),
         };
         match spire_core::models::analysis::GraphSymbol::from_attr_node(&attr) {
@@ -2106,11 +2197,19 @@ impl ProjectQueryActor {
             Ok(e) => e,
             Err(e) => return serde_json::json!({"error": format!("relationships failed: {e}")}),
         };
-        let interesting = ["calls", "references", "imports", "calledby", "semanticallyrelated"];
+        let interesting = [
+            "calls",
+            "references",
+            "imports",
+            "calledby",
+            "semanticallyrelated",
+        ];
         let mut refs: Vec<serde_json::Value> = Vec::new();
         for edge in edges {
             let rel = match &edge.edge_type {
-                spire_core::models::memory_graph::RelationshipType::Custom(name) => name.to_lowercase(),
+                spire_core::models::memory_graph::RelationshipType::Custom(name) => {
+                    name.to_lowercase()
+                }
                 other => format!("{:?}", other).to_lowercase(),
             };
             if interesting.iter().any(|i| rel.contains(i)) {
@@ -2136,7 +2235,10 @@ impl ProjectQueryActor {
             // We need the full AST symbol set to build the index.
             let mut symbols: Vec<spire_core::models::analysis::GraphSymbol> = Vec::new();
             for nt in ["astFunction", "astClass", "astVariable", "astImport"] {
-                if let Ok(nodes) = self.query_attr_nodes(Some(nt.to_string()), None, None, None).await {
+                if let Ok(nodes) = self
+                    .query_attr_nodes(Some(nt.to_string()), None, None, None)
+                    .await
+                {
                     symbols.extend(
                         nodes
                             .iter()

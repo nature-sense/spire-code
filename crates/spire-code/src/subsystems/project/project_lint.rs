@@ -16,10 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::subsystems::build::build_manager::BuildManagerMessage;
-use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use crate::subsystems::project::project_query::ProjectQueryMessage;
 use spire_core::actors::Actor;
 use spire_core::actors::ToolInfo;
+use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 
 // ============================================================================
 // ProjectLintMessage
@@ -139,14 +139,16 @@ impl ProjectLintActor {
                 // Lint through the registered build module when available
                 // (Cargo → clippy, Meson → clang analyzer, …) — the
                 // BuildManager routes by capability.
-                let node_family = matches!(
-                    dispatch.build_type.as_str(),
-                    "npm" | "pnpm" | "yarn"
-                );
+                let node_family = matches!(dispatch.build_type.as_str(), "npm" | "pnpm" | "yarn");
                 let result = if node_family {
-                    Self::call_mcp_tool(&mcp_client_tx, "mcp-node", "lint", serde_json::json!({
-                        "path": dispatch.path,
-                    }))
+                    Self::call_mcp_tool(
+                        &mcp_client_tx,
+                        "mcp-node",
+                        "lint",
+                        serde_json::json!({
+                            "path": dispatch.path,
+                        }),
+                    )
                     .await
                 } else {
                     Self::call_build_module_tool(
@@ -198,14 +200,16 @@ impl ProjectLintActor {
             handles.push(tokio::spawn(async move {
                 // Format through the registered build module when available
                 // (Cargo → fmt, etc.) — the BuildManager routes by capability.
-                let node_family = matches!(
-                    dispatch.build_type.as_str(),
-                    "npm" | "pnpm" | "yarn"
-                );
+                let node_family = matches!(dispatch.build_type.as_str(), "npm" | "pnpm" | "yarn");
                 let result = if node_family {
-                    Self::call_mcp_tool(&mcp_client_tx, "mcp-node", "format", serde_json::json!({
-                        "path": dispatch.path,
-                    }))
+                    Self::call_mcp_tool(
+                        &mcp_client_tx,
+                        "mcp-node",
+                        "format",
+                        serde_json::json!({
+                            "path": dispatch.path,
+                        }),
+                    )
                     .await
                 } else {
                     Self::call_build_module_tool(

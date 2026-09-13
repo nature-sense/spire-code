@@ -35,8 +35,7 @@ fn render_fill_item(root: &Path, item: &serde_json::Value) -> Option<String> {
     // lists (e.g. video_scaler::scale_nv12), producing "no classes".
     let header = root.join("hal").join("api").join(format!("{iface}.hpp"));
     let content = std::fs::read_to_string(&header).ok()?;
-    let classes =
-        crate::build::generic_helpers::extract_contract_methods_cpp(&content);
+    let classes = crate::build::generic_helpers::extract_contract_methods_cpp(&content);
     let (class_name, methods) = classes.first()?;
 
     let src = if kind == "none" {
@@ -63,7 +62,9 @@ fn render_fill_item(root: &Path, item: &serde_json::Value) -> Option<String> {
              #pragma message(\"SPIRE HAL stub needs implementation: {iface}.cpp ({plat})\")\n\n"
         );
         let impl_hpp = std::path::Path::new(
-            item.get("create_file").and_then(|v| v.as_str()).unwrap_or(""),
+            item.get("create_file")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
         )
         .with_extension("hpp")
         .file_name()
@@ -123,8 +124,7 @@ fn render_fill_item(root: &Path, item: &serde_json::Value) -> Option<String> {
 /// Build a fill plan per platform/interface. Read-only — includes the exact
 /// `content` each item would write so the UI can preview before applying.
 pub fn plan(root: &Path, platform: &str, interfaces: &[String]) -> serde_json::Value {
-    let coverage =
-        crate::build::generic_helpers::hal_platform_coverage_map(root);
+    let coverage = crate::build::generic_helpers::hal_platform_coverage_map(root);
     let mut plan: Vec<serde_json::Value> = Vec::new();
     let mut plats: Vec<&String> = if platform.is_empty() {
         coverage.keys().collect()
@@ -133,7 +133,9 @@ pub fn plan(root: &Path, platform: &str, interfaces: &[String]) -> serde_json::V
     };
     plats.sort();
     for plat in plats {
-        let Some(ifaces) = coverage.get(plat) else { continue };
+        let Some(ifaces) = coverage.get(plat) else {
+            continue;
+        };
         let mut names: Vec<&String> = ifaces.keys().collect();
         names.sort();
         for iface in names {
@@ -160,13 +162,17 @@ pub fn plan(root: &Path, platform: &str, interfaces: &[String]) -> serde_json::V
             // Variant-aware naming for NEW classes: resolve (class, cpp, hpp)
             // filename tokens against the platform dir (no `_stub` suffix; the
             // SPIRE-HAL-STUB sentinel inside the files marks them pending).
-            let (class_name, fname_cpp, fname_hpp) =
-                if kind == "none" {
-                    let (cn, cpp, hpp) = crate::build::generic_helpers::resolve_hal_impl_names(iface, plat, &impl_dir);
-                    (cn, cpp, hpp)
-                } else {
-                    (crate::build::generic_helpers::hal_impl_class_name(iface, plat), format!("{iface}_gap.cpp"), String::new())
-                };
+            let (class_name, fname_cpp, fname_hpp) = if kind == "none" {
+                let (cn, cpp, hpp) =
+                    crate::build::generic_helpers::resolve_hal_impl_names(iface, plat, &impl_dir);
+                (cn, cpp, hpp)
+            } else {
+                (
+                    crate::build::generic_helpers::hal_impl_class_name(iface, plat),
+                    format!("{iface}_gap.cpp"),
+                    String::new(),
+                )
+            };
             let create_file = impl_dir.join(&fname_cpp).to_string_lossy().to_string();
             let mut item = json!({
                 "platform": plat,
@@ -189,9 +195,10 @@ pub fn plan(root: &Path, platform: &str, interfaces: &[String]) -> serde_json::V
             // model: contract .hpp immutable, impl .hpp + .cpp one unit).
             if kind == "none" {
                 if let Ok(content) = std::fs::read_to_string(
-                    root.join("hal").join("api").join(format!("{iface}.hpp"))
+                    root.join("hal").join("api").join(format!("{iface}.hpp")),
                 ) {
-                    let classes = crate::build::generic_helpers::extract_contract_methods_cpp(&content);
+                    let classes =
+                        crate::build::generic_helpers::extract_contract_methods_cpp(&content);
                     // The concrete class derives the CONTRACT's abstract class.
                     // Prefer the HalModule-derived base (canonical), falling back
                     // to the first declared abstract class (simplified contracts
@@ -202,19 +209,18 @@ pub fn plan(root: &Path, platform: &str, interfaces: &[String]) -> serde_json::V
                         .map(|(name, _)| name)
                         .or_else(|| classes.first().map(|(name, _)| name.clone()));
                     if let Some(base) = base {
-                        let methods: Vec<_> = classes.iter().flat_map(|(_, ms)| ms.clone()).collect();
+                        let methods: Vec<_> =
+                            classes.iter().flat_map(|(_, ms)| ms.clone()).collect();
                         let token = item
                             .get("class_name")
                             .and_then(|v| v.as_str())
                             .map(ToOwned::to_owned)
-                            .unwrap_or_else(|| crate::build::generic_helpers::hal_impl_class_name(iface, plat));
+                            .unwrap_or_else(|| {
+                                crate::build::generic_helpers::hal_impl_class_name(iface, plat)
+                            });
                         let hpp_path = impl_dir.join(&fname_hpp).to_string_lossy().to_string();
                         let hpp = crate::build::generic_helpers::generate_hal_module_header(
-                            iface,
-                            &token,
-                            &base,
-                            &methods,
-                            plat,
+                            iface, &token, &base, &methods, plat,
                         );
                         item["declaration_path"] = json!(hpp_path);
                         item["declaration_content"] = json!(hpp);
@@ -263,9 +269,15 @@ pub async fn apply(
         std::collections::BTreeMap::new();
     if let Some(items) = plan.as_array() {
         for item in items {
-            let Some(plat) = item.get("platform").and_then(|v| v.as_str()) else { continue };
-            let Some(iface) = item.get("interface").and_then(|v| v.as_str()) else { continue };
-            let Some(create) = item.get("create_file").and_then(|v| v.as_str()) else { continue };
+            let Some(plat) = item.get("platform").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(iface) = item.get("interface").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(create) = item.get("create_file").and_then(|v| v.as_str()) else {
+                continue;
+            };
             let target = Path::new(create);
             // Render through the SAME helper as plan() — the previewed
             // content is exactly what gets written.

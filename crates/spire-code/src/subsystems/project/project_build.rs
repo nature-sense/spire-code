@@ -29,14 +29,14 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::info;
 
 use crate::subsystems::build::build_manager::BuildManagerMessage;
-use spire_core::subsystems::chat::chat::ChatMessage;
-use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
-use spire_core::actors::progress::{ProgressMessage, ProgressStatus, ProgressUpdate};
 use crate::subsystems::project::project_query::ProjectQueryMessage;
+use spire_core::actors::progress::{ProgressMessage, ProgressStatus, ProgressUpdate};
 use spire_core::actors::Actor;
 use spire_core::actors::ToolInfo;
 use spire_core::models::memory_graph::{RelationshipInput, RelationshipType};
+use spire_core::subsystems::chat::chat::ChatMessage;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
+use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use spire_core::transport::socket::TransportMessage;
 
 // ============================================================================
@@ -74,9 +74,7 @@ pub enum ProjectBuildMessage {
     },
     /// Set the project root (the FFI opens projects dynamically; the root is
     /// re-pointed on every `project/open` / `AnalyzeProject`).
-    SetProjectRoot {
-        root: PathBuf,
-    },
+    SetProjectRoot { root: PathBuf },
 }
 
 // ============================================================================
@@ -479,10 +477,7 @@ impl ProjectBuildActor {
                 // BuildManager's generic CallModuleTool. Only Node-family
                 // build types keep their legacy MCP-server path. There are no
                 // hardcoded per-build-system branches beyond that.
-                let node_family = matches!(
-                    dispatch.build_type.as_str(),
-                    "npm" | "pnpm" | "yarn"
-                );
+                let node_family = matches!(dispatch.build_type.as_str(), "npm" | "pnpm" | "yarn");
                 let result = if node_family {
                     Self::build_node(
                         mcp_client_tx,
@@ -1061,43 +1056,44 @@ impl ProjectBuildActor {
                 file.as_deref().unwrap_or("unknown"),
                 build_run_id
             );
-            let diagnostic_node = {
-                let now = chrono::Utc::now();
-                spire_core::models::memory_graph::AttrNode {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    node_type: "Diagnostic".to_string(),
-                    subtype: Some(severity.to_string()),
-                    name: diag_name,
-                    description: Some(message.clone()),
-                    properties: [("message", &message), ("severity", &severity.to_string())]
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
-                        .chain(file.as_ref().map(|f| {
-                            ("file".to_string(), serde_json::Value::String(f.clone()))
-                        }))
-                        .chain(
-                            line.map(|n| {
-                                ("line".to_string(), serde_json::Value::Number(n.into()))
-                            }),
-                        )
-                        .chain(column.map(|n| {
-                            ("column".to_string(), serde_json::Value::Number(n.into()))
-                        }))
-                        .chain(std::iter::once((
-                            "build_type".to_string(),
-                            serde_json::Value::String(build_type.to_string()),
-                        )))
-                        .chain(std::iter::once((
-                            "build_run_id".to_string(),
-                            serde_json::Value::String(build_run_id.to_string()),
-                        )))
-                        .collect(),
-                    embedding_id: None,
-                    created_at: now,
-                    updated_at: now,
-                    version: 1,
-                }
-            };
+            let diagnostic_node =
+                {
+                    let now = chrono::Utc::now();
+                    spire_core::models::memory_graph::AttrNode {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        node_type: "Diagnostic".to_string(),
+                        subtype: Some(severity.to_string()),
+                        name: diag_name,
+                        description: Some(message.clone()),
+                        properties: [("message", &message), ("severity", &severity.to_string())]
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                            .chain(file.as_ref().map(|f| {
+                                ("file".to_string(), serde_json::Value::String(f.clone()))
+                            }))
+                            .chain(
+                                line.map(|n| {
+                                    ("line".to_string(), serde_json::Value::Number(n.into()))
+                                }),
+                            )
+                            .chain(column.map(|n| {
+                                ("column".to_string(), serde_json::Value::Number(n.into()))
+                            }))
+                            .chain(std::iter::once((
+                                "build_type".to_string(),
+                                serde_json::Value::String(build_type.to_string()),
+                            )))
+                            .chain(std::iter::once((
+                                "build_run_id".to_string(),
+                                serde_json::Value::String(build_run_id.to_string()),
+                            )))
+                            .collect(),
+                        embedding_id: None,
+                        created_at: now,
+                        updated_at: now,
+                        version: 1,
+                    }
+                };
 
             let (store_tx, store_rx) = oneshot::channel();
             let _ = memory_graph_tx

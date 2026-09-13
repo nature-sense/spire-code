@@ -16,10 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 use crate::subsystems::build::build_manager::BuildManagerMessage;
-use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use crate::subsystems::project::project_query::ProjectQueryMessage;
 use spire_core::actors::Actor;
 use spire_core::actors::ToolInfo;
+use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 
 // ============================================================================
 // ProjectTestMessage
@@ -136,10 +136,7 @@ impl ProjectTestActor {
             let mcp_client_tx = self.mcp_client_tx.clone();
             let build_manager_tx = self.build_manager_tx.clone();
             handles.push(tokio::spawn(async move {
-                let node_family = matches!(
-                    dispatch.build_type.as_str(),
-                    "npm" | "pnpm" | "yarn"
-                );
+                let node_family = matches!(dispatch.build_type.as_str(), "npm" | "pnpm" | "yarn");
                 let result = if node_family {
                     let mut args = serde_json::Map::new();
                     args.insert("path".into(), Value::String(dispatch.path.clone()));
@@ -202,10 +199,7 @@ impl ProjectTestActor {
             let mcp_client_tx = self.mcp_client_tx.clone();
             let build_manager_tx = self.build_manager_tx.clone();
             handles.push(tokio::spawn(async move {
-                let node_family = matches!(
-                    dispatch.build_type.as_str(),
-                    "npm" | "pnpm" | "yarn"
-                );
+                let node_family = matches!(dispatch.build_type.as_str(), "npm" | "pnpm" | "yarn");
                 let result = if node_family {
                     Self::call_mcp_tool(
                         &mcp_client_tx,

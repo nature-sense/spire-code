@@ -10,9 +10,7 @@ use super::generic_helpers::{
     extract_cpp_base_classes, extract_cpp_method_definitions_ts, parse_cpp_source_file_std,
     parse_source_file_std,
 };
-use super::{
-    BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability, TestOptions,
-};
+use super::{BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability, TestOptions};
 
 use super::generic_helpers::run_cmd;
 use crate::Actor;
@@ -107,8 +105,8 @@ impl MesonBuildModule {
         //   find_library('tensorflow-lite', ...)
         //   declare_dependency(...)  (skipped — internal)
         let mut deps: Vec<spire_core::build_types::Dependency> = Vec::new();
-        let dep_re = regex::Regex::new(r#"(?:dependency|find_library)\s*\(\s*['"]([^'"]+)['"]"#)
-            .unwrap();
+        let dep_re =
+            regex::Regex::new(r#"(?:dependency|find_library)\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
         let mut seen = std::collections::HashSet::new();
         for cap in dep_re.captures_iter(&aggregated) {
             if let Some(m) = cap.get(1) {
@@ -151,8 +149,7 @@ impl MesonBuildModule {
 
         // Source-file regexes: every `'path.cpp'` literal and Meson `files(...)`
         // variable references appear in the executable declaration block.
-        let file_literal_re =
-            regex::Regex::new(r#"['"]([^'"]+\.(?:c|cpp|cc|cxx))['"]"#).unwrap();
+        let file_literal_re = regex::Regex::new(r#"['"]([^'"]+\.(?:c|cpp|cc|cxx))['"]"#).unwrap();
         let var_ref_re = regex::Regex::new(r#"(?m)([a-z_][a-z0-9_]*)\s*[+]"#).unwrap();
 
         // `library` must NOT match inside `find_library(...)` / `shared_library(...)`
@@ -186,15 +183,14 @@ impl MesonBuildModule {
                     // this section so identically-named vars (app_sources,
                     // core_deps, platform_deps) don't bleed across platforms.
                     let target_start = cap.get(0).map(|m| m.start()).unwrap_or(0);
-                    let (sec_start, sec_end, platform) =
-                        if let Some((sub, s, e)) = sections
-                            .iter()
-                            .find(|(_, s, e)| target_start >= *s && target_start < *e)
-                        {
-                            (*s, *e, sub.clone())
-                        } else {
-                            (0, target_start, "host".to_string())
-                        };
+                    let (sec_start, sec_end, platform) = if let Some((sub, s, e)) = sections
+                        .iter()
+                        .find(|(_, s, e)| target_start >= *s && target_start < *e)
+                    {
+                        (*s, *e, sub.clone())
+                    } else {
+                        (0, target_start, "host".to_string())
+                    };
                     let section = &aggregated[sec_start..sec_end];
 
                     // ── Source file extraction ──────────────────────────────
@@ -324,7 +320,9 @@ impl MesonBuildModule {
                                         // HAL implementation files are per-platform
                                         // HalImplementation sources, NOT shared —
                                         // only toolkit vars are role=Shared.
-                                        if !is_hal_var && !p.is_empty() && !shared_files.contains(&p)
+                                        if !is_hal_var
+                                            && !p.is_empty()
+                                            && !shared_files.contains(&p)
                                         {
                                             shared_files.push(p);
                                         }
@@ -410,15 +408,21 @@ impl MesonBuildModule {
         //          description: 'Target platform. Valid values: host, rpi5')
         let mut platform_targets: Vec<String> = Vec::new();
         if let Ok(opts) = std::fs::read_to_string(path.join("meson_options.txt")) {
-            if let Some(caps) =
-                regex::Regex::new(r#"option\s*\(\s*['"]platform['"]"#).unwrap().captures(&opts)
+            if let Some(caps) = regex::Regex::new(r#"option\s*\(\s*['"]platform['"]"#)
+                .unwrap()
+                .captures(&opts)
             {
                 let _ = caps; // marker found; now scrape the documented values
-                // Match the description line "Valid values: host, rpi5"
-                if let Some(vals) = regex::Regex::new(
-                    r"(?i)valid\s+values\s*:\s*([A-Za-z0-9_ ,\-]+)",
-                ).unwrap().captures(&opts) {
-                    let v = vals.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+                              // Match the description line "Valid values: host, rpi5"
+                if let Some(vals) =
+                    regex::Regex::new(r"(?i)valid\s+values\s*:\s*([A-Za-z0-9_ ,\-]+)")
+                        .unwrap()
+                        .captures(&opts)
+                {
+                    let v = vals
+                        .get(1)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
                     platform_targets = v
                         .split(',')
                         .map(|t| t.trim().to_string())
@@ -429,7 +433,10 @@ impl MesonBuildModule {
                 if platform_targets.is_empty() {
                     if let Some(dv) = regex::Regex::new(
                         r#"option\s*\(\s*['"]platform['"][^)]*value\s*:\s*['"]([^'"]+)['"]"#,
-                    ).unwrap().captures(&opts) {
+                    )
+                    .unwrap()
+                    .captures(&opts)
+                    {
                         if let Some(m) = dv.get(1) {
                             platform_targets.push(m.as_str().to_string());
                         }
@@ -460,9 +467,12 @@ impl MesonBuildModule {
             let first = &targets[0].dependencies;
             first
                 .iter()
-                .filter(|d| targets.iter().skip(1).all(|t| {
-                    t.dependencies.iter().any(|td| td.name == d.name)
-                }))
+                .filter(|d| {
+                    targets
+                        .iter()
+                        .skip(1)
+                        .all(|t| t.dependencies.iter().any(|td| td.name == d.name))
+                })
                 .map(|d| d.name.clone())
                 .collect()
         } else {
@@ -496,107 +506,106 @@ impl MesonBuildModule {
         // build spec). Single-host projects get a single `common` domain only
         // when the project is actually composite; Native projects get none
         // (their filesystem subproject tree is the correct view).
-        let domains: Vec<spire_core::build_types::ProjectDomain> = if structure
-            == spire_core::build_types::ProjectStructure::Native
-        {
-            Vec::new()
-        } else {
-            use spire_core::build_types::{DomainEditability, ProjectDomain, SourceRole};
+        let domains: Vec<spire_core::build_types::ProjectDomain> =
+            if structure == spire_core::build_types::ProjectStructure::Native {
+                Vec::new()
+            } else {
+                use spire_core::build_types::{DomainEditability, ProjectDomain, SourceRole};
 
-            let mut domains: Vec<ProjectDomain> = Vec::new();
+                let mut domains: Vec<ProjectDomain> = Vec::new();
 
-            // ── common: shared toolkit + HAL contract headers ──────────
-            let mut common_files: Vec<String> = Vec::new();
-            let mut common_contracts: Vec<String> = Vec::new();
-            // Contract headers from hal_interfaces (canonical + legacy paths).
-            for i in &hal_interfaces {
-                common_contracts.push(i.header_path.clone());
-                common_files.push(i.header_path.clone());
-            }
-            // Shared source units across all targets (e.g. `toolkit`).
-            for t in &targets {
-                for u in &t.source_units {
-                    if u.role == SourceRole::Shared && !common_files.contains(&u.path) {
-                        common_files.push(u.path.clone());
+                // ── common: shared toolkit + HAL contract headers ──────────
+                let mut common_files: Vec<String> = Vec::new();
+                let mut common_contracts: Vec<String> = Vec::new();
+                // Contract headers from hal_interfaces (canonical + legacy paths).
+                for i in &hal_interfaces {
+                    common_contracts.push(i.header_path.clone());
+                    common_files.push(i.header_path.clone());
+                }
+                // Shared source units across all targets (e.g. `toolkit`).
+                for t in &targets {
+                    for u in &t.source_units {
+                        if u.role == SourceRole::Shared && !common_files.contains(&u.path) {
+                            common_files.push(u.path.clone());
+                        }
                     }
                 }
-            }
-            if !common_files.is_empty() || !common_contracts.is_empty() {
-                // `common` owns NO dependencies. It is a shared-context slice
-                // (toolkit + contracts), not a buildable target — every dep is
-                // resolved per platform target, and shared deps already appear
-                // on each platform's domain. Attaching them here made the
-                // "common" row in the UI list the whole project's dependencies.
-                domains.push(ProjectDomain {
-                    id: "common".to_string(),
-                    name: "Common".to_string(),
-                    kind: "common".to_string(),
-                    files: common_files,
-                    dependencies: Vec::new(),
-                    build_spec: None,
-                    // `common` is shared, editable toolkit + contracts — NOT
-                    // read-only. Contract changes go through the HAL tools, but
-                    // the shared sources are fair game for edits.
-                    editability: DomainEditability::Shared,
-                    contracts: common_contracts,
-                });
-            }
+                if !common_files.is_empty() || !common_contracts.is_empty() {
+                    // `common` owns NO dependencies. It is a shared-context slice
+                    // (toolkit + contracts), not a buildable target — every dep is
+                    // resolved per platform target, and shared deps already appear
+                    // on each platform's domain. Attaching them here made the
+                    // "common" row in the UI list the whole project's dependencies.
+                    domains.push(ProjectDomain {
+                        id: "common".to_string(),
+                        name: "Common".to_string(),
+                        kind: "common".to_string(),
+                        files: common_files,
+                        dependencies: Vec::new(),
+                        build_spec: None,
+                        // `common` is shared, editable toolkit + contracts — NOT
+                        // read-only. Contract changes go through the HAL tools, but
+                        // the shared sources are fair game for edits.
+                        editability: DomainEditability::Shared,
+                        contracts: common_contracts,
+                    });
+                }
 
-            // ── platform: one domain per non-host composite target ──────
-            for t in targets.iter().filter(|t| t.platform != "host") {
-                // Clean, DIRECTORY-level slices of THIS platform only:
-                //   App               → "<plat>/"
-                //   HalImplementation → "hal/implementations/<plat>/"
-                // Shared (`toolkit/`) and the contract headers belong to
-                // `common` alone — never duplicated into platform domains.
-                // (Source files are meson-relative and can't be mapped to the
-                // tree without the container paths, so the domains carry the
-                // two directories the UI shows.)
-                let mut plat_files: Vec<String> = Vec::new();
-                let mut has_hal_impl = false;
-                for u in &t.source_units {
-                    let p: Option<String> = match u.role {
-                        SourceRole::App => Some(t.platform.clone()),
-                        SourceRole::HalImplementation => {
-                            has_hal_impl = true;
-                            Some(format!("hal/implementations/{}", t.platform))
+                // ── platform: one domain per non-host composite target ──────
+                for t in targets.iter().filter(|t| t.platform != "host") {
+                    // Clean, DIRECTORY-level slices of THIS platform only:
+                    //   App               → "<plat>/"
+                    //   HalImplementation → "hal/implementations/<plat>/"
+                    // Shared (`toolkit/`) and the contract headers belong to
+                    // `common` alone — never duplicated into platform domains.
+                    // (Source files are meson-relative and can't be mapped to the
+                    // tree without the container paths, so the domains carry the
+                    // two directories the UI shows.)
+                    let mut plat_files: Vec<String> = Vec::new();
+                    let mut has_hal_impl = false;
+                    for u in &t.source_units {
+                        let p: Option<String> = match u.role {
+                            SourceRole::App => Some(t.platform.clone()),
+                            SourceRole::HalImplementation => {
+                                has_hal_impl = true;
+                                Some(format!("hal/implementations/{}", t.platform))
+                            }
+                            _ => None,
+                        };
+                        if let Some(p) = p {
+                            if !plat_files.contains(&p) {
+                                plat_files.push(p);
+                            }
                         }
-                        _ => None,
-                    };
-                    if let Some(p) = p {
+                    }
+                    // Fallback: a platform target that references implementations/
+                    // sources still gets its container dir listed.
+                    if !has_hal_impl {
+                        let p = format!("hal/implementations/{}", t.platform);
                         if !plat_files.contains(&p) {
                             plat_files.push(p);
                         }
                     }
-                }
-                // Fallback: a platform target that references implementations/
-                // sources still gets its container dir listed.
-                if !has_hal_impl {
-                    let p = format!("hal/implementations/{}", t.platform);
-                    if !plat_files.contains(&p) {
-                        plat_files.push(p);
+                    let mut plat_deps: Vec<spire_core::build_types::Dependency> = Vec::new();
+                    for d in &t.dependencies {
+                        if d.scope.as_deref() != Some("shared") {
+                            plat_deps.push(d.clone());
+                        }
                     }
+                    domains.push(ProjectDomain {
+                        id: t.platform.clone(),
+                        name: t.platform.clone(),
+                        kind: "platform".to_string(),
+                        files: plat_files,
+                        dependencies: plat_deps,
+                        build_spec: t.build_spec.clone(),
+                        editability: DomainEditability::Fillable,
+                        contracts: Vec::new(),
+                    });
                 }
-                let mut plat_deps: Vec<spire_core::build_types::Dependency> = Vec::new();
-                for d in &t.dependencies {
-                    if d.scope.as_deref() != Some("shared") {
-                        plat_deps.push(d.clone());
-                    }
-                }
-                domains.push(ProjectDomain {
-                    id: t.platform.clone(),
-                    name: t.platform.clone(),
-                    kind: "platform".to_string(),
-                    files: plat_files,
-                    dependencies: plat_deps,
-                    build_spec: t.build_spec.clone(),
-                    editability: DomainEditability::Fillable,
-                    contracts: Vec::new(),
-                });
-            }
 
-            domains
-        };
+                domains
+            };
 
         Ok(BuildMetadata {
             project_name: name,
@@ -674,7 +683,10 @@ impl MesonBuildModule {
                     let _ = std::fs::create_dir_all(&cross_dir);
                     let cross_path = cross_dir.join(format!("{plat}-cross.txt"));
                     if let Err(e) = std::fs::write(&cross_path, &cross_content) {
-                        return Err(format!("failed to write cross file {}: {e}", cross_path.display()));
+                        return Err(format!(
+                            "failed to write cross file {}: {e}",
+                            cross_path.display()
+                        ));
                     }
                     let abs_cross = cross_path.to_string_lossy().to_string();
 
@@ -683,11 +695,13 @@ impl MesonBuildModule {
                     if !prod_path.join("build.ninja").exists()
                         && !prod_path.join("meson-info").exists()
                     {
-                        let setup_args = ["setup".to_string(),
+                        let setup_args = [
+                            "setup".to_string(),
                             dir.clone(),
                             path.to_string_lossy().to_string(),
                             format!("--cross-file={abs_cross}"),
-                            format!("-Dplatform={plat}")];
+                            format!("-Dplatform={plat}"),
+                        ];
                         let refs: Vec<&str> = setup_args.iter().map(|s| s.as_str()).collect();
                         let setup = run_cmd(path, "meson", &refs).await?;
                         // Then compile in it.
@@ -777,7 +791,12 @@ impl MesonBuildModule {
         }
         let build_dir = self.find_compile_db_dir(path);
         if !build_dir.as_os_str().is_empty() {
-            return run_cmd(path, "meson", &["compile", "-C", build_dir.to_str().unwrap_or(""), "--clean"]).await;
+            return run_cmd(
+                path,
+                "meson",
+                &["compile", "-C", build_dir.to_str().unwrap_or(""), "--clean"],
+            )
+            .await;
         }
         // No discovered build dir: use the conventional relative builddir.
         let dir = path.join("builddir");
@@ -865,7 +884,9 @@ impl MesonBuildModule {
         let mut out = Vec::new();
         let mut stack = vec![path.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in rd.flatten() {
                 let ep = entry.path();
                 if ep.is_dir() {
@@ -932,11 +953,7 @@ impl MesonBuildModule {
         &self,
         path: &Path,
         platform: Option<&str>,
-    ) -> (
-        std::path::PathBuf,
-        CompileDb,
-        Vec<String>,
-    ) {
+    ) -> (std::path::PathBuf, CompileDb, Vec<String>) {
         let db_dir = if let Some(plat) = platform {
             self.find_named_build_dir(path, &format!("build-{plat}"))
         } else {
@@ -1012,10 +1029,7 @@ impl MesonBuildModule {
     /// Load `compile_commands.json` from any `build*` subdir (in this dir or
     /// any ancestor): file→flags map. Meson typically writes the build dir at
     /// the project root while subprojects are nested below it.
-    fn load_compile_commands(
-        &self,
-        path: &Path,
-    ) -> CompileDb {
+    fn load_compile_commands(&self, path: &Path) -> CompileDb {
         let mut search = path.to_path_buf();
         loop {
             let map = self.load_compile_commands_in(&search);
@@ -1098,10 +1112,7 @@ impl MesonBuildModule {
 
     /// Load compile_commands.json from a specific build dir (path = the dir
     /// containing the compile DB, or "" to use the legacy walk-up discovery).
-    fn load_compile_commands_from(
-        &self,
-        build_dir: std::path::PathBuf,
-    ) -> CompileDb {
+    fn load_compile_commands_from(&self, build_dir: std::path::PathBuf) -> CompileDb {
         if build_dir.as_os_str().is_empty() {
             return self.load_compile_commands(std::path::Path::new("/"));
         }
@@ -1118,12 +1129,17 @@ impl MesonBuildModule {
             let (Some(file), Some(cmd)) = (
                 ent.get("file").and_then(|v| v.as_str()),
                 ent.get("command").and_then(|v| v.as_str()),
-            ) else { continue };
+            ) else {
+                continue;
+            };
             let dir = ent.get("directory").and_then(|v| v.as_str()).unwrap_or("");
             let canon = if file.starts_with('/') {
                 file.to_string()
             } else if !dir.is_empty() {
-                std::path::Path::new(dir).join(file).to_string_lossy().to_string()
+                std::path::Path::new(dir)
+                    .join(file)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 build_dir.join(file).to_string_lossy().to_string()
             };
@@ -1153,7 +1169,9 @@ impl MesonBuildModule {
     fn find_named_build_dir(&self, path: &Path, wanted: &str) -> std::path::PathBuf {
         let mut search = path.to_path_buf();
         loop {
-            let Ok(rd) = std::fs::read_dir(&search) else { return std::path::PathBuf::new() };
+            let Ok(rd) = std::fs::read_dir(&search) else {
+                return std::path::PathBuf::new();
+            };
             for entry in rd.flatten() {
                 let ep = entry.path();
                 let name = ep
@@ -1175,12 +1193,11 @@ impl MesonBuildModule {
         std::path::PathBuf::new()
     }
 
-    fn load_compile_commands_in(
-        &self,
-        path: &Path,
-    ) -> CompileDb {
+    fn load_compile_commands_in(&self, path: &Path) -> CompileDb {
         let mut map = std::collections::HashMap::new();
-        let Ok(rd) = std::fs::read_dir(path) else { return map };
+        let Ok(rd) = std::fs::read_dir(path) else {
+            return map;
+        };
         for entry in rd.flatten() {
             let ep = entry.path();
             let name = ep
@@ -1201,12 +1218,17 @@ impl MesonBuildModule {
                 let (Some(file), Some(cmd)) = (
                     ent.get("file").and_then(|v| v.as_str()),
                     ent.get("command").and_then(|v| v.as_str()),
-                ) else { continue };
+                ) else {
+                    continue;
+                };
                 let dir = ent.get("directory").and_then(|v| v.as_str()).unwrap_or("");
                 let canon = if file.starts_with('/') {
                     file.to_string()
                 } else if !dir.is_empty() {
-                    std::path::Path::new(dir).join(file).to_string_lossy().to_string()
+                    std::path::Path::new(dir)
+                        .join(file)
+                        .to_string_lossy()
+                        .to_string()
                 } else {
                     path.join(file).to_string_lossy().to_string()
                 };
@@ -1364,13 +1386,15 @@ impl MesonBuildModule {
             let bc = r#"project('__P__', 'c')
 
 executable('__P__', 'src/main.c')
-"#.replace("__P__", project_name);
+"#
+            .replace("__P__", project_name);
             let sc = r#"#include <stdio.h>
 int main() {
     printf("Hello from __P__!\n");
     return 0;
 }
-"#.replace("__P__", project_name);
+"#
+            .replace("__P__", project_name);
             return Ok(super::ScaffoldOutput {
                 build_file: "meson.build".to_string(),
                 build_content: bc,
@@ -1537,7 +1561,10 @@ fn dir_for(plat: &str, root: &Path) -> std::path::PathBuf {
 fn detect_hal_interfaces(
     root: &Path,
     targets: &[BuildTarget],
-) -> (Vec<spire_core::build_types::HalInterface>, Vec<spire_core::build_types::BuildIssue>) {
+) -> (
+    Vec<spire_core::build_types::HalInterface>,
+    Vec<spire_core::build_types::BuildIssue>,
+) {
     let mut interfaces: Vec<spire_core::build_types::HalInterface> = Vec::new();
     let mut issues: Vec<spire_core::build_types::BuildIssue> = Vec::new();
 
@@ -1590,7 +1617,9 @@ fn detect_hal_interfaces(
     let mut stem_to_header: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for dir in &header_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let ep = e.path();
             let Some(ext) = ep.extension().and_then(|x| x.to_str()) else {
@@ -1647,12 +1676,24 @@ fn detect_hal_interfaces(
 
         for (plat, dir) in &impl_dir_by_platform {
             let mut matched: Vec<String> = Vec::new();
-            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
             for e in entries.flatten() {
                 let ep = e.path();
-                let en = ep.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let en = ep
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 let ext = ep.extension().and_then(|x| x.to_str()).unwrap_or("");
-                if ext != "cpp" && ext != "cxx" && ext != "cc" && ext != "c" && ext != "hpp" && ext != "h" {
+                if ext != "cpp"
+                    && ext != "cxx"
+                    && ext != "cc"
+                    && ext != "c"
+                    && ext != "hpp"
+                    && ext != "h"
+                {
                     continue;
                 }
                 // AST inheritance match: the file defines a class whose base
@@ -1677,48 +1718,63 @@ fn detect_hal_interfaces(
                         let impls = extract_cpp_method_definitions_ts(&src);
                         let defined: std::collections::BTreeSet<&str> =
                             impls.iter().map(|m| m.name.as_str()).collect();
-                        contract_methods.iter().any(|m| defined.contains(m.as_str()))
+                        contract_methods
+                            .iter()
+                            .any(|m| defined.contains(m.as_str()))
                     })
                     .unwrap_or(false);
                 // Filename fallback: stem prefix (e.g. camera_hal_imx219.cpp).
-                let name_match = en.starts_with(&format!("{stem}.")) || en.starts_with(&format!("{stem}_"));
+                let name_match =
+                    en.starts_with(&format!("{stem}.")) || en.starts_with(&format!("{stem}_"));
                 if ast_match || method_match || name_match {
                     matched.push(en.clone());
                 }
             }
-                // Legacy naming: impls directly in <plat>/hal or via the platform dir.
-                let plat_hdr_dir = root.join(plat).join("hal");
-                if plat_hdr_dir.is_dir() && plat_hdr_dir != *dir {
-                    if let Ok(entries) = std::fs::read_dir(&plat_hdr_dir) {
-                        for e in entries.flatten() {
-                            let ep = e.path();
-                            let en = ep.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            let ext = ep.extension().and_then(|x| x.to_str()).unwrap_or("");
-                            if ext != "cpp" && ext != "cxx" && ext != "cc" && ext != "c" {
-                                continue;
-                            }
-                            let ast_match = std::fs::read_to_string(&ep)
-                                .ok()
-                                .map(|src| {
-                                    extract_cpp_base_classes(&src)
-                                        .iter()
-                                        .any(|(_, bases)| bases.iter().any(|b| b == &stem))
-                                })
-                                .unwrap_or(false);
-                            let method_match = std::fs::read_to_string(&ep).ok().map(|src| {
-                                if contract_methods.is_empty() { return false; }
+            // Legacy naming: impls directly in <plat>/hal or via the platform dir.
+            let plat_hdr_dir = root.join(plat).join("hal");
+            if plat_hdr_dir.is_dir() && plat_hdr_dir != *dir {
+                if let Ok(entries) = std::fs::read_dir(&plat_hdr_dir) {
+                    for e in entries.flatten() {
+                        let ep = e.path();
+                        let en = ep
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let ext = ep.extension().and_then(|x| x.to_str()).unwrap_or("");
+                        if ext != "cpp" && ext != "cxx" && ext != "cc" && ext != "c" {
+                            continue;
+                        }
+                        let ast_match = std::fs::read_to_string(&ep)
+                            .ok()
+                            .map(|src| {
+                                extract_cpp_base_classes(&src)
+                                    .iter()
+                                    .any(|(_, bases)| bases.iter().any(|b| b == &stem))
+                            })
+                            .unwrap_or(false);
+                        let method_match = std::fs::read_to_string(&ep)
+                            .ok()
+                            .map(|src| {
+                                if contract_methods.is_empty() {
+                                    return false;
+                                }
                                 let impls = extract_cpp_method_definitions_ts(&src);
                                 let defined: std::collections::BTreeSet<&str> =
                                     impls.iter().map(|m| m.name.as_str()).collect();
-                                contract_methods.iter().any(|m| defined.contains(m.as_str()))
-                            }).unwrap_or(false);
-                            let name_match = en.starts_with(&format!("{stem}.")) || en.starts_with(&format!("{stem}_"));
-                            if ast_match || method_match || name_match {
-                                matched.push(en.clone());
-                            }
+                                contract_methods
+                                    .iter()
+                                    .any(|m| defined.contains(m.as_str()))
+                            })
+                            .unwrap_or(false);
+                        let name_match = en.starts_with(&format!("{stem}."))
+                            || en.starts_with(&format!("{stem}_"));
+                        if ast_match || method_match || name_match {
+                            matched.push(en.clone());
                         }
                     }
                 }
+            }
             if !matched.is_empty() {
                 by_plat.insert(plat.clone(), matched);
             }
@@ -1802,13 +1858,17 @@ fn detect_hal_interfaces(
 
     // Orphan implementations: impl files with no matching interface header.
     for (plat, dir) in &impl_dir_by_platform {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let en = e.file_name().to_string_lossy().to_string();
             if !en.ends_with(".cpp") && !en.ends_with(".cxx") && !en.ends_with(".cc") {
                 continue;
             }
-            let Some(stem) = en.split('.').next().map(String::from) else { continue };
+            let Some(stem) = en.split('.').next().map(String::from) else {
+                continue;
+            };
             let has_match = stem_to_header
                 .keys()
                 .any(|s| stem.starts_with(&format!("{s}_")) || stem == *s);
@@ -1845,8 +1905,8 @@ fn resolve_target_deps(
 ) -> Vec<spire_core::build_types::Dependency> {
     let dep_call_re =
         regex::Regex::new(r#"(?:dependency|find_library)\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
-    let var_assign_re = regex::Regex::new(r#"(?m)^\s*([a-z_][a-z0-9_]*)\s*(?:=|\+=)\s*\[([^\]]*)\]"#)
-        .unwrap();
+    let var_assign_re =
+        regex::Regex::new(r#"(?m)^\s*([a-z_][a-z0-9_]*)\s*(?:=|\+=)\s*\[([^\]]*)\]"#).unwrap();
     let var_ref_re = regex::Regex::new(r#"(?m)([a-z_][a-z0-9_]*)"#).unwrap();
 
     let mut resolved: Vec<spire_core::build_types::Dependency> = Vec::new();
@@ -1892,7 +1952,9 @@ fn resolve_target_deps(
     let mut declared: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for cap in var_assign_re.captures_iter(section) {
-        let (Some(var_m), Some(g)) = (cap.get(1), cap.get(2)) else { continue };
+        let (Some(var_m), Some(g)) = (cap.get(1), cap.get(2)) else {
+            continue;
+        };
         let var = var_m.as_str().trim().to_string();
         let mut names: Vec<String> = Vec::new();
         for vc in var_ref_re.captures_iter(g.as_str()) {
@@ -1917,8 +1979,13 @@ fn resolve_target_deps(
     let mut dep_var_to_name: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for cap in dep_var_re.captures_iter(section) {
-        let (Some(vm), Some(nm)) = (cap.get(1), cap.get(2)) else { continue };
-        dep_var_to_name.insert(vm.as_str().trim().to_string(), nm.as_str().trim().to_string());
+        let (Some(vm), Some(nm)) = (cap.get(1), cap.get(2)) else {
+            continue;
+        };
+        dep_var_to_name.insert(
+            vm.as_str().trim().to_string(),
+            nm.as_str().trim().to_string(),
+        );
     }
 
     // Collect all declaration names referenced in the executable block.
@@ -2012,7 +2079,11 @@ impl Actor for MesonBuildModule {
                 // and emit a single synthetic "finished" event.
                 let result = self.build(&path, &opts).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -2032,11 +2103,21 @@ impl Actor for MesonBuildModule {
                 let _ = reply_to.send(self.test(&path, &opts, platform.as_deref()).await);
             }
 
-            BuildModuleMessage::Clean { path, platform, reply_to, .. } => {
+            BuildModuleMessage::Clean {
+                path,
+                platform,
+                reply_to,
+                ..
+            } => {
                 let _ = reply_to.send(self.clean(&path, platform.as_deref()).await);
             }
 
-            BuildModuleMessage::Lint { path, platform, reply_to, .. } => {
+            BuildModuleMessage::Lint {
+                path,
+                platform,
+                reply_to,
+                ..
+            } => {
                 let _ = reply_to.send(self.lint(&path, platform.as_deref()).await);
             }
 
@@ -2142,7 +2223,11 @@ impl Actor for MesonBuildModule {
             } => {
                 let result = self.fix(&path).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished fix {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -2183,8 +2268,7 @@ impl Actor for MesonBuildModule {
                 embedded: _,
                 reply_to,
             } => {
-                let result =
-                    self.scaffold_layout(&project_name, &goal, &platforms, structure);
+                let result = self.scaffold_layout(&project_name, &goal, &platforms, structure);
                 let _ = reply_to.send(result);
             }
 
@@ -2209,9 +2293,7 @@ mod tests {
         std::fs::create_dir_all(tmp.join("rock3c")).unwrap();
         std::fs::File::create(tmp.join("meson.build"))
             .unwrap()
-            .write_all(
-                b"project('ai-traps', 'cpp')\nsubdir('rpi5')\nsubdir('rock3c')\n",
-            )
+            .write_all(b"project('ai-traps', 'cpp')\nsubdir('rpi5')\nsubdir('rock3c')\n")
             .unwrap();
         std::fs::File::create(tmp.join("rpi5/meson.build"))
             .unwrap()
@@ -2317,7 +2399,9 @@ mod tests {
             "-target and its triple must stay paired: {flags:?}"
         );
         assert!(
-            flags.iter().any(|f| f == "--sysroot=/opt/cross/sysroot/rpi5"),
+            flags
+                .iter()
+                .any(|f| f == "--sysroot=/opt/cross/sysroot/rpi5"),
             "--sysroot must be kept: {flags:?}"
         );
         assert!(
@@ -2329,7 +2413,10 @@ mod tests {
             "defines kept: {flags:?}"
         );
         // Output/source args must NOT leak into the analyzer command line.
-        assert!(!flags.iter().any(|f| f == "-c"), "-c must be dropped: {flags:?}");
+        assert!(
+            !flags.iter().any(|f| f == "-c"),
+            "-c must be dropped: {flags:?}"
+        );
         assert!(
             !flags.iter().any(|f| f.ends_with("main.cpp")),
             "the source file must not appear as a flag: {flags:?}"
@@ -2398,7 +2485,11 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked > 0, "no cross-compile entries found in {}", db.display());
+        assert!(
+            checked > 0,
+            "no cross-compile entries found in {}",
+            db.display()
+        );
     }
 
     /// Opt-in END-TO-END guard for the user-facing symptom: `Verify` on rpi5
@@ -2451,7 +2542,10 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
-        assert!(stray.is_empty(), "analyzer left reports in the project: {stray:?}");
+        assert!(
+            stray.is_empty(),
+            "analyzer left reports in the project: {stray:?}"
+        );
     }
 
     /// Opt-in END-TO-END guard for the path the UI's Verify/Lint buttons really
@@ -2518,10 +2612,12 @@ mod tests {
     #[test]
     fn analyzer_writes_no_plist_into_the_project() {
         let m = MesonBuildModule::new();
-        let db: CompileDb =
-            [("a.cpp".to_string(), (vec!["-DA=1".to_string()], "c++".to_string()))]
-                .into_iter()
-                .collect();
+        let db: CompileDb = [(
+            "a.cpp".to_string(),
+            (vec!["-DA=1".to_string()], "c++".to_string()),
+        )]
+        .into_iter()
+        .collect();
         let (_program, args) = m.analyzer_for_file("a.cpp", &db, std::path::Path::new("/tmp"));
 
         let pos = args
@@ -2533,8 +2629,14 @@ mod tests {
             "/dev/null",
             "the analysis report must be discarded: {args:?}"
         );
-        assert!(args.iter().any(|a| a == "--analyze"), "still analyzing: {args:?}");
-        assert!(args.iter().any(|a| a == "a.cpp"), "source still analysed: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "--analyze"),
+            "still analyzing: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "a.cpp"),
+            "source still analysed: {args:?}"
+        );
     }
 
     /// A per-platform lint must analyse only that build's translation units.
@@ -2568,7 +2670,11 @@ mod tests {
 
         // Without a platform we use one build's DB, never the union.
         let (_, _, all) = m.lint_scope(root, None);
-        assert_eq!(all.len(), 1, "no platform → the single DB we found: {all:?}");
+        assert_eq!(
+            all.len(),
+            1,
+            "no platform → the single DB we found: {all:?}"
+        );
     }
 
     /// Opt-in: the scope behind the UI's Verify button must contain ONLY the
@@ -2625,7 +2731,10 @@ mod tests {
             names.iter().any(|n| n == "main.cpp"),
             "own sources must be kept: {names:?}"
         );
-        assert!(!names.iter().any(|n| n == "lib.c"), "vendor/ must be skipped: {names:?}");
+        assert!(
+            !names.iter().any(|n| n == "lib.c"),
+            "vendor/ must be skipped: {names:?}"
+        );
         assert!(
             !names.iter().any(|n| n == "other.c"),
             "third_party/ must be skipped: {names:?}"
@@ -2650,7 +2759,10 @@ mod tests {
 
         let result = MesonBuildModule::new().fix(root).await;
 
-        assert!(result.is_err(), "fix() must fail rather than reformat: {result:?}");
+        assert!(
+            result.is_err(),
+            "fix() must fail rather than reformat: {result:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&src).unwrap(),
             original,
@@ -2697,9 +2809,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("rock3c")).unwrap();
         std::fs::File::create(tmp.path().join("meson.build"))
             .unwrap()
-            .write_all(
-                b"project('ai-traps', 'cpp')\nsubdir('rpi5')\nsubdir('rock3c')\n",
-            )
+            .write_all(b"project('ai-traps', 'cpp')\nsubdir('rpi5')\nsubdir('rock3c')\n")
             .unwrap();
 
         // rpi5 platform: shared core deps + libcamera/tflite/edgetpu.
@@ -2743,11 +2853,7 @@ mod tests {
             .iter()
             .find(|t| t.name == "ai-trap-rpi5")
             .expect("ai-trap-rpi5 target");
-        let rpi5_deps: Vec<&str> = rpi5
-            .dependencies
-            .iter()
-            .map(|d| d.name.as_str())
-            .collect();
+        let rpi5_deps: Vec<&str> = rpi5.dependencies.iter().map(|d| d.name.as_str()).collect();
         assert!(
             rpi5_deps.contains(&"libcamera"),
             "rpi5 missing libcamera — got {rpi5_deps:?}"
@@ -2806,9 +2912,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("rpi5/hal")).unwrap();
         std::fs::File::create(tmp.path().join("meson.build"))
             .unwrap()
-            .write_all(
-                b"project('ai-traps', 'cpp')\nsubdir('toolkit')\nsubdir('rpi5')\n",
-            )
+            .write_all(b"project('ai-traps', 'cpp')\nsubdir('toolkit')\nsubdir('rpi5')\n")
             .unwrap();
         std::fs::File::create(tmp.path().join("toolkit/meson.build"))
             .unwrap()
@@ -2836,17 +2940,20 @@ mod tests {
             .find(|t| t.name == "ai-trap-rpi5")
             .expect("ai-trap-rpi5 target");
         assert!(
-            rpi5.source_files.contains(&"hal/camera_hal_rpi5.cpp".to_string()),
+            rpi5.source_files
+                .contains(&"hal/camera_hal_rpi5.cpp".to_string()),
             "missing camera_hal_rpi5.cpp — got {:?}",
             rpi5.source_files
         );
         assert!(
-            rpi5.source_files.contains(&"hal/h264_encoder_rpi5.cpp".to_string()),
+            rpi5.source_files
+                .contains(&"hal/h264_encoder_rpi5.cpp".to_string()),
             "missing h264_encoder_rpi5.cpp — got {:?}",
             rpi5.source_files
         );
         assert!(
-            rpi5.source_files.contains(&"src/actors/camera/camera_actor.cpp".to_string()),
+            rpi5.source_files
+                .contains(&"src/actors/camera/camera_actor.cpp".to_string()),
             "missing shared toolkit source — got {:?}",
             rpi5.source_files
         );
@@ -2885,24 +2992,40 @@ mod tests {
         )
         .unwrap();
         // Shared toolkit source.
-        std::fs::File::create(root.join("toolkit/meson.build")).unwrap().write_all(
-            b"toolkit_sources = files('src/pipeline/base.cpp')\n",
-        ).unwrap();
+        std::fs::File::create(root.join("toolkit/meson.build"))
+            .unwrap()
+            .write_all(b"toolkit_sources = files('src/pipeline/base.cpp')\n")
+            .unwrap();
         // hal/meson.build: variables only — per-platform implementation file
         // lists (paths relative to the hal/ dir, i.e. implementations/<plat>/…).
-        std::fs::File::create(root.join("hal/meson.build")).unwrap().write_all(
-            b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n\
+        std::fs::File::create(root.join("hal/meson.build"))
+            .unwrap()
+            .write_all(
+                b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n\
               hal_impl_rock3c_sources = files('implementations/rock3c/camera_hal_ov5647.cpp',\n\
                                                'implementations/rock3c/h264_encoder_mpp.cpp')\n",
-        ).unwrap();
+            )
+            .unwrap();
         // rpi5 platform: implements camera_hal only (h264_encoder missing).
-        std::fs::write(root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"), "").unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"),
+            "",
+        )
+        .unwrap();
         std::fs::File::create(root.join("rpi5/meson.build")).unwrap().write_all(
             b"executable('ai-trap-rpi5', 'main.cpp' + hal_impl_rpi5_sources + toolkit_sources)\n",
         ).unwrap();
         // rock3c platform: implements camera_hal + h264_encoder.
-        std::fs::write(root.join("hal/implementations/rock3c/camera_hal_ov5647.cpp"), "").unwrap();
-        std::fs::write(root.join("hal/implementations/rock3c/h264_encoder_mpp.cpp"), "").unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rock3c/camera_hal_ov5647.cpp"),
+            "",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rock3c/h264_encoder_mpp.cpp"),
+            "",
+        )
+        .unwrap();
         std::fs::File::create(root.join("rock3c/meson.build")).unwrap().write_all(
             b"executable('ai-trap-rock3c', 'main.cpp' + hal_impl_rock3c_sources + toolkit_sources)\n",
         ).unwrap();
@@ -2910,34 +3033,65 @@ mod tests {
         let meta = MesonBuildModule::new().analyze(root).unwrap();
 
         // HAL interfaces discovered from hal/api.
-        let names: Vec<&str> = meta.hal_interfaces.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = meta
+            .hal_interfaces
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
         assert!(names.contains(&"camera_hal"), "interfaces: {names:?}");
         assert!(names.contains(&"h264_encoder"), "interfaces: {names:?}");
 
         // Implementation mapping by stem.
-        let camera = meta.hal_interfaces.iter().find(|i| i.name == "camera_hal").unwrap();
-        let h264 = meta.hal_interfaces.iter().find(|i| i.name == "h264_encoder").unwrap();
-        assert!(camera.implementations.contains(&"rpi5".to_string()), "camera impls: {:?}", camera.implementations);
+        let camera = meta
+            .hal_interfaces
+            .iter()
+            .find(|i| i.name == "camera_hal")
+            .unwrap();
+        let h264 = meta
+            .hal_interfaces
+            .iter()
+            .find(|i| i.name == "h264_encoder")
+            .unwrap();
+        assert!(
+            camera.implementations.contains(&"rpi5".to_string()),
+            "camera impls: {:?}",
+            camera.implementations
+        );
         assert!(camera.implementations.contains(&"rock3c".to_string()));
         assert!(h264.implementations.contains(&"rock3c".to_string()));
         assert!(!h264.implementations.contains(&"rpi5".to_string()));
 
         // Missing implementation diagnostic for rpi5 on h264_encoder.
-        let missing: Vec<&str> = meta.issues.iter().filter(|i| i.kind == "missing_implementation").map(|i| i.message.as_str()).collect();
+        let missing: Vec<&str> = meta
+            .issues
+            .iter()
+            .filter(|i| i.kind == "missing_implementation")
+            .map(|i| i.message.as_str())
+            .collect();
         assert!(
-            missing.iter().any(|m| m.contains("h264_encoder") && m.contains("rpi5")),
+            missing
+                .iter()
+                .any(|m| m.contains("h264_encoder") && m.contains("rpi5")),
             "expected rpi5 missing h264_encoder, got: {missing:?}"
         );
 
         // Source-unit classification: rpi5 target has App + HalImplementation
         // (its hal/ file) + Shared toolkit.
-        let rpi5 = meta.targets.iter().find(|t| t.name == "ai-trap-rpi5").unwrap();
-        let roles: Vec<&str> = rpi5.source_units.iter().map(|u| match u.role {
-            spire_core::build_types::SourceRole::App => "app",
-            spire_core::build_types::SourceRole::HalImplementation => "hal_implementation",
-            spire_core::build_types::SourceRole::Shared => "shared",
-            _ => "other",
-        }).collect();
+        let rpi5 = meta
+            .targets
+            .iter()
+            .find(|t| t.name == "ai-trap-rpi5")
+            .unwrap();
+        let roles: Vec<&str> = rpi5
+            .source_units
+            .iter()
+            .map(|u| match u.role {
+                spire_core::build_types::SourceRole::App => "app",
+                spire_core::build_types::SourceRole::HalImplementation => "hal_implementation",
+                spire_core::build_types::SourceRole::Shared => "shared",
+                _ => "other",
+            })
+            .collect();
         assert!(roles.contains(&"app"), "roles: {roles:?}");
         assert!(roles.contains(&"hal_implementation"), "roles: {roles:?}");
         assert!(roles.contains(&"shared"), "roles: {roles:?}");
@@ -2952,27 +3106,34 @@ mod tests {
         std::fs::create_dir_all(root.join("rpi5")).unwrap();
         std::fs::create_dir_all(root.join("toolkit/src/hal/api")).unwrap();
         std::fs::create_dir_all(root.join("rpi5/hal")).unwrap();
-        std::fs::File::create(root.join("meson.build")).unwrap().write_all(
-            b"project('ai-traps', 'cpp')\nsubdir('toolkit')\nsubdir('rpi5')\n",
-        ).unwrap();
+        std::fs::File::create(root.join("meson.build"))
+            .unwrap()
+            .write_all(b"project('ai-traps', 'cpp')\nsubdir('toolkit')\nsubdir('rpi5')\n")
+            .unwrap();
         std::fs::write(
             root.join("toolkit/src/hal/api/camera_hal.hpp"),
             "class CameraHAL {\npublic:\n    virtual bool start() = 0;\n};\n",
         )
         .unwrap();
         std::fs::write(root.join("rpi5/hal/camera_hal_imx219.cpp"), "").unwrap();
-        std::fs::File::create(root.join("toolkit/meson.build")).unwrap().write_all(
-            b"toolkit_sources = files('src/pipeline/base.cpp')\n",
-        ).unwrap();
-        std::fs::File::create(root.join("rpi5/meson.build")).unwrap().write_all(
-            b"cam = files('hal/camera_hal_imx219.cpp')\n\
+        std::fs::File::create(root.join("toolkit/meson.build"))
+            .unwrap()
+            .write_all(b"toolkit_sources = files('src/pipeline/base.cpp')\n")
+            .unwrap();
+        std::fs::File::create(root.join("rpi5/meson.build"))
+            .unwrap()
+            .write_all(
+                b"cam = files('hal/camera_hal_imx219.cpp')\n\
               executable('ai-trap-rpi5', 'main.cpp' + cam + toolkit_sources)\n",
-        ).unwrap();
+            )
+            .unwrap();
 
         let meta = MesonBuildModule::new().analyze(root).unwrap();
         assert_eq!(meta.hal_interfaces.len(), 1);
         assert_eq!(meta.hal_interfaces[0].name, "camera_hal");
-        assert!(meta.hal_interfaces[0].implementations.contains(&"rpi5".to_string()));
+        assert!(meta.hal_interfaces[0]
+            .implementations
+            .contains(&"rpi5".to_string()));
     }
 
     /// Run the real analyzer + HAL sanity check against the ai-traps project
@@ -2987,18 +3148,37 @@ mod tests {
             return;
         };
         let root = std::path::PathBuf::from(root);
-        assert!(root.join("meson.build").exists(), "ai-traps meson.build missing at {root:?}");
-        assert!(root.join("hal/meson.build").exists(), "hal/meson.build missing at {root:?}");
+        assert!(
+            root.join("meson.build").exists(),
+            "ai-traps meson.build missing at {root:?}"
+        );
+        assert!(
+            root.join("hal/meson.build").exists(),
+            "hal/meson.build missing at {root:?}"
+        );
 
         // ── 1. Analyzer HAL interface discovery ──────────────────────────
         let meta = MesonBuildModule::new().analyze(&root).unwrap();
-        let names: Vec<&str> = meta.hal_interfaces.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = meta
+            .hal_interfaces
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
         // Non-contract headers (types, frame_buffer) must NOT be interfaces.
         assert!(names.contains(&"camera_hal"), "interfaces: {names:?}");
         assert!(names.contains(&"h264_encoder"), "interfaces: {names:?}");
-        assert!(!names.contains(&"types"), "types.hpp is not a contract: {names:?}");
-        assert!(!names.contains(&"frame_buffer"), "frame_buffer.hpp is not a contract: {names:?}");
-        assert!(!names.contains(&"config_loader"), "config_loader.hpp is not a contract: {names:?}");
+        assert!(
+            !names.contains(&"types"),
+            "types.hpp is not a contract: {names:?}"
+        );
+        assert!(
+            !names.contains(&"frame_buffer"),
+            "frame_buffer.hpp is not a contract: {names:?}"
+        );
+        assert!(
+            !names.contains(&"config_loader"),
+            "config_loader.hpp is not a contract: {names:?}"
+        );
 
         // Both platform targets resolved with HAL impl source units.
         let targets: Vec<&str> = meta.targets.iter().map(|t| t.name.as_str()).collect();
@@ -3032,7 +3212,6 @@ mod tests {
             "spurious h264_encoder/rock3c missing method issue: {missing_msgs:?}"
         );
 
-
         // Platform DOMAINS list their app dir + HAL impl dir, so the UI shows
         // main.cpp / platform pipeline files in Sources (regression: app_sources
         // was misclassified as shared, dropping the <plat>/ dir). App target
@@ -3042,14 +3221,25 @@ mod tests {
                 .domains
                 .iter()
                 .find(|d| d.id == plat)
-                .unwrap_or_else(|| panic!("missing platform domain {plat}: {:?}", meta.domains.iter().map(|d| d.id.as_str()).collect::<Vec<_>>()));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing platform domain {plat}: {:?}",
+                        meta.domains
+                            .iter()
+                            .map(|d| d.id.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                });
             assert!(
                 domain.files.iter().any(|f| f == plat),
                 "{plat} domain must list the app dir: {:?}",
                 domain.files
             );
             assert!(
-                domain.files.iter().any(|f| f == &format!("hal/implementations/{plat}")),
+                domain
+                    .files
+                    .iter()
+                    .any(|f| f == &format!("hal/implementations/{plat}")),
                 "{plat} domain must list the HAL impl dir: {:?}",
                 domain.files
             );
@@ -3057,7 +3247,11 @@ mod tests {
 
         // ── 2. Migration/sanity: the cleaned project is canonical ────────
         let report = crate::build::hal_migration::hal_sanity_check(&root);
-        assert_eq!(report.layout, "canonical", "layout after cleanup: {:?}", report.issues);
+        assert_eq!(
+            report.layout, "canonical",
+            "layout after cleanup: {:?}",
+            report.issues
+        );
         // Pure-data headers (types.hpp, frame_buffer.hpp) must NOT be flagged —
         // this is the bug the user reported.
         assert_eq!(
@@ -3076,7 +3270,11 @@ mod tests {
         let plan = crate::build::hal_migration::migrate_hal_plan(&root).unwrap();
         assert_eq!(plan.layout_name, "canonical", "expected no-op plan");
         assert!(!plan.can_apply, "canonical project must not be migratable");
-        assert!(plan.moves.is_empty(), "no file moves expected: {:?}", plan.moves);
+        assert!(
+            plan.moves.is_empty(),
+            "no file moves expected: {:?}",
+            plan.moves
+        );
     }
 
     /// Plain Meson projects without a hal/ layout produce no HAL interfaces
@@ -3085,9 +3283,10 @@ mod tests {
     fn analyze_no_hal_on_plain_meson_project() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::File::create(root.join("meson.build")).unwrap().write_all(
-            b"project('plain', 'cpp')\nexecutable('plain', 'main.cpp')\n",
-        ).unwrap();
+        std::fs::File::create(root.join("meson.build"))
+            .unwrap()
+            .write_all(b"project('plain', 'cpp')\nexecutable('plain', 'main.cpp')\n")
+            .unwrap();
         let meta = MesonBuildModule::new().analyze(root).unwrap();
         assert!(meta.hal_interfaces.is_empty());
         assert!(meta.issues.is_empty());
@@ -3114,31 +3313,52 @@ mod tests {
         std::fs::write(
             root.join("hal/api/camera_hal.hpp"),
             "class CameraHAL {\npublic:\n    virtual bool start() = 0;\n};\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             root.join("hal/api/h264_encoder.hpp"),
             "class H264Encoder {\npublic:\n    virtual bool encode() = 0;\n};\n",
-        ).unwrap();
-        std::fs::File::create(root.join("toolkit/meson.build")).unwrap().write_all(
-            b"toolkit_sources = files('src/pipeline/base.cpp')\n",
-        ).unwrap();
-        std::fs::File::create(root.join("hal/meson.build")).unwrap().write_all(
-            b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n\
+        )
+        .unwrap();
+        std::fs::File::create(root.join("toolkit/meson.build"))
+            .unwrap()
+            .write_all(b"toolkit_sources = files('src/pipeline/base.cpp')\n")
+            .unwrap();
+        std::fs::File::create(root.join("hal/meson.build"))
+            .unwrap()
+            .write_all(
+                b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n\
               hal_impl_rock3c_sources = files('implementations/rock3c/camera_hal_ov5647.cpp',\n\
                                                'implementations/rock3c/h264_encoder_mpp.cpp')\n",
-        ).unwrap();
-        std::fs::write(root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"), "").unwrap();
-        std::fs::write(root.join("hal/implementations/rock3c/camera_hal_ov5647.cpp"), "").unwrap();
-        std::fs::write(root.join("hal/implementations/rock3c/h264_encoder_mpp.cpp"), "").unwrap();
+            )
+            .unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"),
+            "",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rock3c/camera_hal_ov5647.cpp"),
+            "",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rock3c/h264_encoder_mpp.cpp"),
+            "",
+        )
+        .unwrap();
         // Per-target deps: rpi5 libcamera, rock3c rknn — plus shared yaml-cpp.
-        std::fs::File::create(root.join("rpi5/meson.build")).unwrap().write_all(
-            b"yaml_cpp_dep = dependency('yaml-cpp', required: false)\n\
+        std::fs::File::create(root.join("rpi5/meson.build"))
+            .unwrap()
+            .write_all(
+                b"yaml_cpp_dep = dependency('yaml-cpp', required: false)\n\
               libcamera_dep = dependency('libcamera', required: true)\n\
               core_deps = [yaml_cpp_dep]\n\
               platform_deps = [libcamera_dep]\n\
               executable('ai-trap-rpi5', 'main.cpp' + hal_impl_rpi5_sources + toolkit_sources,\n\
                 dependencies: core_deps + platform_deps)\n",
-        ).unwrap();
+            )
+            .unwrap();
         std::fs::File::create(root.join("rock3c/meson.build")).unwrap().write_all(
             b"yaml_cpp_dep = dependency('yaml-cpp', required: false)\n\
               rknn_dep = cpp.find_library('rknnrt', required: true)\n\
@@ -3149,7 +3369,10 @@ mod tests {
         ).unwrap();
 
         let meta = MesonBuildModule::new().analyze(root).unwrap();
-        assert_eq!(meta.structure, spire_core::build_types::ProjectStructure::Hal);
+        assert_eq!(
+            meta.structure,
+            spire_core::build_types::ProjectStructure::Hal
+        );
         let ids: Vec<&str> = meta.domains.iter().map(|d| d.id.as_str()).collect();
         assert!(ids.contains(&"common"), "domains: {ids:?}");
         assert!(ids.contains(&"rpi5"), "domains: {ids:?}");
@@ -3157,10 +3380,22 @@ mod tests {
 
         let common = meta.domains.iter().find(|d| d.id == "common").unwrap();
         // Contracts are part of the common domain.
-        assert!(common.contracts.iter().any(|c| c.contains("camera_hal")), "contracts: {:?}", common.contracts);
-        assert!(common.contracts.iter().any(|c| c.contains("h264_encoder")), "contracts: {:?}", common.contracts);
+        assert!(
+            common.contracts.iter().any(|c| c.contains("camera_hal")),
+            "contracts: {:?}",
+            common.contracts
+        );
+        assert!(
+            common.contracts.iter().any(|c| c.contains("h264_encoder")),
+            "contracts: {:?}",
+            common.contracts
+        );
         // Shared toolkit path is in common files.
-        assert!(common.files.iter().any(|f| f == "toolkit"), "common files: {:?}", common.files);
+        assert!(
+            common.files.iter().any(|f| f == "toolkit"),
+            "common files: {:?}",
+            common.files
+        );
         // `common` owns NO dependencies — deps are per-platform only.
         assert!(
             common.dependencies.is_empty(),
@@ -3188,8 +3423,14 @@ mod tests {
             rpi5.files
         );
         let rpi5_dep_names: Vec<&str> = rpi5.dependencies.iter().map(|d| d.name.as_str()).collect();
-        assert!(rpi5_dep_names.contains(&"libcamera"), "rpi5 deps: {rpi5_dep_names:?}");
-        assert!(!rpi5_dep_names.contains(&"rknnrt"), "rpi5 must not carry rock3c deps: {rpi5_dep_names:?}");
+        assert!(
+            rpi5_dep_names.contains(&"libcamera"),
+            "rpi5 deps: {rpi5_dep_names:?}"
+        );
+        assert!(
+            !rpi5_dep_names.contains(&"rknnrt"),
+            "rpi5 must not carry rock3c deps: {rpi5_dep_names:?}"
+        );
 
         let rock3c = meta.domains.iter().find(|d| d.id == "rock3c").unwrap();
         assert!(
@@ -3198,7 +3439,10 @@ mod tests {
             rock3c.files
         );
         assert!(
-            rock3c.files.iter().any(|f| f == "hal/implementations/rock3c"),
+            rock3c
+                .files
+                .iter()
+                .any(|f| f == "hal/implementations/rock3c"),
             "rock3c files must list the HAL impl dir: {:?}",
             rock3c.files
         );
@@ -3207,9 +3451,19 @@ mod tests {
             "rock3c must not carry toolkit files: {:?}",
             rock3c.files
         );
-        let rock3c_dep_names: Vec<&str> = rock3c.dependencies.iter().map(|d| d.name.as_str()).collect();
-        assert!(rock3c_dep_names.contains(&"rknnrt"), "rock3c deps: {rock3c_dep_names:?}");
-        assert!(!rock3c_dep_names.contains(&"libcamera"), "rock3c must not carry rpi5 deps: {rock3c_dep_names:?}");
+        let rock3c_dep_names: Vec<&str> = rock3c
+            .dependencies
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(
+            rock3c_dep_names.contains(&"rknnrt"),
+            "rock3c deps: {rock3c_dep_names:?}"
+        );
+        assert!(
+            !rock3c_dep_names.contains(&"libcamera"),
+            "rock3c must not carry rpi5 deps: {rock3c_dep_names:?}"
+        );
         // `common` is shared/editable (not read-only).
         assert_eq!(
             common.editability,
@@ -3233,57 +3487,83 @@ mod tests {
         std::fs::create_dir_all(root.join("hal/implementations/rpi5")).unwrap();
         std::fs::create_dir_all(root.join("toolkit")).unwrap();
         std::fs::create_dir_all(root.join("rpi5")).unwrap();
-        std::fs::File::create(root.join("meson.build")).unwrap().write_all(
-            b"project('ai-traps', 'cpp')\nsubdir('toolkit')\nsubdir('hal')\nsubdir('rpi5')\n",
-        ).unwrap();
+        std::fs::File::create(root.join("meson.build"))
+            .unwrap()
+            .write_all(
+                b"project('ai-traps', 'cpp')\nsubdir('toolkit')\nsubdir('hal')\nsubdir('rpi5')\n",
+            )
+            .unwrap();
         std::fs::write(
             root.join("hal/api/camera_hal.hpp"),
             "class CameraHAL {\npublic:\n    virtual bool start() = 0;\n};\n",
-        ).unwrap();
-        std::fs::write(root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"), "").unwrap();
-        std::fs::File::create(root.join("toolkit/meson.build")).unwrap().write_all(
-            b"toolkit_sources = files('src/pipeline/base.cpp')\n",
-        ).unwrap();
-        std::fs::File::create(root.join("hal/meson.build")).unwrap().write_all(
-            b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
-        ).unwrap();
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"),
+            "",
+        )
+        .unwrap();
+        std::fs::File::create(root.join("toolkit/meson.build"))
+            .unwrap()
+            .write_all(b"toolkit_sources = files('src/pipeline/base.cpp')\n")
+            .unwrap();
+        std::fs::File::create(root.join("hal/meson.build"))
+            .unwrap()
+            .write_all(
+                b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
+            )
+            .unwrap();
         // Real ai-traps shape: `app_sources` is platform-local (assigned in
         // THIS section), `rpi5_hal_sources` aliases the hal/ container var,
         // and the executable() mixes all three with `+`.
-        std::fs::File::create(root.join("rpi5/meson.build")).unwrap().write_all(
-            b"app_sources = files('main.cpp', 'rpi5_detection_pipeline.cpp')\n\
+        std::fs::File::create(root.join("rpi5/meson.build"))
+            .unwrap()
+            .write_all(
+                b"app_sources = files('main.cpp', 'rpi5_detection_pipeline.cpp')\n\
               rpi5_hal_sources = hal_impl_rpi5_sources\n\
               executable('ai-trap-rpi5', app_sources + rpi5_hal_sources + toolkit_sources)\n",
-        ).unwrap();
+            )
+            .unwrap();
         std::fs::write(root.join("rpi5/main.cpp"), "int main(){}\n").unwrap();
-        std::fs::write(root.join("rpi5/rpi5_detection_pipeline.cpp"), "// pipeline\n").unwrap();
+        std::fs::write(
+            root.join("rpi5/rpi5_detection_pipeline.cpp"),
+            "// pipeline\n",
+        )
+        .unwrap();
 
         let meta = MesonBuildModule::new().analyze(root).unwrap();
 
         // The ai-trap-rpi5 target carries its App sources…
-        let rpi5 = meta.targets.iter().find(|t| t.name == "ai-trap-rpi5").unwrap();
+        let rpi5 = meta
+            .targets
+            .iter()
+            .find(|t| t.name == "ai-trap-rpi5")
+            .unwrap();
         assert!(
             rpi5.source_files.contains(&"main.cpp".to_string()),
             "target source_files missing main.cpp: {:?}",
             rpi5.source_files
         );
         assert!(
-            rpi5.source_files.contains(&"rpi5_detection_pipeline.cpp".to_string()),
+            rpi5.source_files
+                .contains(&"rpi5_detection_pipeline.cpp".to_string()),
             "target source_files missing rpi5_detection_pipeline.cpp: {:?}",
             rpi5.source_files
         );
         // …and gets an App source unit (not Shared).
-        let app_unit = rpi5.source_units.iter().any(|u| {
-            u.role == spire_core::build_types::SourceRole::App
-        });
+        let app_unit = rpi5
+            .source_units
+            .iter()
+            .any(|u| u.role == spire_core::build_types::SourceRole::App);
         assert!(
             app_unit,
             "platform target must have an App source unit: {:?}",
             rpi5.source_units
         );
-        let shared_unit = rpi5.source_units.iter().any(|u| {
-            u.role == spire_core::build_types::SourceRole::Shared
-        });
+        let shared_unit = rpi5
+            .source_units
+            .iter()
+            .any(|u| u.role == spire_core::build_types::SourceRole::Shared);
         assert!(
             shared_unit,
             "platform target must still have a Shared toolkit unit: {:?}",
@@ -3334,18 +3614,21 @@ mod tests {
         let single = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(single.path().join("rpi5")).unwrap();
         std::fs::create_dir_all(single.path().join("rock3c")).unwrap();
-        std::fs::File::create(single.path().join("meson.build")).unwrap().write_all(
-            b"project('single', 'cpp')\nsubdir('rpi5')\nsubdir('rock3c')\n",
-        ).unwrap();
+        std::fs::File::create(single.path().join("meson.build"))
+            .unwrap()
+            .write_all(b"project('single', 'cpp')\nsubdir('rpi5')\nsubdir('rock3c')\n")
+            .unwrap();
         std::fs::File::create(single.path().join("meson_options.txt")).unwrap().write_all(
             b"option('platform', type: 'string', value: 'host',\n       description: 'Valid values: host, rpi5, rock3c')\n",
         ).unwrap();
-        std::fs::File::create(single.path().join("rpi5/meson.build")).unwrap().write_all(
-            b"executable('single-rpi5', 'main.cpp')\n",
-        ).unwrap();
-        std::fs::File::create(single.path().join("rock3c/meson.build")).unwrap().write_all(
-            b"executable('single-rock3c', 'main.cpp')\n",
-        ).unwrap();
+        std::fs::File::create(single.path().join("rpi5/meson.build"))
+            .unwrap()
+            .write_all(b"executable('single-rpi5', 'main.cpp')\n")
+            .unwrap();
+        std::fs::File::create(single.path().join("rock3c/meson.build"))
+            .unwrap()
+            .write_all(b"executable('single-rock3c', 'main.cpp')\n")
+            .unwrap();
         let meta = MesonBuildModule::new().analyze(single.path()).unwrap();
         assert_eq!(
             meta.structure,
@@ -3359,21 +3642,30 @@ mod tests {
         std::fs::create_dir_all(root.join("hal/api")).unwrap();
         std::fs::create_dir_all(root.join("hal/implementations/rpi5")).unwrap();
         std::fs::create_dir_all(root.join("rpi5")).unwrap();
-        std::fs::File::create(root.join("meson.build")).unwrap().write_all(
-            b"project('ai-traps', 'cpp')\nsubdir('hal')\nsubdir('rpi5')\n",
-        ).unwrap();
+        std::fs::File::create(root.join("meson.build"))
+            .unwrap()
+            .write_all(b"project('ai-traps', 'cpp')\nsubdir('hal')\nsubdir('rpi5')\n")
+            .unwrap();
         std::fs::write(
             root.join("hal/api/camera_hal.hpp"),
             "class CameraHAL {\npublic:\n    virtual bool start() = 0;\n};\n",
         )
         .unwrap();
-        std::fs::write(root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"), "").unwrap();
-        std::fs::File::create(root.join("hal/meson.build")).unwrap().write_all(
-            b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
-        ).unwrap();
-        std::fs::File::create(root.join("rpi5/meson.build")).unwrap().write_all(
-            b"executable('ai-trap-rpi5', 'main.cpp' + hal_impl_rpi5_sources)\n",
-        ).unwrap();
+        std::fs::write(
+            root.join("hal/implementations/rpi5/camera_hal_imx219.cpp"),
+            "",
+        )
+        .unwrap();
+        std::fs::File::create(root.join("hal/meson.build"))
+            .unwrap()
+            .write_all(
+                b"hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
+            )
+            .unwrap();
+        std::fs::File::create(root.join("rpi5/meson.build"))
+            .unwrap()
+            .write_all(b"executable('ai-trap-rpi5', 'main.cpp' + hal_impl_rpi5_sources)\n")
+            .unwrap();
         let meta = MesonBuildModule::new().analyze(root).unwrap();
         assert_eq!(
             meta.structure,
@@ -3427,16 +3719,24 @@ mod tests {
         std::fs::write(root.join("rpi5/main.cpp"), "int main(){}\n").unwrap();
         std::fs::File::create(root.join("rpi5/meson.build"))
             .unwrap()
-            .write_all(
-                b"executable('ai-trap-rpi5', 'main.cpp' + hal_impl_rpi5_sources)\n",
-            )
+            .write_all(b"executable('ai-trap-rpi5', 'main.cpp' + hal_impl_rpi5_sources)\n")
             .unwrap();
 
         let meta = MesonBuildModule::new().analyze(root).unwrap();
-        let names: Vec<&str> = meta.hal_interfaces.iter().map(|i| i.name.as_str()).collect();
+        let names: Vec<&str> = meta
+            .hal_interfaces
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect();
         assert_eq!(names, vec!["camera_hal"], "interfaces: {names:?}");
-        assert!(!names.contains(&"frame_buffer"), "frame_buffer is not a contract: {names:?}");
-        assert!(!names.contains(&"config_loader"), "config_loader is not a contract: {names:?}");
+        assert!(
+            !names.contains(&"frame_buffer"),
+            "frame_buffer is not a contract: {names:?}"
+        );
+        assert!(
+            !names.contains(&"config_loader"),
+            "config_loader is not a contract: {names:?}"
+        );
     }
 
     #[test]
@@ -3473,9 +3773,16 @@ mod tests {
         assert!(out.files.iter().any(|f| f.path == "rock3c/meson.build"));
         assert!(out.files.iter().any(|f| f.path == "rpi5/main.cpp"));
         assert!(out.files.iter().any(|f| f.path == "rock3c/main.cpp"));
-        assert_eq!(out.platform_targets, vec!["rpi5".to_string(), "rock3c".to_string()]);
+        assert_eq!(
+            out.platform_targets,
+            vec!["rpi5".to_string(), "rock3c".to_string()]
+        );
         // meson_options declares both platforms.
-        let opts = out.files.iter().find(|f| f.path == "meson_options.txt").unwrap();
+        let opts = out
+            .files
+            .iter()
+            .find(|f| f.path == "meson_options.txt")
+            .unwrap();
         assert!(opts.content.contains("rpi5"));
         assert!(opts.content.contains("rock3c"));
         // Root declares subdir('rpi5') + subdir('rock3c').
@@ -3505,9 +3812,18 @@ mod tests {
         }
         let meta = MesonBuildModule::new().analyze(tmp.path()).unwrap();
         let names: Vec<String> = meta.targets.iter().map(|t| t.name.clone()).collect();
-        assert!(names.contains(&"demo-rpi5".to_string()), "targets: {names:?}");
-        assert!(names.contains(&"demo-rock3c".to_string()), "targets: {names:?}");
-        assert_eq!(meta.platform_targets, vec!["rpi5".to_string(), "rock3c".to_string()]);
+        assert!(
+            names.contains(&"demo-rpi5".to_string()),
+            "targets: {names:?}"
+        );
+        assert!(
+            names.contains(&"demo-rock3c".to_string()),
+            "targets: {names:?}"
+        );
+        assert_eq!(
+            meta.platform_targets,
+            vec!["rpi5".to_string(), "rock3c".to_string()]
+        );
     }
 
     #[test]

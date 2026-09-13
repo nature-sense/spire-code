@@ -11,13 +11,13 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
-use tokio::process::Command;
 use tokio::io::AsyncBufReadExt;
+use tokio::process::Command;
 
 use super::generic_helpers::sha256_hex;
 use super::{
-    parse_with_tree_sitter, rust_language_config, AstParseResult, BuildModuleMessage,
-    BuildOptions, BuildOutput, McpServerDependency, ModuleCapability, TestOptions,
+    parse_with_tree_sitter, rust_language_config, AstParseResult, BuildModuleMessage, BuildOptions,
+    BuildOutput, McpServerDependency, ModuleCapability, TestOptions,
 };
 use crate::Actor;
 
@@ -117,16 +117,15 @@ impl CargoBuildModule {
                 // Extract version from inline table: { version = "1.2", ... }
                 //  or plain string: "1.2"
                 let version_req = if rhs.starts_with('{') {
-                    let version_here = rhs.find("version")
+                    let version_here = rhs
+                        .find("version")
                         .and_then(|vi| {
                             let after = &rhs[vi..];
                             after.find('=').map(|ei| &after[ei + 1..])
                         })
                         .map(|v| v.trim().trim_start_matches(['"', '\'']))
                         .map(|v| {
-                            let end = v
-                                .find(['"', '\'', ',', '}'])
-                                .unwrap_or(v.len());
+                            let end = v.find(['"', '\'', ',', '}']).unwrap_or(v.len());
                             v[..end].trim().to_string()
                         })
                         .filter(|s| !s.is_empty());
@@ -188,8 +187,7 @@ impl CargoBuildModule {
                     }
                     continue;
                 }
-                if trimmed.starts_with('"') && trimmed.ends_with('"') && !trimmed.ends_with(']')
-                {
+                if trimmed.starts_with('"') && trimmed.ends_with('"') && !trimmed.ends_with(']') {
                     // multi-line member list: "dir",
                     let item = trimmed.trim_matches('"').trim();
                     if !item.is_empty() && !item.contains('[') {
@@ -251,9 +249,7 @@ impl CargoBuildModule {
                     }
                 }
                 if name.is_none() {
-                    name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string());
+                    name = path.file_name().map(|n| n.to_string_lossy().to_string());
                 }
                 let mut per_platform: Vec<spire_core::build_types::BuildTarget> = Vec::new();
                 for p in &platform_members {
@@ -479,9 +475,7 @@ impl CargoBuildModule {
             project_name: name,
             description,
             version,
-            project_type: if structure
-                == spire_core::build_types::ProjectStructure::SpireApp
-            {
+            project_type: if structure == spire_core::build_types::ProjectStructure::SpireApp {
                 "spire_app".to_string()
             } else if is_workspace {
                 "rust_workspace".to_string()
@@ -521,7 +515,9 @@ impl CargoBuildModule {
         let Some(spec) = crate::platform::CrossSpec::for_platform(plat) else {
             return Ok(());
         };
-        let Some(toml) = spec.cargo_config else { return Ok(()); };
+        let Some(toml) = spec.cargo_config else {
+            return Ok(());
+        };
         // Sanity gate: fail fast when the target's sysroot is missing or
         // unpopulated instead of writing a `.cargo/config.toml` whose
         // `--sysroot` points at a nonexistent directory.
@@ -537,8 +533,7 @@ impl CargoBuildModule {
             }
         }
         let dir = path.join(".cargo");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("Failed to create .cargo: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create .cargo: {e}"))?;
         std::fs::write(dir.join("config.toml"), toml)
             .map_err(|e| format!("Failed to write .cargo/config.toml: {e}"))
     }
@@ -694,7 +689,10 @@ impl CargoBuildModule {
             all_err
         });
 
-        let status = child.wait().await.map_err(|e| format!("cargo wait failed: {e}"))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("cargo wait failed: {e}"))?;
         let (out, err) = tokio::join!(stdout_task, stderr_task);
         let stdout = out.map_err(|e| e.to_string())?;
         let stderr = err.map_err(|e| e.to_string())?;
@@ -787,9 +785,7 @@ fn find_workspace_versions(path: &Path) -> std::collections::HashMap<String, Str
                                 })
                                 .map(|v| v.trim().trim_start_matches(['"', '\'']))
                                 .map(|v| {
-                                    let end = v
-                                        .find(['"', '\'', ',', '}'])
-                                        .unwrap_or(v.len());
+                                    let end = v.find(['"', '\'', ',', '}']).unwrap_or(v.len());
                                     v[..end].trim().to_string()
                                 })
                                 .filter(|s| !s.is_empty())
@@ -898,7 +894,11 @@ impl BuildLineParser {
             let ev = self.flush();
             // Lint drivers promote warnings to errors with `-D warnings`;
             // render those as warnings in the UI.
-            self.block_level = if self.is_lint { Some("warning") } else { Some("error") };
+            self.block_level = if self.is_lint {
+                Some("warning")
+            } else {
+                Some("error")
+            };
             self.block_message = Some(msg);
             self.block_lines.push(line.to_string());
             return ev;
@@ -910,7 +910,10 @@ impl BuildLineParser {
             if let Some(path_part) = trimmed.strip_prefix("-->") {
                 let loc = path_part.trim();
                 self.block_file = loc.split(':').next().map(|s| s.to_string());
-                self.block_line_number = loc.split(':').nth(1).and_then(|ln| ln.trim().parse::<u32>().ok());
+                self.block_line_number = loc
+                    .split(':')
+                    .nth(1)
+                    .and_then(|ln| ln.trim().parse::<u32>().ok());
             }
             // Code-context / continuation lines belong to the block.
             let is_context = trimmed.contains("-->")
@@ -990,7 +993,6 @@ impl Default for CargoBuildModule {
 #[async_trait]
 impl Actor for CargoBuildModule {
     type Message = BuildModuleMessage;
-
 
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
@@ -1095,13 +1097,8 @@ impl Actor for CargoBuildModule {
                     }
                     None => {
                         let _ = self.write_cargo_config(&path, opts.platform.as_deref());
-                        self.run_cargo_streaming(
-                            &path,
-                            &build_args(&opts),
-                            &event_tx,
-                            false,
-                        )
-                        .await
+                        self.run_cargo_streaming(&path, &build_args(&opts), &event_tx, false)
+                            .await
                     }
                 };
                 let _ = reply_to.send(result);
@@ -1294,11 +1291,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-"#.replace("__P__", project_name);
+"#
+            .replace("__P__", project_name);
             let sc = r#"fn main() {
     println!("Hello from __P__!");
 }
-"#.replace("__P__", project_name);
+"#
+            .replace("__P__", project_name);
             return Ok(super::ScaffoldOutput {
                 build_file: "Cargo.toml".to_string(),
                 build_content: bc,
@@ -1336,9 +1335,7 @@ edition = "2021"
         // not a lib stub: an MCP server is an executable crate.
         files.push(super::ScaffoldFile {
             path: "src/main.rs".to_string(),
-            content: format!(
-                "fn main() {{\n    println!(\"Hello from {project_name}!\");\n}}\n"
-            ),
+            content: format!("fn main() {{\n    println!(\"Hello from {project_name}!\");\n}}\n"),
             // Source stub — the LLM may fill it.
             structural: false,
             ..Default::default()
@@ -1364,10 +1361,7 @@ edition = "2021"
                 }
             }
         }
-        build_rs.insert_str(
-            0,
-            "use std::env;\n\n",
-        );
+        build_rs.insert_str(0, "use std::env;\n\n");
         build_rs.push_str("// TODO: add cargo:rustc-link-lib=... for device libraries\n");
         files.push(super::ScaffoldFile {
             path: "build.rs".to_string(),
@@ -1488,7 +1482,9 @@ edition = "2021"
             }
             "check" => {
                 let path = get("path");
-                let out = self.run_cargo(Path::new(&path), &["check".to_string()]).await?;
+                let out = self
+                    .run_cargo(Path::new(&path), &["check".to_string()])
+                    .await?;
                 Ok(serde_json::to_value(out).unwrap_or(serde_json::json!({"error": "serialize"})))
             }
             "add_dependency" | "declare_dependencies" => {
@@ -1514,17 +1510,16 @@ edition = "2021"
                     .map(|c| c.contains("[workspace]"))
                     .unwrap_or(false);
                 let mut added = Vec::new();
-                let deps: Vec<serde_json::Value> = if let Some(arr) =
-                    args.get("dependencies").and_then(|v| v.as_array())
-                {
-                    arr.clone()
-                } else {
-                    args.get("crate")
-                        .and_then(|v| v.as_str())
-                        .map(|s| serde_json::json!({ "name": s }))
-                        .into_iter()
-                        .collect()
-                };
+                let deps: Vec<serde_json::Value> =
+                    if let Some(arr) = args.get("dependencies").and_then(|v| v.as_array()) {
+                        arr.clone()
+                    } else {
+                        args.get("crate")
+                            .and_then(|v| v.as_str())
+                            .map(|s| serde_json::json!({ "name": s }))
+                            .into_iter()
+                            .collect()
+                    };
                 if deps.is_empty() {
                     return Err("declare_dependencies: 'dependencies' (array of {name,version,features}) is required".to_string());
                 }
@@ -1565,10 +1560,7 @@ edition = "2021"
                         }
                     }
                     let out = self
-                        .run_cargo(
-                            manifest_path.parent().unwrap_or(Path::new(".")),
-                            &args_vec,
-                        )
+                        .run_cargo(manifest_path.parent().unwrap_or(Path::new(".")), &args_vec)
                         .await?;
                     if !out.success {
                         return Err(format!("cargo add {crate_name} failed: {}", out.output));
@@ -1613,7 +1605,12 @@ edition = "2021"
     /// and executed directly (no external MCP process needed).
     fn call_tool(tool_name: &str, args: &serde_json::Value) -> Result<serde_json::Value, String> {
         const UA: &str = "spire-crates-mcp/0.1 (spire)";
-        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let get = |k: &str| {
+            args.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
 
         let run = |url: &str| -> Result<serde_json::Value, String> {
             reqwest::blocking::Client::builder()
@@ -1630,7 +1627,10 @@ edition = "2021"
         let result: Result<serde_json::Value, String> = match tool_name {
             "search_crates" => {
                 let q = get("query");
-                run(&format!("https://crates.io/api/v1/crates?q={}&per_page=5", q))
+                run(&format!(
+                    "https://crates.io/api/v1/crates?q={}&per_page=5",
+                    q
+                ))
             }
             "get_crate_info" => {
                 let n = get("name");
@@ -1656,12 +1656,18 @@ edition = "2021"
                 // Fetch crate top-level info (includes description + links).
                 let info = run(&format!("https://crates.io/api/v1/crates/{}", n))?;
                 let crate_data = &info["crate"];
-                let description = crate_data["description"].as_str().unwrap_or("No description available.");
+                let description = crate_data["description"]
+                    .as_str()
+                    .unwrap_or("No description available.");
                 let max_version = crate_data["max_version"].as_str().unwrap_or("unknown");
                 let documentation = crate_data["documentation"].as_str().unwrap_or("");
                 let homepage = crate_data["homepage"].as_str().unwrap_or("");
                 let repository = crate_data["repository"].as_str().unwrap_or("");
-                let requested = if v.is_empty() { max_version } else { v.as_str() };
+                let requested = if v.is_empty() {
+                    max_version
+                } else {
+                    v.as_str()
+                };
 
                 // Try to fetch the README body (rich docs).
                 let readme = reqwest::blocking::Client::builder()
@@ -1711,7 +1717,10 @@ edition = "2021"
                         .ok()
                         .and_then(|json| json.get("versions").cloned())
                         .and_then(|arr| arr.as_array().cloned())
-                        .and_then(|arr| arr.into_iter().find(|x| x["yanked"] != serde_json::json!(true)))
+                        .and_then(|arr| {
+                            arr.into_iter()
+                                .find(|x| x["yanked"] != serde_json::json!(true))
+                        })
                         .and_then(|x| x["num"].as_str().map(|s| s.to_string()))
                         .unwrap_or_default()
                 } else {
@@ -1803,8 +1812,12 @@ mod tests {
             .find(|f| f.path == "Cargo.toml")
             .expect("workspace Cargo.toml");
         assert!(ws.structural);
-        assert!(ws.content.contains("spire-actor = { path = \"../spire-actor\" }"));
-        assert!(ws.content.contains("spire-core = { path = \"../spire-core\" }"));
+        assert!(ws
+            .content
+            .contains("spire-actor = { path = \"../spire-actor\" }"));
+        assert!(ws
+            .content
+            .contains("spire-core = { path = \"../spire-core\" }"));
         assert!(ws.content.contains("strip = \"none\""));
         assert!(ws.content.contains("crates/spire-quicknotes"));
 
@@ -1850,7 +1863,11 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("crates/spire-quicknotes/src/lib.rs"), "").unwrap();
         std::fs::create_dir_all(root.join("ui/swift")).unwrap();
-        std::fs::write(root.join("ui/swift/Package.swift"), "// swift-tools-version: 5.10").unwrap();
+        std::fs::write(
+            root.join("ui/swift/Package.swift"),
+            "// swift-tools-version: 5.10",
+        )
+        .unwrap();
 
         let meta = CargoBuildModule::new().analyze(root).unwrap();
         assert_eq!(
@@ -1889,7 +1906,10 @@ mod tests {
         assert!(!paths.contains(&"core/Cargo.toml"));
         assert!(!paths.contains(&"rpi5/Cargo.toml"));
         assert!(!paths.contains(&"rock3c/Cargo.toml"));
-        assert_eq!(out.platform_targets, vec!["rpi5".to_string(), "rock3c".to_string()]);
+        assert_eq!(
+            out.platform_targets,
+            vec!["rpi5".to_string(), "rock3c".to_string()]
+        );
 
         // Single [dependencies] section (no [workspace.dependencies]).
         let root = out.files.iter().find(|f| f.path == "Cargo.toml").unwrap();

@@ -381,8 +381,7 @@ impl SpecDesignActor {
         self.require_session()?;
         let Some(md) = self.spec_md.as_ref() else {
             return Err(
-                "nothing to accept — convert the freeform spec into an AppSpec first"
-                    .to_string(),
+                "nothing to accept — convert the freeform spec into an AppSpec first".to_string(),
             );
         };
         let md = md.clone();
@@ -621,7 +620,10 @@ impl Actor for SpecDesignActor {
             } => {
                 let _ = reply_to.send(self.start_session(&project_name, &goal, reset).await);
             }
-            SpecDesignMessage::Convert { spec_text, reply_to } => {
+            SpecDesignMessage::Convert {
+                spec_text,
+                reply_to,
+            } => {
                 let _ = reply_to.send(self.convert(&spec_text).await);
             }
             SpecDesignMessage::Accept { reply_to } => {
@@ -677,8 +679,7 @@ mod tests {
     fn start_and_convert_produce_a_parseable_appspec() {
         let (mut a, prompts) = actor(vec![example_spec_md()]);
         a.start("spire-gis", "view and edit map layers").unwrap();
-        let out = pollster(a.convert("A map view for GIS features stored in the graph."))
-            .unwrap();
+        let out = pollster(a.convert("A map view for GIS features stored in the graph.")).unwrap();
         assert!(out.parse_error.is_none(), "{:?}", out.parse_error);
         assert_eq!(out.state.spec_md.as_deref(), Some(out.spec_md.as_str()));
         assert!(out.state.latest.is_some());

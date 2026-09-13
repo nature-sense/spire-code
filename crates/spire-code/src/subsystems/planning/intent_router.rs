@@ -27,9 +27,9 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use spire_core::actors::Actor;
 use spire_core::models::memory_graph::SearchOptions;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 
 // ============================================================================
 // RouteResult — the output of intent routing
@@ -127,10 +127,8 @@ impl IntentRouterActor {
                         if let Some(pattern_str) = pattern.as_str() {
                             let pattern_lower = pattern_str.to_lowercase();
                             let matched = query_lower.contains(&pattern_lower);
-                            let priority = intent
-                                .get("priority")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as u32;
+                            let priority =
+                                intent.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                             debug!(
                                 "[INTENT_ROUTER] SCAN intent='{}' (P={}): pattern=\"{}\" → {}",
                                 intent.name(),
@@ -162,10 +160,7 @@ impl IntentRouterActor {
 
             // Also check if the intent name or description appears in the query
             let name_desc_match = query_lower.contains(&name) || query_lower.contains(&description);
-            let priority = intent
-                .get("priority")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
+            let priority = intent.get("priority").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             debug!(
                 "[INTENT_ROUTER] SCAN intent='{}' (P={}): name/desc match → {}",
                 intent.name(),
@@ -259,14 +254,8 @@ impl IntentRouterActor {
                         }
 
                         // Step 3: Route to handler based on config-driven handler/action fields
-                        let handler = intent
-                            .get("handler")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let action = intent
-                            .get("action")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let handler = intent.get("handler").and_then(|v| v.as_str()).unwrap_or("");
+                        let action = intent.get("action").and_then(|v| v.as_str()).unwrap_or("");
                         info!("[INTENT_ROUTER] ROUTING: intent='{}' → handler='{}', action='{}', confidence={}", intent_name, handler, action, confidence);
 
                         self.route_to_handler(
@@ -339,14 +328,10 @@ impl IntentRouterActor {
                                     };
                                 }
 
-                                let handler = intent
-                                    .get("handler")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let action = intent
-                                    .get("action")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let handler =
+                                    intent.get("handler").and_then(|v| v.as_str()).unwrap_or("");
+                                let action =
+                                    intent.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
                                 self.route_to_handler(
                                     &intent_name,
@@ -446,9 +431,7 @@ impl IntentRouterActor {
             Ok(Ok(result)) => {
                 // Post-filter for intent nodes (subtype="intent") above threshold
                 for scored in &result.nodes {
-                    if scored.node.subtype() == Some("intent")
-                        && scored.similarity >= 0.6
-                    {
+                    if scored.node.subtype() == Some("intent") && scored.similarity >= 0.6 {
                         return Some((scored.node.name().to_string(), scored.similarity));
                     }
                 }

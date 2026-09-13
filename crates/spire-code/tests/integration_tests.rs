@@ -29,15 +29,19 @@ fn build_binary() -> std::path::PathBuf {
         .args(["metadata", "--format-version", "1", "--no-deps"])
         .output()
         .expect("Failed to run cargo metadata");
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .expect("Failed to parse cargo metadata JSON");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("Failed to parse cargo metadata JSON");
     let target_dir = metadata
         .get("target_directory")
         .and_then(|v| v.as_str())
         .map(std::path::PathBuf::from)
         .expect("cargo metadata missing target_directory");
 
-    let profile_dir = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let profile_dir = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
     let mut binary = target_dir.join(profile_dir).join("spire-core");
     if cfg!(target_os = "windows") {
         binary.set_extension("exe");
@@ -123,12 +127,8 @@ impl CoreProcess {
 
         let stream = TcpStream::connect(("127.0.0.1", port))
             .unwrap_or_else(|e| panic!("Failed to connect to core on 127.0.0.1:{port}: {e}"));
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .ok();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .ok();
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
         let writer = stream.try_clone().expect("Failed to clone TCP stream");
 
         let mut core = Self {
@@ -153,7 +153,10 @@ impl CoreProcess {
                 let _ = writeln!(core.writer, "{}", ready_line);
                 let _ = core.writer.flush();
                 // Short timeout for the probe read.
-                let _ = core.reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)));
+                let _ = core
+                    .reader
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_millis(250)));
             }
             let mut probe = String::new();
             match core.reader.read_line(&mut probe) {
@@ -163,8 +166,7 @@ impl CoreProcess {
                         // A `-32601 Method not found` (or any error) reply means the
                         // request handler isn't registered yet — keep polling.
                         let is_id = v.get("id").and_then(|i| i.as_u64()) == Some(0);
-                        let is_error =
-                            v.get("error").map(|e| !e.is_null()).unwrap_or(false);
+                        let is_error = v.get("error").map(|e| !e.is_null()).unwrap_or(false);
                         if is_id && !is_error {
                             ready = true;
                             break;
@@ -175,7 +177,10 @@ impl CoreProcess {
         }
         assert!(ready, "spire-core backend did not become ready within 120s");
         // Restore the normal 30s read timeout for request/response.
-        let _ = core.reader.get_ref().set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = core
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(30)));
 
         core
     }
@@ -215,9 +220,8 @@ impl CoreProcess {
             if trimmed.is_empty() {
                 continue;
             }
-            let parsed: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
-                panic!("Failed to parse response JSON: {e} — raw: {trimmed}")
-            });
+            let parsed: serde_json::Value = serde_json::from_str(trimmed)
+                .unwrap_or_else(|e| panic!("Failed to parse response JSON: {e} — raw: {trimmed}"));
             if parsed.get("id").and_then(|v| v.as_u64()) == Some(id) {
                 return parsed;
             }

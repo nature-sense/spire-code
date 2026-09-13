@@ -34,14 +34,14 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use spire_core::actors::Actor;
 use spire_core::analyzer::scanner as analyzer_scanner;
 use spire_core::models::embedding::Embedder;
 use spire_core::models::memory_graph::{
-    GraphEdge, AttrNode, NodeUpdate, RelationshipInput,
-    RelationshipType, StreamOp, StreamOpResult, TransactionRequest,
+    AttrNode, GraphEdge, NodeUpdate, RelationshipInput, RelationshipType, StreamOp, StreamOpResult,
+    TransactionRequest,
 };
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 
 // ============================================================================
 // TransactionStream — streaming atomic multi-op helper
@@ -184,7 +184,6 @@ impl TransactionStream {
             _ => Err(anyhow!("Expected RawGql on commit, got {:?}", result)),
         }
     }
-
 }
 
 // ============================================================================
@@ -330,7 +329,8 @@ pub enum ProjectSyncMessage {
     /// Provide the BuildManager sender so file events can trigger AST
     /// (re)parses and BuildSystem rebuilds.
     SetBuildManager {
-        build_manager_tx: mpsc::Sender<crate::subsystems::build::build_manager::BuildManagerMessage>,
+        build_manager_tx:
+            mpsc::Sender<crate::subsystems::build::build_manager::BuildManagerMessage>,
     },
 }
 
@@ -362,7 +362,8 @@ pub struct ProjectSyncActor {
 
     /// Sender to the BuildManager actor — used to trigger AST (re)parses
     /// and BuildSystem rebuilds on file events (gaps G2/G3/G4/G5).
-    build_manager_tx: Option<mpsc::Sender<crate::subsystems::build::build_manager::BuildManagerMessage>>,
+    build_manager_tx:
+        Option<mpsc::Sender<crate::subsystems::build::build_manager::BuildManagerMessage>>,
 }
 
 impl Default for ProjectSyncActor {
@@ -468,8 +469,15 @@ impl ProjectSyncActor {
                     summary.edges_written
                 );
             }
-            Ok(Err(e)) => warn!("ProjectSync: AST parse of {} failed: {}", path_buf.display(), e),
-            Err(_) => warn!("ProjectSync: AST parse response lost for {}", path_buf.display()),
+            Ok(Err(e)) => warn!(
+                "ProjectSync: AST parse of {} failed: {}",
+                path_buf.display(),
+                e
+            ),
+            Err(_) => warn!(
+                "ProjectSync: AST parse response lost for {}",
+                path_buf.display()
+            ),
         }
     }
 
@@ -844,20 +852,19 @@ impl ProjectSyncActor {
 
         let project_node = stream
             .store_node(ps_attr_unknown(
-                    "Project",
-                    None,
-                    project_name.clone(),
-                    Some(format!("Project root: {}", project_root.display())),
-                    {
-
+                "Project",
+                None,
+                project_name.clone(),
+                Some(format!("Project root: {}", project_root.display())),
+                {
                     let mut m = HashMap::new();
                     m.insert(
                         "path".to_string(),
                         serde_json::Value::String(project_root.to_string_lossy().to_string()),
                     );
                     m
-                                    },
-                ))
+                },
+            ))
             .await?;
         result.nodes_created += 1;
 
@@ -1027,34 +1034,28 @@ impl ProjectSyncActor {
 
             let node = stream
                 .store_node_with_embedding(
-                    ps_attr_unknown(
-                        "SourceFile",
-                        None,
-                        filename,
-                        Some(desc),
-                        {
-                            let mut m = HashMap::new();
-                            m.insert("path".to_string(), serde_json::Value::String(path.clone()));
-                            m.insert("extension".to_string(), serde_json::Value::String(ext));
-                            m.insert(
-                                "language".to_string(),
-                                serde_json::Value::String(language.clone()),
-                            );
-                            m.insert(
-                                "role".to_string(),
-                                serde_json::Value::String(role.to_string()),
-                            );
-                            m.insert(
-                                "size".to_string(),
-                                serde_json::Value::Number(serde_json::Number::from(entry.size)),
-                            );
-                            m.insert(
-                                "lines".to_string(),
-                                serde_json::Value::Number(serde_json::Number::from(lines as u64)),
-                            );
-                            m
-                        },
-                    ),
+                    ps_attr_unknown("SourceFile", None, filename, Some(desc), {
+                        let mut m = HashMap::new();
+                        m.insert("path".to_string(), serde_json::Value::String(path.clone()));
+                        m.insert("extension".to_string(), serde_json::Value::String(ext));
+                        m.insert(
+                            "language".to_string(),
+                            serde_json::Value::String(language.clone()),
+                        );
+                        m.insert(
+                            "role".to_string(),
+                            serde_json::Value::String(role.to_string()),
+                        );
+                        m.insert(
+                            "size".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(entry.size)),
+                        );
+                        m.insert(
+                            "lines".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(lines as u64)),
+                        );
+                        m
+                    }),
                     embedding_vector,
                 )
                 .await?;
@@ -1182,12 +1183,11 @@ impl ProjectSyncActor {
 
                 let node = stream
                     .store_node(ps_attr_unknown(
-                            "Unknown",
-                            Some("BuildSystem".to_string()),
-                            build_system_name,
-                            Some(description),
-                            {
-
+                        "Unknown",
+                        Some("BuildSystem".to_string()),
+                        build_system_name,
+                        Some(description),
+                        {
                             let mut m = HashMap::new();
                             m.insert(
                                 "build_type".to_string(),
@@ -1223,8 +1223,8 @@ impl ProjectSyncActor {
                             m.insert("workspace_members".to_string(), workspace_members_json);
                             m.insert("dependencies".to_string(), dependencies_json);
                             m
-                                                    },
-                        ))
+                        },
+                    ))
                     .await?;
                 result.nodes_created += 1;
                 build_system_node_ids.push(node.id().to_string());
@@ -1331,8 +1331,7 @@ impl ProjectSyncActor {
         );
 
         // 4. Get existing nodes from the graph
-        let existing_nodes = self
-            .query_nodes(None, None, None, None).await?;
+        let existing_nodes = self.query_nodes(None, None, None, None).await?;
 
         // Build a map of path → existing node ID
         let mut existing_by_path: HashMap<String, String> = HashMap::new();
@@ -1413,12 +1412,11 @@ impl ProjectSyncActor {
 
             let node = stream
                 .store_node(ps_attr_unknown(
-                        "Unknown",
-                        Some("Directory".to_string()),
-                        dir_name,
-                        Some(Self::build_directory_description(dir_path, role, 0, &[])),
-                        {
-
+                    "Unknown",
+                    Some("Directory".to_string()),
+                    dir_name,
+                    Some(Self::build_directory_description(dir_path, role, 0, &[])),
+                    {
                         let mut m = HashMap::new();
                         m.insert(
                             "path".to_string(),
@@ -1433,8 +1431,8 @@ impl ProjectSyncActor {
                             serde_json::Value::Number(serde_json::Number::from(0)),
                         );
                         m
-                                            },
-                    ))
+                    },
+                ))
                 .await?;
             result.nodes_created += 1;
             dir_node_ids.insert(dir_path.clone(), node.id().to_string());
@@ -1463,18 +1461,17 @@ impl ProjectSyncActor {
 
             let node = stream
                 .store_node(ps_attr_unknown(
-                        "SourceFile",
-                        None,
-                        filename,
-                        Some(Self::build_file_description(
+                    "SourceFile",
+                    None,
+                    filename,
+                    Some(Self::build_file_description(
                         &entry.path,
                         &language,
                         role,
                         lines,
                         entry.size,
                     )),
-                        {
-
+                    {
                         let mut m = HashMap::new();
                         m.insert(
                             "path".to_string(),
@@ -1498,8 +1495,8 @@ impl ProjectSyncActor {
                             serde_json::Value::Number(serde_json::Number::from(lines as u64)),
                         );
                         m
-                                            },
-                    ))
+                    },
+                ))
                 .await?;
             result.nodes_created += 1;
 
@@ -1535,7 +1532,8 @@ impl ProjectSyncActor {
         // 11. Rebuild BuildSystem nodes — delete stale ones and re-parse all build configs
         // First, find the Project node
         let project_nodes = self
-            .query_nodes(Some("Project"), None, None, Some(1)).await?;
+            .query_nodes(Some("Project"), None, None, Some(1))
+            .await?;
         let project_node = project_nodes.into_iter().next();
 
         // Build a file_node_ids map from existing_by_path (which maps path → node ID)
@@ -1645,18 +1643,17 @@ impl ProjectSyncActor {
 
                 let node = stream
                     .store_node(ps_attr_unknown(
-                            "SourceFile",
-                            None,
-                            filename,
-                            Some(Self::build_file_description(
+                        "SourceFile",
+                        None,
+                        filename,
+                        Some(Self::build_file_description(
                             &path.to_string_lossy(),
                             &language,
                             role,
                             lines,
                             size,
                         )),
-                            {
-
+                        {
                             let mut m = HashMap::new();
                             m.insert(
                                 "path".to_string(),
@@ -1680,8 +1677,8 @@ impl ProjectSyncActor {
                                 serde_json::Value::Number(serde_json::Number::from(lines as u64)),
                             );
                             m
-                                                    },
-                        ))
+                        },
+                    ))
                     .await?;
                 result.nodes_created += 1;
 
@@ -1725,17 +1722,16 @@ impl ProjectSyncActor {
 
                         let dir_node = stream
                             .store_node(ps_attr_unknown(
-                                    "Unknown",
-                                    Some("Directory".to_string()),
-                                    dir_name,
-                                    Some(Self::build_directory_description(
+                                "Unknown",
+                                Some("Directory".to_string()),
+                                dir_name,
+                                Some(Self::build_directory_description(
                                     parent_str,
                                     dir_role,
                                     0,
                                     &[],
                                 )),
-                                    {
-
+                                {
                                     let mut m = HashMap::new();
                                     m.insert(
                                         "path".to_string(),
@@ -1750,8 +1746,8 @@ impl ProjectSyncActor {
                                         serde_json::Value::Number(serde_json::Number::from(0)),
                                     );
                                     m
-                                                                    },
-                                ))
+                                },
+                            ))
                             .await?;
                         result.nodes_created += 1;
 
@@ -1909,13 +1905,11 @@ impl ProjectSyncActor {
             _ => return,
         };
         let build_systems = self
-            .query_nodes(None, Some("BuildSystem"), None, None).await
+            .query_nodes(None, Some("BuildSystem"), None, None)
+            .await
             .unwrap_or_default();
         for bs in &build_systems {
-            let config_file = bs
-                .get("config_file")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let config_file = bs.get("config_file").and_then(|v| v.as_str()).unwrap_or("");
             let scope_dir = Path::new(config_file)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -1932,9 +1926,16 @@ impl ProjectSyncActor {
                     })
                     .await
                 {
-                    warn!("ProjectSync: failed to link {} to build system: {}", path_str, e);
+                    warn!(
+                        "ProjectSync: failed to link {} to build system: {}",
+                        path_str, e
+                    );
                 } else {
-                    debug!("ProjectSync: linked {} to build system {}", path_str, bs.name());
+                    debug!(
+                        "ProjectSync: linked {} to build system {}",
+                        path_str,
+                        bs.name()
+                    );
                 }
             }
         }
@@ -1960,31 +1961,34 @@ impl ProjectSyncActor {
         // are reflected in the analysis graph. The rich metadata is then stored
         // as first-class BuildTarget/Dependency/Platform nodes + edges, not a
         // JSON property blob.
-        let mut rich_metadata: Vec<(PathBuf, spire_core::analyzer::models::BuildMetadata)> = Vec::new();
+        let mut rich_metadata: Vec<(PathBuf, spire_core::analyzer::models::BuildMetadata)> =
+            Vec::new();
         if let Some(bm_tx) = self.build_manager_tx.as_ref() {
-            let target = path.parent().map(|p| {
-                if p.as_os_str().is_empty() || p.to_string_lossy() == "." {
-                    root.clone()
-                } else {
-                    root.join(p)
-                }
-            }).unwrap_or_else(|| root.clone());
+            let target = path
+                .parent()
+                .map(|p| {
+                    if p.as_os_str().is_empty() || p.to_string_lossy() == "." {
+                        root.clone()
+                    } else {
+                        root.join(p)
+                    }
+                })
+                .unwrap_or_else(|| root.clone());
             let (reply_tx, reply_rx) = oneshot::channel();
             let send_result = bm_tx
-                .send(crate::subsystems::build::build_manager::BuildManagerMessage::AnalyzeProject {
-                    path: target.clone(),
-                    config_file: None,
-                    reply_to: reply_tx,
-                })
+                .send(
+                    crate::subsystems::build::build_manager::BuildManagerMessage::AnalyzeProject {
+                        path: target.clone(),
+                        config_file: None,
+                        reply_to: reply_tx,
+                    },
+                )
                 .await;
             match send_result {
                 Ok(()) => {
                     // Fire-and-forget: wait briefly for the analysis to complete,
                     // log failures but don't block the sync.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
-                        reply_rx,
-                    ).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
                         Ok(Ok(Ok(meta))) => {
                             info!(
                                 "ProjectSync: rich analysis refreshed for {:?}: build_system='{}' deps={}",
@@ -2006,7 +2010,10 @@ impl ProjectSyncActor {
                     }
                 }
                 Err(_) => {
-                    warn!("ProjectSync: BuildManager channel closed; cannot analyze {:?}", target);
+                    warn!(
+                        "ProjectSync: BuildManager channel closed; cannot analyze {:?}",
+                        target
+                    );
                 }
             }
         } else {
@@ -2016,7 +2023,8 @@ impl ProjectSyncActor {
         // Build a file→id map from the graph.
         let mut file_node_ids: HashMap<String, String> = HashMap::new();
         let files = self
-            .query_nodes(Some("SourceFile"), None, None, None).await
+            .query_nodes(Some("SourceFile"), None, None, None)
+            .await
             .unwrap_or_default();
         for f in files {
             if let Some(path) = f.get("path").and_then(|v| v.as_str()) {
@@ -2025,7 +2033,8 @@ impl ProjectSyncActor {
         }
 
         let project_node = self
-            .query_nodes(Some("Project"), None, None, Some(1)).await
+            .query_nodes(Some("Project"), None, None, Some(1))
+            .await
             .ok()
             .and_then(|mut v| v.pop());
 
@@ -2036,7 +2045,10 @@ impl ProjectSyncActor {
         let stream = match TransactionStream::open(tx_ref).await {
             Ok(s) => s,
             Err(e) => {
-                warn!("ProjectSync: failed to open txn for build-system rebuild: {}", e);
+                warn!(
+                    "ProjectSync: failed to open txn for build-system rebuild: {}",
+                    e
+                );
                 return;
             }
         };
@@ -2060,13 +2072,11 @@ impl ProjectSyncActor {
     async fn delete_build_system_for_config(&self, path: &Path) {
         let path_str = path.to_string_lossy().to_string();
         let build_systems = self
-            .query_nodes(None, Some("BuildSystem"), None, None).await
+            .query_nodes(None, Some("BuildSystem"), None, None)
+            .await
             .unwrap_or_default();
         for bs in &build_systems {
-            let config_file = bs
-                .get("config_file")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let config_file = bs.get("config_file").and_then(|v| v.as_str()).unwrap_or("");
             if config_file == path_str {
                 if let Err(e) = self.delete_node(bs.id().to_string()).await {
                     warn!(
@@ -2122,18 +2132,17 @@ impl ProjectSyncActor {
 
                     let node = stream
                         .store_node(ps_attr_unknown(
-                                "SourceFile",
-                                None,
-                                filename,
-                                Some(Self::build_file_description(
+                            "SourceFile",
+                            None,
+                            filename,
+                            Some(Self::build_file_description(
                                 &path.to_string_lossy(),
                                 &language,
                                 role,
                                 lines,
                                 size,
                             )),
-                                {
-
+                            {
                                 let mut m = HashMap::new();
                                 m.insert(
                                     "path".to_string(),
@@ -2159,8 +2168,8 @@ impl ProjectSyncActor {
                                     )),
                                 );
                                 m
-                                                            },
-                            ))
+                            },
+                        ))
                         .await?;
                     result.nodes_created += 1;
 
@@ -2279,7 +2288,8 @@ impl ProjectSyncActor {
         // 1. Delete all existing BuildSystem nodes from the graph
         // We need to query them first (can't query through the stream)
         let existing_build_systems = self
-            .query_nodes(Some("Unknown"), Some("BuildSystem"), None, None).await?;
+            .query_nodes(Some("Unknown"), Some("BuildSystem"), None, None)
+            .await?;
 
         for bs_node in &existing_build_systems {
             stream.delete_node(bs_node.id().to_string()).await?;
@@ -2323,10 +2333,10 @@ impl ProjectSyncActor {
 
             let node = stream
                 .store_node(ps_attr_unknown(
-                        "Unknown",
-                        Some("BuildSystem".to_string()),
-                        build_system_name,
-                        Some(
+                    "Unknown",
+                    Some("BuildSystem".to_string()),
+                    build_system_name,
+                    Some(
                         serde_json::json!({
                             "build_system": metadata.build_system,
                             "project_type": metadata.project_type,
@@ -2337,8 +2347,7 @@ impl ProjectSyncActor {
                         })
                         .to_string(),
                     ),
-                        {
-
+                    {
                         let mut m = HashMap::new();
                         m.insert(
                             "build_type".to_string(),
@@ -2369,8 +2378,8 @@ impl ProjectSyncActor {
                             serde_json::Value::String(build_file.clone()),
                         );
                         m
-                                            },
-                    ))
+                    },
+                ))
                 .await?;
             result.nodes_created += 1;
 
@@ -2384,25 +2393,29 @@ impl ProjectSyncActor {
             for t in &metadata.targets {
                 let t_node = stream
                     .store_node(ps_attr_unknown(
-                            "Unknown",
-                            Some("BuildTarget".to_string()),
-                            format!("{}-{}", build_file.replace('/', "-"), t.name),
-                            Some(format!("Build target {} ({:?})", t.name, t.kind)),
-                            {
-
+                        "Unknown",
+                        Some("BuildTarget".to_string()),
+                        format!("{}-{}", build_file.replace('/', "-"), t.name),
+                        Some(format!("Build target {} ({:?})", t.name, t.kind)),
+                        {
                             let mut m = HashMap::new();
-                            m.insert("name".to_string(), serde_json::Value::String(t.name.clone()));
+                            m.insert(
+                                "name".to_string(),
+                                serde_json::Value::String(t.name.clone()),
+                            );
                             m.insert(
                                 "kind".to_string(),
-                                serde_json::Value::String(t.kind.first().cloned().unwrap_or_default()),
+                                serde_json::Value::String(
+                                    t.kind.first().cloned().unwrap_or_default(),
+                                ),
                             );
                             m.insert(
                                 "config_file".to_string(),
                                 serde_json::Value::String(build_file.clone()),
                             );
                             m
-                                                    },
-                        ))
+                        },
+                    ))
                     .await?;
                 result.nodes_created += 1;
                 target_ids.insert(t.name.clone(), t_node.id().to_string());
@@ -2427,20 +2440,25 @@ impl ProjectSyncActor {
                 }
                 let d_node = stream
                     .store_node(ps_attr_unknown(
-                            "Unknown",
-                            Some("Dependency".to_string()),
-                            format!("dep-{}", d.name.replace('/', "-")),
-                            Some(format!("Dependency {}", d.name)),
-                            {
-
+                        "Unknown",
+                        Some("Dependency".to_string()),
+                        format!("dep-{}", d.name.replace('/', "-")),
+                        Some(format!("Dependency {}", d.name)),
+                        {
                             let mut m = HashMap::new();
-                            m.insert("name".to_string(), serde_json::Value::String(d.name.clone()));
+                            m.insert(
+                                "name".to_string(),
+                                serde_json::Value::String(d.name.clone()),
+                            );
                             if let Some(ref v) = d.version_req {
-                                m.insert("version".to_string(), serde_json::Value::String(v.clone()));
+                                m.insert(
+                                    "version".to_string(),
+                                    serde_json::Value::String(v.clone()),
+                                );
                             }
                             m
-                                                    },
-                        ))
+                        },
+                    ))
                     .await?;
                 result.nodes_created += 1;
                 dep_ids.insert(d.name.clone(), d_node.id().to_string());
@@ -2478,17 +2496,16 @@ impl ProjectSyncActor {
             for p in &metadata.platform_targets {
                 let p_node = stream
                     .store_node(ps_attr_unknown(
-                            "Unknown",
-                            Some("Platform".to_string()),
-                            format!("platform-{}", p.replace('/', "-")),
-                            Some(format!("Platform {}", p)),
-                            {
-
+                        "Unknown",
+                        Some("Platform".to_string()),
+                        format!("platform-{}", p.replace('/', "-")),
+                        Some(format!("Platform {}", p)),
+                        {
                             let mut m = HashMap::new();
                             m.insert("name".to_string(), serde_json::Value::String(p.clone()));
                             m
-                                                    },
-                        ))
+                        },
+                    ))
                     .await?;
                 result.nodes_created += 1;
 
@@ -2656,12 +2673,11 @@ impl ProjectSyncActor {
         // Store the Packaging node
         let pkg_node = stream
             .store_node(ps_attr_unknown(
-                    "Packaging",
-                    None,
-                    format!("{}-{}.vsix", pkg_name, pkg_version),
-                    Some(description),
-                    {
-
+                "Packaging",
+                None,
+                format!("{}-{}.vsix", pkg_name, pkg_version),
+                Some(description),
+                {
                     let mut m = HashMap::new();
                     m.insert(
                         "packager_type".to_string(),
@@ -2682,13 +2698,14 @@ impl ProjectSyncActor {
                         ),
                     );
                     m
-                                    },
-                ))
+                },
+            ))
             .await?;
 
         // Query existing BuildSystem nodes to create INCLUDES relationships
         let existing_bs = self
-            .query_nodes(None, Some("BuildSystem"), None, None).await?;
+            .query_nodes(None, Some("BuildSystem"), None, None)
+            .await?;
 
         // Match native binary names to BuildSystem nodes by checking
         // if the build system's project_name contains the binary name
@@ -2766,8 +2783,7 @@ impl ProjectSyncActor {
         info!("ProjectSync: force re-sync for {}", project_root.display());
 
         // 1. Get all existing nodes
-        let existing_nodes = self
-            .query_nodes(None, None, None, None).await?;
+        let existing_nodes = self.query_nodes(None, None, None, None).await?;
 
         // 2. Open a transaction stream for the delete + re-bootstrap
         let tx_ref = self

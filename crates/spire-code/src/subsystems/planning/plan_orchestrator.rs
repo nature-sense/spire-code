@@ -24,16 +24,16 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use spire_core::subsystems::chat::chat::ChatMessage;
-use spire_core::subsystems::llm::llm::LlmMessage;
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
-use spire_core::subsystems::tools::tool_orchestrator::ToolOrchestratorMessage;
 use spire_core::actors::Actor;
 use spire_core::models::memory_graph::PlanStatus;
 use spire_core::models::memory_graph::PlanStatusResult;
 use spire_core::models::memory_graph::PlanStepData;
 use spire_core::models::memory_graph::PlanStepEntry;
 use spire_core::models::memory_graph::{AttrNode, NodeUpdate};
+use spire_core::subsystems::chat::chat::ChatMessage;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
+use spire_core::subsystems::llm::llm::LlmMessage;
+use spire_core::subsystems::tools::tool_orchestrator::ToolOrchestratorMessage;
 use spire_core::transport::socket::TransportMessage;
 
 /// Modification scope — determines what the LLM is allowed to touch.
@@ -178,11 +178,13 @@ impl PlanOrchestrator {
         // 2. Generate plan steps via LLM (scope-aware when a scope is given)
         let steps = match scope {
             Some(ModificationScope::Project) => {
-                self.generate_plan_steps_scoped(&goal, &context, "project").await?
+                self.generate_plan_steps_scoped(&goal, &context, "project")
+                    .await?
             }
             Some(ModificationScope::Subproject { ref path }) => {
                 let ctx = format!("Scope directory: {}\n{}", path, context);
-                self.generate_plan_steps_scoped(&goal, &ctx, "subproject").await?
+                self.generate_plan_steps_scoped(&goal, &ctx, "subproject")
+                    .await?
             }
             None => self.generate_plan_steps(&goal, &context).await?,
         };
@@ -295,10 +297,7 @@ impl PlanOrchestrator {
                 let step_names: Vec<String> = nodes
                     .iter()
                     .map(|n| {
-                        let cat = n
-                            .get("category")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let cat = n.get("category").and_then(|v| v.as_str()).unwrap_or("");
                         format!("{} ({})", n.name(), cat)
                     })
                     .collect();
@@ -312,11 +311,25 @@ impl PlanOrchestrator {
         // from THIS list — invented names (e.g. "create_file") cannot be
         // dispatched by the ToolRouter in standalone mode.
         let curated_tools = [
-            "filesystem_read", "filesystem_write", "filesystem_list",
-            "filesystem_delete", "filesystem_move", "filesystem_copy",
-            "build_analyze", "build_build", "build_verify", "build_test", "build_clean", "build_lint",
-            "build_format", "build_fix", "build_autofix", "build_list_modules",
-            "project/build", "project/test", "project/lint",
+            "filesystem_read",
+            "filesystem_write",
+            "filesystem_list",
+            "filesystem_delete",
+            "filesystem_move",
+            "filesystem_copy",
+            "build_analyze",
+            "build_build",
+            "build_verify",
+            "build_test",
+            "build_clean",
+            "build_lint",
+            "build_format",
+            "build_fix",
+            "build_autofix",
+            "build_list_modules",
+            "project/build",
+            "project/test",
+            "project/lint",
         ];
         context_parts.push(format!("Available tools: {}", curated_tools.join(", ")));
 
@@ -325,7 +338,8 @@ impl PlanOrchestrator {
 
     /// Use the LLM to generate a step-by-step plan from the goal.
     async fn generate_plan_steps(&self, goal: &str, context: &str) -> Result<Vec<PlanStepData>> {
-        self.generate_plan_steps_scoped(goal, context, "unscoped").await
+        self.generate_plan_steps_scoped(goal, context, "unscoped")
+            .await
     }
 
     /// Scope-aware plan generation. `scope_label` is one of:
@@ -355,9 +369,7 @@ impl PlanOrchestrator {
                  When modifying the build config, ALWAYS include a step to run build_analyze \
                  on the scope directory so the subproject analysis reflects the change."
             }
-            _ => {
-                "No modification scope constraint — use general planning rules."
-            }
+            _ => "No modification scope constraint — use general planning rules.",
         };
 
         let system_prompt = format!(
@@ -590,11 +602,21 @@ impl PlanOrchestrator {
             // Resolve relative file paths in the step's params against the
             // plan's project root (from project/open) so filesystem tools
             // write into the REAL project, not the process CWD.
-            if let Some(root) = self.workspace_roots.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id).cloned() {
+            if let Some(root) = self
+                .workspace_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(plan_id)
+                .cloned()
+            {
                 let path_keys = ["path", "src", "destination", "dir", "root", "file_path"];
                 for (k, v) in params.iter_mut() {
                     if path_keys.contains(&k.as_str()) && !v.starts_with('/') && !v.is_empty() {
-                        *v = format!("{}/{}", root.trim_end_matches('/'), v.trim_start_matches('/'));
+                        *v = format!(
+                            "{}/{}",
+                            root.trim_end_matches('/'),
+                            v.trim_start_matches('/')
+                        );
                     }
                 }
             }
@@ -768,7 +790,12 @@ impl PlanOrchestrator {
 
     async fn get_plan_status(&self, plan_id: &str) -> Result<PlanStatusResult> {
         // Prefer the in-memory cache created during plan creation.
-        if let Some(plan) = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id) {
+        if let Some(plan) = self
+            .plan_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(plan_id)
+        {
             return Ok(plan.clone());
         }
         // Fall back to querying the Plan node by name — plans are stored as
@@ -804,12 +831,18 @@ impl PlanOrchestrator {
             .get("intent_name")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let total = attr.get("total_steps").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let total = attr
+            .get("total_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         let completed = attr
             .get("completed_steps")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let failed = attr.get("failed_steps").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let failed = attr
+            .get("failed_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         let status = match status_str.as_str() {
             "approved" => PlanStatus::Approved,
             "executing" => PlanStatus::Executing,
@@ -838,7 +871,12 @@ impl PlanOrchestrator {
     /// Query PlanStep nodes for a plan, sorted by order.
     async fn get_plan_steps(&self, plan_id: &str) -> Result<Vec<PlanStepEntry>> {
         // Prefer the in-memory step cache (created during plan creation).
-        if let Some(data) = self.step_data_cache.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id) {
+        if let Some(data) = self
+            .step_data_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(plan_id)
+        {
             let steps: Vec<PlanStepEntry> = data
                 .iter()
                 .enumerate()
@@ -875,10 +913,7 @@ impl PlanOrchestrator {
         let mut steps: Vec<PlanStepEntry> = nodes
             .iter()
             .map(|n| {
-                let order = n
-                    .get("order")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
+                let order = n.get("order").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let status_str = n
                     .get("status")
                     .and_then(|v| v.as_str())
@@ -926,7 +961,12 @@ impl PlanOrchestrator {
     /// Get PlanStepData from plan steps (for dependency resolution).
     async fn get_step_data(&self, plan_id: &str) -> Result<Vec<PlanStepData>> {
         // Prefer the in-memory step cache (created during plan creation).
-        if let Some(data) = self.step_data_cache.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id) {
+        if let Some(data) = self
+            .step_data_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(plan_id)
+        {
             return Ok(data.clone());
         }
         let (tx, rx) = oneshot::channel();
@@ -990,14 +1030,24 @@ impl PlanOrchestrator {
 
     async fn update_plan_status(&self, plan_id: &str, status: PlanStatus) -> Result<()> {
         // Keep the in-memory cache in sync so approve/execute can read it.
-        if let Some(plan) = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).get_mut(plan_id) {
+        if let Some(plan) = self
+            .plan_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(plan_id)
+        {
             plan.status = status.clone();
         }
 
         // The in-memory cache is the source of truth for approve/execute.
         // If the plan is cached, graph persistence is best-effort — the
         // graph row may be missing if property round-tripping failed.
-        if self.plan_cache.lock().unwrap_or_else(|e| e.into_inner()).contains_key(plan_id) {
+        if self
+            .plan_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(plan_id)
+        {
             return Ok(());
         }
 
@@ -1073,13 +1123,10 @@ impl PlanOrchestrator {
             Ok(Ok(nodes)) => nodes,
             _ => return Ok(()),
         };
-        if let Some(node) = nodes
-            .into_iter()
-            .find(|n| {
-                n.get("plan_id").and_then(|v| v.as_str()) == Some(plan_id)
-                    && n.get("order").and_then(|v| v.as_u64()) == Some(order as u64)
-            })
-        {
+        if let Some(node) = nodes.into_iter().find(|n| {
+            n.get("plan_id").and_then(|v| v.as_str()) == Some(plan_id)
+                && n.get("order").and_then(|v| v.as_u64()) == Some(order as u64)
+        }) {
             let mut props = std::collections::HashMap::from([(
                 "status".to_string(),
                 serde_json::json!(status),

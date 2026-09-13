@@ -115,7 +115,6 @@ pub struct HalSanityReport {
     pub interfaces: Vec<String>,
 }
 
-
 fn root_has_file(root: &Path, rel: &str) -> bool {
     root.join(rel).exists()
 }
@@ -128,7 +127,10 @@ fn hpp_files(root: &Path, rel_dir: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for e in entries.flatten() {
         let p = e.path();
-        if p.extension().and_then(|x| x.to_str()).is_some_and(|x| x == "hpp") {
+        if p.extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x == "hpp")
+        {
             out.push(p);
         }
     }
@@ -159,7 +161,8 @@ pub fn detect_hal_layout(root: &Path) -> HalLayout {
     let legacy_leftovers = dir_has_any_file(&legacy_api_dir);
     let legacy_impls = has_legacy_platform_impls(root);
     let stale_wiring = has_stale_platform_hal_refs(root);
-    let has_legacy = !legacy_contracts.is_empty() || legacy_leftovers || legacy_impls || stale_wiring;
+    let has_legacy =
+        !legacy_contracts.is_empty() || legacy_leftovers || legacy_impls || stale_wiring;
 
     match (has_canonical, has_legacy) {
         (true, false) => HalLayout::Canonical,
@@ -176,13 +179,22 @@ fn has_legacy_platform_impls(root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
     };
-    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+    let skip = [
+        "toolkit",
+        "hal",
+        "build",
+        "build-native",
+        "subprojects",
+        ".git",
+    ];
     for e in entries.flatten() {
         let p = e.path();
         if !p.is_dir() {
             continue;
         }
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if skip.contains(&name) || name.starts_with(".") {
             continue;
         }
@@ -190,12 +202,14 @@ fn has_legacy_platform_impls(root: &Path) -> bool {
         if hal_dir.is_dir() {
             // A legacy impl dir counts only if it has source files.
             if std::fs::read_dir(&hal_dir)
-                .map(|rd| rd.filter_map(|x| x.ok()).any(|x| {
-                    x.path()
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| e == "cpp" || e == "c")
-                }))
+                .map(|rd| {
+                    rd.filter_map(|x| x.ok()).any(|x| {
+                        x.path()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e == "cpp" || e == "c")
+                    })
+                })
                 .unwrap_or(false)
             {
                 return true;
@@ -208,13 +222,17 @@ fn has_legacy_platform_impls(root: &Path) -> bool {
 /// True when a directory contains at least one entry (a leftover `.cpp` in the
 /// legacy contract dir is still a legacy marker, even without `.hpp` files).
 fn dir_has_any_file(dir: &Path) -> bool {
-    std::fs::read_dir(dir).map(|rd| rd.flatten().next().is_some()).unwrap_or(false)
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().next().is_some())
+        .unwrap_or(false)
 }
 
 /// True when `<plat>/meson.build` still references the legacy layout: source
 /// files under a `hal/` subdir, or a legacy `<plat>_hal_sources` variable.
 fn platform_meson_has_legacy_hal(plat_meson: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(plat_meson) else { return false };
+    let Ok(text) = std::fs::read_to_string(plat_meson) else {
+        return false;
+    };
     // Strip `#` comments so `# hal/...` prose never false-positives.
     let stripped = Regex::new(r"(?m)#.*$").unwrap().replace_all(&text, "");
     let hal_files = Regex::new(r#"['"]hal/[^'"]+\.(?:c|cpp|cc|cxx)['"]"#).unwrap();
@@ -224,8 +242,7 @@ fn platform_meson_has_legacy_hal(plat_meson: &Path) -> bool {
     // Legacy inline declaration: `<plat>_hal_sources = files('hal/...')` or
     // `+= files(...)`. A READ assignment like
     // `rpi5_hal_sources = hal_impl_rpi5_sources` (canonical alias) is NOT legacy.
-    let legacy_var = Regex::new(r"(?m)^\s*\w+_hal_sources\s*(?:=|\+=)\s*files\s*\(")
-        .unwrap();
+    let legacy_var = Regex::new(r"(?m)^\s*\w+_hal_sources\s*(?:=|\+=)\s*files\s*\(").unwrap();
     legacy_var.is_match(&stripped)
 }
 
@@ -245,16 +262,21 @@ fn rewrite_platform_meson(plat: &str, text: &str) -> String {
     let escaped = regex::escape(&legacy_var);
 
     // 1. Remove the empty init (`<var> = files()`).
-    let empty_init = Regex::new(&format!(r"(?m)^[ \t]*{}\s*=\s*files\(\)[ \t]*$\n?", escaped))
-        .unwrap();
+    let empty_init = Regex::new(&format!(
+        r"(?m)^[ \t]*{}\s*=\s*files\(\)[ \t]*$\n?",
+        escaped
+    ))
+    .unwrap();
     let mut out = empty_init.replace_all(text, "").to_string();
 
     // 2. Remove `<var> = files(...)` and `<var> += files(...)` declarations,
     //    including multi-line `files(` blocks (paths contain no parens, so a
     //    non-greedy `\)` stop is safe).
-    let decl_re =
-        Regex::new(&format!(r"(?ms)^[ \t]*{}\s*(?:=|\+=)\s*files\(.*?\)[ \t]*$\n?", escaped))
-            .unwrap();
+    let decl_re = Regex::new(&format!(
+        r"(?ms)^[ \t]*{}\s*(?:=|\+=)\s*files\(.*?\)[ \t]*$\n?",
+        escaped
+    ))
+    .unwrap();
     out = decl_re.replace_all(&out, "").to_string();
 
     // 3. Remove the rpi5-style `foreach … [ … 'hal/…' … ]` block (its body
@@ -267,8 +289,7 @@ fn rewrite_platform_meson(plat: &str, text: &str) -> String {
     out = foreach_re.replace_all(&out, "").to_string();
 
     // 4. Replace `+ <legacy_var>` references with `+ hal_impl_<plat>_sources`.
-    let ref_re =
-        Regex::new(&format!(r"\+[ \t]*{}\b", escaped)).unwrap();
+    let ref_re = Regex::new(&format!(r"\+[ \t]*{}\b", escaped)).unwrap();
     out = ref_re
         .replace_all(&out, format!("+ hal_impl_{}_sources", plat).as_str())
         .to_string();
@@ -298,13 +319,28 @@ fn rewrite_platform_meson(plat: &str, text: &str) -> String {
 /// True when any top-level platform dir's meson.build still references the
 /// legacy per-platform HAL layout (stale wiring after a partial migration).
 fn has_stale_platform_hal_refs(root: &Path) -> bool {
-    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
-    let Ok(entries) = std::fs::read_dir(root) else { return false };
+    let skip = [
+        "toolkit",
+        "hal",
+        "build",
+        "build-native",
+        "subprojects",
+        ".git",
+    ];
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
     for e in entries.flatten() {
         let p = e.path();
-        if !p.is_dir() { continue; }
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
-        if skip.contains(&name) || name.starts_with(".") { continue; }
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if skip.contains(&name) || name.starts_with(".") {
+            continue;
+        }
         if platform_meson_has_legacy_hal(&p.join("meson.build")) {
             return true;
         }
@@ -319,7 +355,11 @@ pub fn hal_meson_var_section(platform: &str, impl_files: &[String]) -> String {
         .iter()
         .map(|f| format!("'implementations/{}/{}'", platform, rel_name(f)))
         .collect();
-    format!("hal_impl_{}_sources = files({})", platform, quoted.join(", "))
+    format!(
+        "hal_impl_{}_sources = files({})",
+        platform,
+        quoted.join(", ")
+    )
 }
 
 fn rel_name(p: &str) -> String {
@@ -347,21 +387,37 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
 
     // Record which exact paths drove the classification.
     for c in hpp_files(root, "hal/api") {
-        plan.reasons.push(format!("canonical contracts: {}", c.display()));
+        plan.reasons
+            .push(format!("canonical contracts: {}", c.display()));
     }
     if root.join("hal/implementations").is_dir() {
-        plan.reasons.push("canonical impls: hal/implementations/".to_string());
+        plan.reasons
+            .push("canonical impls: hal/implementations/".to_string());
     }
     for c in hpp_files(root, "toolkit/src/hal/api") {
-        plan.reasons.push(format!("legacy contracts: {}", c.display()));
+        plan.reasons
+            .push(format!("legacy contracts: {}", c.display()));
     }
-    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+    let skip = [
+        "toolkit",
+        "hal",
+        "build",
+        "build-native",
+        "subprojects",
+        ".git",
+    ];
     if let Ok(entries) = std::fs::read_dir(root) {
         for e in entries.flatten() {
             let p = e.path();
-            if !p.is_dir() { continue; }
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
-            if skip.contains(&name) || name.starts_with(".") { continue; }
+            if !p.is_dir() {
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if skip.contains(&name) || name.starts_with(".") {
+                continue;
+            }
             let hal_dir = p.join("hal");
             if hal_dir.is_dir() {
                 plan.reasons.push(format!("legacy impls: {}/hal/", name));
@@ -371,16 +427,19 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
 
     if layout == HalLayout::Canonical {
         plan.can_apply = false;
-        plan.notes.push("Project is already in the canonical hal/ layout.".to_string());
+        plan.notes
+            .push("Project is already in the canonical hal/ layout.".to_string());
         return Ok(plan);
     }
     if layout == HalLayout::None {
         plan.can_apply = false;
-        plan.notes.push("No HAL layout detected — nothing to migrate.".to_string());
+        plan.notes
+            .push("No HAL layout detected — nothing to migrate.".to_string());
         return Ok(plan);
     }
     if layout == HalLayout::Mixed {
-        plan.notes.push("Both layouts present — only the legacy files will move.".to_string());
+        plan.notes
+            .push("Both layouts present — only the legacy files will move.".to_string());
     }
 
     // 1. Contracts: toolkit/src/hal/api/*.hpp → hal/api/.
@@ -389,7 +448,8 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
         let to = PathBuf::from("hal/api").join(&name);
         let from = contract.strip_prefix(root).unwrap_or(&contract);
         if root.join(&to).exists() {
-            plan.conflicts.push(format!("{} already exists", to.display()));
+            plan.conflicts
+                .push(format!("{} already exists", to.display()));
         } else {
             plan.moves.push(FileMove {
                 from: from.to_string_lossy().to_string(),
@@ -407,7 +467,9 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
     if let Ok(entries) = std::fs::read_dir(root.join("toolkit/src/hal/api")) {
         for e in entries.flatten() {
             let ep = e.path();
-            let Some(ext) = ep.extension().and_then(|x| x.to_str()) else { continue };
+            let Some(ext) = ep.extension().and_then(|x| x.to_str()) else {
+                continue;
+            };
             if ext != "cpp" && ext != "c" && ext != "cc" && ext != "cxx" {
                 continue;
             }
@@ -415,7 +477,8 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
             let to = PathBuf::from("toolkit").join("src").join(&fname);
             let from = ep.strip_prefix(root).unwrap_or(&ep);
             if root.join(&to).exists() {
-                plan.conflicts.push(format!("{} already exists", to.display()));
+                plan.conflicts
+                    .push(format!("{} already exists", to.display()));
             } else {
                 plan.moves.push(FileMove {
                     from: from.to_string_lossy().to_string(),
@@ -427,7 +490,14 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
 
     // 2. Per-platform implementations: <plat>/hal/*.{cpp,c} →
     //    hal/implementations/<plat>/ (same filename).
-    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+    let skip = [
+        "toolkit",
+        "hal",
+        "build",
+        "build-native",
+        "subprojects",
+        ".git",
+    ];
     let mut platform_impls: Vec<(String, Vec<String>)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return Err("Cannot read project root".to_string());
@@ -437,7 +507,9 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
         if !p.is_dir() {
             continue;
         }
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if skip.contains(&name) || name.starts_with(".") {
             continue;
         }
@@ -446,18 +518,19 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
             continue;
         }
         let mut files: Vec<String> = Vec::new();
-        let Ok(rd) = std::fs::read_dir(&hal_dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&hal_dir) else {
+            continue;
+        };
         for fe in rd.flatten() {
             let fp = fe.path();
             let ext = fp.extension().and_then(|x| x.to_str()).unwrap_or("");
             if ext == "cpp" || ext == "c" {
                 let fname = rel_name(&fp.to_string_lossy());
-                let to = PathBuf::from("hal/implementations")
-                    .join(name)
-                    .join(&fname);
+                let to = PathBuf::from("hal/implementations").join(name).join(&fname);
                 let from = fp.strip_prefix(root).unwrap_or(&fp);
                 if root.join(&to).exists() {
-                    plan.conflicts.push(format!("{} already exists", to.display()));
+                    plan.conflicts
+                        .push(format!("{} already exists", to.display()));
                 } else {
                     plan.moves.push(FileMove {
                         from: from.to_string_lossy().to_string(),
@@ -497,7 +570,10 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
             if !text.contains("subdir('hal')") && !text.contains("subdir(\"hal\")") {
                 // Insert after the first project(...) line, else at the top.
                 let after = if let Some(idx) = text.find("project(") {
-                    let end = text[idx..].find('\n').map(|off| idx + off + 1).unwrap_or(idx);
+                    let end = text[idx..]
+                        .find('\n')
+                        .map(|off| idx + off + 1)
+                        .unwrap_or(idx);
                     let mut s = text.clone();
                     s.insert_str(end, "subdir('hal')\n");
                     s
@@ -519,16 +595,33 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
     //    inline `<plat>_hal_sources = files('hal/...')` declarations with the
     //    centralized `hal_impl_<plat>_sources` variable from hal/meson.build.
     //    This is what docs/hal-migration.md promises as `build_file_edits`.
-    let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+    let skip = [
+        "toolkit",
+        "hal",
+        "build",
+        "build-native",
+        "subprojects",
+        ".git",
+    ];
     if let Ok(entries) = std::fs::read_dir(root) {
         for e in entries.flatten() {
             let p = e.path();
-            if !p.is_dir() { continue; }
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
-            if skip.contains(&name) || name.starts_with(".") { continue; }
+            if !p.is_dir() {
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if skip.contains(&name) || name.starts_with(".") {
+                continue;
+            }
             let plat_meson = p.join("meson.build");
-            if !plat_meson.exists() { continue; }
-            let Ok(text) = std::fs::read_to_string(&plat_meson) else { continue };
+            if !plat_meson.exists() {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&plat_meson) else {
+                continue;
+            };
             if platform_meson_has_legacy_hal(&plat_meson) {
                 let rewritten = rewrite_platform_meson(name, &text);
                 if rewritten != text {
@@ -537,7 +630,8 @@ pub fn migrate_hal_plan(root: &Path) -> Result<HalMigrationPlan, String> {
                         before: text,
                         after: rewritten,
                     });
-                    plan.reasons.push(format!("stale {} meson.build rewired", name));
+                    plan.reasons
+                        .push(format!("stale {} meson.build rewired", name));
                 }
             }
         }
@@ -566,19 +660,21 @@ pub fn migrate_hal_apply(root: &Path, plan: &HalMigrationPlan) -> Result<Migrati
         let from = root.join(&m.from);
         let to = root.join(&m.to);
         if !from.exists() {
-            result
-                .errors
-                .push(format!("missing source {}", m.from));
+            result.errors.push(format!("missing source {}", m.from));
             continue;
         }
         if let Some(parent) = to.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                result.errors.push(format!("mkdir {}: {}", parent.display(), e));
+                result
+                    .errors
+                    .push(format!("mkdir {}: {}", parent.display(), e));
                 continue;
             }
         }
         if to.exists() {
-            result.errors.push(format!("conflict: {} already exists", m.to));
+            result
+                .errors
+                .push(format!("conflict: {} already exists", m.to));
             continue;
         }
         match std::fs::rename(&from, &to) {
@@ -602,13 +698,26 @@ pub fn migrate_hal_apply(root: &Path, plan: &HalMigrationPlan) -> Result<Migrati
     // 3b. Clean up now-empty legacy directories (best-effort).
     let legacy_hal_dirs: Vec<std::path::PathBuf> = {
         let mut v = Vec::new();
-        let skip = ["toolkit", "hal", "build", "build-native", "subprojects", ".git"];
+        let skip = [
+            "toolkit",
+            "hal",
+            "build",
+            "build-native",
+            "subprojects",
+            ".git",
+        ];
         if let Ok(entries) = std::fs::read_dir(root) {
             for e in entries.flatten() {
                 let p = e.path();
-                if !p.is_dir() { continue; }
-                let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
-                if skip.contains(&name) || name.starts_with(".") { continue; }
+                if !p.is_dir() {
+                    continue;
+                }
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if skip.contains(&name) || name.starts_with(".") {
+                    continue;
+                }
                 v.push(p.join("hal"));
             }
         }
@@ -619,9 +728,15 @@ pub fn migrate_hal_apply(root: &Path, plan: &HalMigrationPlan) -> Result<Migrati
     for dir in legacy_hal_dirs {
         if dir.is_dir() {
             // Only remove if truly empty.
-            let empty = std::fs::read_dir(&dir).map(|rd| rd.count() == 0).unwrap_or(false);
+            let empty = std::fs::read_dir(&dir)
+                .map(|rd| rd.count() == 0)
+                .unwrap_or(false);
             if empty {
-                let rel = dir.strip_prefix(root).unwrap_or(&dir).to_string_lossy().to_string();
+                let rel = dir
+                    .strip_prefix(root)
+                    .unwrap_or(&dir)
+                    .to_string_lossy()
+                    .to_string();
                 match std::fs::remove_dir(&dir) {
                     Ok(()) => result.cleanup.push(rel),
                     Err(_) => { /* best-effort */ }
@@ -691,7 +806,11 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
             continue; // pure-data definition — legitimate, no warning
         }
         if let Some(name) = c.file_name().and_then(|x| x.to_str()) {
-            let rel = c.strip_prefix(root).unwrap_or(c).to_string_lossy().to_string();
+            let rel = c
+                .strip_prefix(root)
+                .unwrap_or(c)
+                .to_string_lossy()
+                .to_string();
             issues.push(HalIssue {
                 severity: "warning".to_string(),
                 title: "Non-contract header in HAL api dir".to_string(),
@@ -709,7 +828,9 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
         if let Ok(entries) = std::fs::read_dir(root.join("toolkit/src/hal/api")) {
             for e in entries.flatten() {
                 let ep = e.path();
-                let Some(ext) = ep.extension().and_then(|x| x.to_str()) else { continue };
+                let Some(ext) = ep.extension().and_then(|x| x.to_str()) else {
+                    continue;
+                };
                 if ext == "cpp" || ext == "c" || ext == "cc" || ext == "cxx" {
                     let rel = "toolkit/src/hal/api".to_string()
                         + "/"
@@ -739,7 +860,9 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
             severity: "warning".to_string(),
             title: "No platform directories".to_string(),
             path: root.to_string_lossy().to_string(),
-            suggested_fix: "Add per-platform directories (rpi5/, rock3c/, ...) with HAL implementations.".to_string(),
+            suggested_fix:
+                "Add per-platform directories (rpi5/, rock3c/, ...) with HAL implementations."
+                    .to_string(),
         });
     } else {
         for plat in &platforms {
@@ -749,9 +872,14 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
             };
             let has_impls = impl_dir.is_dir()
                 && std::fs::read_dir(&impl_dir)
-                    .map(|rd| rd.filter_map(|x| x.ok()).any(|x| {
-                        x.path().extension().and_then(|e| e.to_str()).is_some_and(|e| e == "cpp" || e == "c")
-                    }))
+                    .map(|rd| {
+                        rd.filter_map(|x| x.ok()).any(|x| {
+                            x.path()
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .is_some_and(|e| e == "cpp" || e == "c")
+                        })
+                    })
                     .unwrap_or(false);
             if !has_impls {
                 issues.push(HalIssue {
@@ -788,7 +916,10 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
                         severity: "warning".to_string(),
                         title: format!("Missing {} wiring", var),
                         path: f.to_string_lossy().to_string(),
-                        suggested_fix: format!("Declare {} = files('implementations/{}/<stem>_<impl>.cpp').", var, plat),
+                        suggested_fix: format!(
+                            "Declare {} = files('implementations/{}/<stem>_<impl>.cpp').",
+                            var, plat
+                        ),
                     });
                 }
             }
@@ -823,14 +954,17 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
             });
         }
         _ if (root.join("toolkit/src/hal/api").is_dir() || root.join("hal/api").is_dir())
-            && layout == HalLayout::Canonical && root.join("toolkit/src/hal/api").exists() => {
-                issues.push(HalIssue {
-                    severity: "warning".to_string(),
-                    title: "Legacy contract dir left behind".to_string(),
-                    path: "toolkit/src/hal/api".to_string(),
-                    suggested_fix: "Remove the emptied legacy dir or re-run migrations cleanup.".to_string(),
-                });
-            }
+            && layout == HalLayout::Canonical
+            && root.join("toolkit/src/hal/api").exists() =>
+        {
+            issues.push(HalIssue {
+                severity: "warning".to_string(),
+                title: "Legacy contract dir left behind".to_string(),
+                path: "toolkit/src/hal/api".to_string(),
+                suggested_fix: "Remove the emptied legacy dir or re-run migrations cleanup."
+                    .to_string(),
+            });
+        }
         _ => {}
     }
 
@@ -846,7 +980,13 @@ pub fn hal_sanity_check(root: &Path) -> HalSanityReport {
 
 fn rel_of(p: &Path, root: &Path) -> &'static str {
     // hpp_files takes a relative dir; fall back to the raw path between markers.
-    Box::leak(p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned().into_boxed_str())
+    Box::leak(
+        p.strip_prefix(root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .into_owned()
+            .into_boxed_str(),
+    )
 }
 
 /// Discovered target platforms: canonical `hal/implementations/*` subdirs,
@@ -899,8 +1039,12 @@ fn top_level_platforms(root: &Path) -> Vec<String> {
     if let Ok(entries) = std::fs::read_dir(root) {
         for e in entries.flatten() {
             let p = e.path();
-            if !p.is_dir() { continue; }
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+            if !p.is_dir() {
+                continue;
+            }
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             // `build*` covers build/, build-native/ and every per-platform
             // build dir (build-a7s, build-rpi5, build-rock3c, build-host, …):
             // they are outputs, never platforms.
@@ -945,8 +1089,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // Real platform layout (canonical).
-        write(root, "hal/implementations/rpi5/camera_hal_rpi5.cpp", "int x;");
-        write(root, "hal/implementations/rock3c/camera_hal_rock3c.cpp", "int x;");
+        write(
+            root,
+            "hal/implementations/rpi5/camera_hal_rpi5.cpp",
+            "int x;",
+        );
+        write(
+            root,
+            "hal/implementations/rock3c/camera_hal_rock3c.cpp",
+            "int x;",
+        );
         // Shared code and build outputs — none of these is a platform.
         write(root, "app/main.cpp", "int main(){return 0;}");
         write(root, "docs/README.md", "# docs");
@@ -954,8 +1106,14 @@ mod tests {
         write(root, "build-host/notes.cpp", "int y;");
 
         let plats = top_level_platforms(root);
-        assert!(plats.contains(&"rpi5".to_string()), "real platform kept: {plats:?}");
-        assert!(plats.contains(&"rock3c".to_string()), "real platform kept: {plats:?}");
+        assert!(
+            plats.contains(&"rpi5".to_string()),
+            "real platform kept: {plats:?}"
+        );
+        assert!(
+            plats.contains(&"rock3c".to_string()),
+            "real platform kept: {plats:?}"
+        );
         for bad in ["app", "docs", "build-rpi5", "build-host"] {
             assert!(
                 !plats.contains(&bad.to_string()),
@@ -968,16 +1126,36 @@ mod tests {
 
     /// Build a canonical fixture: hal/api/camera_hal.hpp + implementations.
     fn canonical_fixture(root: &Path) {
-        write(root, "meson.build", "project('demo', 'cpp')\nsubdir('hal')\n");
+        write(
+            root,
+            "meson.build",
+            "project('demo', 'cpp')\nsubdir('hal')\n",
+        );
         write(root, "hal/api/camera_hal.hpp", CONTRACT_HPP);
-        write(root, "hal/implementations/rpi5/camera_hal_imx219.cpp", "// impl\n");
-        write(root, "hal/meson.build", "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n");
+        write(
+            root,
+            "hal/implementations/rpi5/camera_hal_imx219.cpp",
+            "// impl\n",
+        );
+        write(
+            root,
+            "hal/meson.build",
+            "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
+        );
     }
     /// Build a legacy fixture: toolkit/src/hal/api/*.hpp + <plat>/hal/*.
     fn legacy_fixture(root: &Path) {
-        write(root, "meson.build", "project('demo', 'cpp')\nsubdir('toolkit')\nsubdir('rpi5')\n");
+        write(
+            root,
+            "meson.build",
+            "project('demo', 'cpp')\nsubdir('toolkit')\nsubdir('rpi5')\n",
+        );
         write(root, "toolkit/src/hal/api/camera_hal.hpp", CONTRACT_HPP);
-        write(root, "toolkit/meson.build", "toolkit_sources = files('src/a.cpp')\n");
+        write(
+            root,
+            "toolkit/meson.build",
+            "toolkit_sources = files('src/a.cpp')\n",
+        );
         write(root, "rpi5/meson.build", "rpi5_hal_sources = files('hal/camera_hal_imx219.cpp')\nexecutable('demo-rpi5', 'main.cpp' + rpi5_hal_sources)\n");
         write(root, "rpi5/hal/camera_hal_imx219.cpp", "// impl\n");
     }
@@ -987,12 +1165,32 @@ mod tests {
     /// an orphaned config_loader.cpp in toolkit/src/hal/api/ and a stale
     /// rpi5/meson.build still declaring rpi5_hal_sources = files('hal/...').
     fn stale_wiring_fixture(root: &Path) {
-        write(root, "meson.build", "project('demo', 'cpp')\nsubdir('hal')\nsubdir('toolkit')\nsubdir('rpi5')\n");
+        write(
+            root,
+            "meson.build",
+            "project('demo', 'cpp')\nsubdir('hal')\nsubdir('toolkit')\nsubdir('rpi5')\n",
+        );
         write(root, "hal/api/camera_hal.hpp", CONTRACT_HPP);
-        write(root, "hal/meson.build", "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n");
-        write(root, "hal/implementations/rpi5/camera_hal_imx219.cpp", "// impl\n");
-        write(root, "toolkit/src/hal/api/config_loader.cpp", "// orphan impl\n");
-        write(root, "toolkit/meson.build", "toolkit_sources = files('src/a.cpp')\n");
+        write(
+            root,
+            "hal/meson.build",
+            "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
+        );
+        write(
+            root,
+            "hal/implementations/rpi5/camera_hal_imx219.cpp",
+            "// impl\n",
+        );
+        write(
+            root,
+            "toolkit/src/hal/api/config_loader.cpp",
+            "// orphan impl\n",
+        );
+        write(
+            root,
+            "toolkit/meson.build",
+            "toolkit_sources = files('src/a.cpp')\n",
+        );
         write(root, "rpi5/meson.build", "rpi5_hal_sources = files('hal/camera_hal_imx219.cpp')\nexecutable('demo-rpi5', 'main.cpp' + rpi5_hal_sources)\n");
         write(root, "rpi5/main.cpp", "int main(){}\n");
     }
@@ -1062,7 +1260,9 @@ mod tests {
         let meson = &plan.write_files[0];
         assert_eq!(meson.path, "hal/meson.build");
         assert!(
-            meson.content.contains("hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')"),
+            meson.content.contains(
+                "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')"
+            ),
             "meson content: {}",
             meson.content
         );
@@ -1086,7 +1286,10 @@ mod tests {
         let result = migrate_hal_apply(dir.path(), &plan).unwrap();
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
         // Files moved.
-        assert!(!dir.path().join("toolkit/src/hal/api/camera_hal.hpp").exists());
+        assert!(!dir
+            .path()
+            .join("toolkit/src/hal/api/camera_hal.hpp")
+            .exists());
         assert!(dir.path().join("hal/api/camera_hal.hpp").exists());
         assert!(!dir.path().join("rpi5/hal/camera_hal_imx219.cpp").exists());
         assert!(dir
@@ -1099,9 +1302,22 @@ mod tests {
         let top = std::fs::read_to_string(dir.path().join("meson.build")).unwrap();
         assert!(top.contains("subdir('hal')"), "top: {top}");
         // Cleanup: legacy dirs removed.
-        assert!(!dir.path().join("rpi5/hal").exists(), "rpi5/hal left behind");
-        assert!(!dir.path().join("toolkit/src/hal/api").exists(), "legacy api left behind");
-        assert!(result.cleanup.iter().any(|c| c.contains("rpi5/hal") || c.contains("hal/api")), "cleanup: {:?}", result.cleanup);
+        assert!(
+            !dir.path().join("rpi5/hal").exists(),
+            "rpi5/hal left behind"
+        );
+        assert!(
+            !dir.path().join("toolkit/src/hal/api").exists(),
+            "legacy api left behind"
+        );
+        assert!(
+            result
+                .cleanup
+                .iter()
+                .any(|c| c.contains("rpi5/hal") || c.contains("hal/api")),
+            "cleanup: {:?}",
+            result.cleanup
+        );
     }
 
     #[test]
@@ -1110,30 +1326,60 @@ mod tests {
         canonical_fixture(dir.path());
         let report = hal_sanity_check(dir.path());
         assert_eq!(report.status, "ok", "issues: {:?}", report.issues);
-        assert!(report.interfaces.contains(&"camera_hal".to_string()), "interfaces: {:?}", report.interfaces);
+        assert!(
+            report.interfaces.contains(&"camera_hal".to_string()),
+            "interfaces: {:?}",
+            report.interfaces
+        );
     }
 
     #[test]
     fn sanity_flags_missing_contract() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "meson.build", "project('d', 'cpp')\nsubdir('hal')\n");
-        write(dir.path(), "hal/implementations/rpi5/camera_hal_imx219.cpp", "// i\n");
-        write(dir.path(), "hal/meson.build", "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n");
+        write(
+            dir.path(),
+            "meson.build",
+            "project('d', 'cpp')\nsubdir('hal')\n",
+        );
+        write(
+            dir.path(),
+            "hal/implementations/rpi5/camera_hal_imx219.cpp",
+            "// i\n",
+        );
+        write(
+            dir.path(),
+            "hal/meson.build",
+            "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
+        );
         let report = hal_sanity_check(dir.path());
         assert_eq!(report.status, "issues");
-        assert!(report.issues.iter().any(|i| i.title.contains("No HAL contracts")));
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.title.contains("No HAL contracts")));
     }
 
     #[test]
     fn sanity_flags_missing_impl_for_platform() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "meson.build", "project('d', 'cpp')\nsubdir('hal')\n");
+        write(
+            dir.path(),
+            "meson.build",
+            "project('d', 'cpp')\nsubdir('hal')\n",
+        );
         write(dir.path(), "hal/api/camera_hal.hpp", CONTRACT_HPP);
         write(dir.path(), "hal/meson.build", "\n");
         // rpi5 dir with sources but no hal/implementations/rpi5.
         write(dir.path(), "rpi5/main.cpp", "int main(){}\n");
         let report = hal_sanity_check(dir.path());
-        assert!(report.issues.iter().any(|i| i.title.contains("Missing HAL implementation")), "issues: {:?}", report.issues);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.title.contains("Missing HAL implementation")),
+            "issues: {:?}",
+            report.issues
+        );
     }
 
     #[test]
@@ -1144,7 +1390,14 @@ mod tests {
         write(dir.path(), "rpi5/hal/stale.cpp", "// stale\n");
         let report = hal_sanity_check(dir.path());
         assert_eq!(report.status, "issues");
-        assert!(report.issues.iter().any(|i| i.title.contains("Mixed HAL layout") || i.title.contains("legacy")), "issues: {:?}", report.issues);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.title.contains("Mixed HAL layout") || i.title.contains("legacy")),
+            "issues: {:?}",
+            report.issues
+        );
     }
 
     /// A stale-wiring project (canonical container + orphaned legacy `.cpp` +
@@ -1200,10 +1453,17 @@ mod tests {
             rpi5.contains("hal_impl_rpi5_sources"),
             "rpi5 meson after apply: {rpi5}"
         );
-        assert!(!rpi5.contains("rpi5_hal_sources = files"), "rpi5 meson after apply: {rpi5}");
+        assert!(
+            !rpi5.contains("rpi5_hal_sources = files"),
+            "rpi5 meson after apply: {rpi5}"
+        );
 
         // After apply + the legacy dir cleanup, re-detect must no longer be Mixed.
-        assert_eq!(detect_hal_layout(dir.path()), HalLayout::Canonical, "project should be canonical after apply");
+        assert_eq!(
+            detect_hal_layout(dir.path()),
+            HalLayout::Canonical,
+            "project should be canonical after apply"
+        );
     }
 
     /// `hal_sanity_check` must flag BOTH the orphaned legacy `.cpp` and stale
@@ -1215,12 +1475,17 @@ mod tests {
         let report = hal_sanity_check(dir.path());
         assert_eq!(report.status, "issues");
         assert!(
-            report.issues.iter().any(|i| i.title.contains("Implementation file left in legacy contract dir")),
+            report.issues.iter().any(|i| i
+                .title
+                .contains("Implementation file left in legacy contract dir")),
             "issues: {:?}",
             report.issues
         );
         assert!(
-            report.issues.iter().any(|i| i.title.contains("Mixed HAL layout")),
+            report
+                .issues
+                .iter()
+                .any(|i| i.title.contains("Mixed HAL layout")),
             "issues: {:?}",
             report.issues
         );
@@ -1233,11 +1498,27 @@ mod tests {
     #[test]
     fn sanity_accepts_data_only_struct_headers_without_warning() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "meson.build", "project('d', 'cpp')\nsubdir('hal')\n");
+        write(
+            dir.path(),
+            "meson.build",
+            "project('d', 'cpp')\nsubdir('hal')\n",
+        );
         write(dir.path(), "hal/api/camera_hal.hpp", CONTRACT_HPP);
-        write(dir.path(), "hal/api/frame_buffer.hpp", "struct FrameBuffer { int w = 0; };\n");
-        write(dir.path(), "hal/implementations/rpi5/camera_hal_imx219.cpp", "// impl\n");
-        write(dir.path(), "hal/meson.build", "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n");
+        write(
+            dir.path(),
+            "hal/api/frame_buffer.hpp",
+            "struct FrameBuffer { int w = 0; };\n",
+        );
+        write(
+            dir.path(),
+            "hal/implementations/rpi5/camera_hal_imx219.cpp",
+            "// impl\n",
+        );
+        write(
+            dir.path(),
+            "hal/meson.build",
+            "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
+        );
 
         let report = hal_sanity_check(dir.path());
         assert!(
@@ -1267,11 +1548,27 @@ mod tests {
     #[test]
     fn sanity_flags_free_function_header_in_api_dir() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "meson.build", "project('d', 'cpp')\nsubdir('hal')\n");
+        write(
+            dir.path(),
+            "meson.build",
+            "project('d', 'cpp')\nsubdir('hal')\n",
+        );
         write(dir.path(), "hal/api/camera_hal.hpp", CONTRACT_HPP);
-        write(dir.path(), "hal/api/misc_helpers.hpp", "// free functions, no class\nint helper();\n");
-        write(dir.path(), "hal/implementations/rpi5/camera_hal_imx219.cpp", "// impl\n");
-        write(dir.path(), "hal/meson.build", "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n");
+        write(
+            dir.path(),
+            "hal/api/misc_helpers.hpp",
+            "// free functions, no class\nint helper();\n",
+        );
+        write(
+            dir.path(),
+            "hal/implementations/rpi5/camera_hal_imx219.cpp",
+            "// impl\n",
+        );
+        write(
+            dir.path(),
+            "hal/meson.build",
+            "hal_impl_rpi5_sources = files('implementations/rpi5/camera_hal_imx219.cpp')\n",
+        );
 
         let report = hal_sanity_check(dir.path());
         assert_eq!(report.status, "issues");

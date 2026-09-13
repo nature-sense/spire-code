@@ -17,8 +17,8 @@
 use std::path::PathBuf;
 use tokio::sync::oneshot;
 
-use spire_core::build_types::{BuildMetadata, BuildSpec};
 use serde::{Deserialize, Serialize};
+use spire_core::build_types::{BuildMetadata, BuildSpec};
 
 pub mod cargo;
 pub use cargo::CargoBuildModule;
@@ -26,13 +26,13 @@ pub mod node;
 pub use node::NodeBuildModule;
 pub mod swift;
 pub use swift::SwiftBuildModule;
-pub mod generic_helpers;
 pub mod ast_parser;
+pub mod generic_helpers;
+pub use ast_parser::LanguageConfig;
 pub use ast_parser::{
     javascript_language_config, parse_with_tree_sitter, python_language_config,
     rust_language_config,
 };
-pub use ast_parser::LanguageConfig;
 
 pub mod python;
 pub use python::PythonBuildModule;
@@ -48,8 +48,8 @@ pub mod make;
 pub use make::MakeBuildModule;
 pub mod ruby;
 pub use ruby::RubyBuildModule;
-pub mod meson;
 pub mod autofix;
+pub mod meson;
 pub use meson::MesonBuildModule;
 pub mod hal_migration;
 pub mod spire_app_scaffold;
@@ -305,7 +305,9 @@ pub struct McpServerDependency {
     pub allowed_tools: Vec<String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// Declared by each module at startup so the manager can build its router.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,4 +448,3 @@ pub struct BuildOutput {
     pub output: String,
     pub exit_code: Option<i32>,
 }
-

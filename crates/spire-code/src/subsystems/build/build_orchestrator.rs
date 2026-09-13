@@ -21,14 +21,14 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::subsystems::planning::error_analyzer::ErrorAnalyzerMessage;
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
-use spire_core::subsystems::tools::tool_orchestrator::ToolOrchestratorMessage;
 use spire_core::actors::tool_providers::ToolRouterMessage;
 use spire_core::actors::Actor;
 use spire_core::models::memory_graph::{
-    BuildContext, BuildError, BuildResult, BuildStartResult, FixPlan,
-    NodeUpdate, StreamOp, StreamOpResult, SystemBuildResult, TransactionRequest,
+    BuildContext, BuildError, BuildResult, BuildStartResult, FixPlan, NodeUpdate, StreamOp,
+    StreamOpResult, SystemBuildResult, TransactionRequest,
 };
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
+use spire_core::subsystems::tools::tool_orchestrator::ToolOrchestratorMessage;
 
 /// Build an envelope `AttrNode` for a node stored by the build orchestrator
 /// (build sessions and state transitions).
@@ -280,12 +280,12 @@ impl BuildOrchestrator {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.memory_graph_tx
                 .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Standard".to_string()),
-                subtype: Some("build_session".to_string()),
-                name: Some(build_id.clone()),
-                limit: Some(1),
-                reply_to: tx,
-            })
+                    node_type: Some("Standard".to_string()),
+                    subtype: Some("build_session".to_string()),
+                    name: Some(build_id.clone()),
+                    limit: Some(1),
+                    reply_to: tx,
+                })
                 .await?;
 
             if let Some(session) = rx.await??.into_iter().next() {
@@ -339,12 +339,12 @@ impl BuildOrchestrator {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.memory_graph_tx
                 .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Standard".to_string()),
-                subtype: Some("build_session".to_string()),
-                name: Some(build_id.clone()),
-                limit: Some(1),
-                reply_to: tx,
-            })
+                    node_type: Some("Standard".to_string()),
+                    subtype: Some("build_session".to_string()),
+                    name: Some(build_id.clone()),
+                    limit: Some(1),
+                    reply_to: tx,
+                })
                 .await?;
 
             if let Some(session) = rx.await??.into_iter().next() {

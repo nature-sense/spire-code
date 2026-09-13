@@ -23,13 +23,13 @@ use crate::build::{
     AstParseResult, BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability, ParseSummary,
     TestOptions,
 };
-use spire_core::subsystems::llm::llm::{LlmMessage, LlmModelRole};
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use spire_core::actors::Actor;
 use spire_core::models::memory_graph::{
-    AttrNode, NodeUpdate, RelationshipInput, RelationshipType, StreamOp,
-    StreamOpResult, TransactionRequest,
+    AttrNode, NodeUpdate, RelationshipInput, RelationshipType, StreamOp, StreamOpResult,
+    TransactionRequest,
 };
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
+use spire_core::subsystems::llm::llm::{LlmMessage, LlmModelRole};
 
 /// Build an envelope `AttrNode` for a node stored through a transaction stream
 /// (diagnostics, source files, and AST nodes are all open-model node kinds).
@@ -125,23 +125,27 @@ fn hal_impl_generation_context(
     library_hints: Option<&str>,
 ) -> Result<HalImplContext, String> {
     use crate::build::generic_helpers::{
-        datatype_docs_to_prompt_text, extract_cpp_base_classes, extract_contract_methods_cpp,
+        datatype_docs_to_prompt_text, extract_contract_methods_cpp, extract_cpp_base_classes,
         generate_hal_impl_prompt_pair, generate_hal_module_header_clean, hal_docs_to_prompt_text,
-        hal_platform_library_hints, parse_hal_docs, resolve_semantic_hal_impl_names, summarize_hal_header,
+        hal_platform_library_hints, parse_hal_docs, resolve_semantic_hal_impl_names,
+        summarize_hal_header,
     };
     // Contract (binding gate) — an invalid header never reaches the LLM.
     let header = std::path::Path::new(root)
         .join("hal")
         .join("api")
         .join(format!("{interface}.hpp"));
-    let content = std::fs::read_to_string(&header)
-        .map_err(|e| format!("read {}: {e}", header.display()))?;
+    let content =
+        std::fs::read_to_string(&header).map_err(|e| format!("read {}: {e}", header.display()))?;
     let summary = summarize_hal_header(&content)
         .map_err(|e| format!("contract {} invalid: {e}", header.display()))?;
     let classes = extract_contract_methods_cpp(&content);
     let methods: Vec<_> = classes.iter().flat_map(|(_, ms)| ms.clone()).collect();
     if methods.is_empty() {
-        return Err(format!("contract {} has no pure-virtual methods", header.display()));
+        return Err(format!(
+            "contract {} has no pure-virtual methods",
+            header.display()
+        ));
     }
     // Concrete base: prefer the HalModule-derived class, else the first
     // abstract class (simplified contracts without the hal::HalModule base).
@@ -161,7 +165,8 @@ fn hal_impl_generation_context(
         .join("hal")
         .join("implementations")
         .join(platform);
-    let (class_name, cpp_name, hpp_name) = resolve_semantic_hal_impl_names(interface, platform, &impl_dir);
+    let (class_name, cpp_name, hpp_name) =
+        resolve_semantic_hal_impl_names(interface, platform, &impl_dir);
     // Clean deterministic declaration header (no SPIRE-HAL-STUB sentinel).
     let impl_header =
         generate_hal_module_header_clean(interface, &class_name, &base_class, &methods, platform);
@@ -180,10 +185,19 @@ fn hal_impl_generation_context(
     let contract_docs = hal_docs_to_prompt_text(&parse_hal_docs(&content));
     let datatype_docs = datatype_docs_to_prompt_text(std::path::Path::new(root));
     let prompt = generate_hal_impl_prompt_pair(
-        &summary, interface, &class_name, &base_class,
-        &plat.id, &plat.name, &hardware_profile, &hints,
-        &format!("{interface}-{platform}"), &impl_header,
-        &contract_docs, &datatype_docs, "",
+        &summary,
+        interface,
+        &class_name,
+        &base_class,
+        &plat.id,
+        &plat.name,
+        &hardware_profile,
+        &hints,
+        &format!("{interface}-{platform}"),
+        &impl_header,
+        &contract_docs,
+        &datatype_docs,
+        "",
     );
     Ok(HalImplContext {
         summary,
@@ -360,9 +374,7 @@ pub enum BuildManagerMessage {
     },
     /// Attach the LLM sender (Stage-1 HAL implementation generation via the
     /// constrained `generate_hal_impl_prompt`).
-    SetLlm {
-        llm_tx: mpsc::Sender<LlmMessage>,
-    },
+    SetLlm { llm_tx: mpsc::Sender<LlmMessage> },
     /// Attach the actor-owned build-event log (drain-safe while a streaming
     /// build/lint/fix occupies this actor's mailbox).
     SetEventLog {
@@ -428,7 +440,9 @@ impl BuildManagerActor {
     ) {
         tracing::info!(
             "BuildManager: registering module '{}' with configs {:?}, extensions {:?}",
-            capability.name, capability.config_files, capability.source_extensions
+            capability.name,
+            capability.config_files,
+            capability.source_extensions
         );
         for config in &capability.config_files {
             self.router.insert(config.clone(), module_tx.clone());
@@ -559,10 +573,9 @@ impl BuildManagerActor {
             })
             .await;
         match rx.await {
-            Ok(Ok(nodes)) => nodes.into_iter().find(|n| {
-                n.name() == path
-                    || n.get("path").and_then(|v| v.as_str()) == Some(path)
-            }),
+            Ok(Ok(nodes)) => nodes
+                .into_iter()
+                .find(|n| n.name() == path || n.get("path").and_then(|v| v.as_str()) == Some(path)),
             _ => None,
         }
     }
@@ -690,17 +703,31 @@ impl BuildManagerActor {
                 .to_string();
             let line = ev["line_number"].as_u64().map(|v| v as u32);
             let mut props = HashMap::new();
-            props.insert("message".to_string(), serde_json::Value::String(message.clone()));
+            props.insert(
+                "message".to_string(),
+                serde_json::Value::String(message.clone()),
+            );
             props.insert("file".to_string(), serde_json::Value::String(file.clone()));
             if let Some(line) = line {
                 props.insert("line".to_string(), serde_json::json!(line));
             }
             props.insert("severity".to_string(), serde_json::Value::String(level));
-            props.insert("build_type".to_string(), serde_json::Value::String(build_type.to_string()));
-            props.insert("build_run_id".to_string(), serde_json::Value::String(run_id.clone()));
+            props.insert(
+                "build_type".to_string(),
+                serde_json::Value::String(build_type.to_string()),
+            );
+            props.insert(
+                "build_run_id".to_string(),
+                serde_json::Value::String(run_id.clone()),
+            );
 
             // Stable name so MergeNode upserts by (Diagnostic, name).
-            let name = format!("{}:{}:{}", file, line.map(|l| l.to_string()).unwrap_or_default(), message);
+            let name = format!(
+                "{}:{}:{}",
+                file,
+                line.map(|l| l.to_string()).unwrap_or_default(),
+                message
+            );
             let merge_result = Self::send_stream_op(
                 &stream,
                 StreamOp::MergeNode(bm_attr_unknown(
@@ -716,7 +743,9 @@ impl BuildManagerActor {
             // Link SourceFile --HasDiagnostic--> Diagnostic using the merged
             // node's stable id (kept across upserts).
             let diag_id = match merge_result {
-                StreamOpResult::NodeStored(n) | StreamOpResult::NodeUpdated(n) => n.id().to_string(),
+                StreamOpResult::NodeStored(n) | StreamOpResult::NodeUpdated(n) => {
+                    n.id().to_string()
+                }
                 _ => continue,
             };
             if let Some(source_node) = self.find_source_file(&file).await {
@@ -770,9 +799,7 @@ impl BuildManagerActor {
 
         // 2. Incremental re-parse: skip if the content hash is unchanged.
         if let Some(existing) = self.find_source_file(&path_str).await {
-            if existing
-                .get("content_hash")
-                .and_then(|v| v.as_str())
+            if existing.get("content_hash").and_then(|v| v.as_str())
                 == Some(result.content_hash.as_str())
             {
                 return Ok(ParseSummary {
@@ -1096,7 +1123,8 @@ impl BuildManagerActor {
         if let Err(e) = self.store_analysis(&path_str, &metadata).await {
             tracing::warn!(
                 "BuildManager: failed to persist analysis for {}: {}",
-                path_str, e
+                path_str,
+                e
             );
         }
 
@@ -1169,7 +1197,8 @@ impl BuildManagerActor {
         let (tx, rx) = oneshot::channel();
         let (build_event_tx, mut build_event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::build::BuildEvent>();
-        let events_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let events_buf =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let event_log = self.event_log_tx.clone();
         {
             let events_buf = events_buf.clone();
@@ -1205,7 +1234,9 @@ impl BuildManagerActor {
             })
             .await
             .map_err(|e| format!("Module channel closed: {}", e))?;
-        let output = rx.await.map_err(|e| format!("Module response lost: {}", e))?;
+        let output = rx
+            .await
+            .map_err(|e| format!("Module response lost: {}", e))?;
         let events = events_buf.lock().unwrap().clone();
         output.map(|o| (o, events))
     }
@@ -1265,7 +1296,8 @@ impl BuildManagerActor {
         let (tx, rx) = oneshot::channel();
         let (build_event_tx, mut build_event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::build::BuildEvent>();
-        let events_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let events_buf =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let event_log = self.event_log_tx.clone();
         {
             let events_buf = events_buf.clone();
@@ -1299,7 +1331,9 @@ impl BuildManagerActor {
             })
             .await
             .map_err(|e| format!("Module channel closed: {}", e))?;
-        let output = rx.await.map_err(|e| format!("Module response lost: {}", e))?;
+        let output = rx
+            .await
+            .map_err(|e| format!("Module response lost: {}", e))?;
         let events = events_buf.lock().unwrap().clone();
         output.map(|o| (o, events))
     }
@@ -1331,7 +1365,8 @@ impl BuildManagerActor {
         let (tx, rx) = oneshot::channel();
         let (build_event_tx, mut build_event_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::build::BuildEvent>();
-        let events_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let events_buf =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let event_log = self.event_log_tx.clone();
         {
             let events_buf = events_buf.clone();
@@ -1364,7 +1399,9 @@ impl BuildManagerActor {
             })
             .await
             .map_err(|e| format!("Module channel closed: {}", e))?;
-        let output = rx.await.map_err(|e| format!("Module response lost: {}", e))?;
+        let output = rx
+            .await
+            .map_err(|e| format!("Module response lost: {}", e))?;
         let events = events_buf.lock().unwrap().clone();
         output.map(|o| (o, events))
     }
@@ -1411,7 +1448,11 @@ impl BuildManagerActor {
 
     /// Unified LLM tool entry point: routes build/* tools to handlers.
     /// Clean: same pattern as build — route to module via a proper message.
-    async fn clean_project(&self, path: &Path, platform: Option<String>) -> Result<BuildOutput, String> {
+    async fn clean_project(
+        &self,
+        path: &Path,
+        platform: Option<String>,
+    ) -> Result<BuildOutput, String> {
         let metadata = self
             .get_analysis(path.to_string_lossy().as_ref())
             .await
@@ -1447,96 +1488,97 @@ impl BuildManagerActor {
             .map_err(|e| format!("Module response lost: {}", e))?
     }
 
-/// Parse clang/clang++ analyzer output into structured lint events:
-/// `file:line:col: error|warning: message` (and `file:line:col: fatal error: …`).
-fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
-    let mut events = Vec::new();
-    // Clang emits diagnostics as:  /path/file.cpp:12:5: error: message text
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+    /// Parse clang/clang++ analyzer output into structured lint events:
+    /// `file:line:col: error|warning: message` (and `file:line:col: fatal error: …`).
+    fn parse_clang_output(output: &str) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        // Clang emits diagnostics as:  /path/file.cpp:12:5: error: message text
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Split at the first ": " that precedes error/warning/fatal.
+            let lower = line.to_lowercase();
+            // Longest marker first: "fatal error:" CONTAINS "error:", so matching
+            // "error:" first would leave the "fatal " prefix in the path part and
+            // swallow the line number — turning `../x.cpp:41:10: fatal error: …` into
+            // the unresolvable file `../x.cpp:41`, which is why missing-header errors
+            // could never be located (and so were silently skipped by the fix loop).
+            let markers = ["fatal error:", "error:", "warning:"];
+            let Some(marker) = markers.iter().find(|m| lower.contains(**m)) else {
+                continue;
+            };
+            // Find the position of the message.
+            let Some(msg_idx) = lower.find(marker) else {
+                continue;
+            };
+            let path_part = &line[..msg_idx];
+            let msg = line[msg_idx + marker.len()..].trim().to_string();
+            // path_part is "<file>:<line>:<col>: " (column optional). Drop the
+            // trailing separator FIRST, then read the numbers off the right — splitting
+            // straight away glued the line number onto the file name, so every build
+            // diagnostic pointed at a path that cannot exist (`../x.cpp:41`) and the
+            // fix loop skipped all of them.
+            let mut loc = path_part.trim_end();
+            if let Some(stripped) = loc.strip_suffix(':') {
+                loc = stripped.trim_end();
+            }
+            let (head, tail) = loc.rsplit_once(':').unwrap_or(("", loc));
+            let (file, line_no, col) = match head.rsplit_once(':') {
+                // "<file>:<line>:<col>" — two numbers, so the pair is line:column.
+                Some((path, line)) if line.trim().parse::<u64>().is_ok() => (
+                    path.trim().to_string(),
+                    line.trim().parse::<u64>().ok(),
+                    tail.trim().parse::<u64>().ok(),
+                ),
+                // "<file>:<line>" — a single number is the line.
+                _ => (
+                    head.trim().to_string(),
+                    tail.trim().parse::<u64>().ok(),
+                    None,
+                ),
+            };
+            // "fatal error:" is an error, not a warning.
+            let severity = if marker.contains("error") {
+                "error"
+            } else {
+                "warning"
+            };
+            events.push(serde_json::json!({
+                "file": file,
+                "level": severity,
+                "line": msg.clone(),
+                "message": msg,
+                "line_number": line_no,
+                "column": col,
+            }));
         }
-        // Split at the first ": " that precedes error/warning/fatal.
-        let lower = line.to_lowercase();
-        // Longest marker first: "fatal error:" CONTAINS "error:", so matching
-        // "error:" first would leave the "fatal " prefix in the path part and
-        // swallow the line number — turning `../x.cpp:41:10: fatal error: …` into
-        // the unresolvable file `../x.cpp:41`, which is why missing-header errors
-        // could never be located (and so were silently skipped by the fix loop).
-        let markers = ["fatal error:", "error:", "warning:"];
-        let Some(marker) = markers.iter().find(|m| lower.contains(**m)) else {
-            continue;
-        };
-        // Find the position of the message.
-        let Some(msg_idx) = lower.find(marker) else { continue };
-        let path_part = &line[..msg_idx];
-        let msg = line[msg_idx + marker.len()..].trim().to_string();
-        // path_part is "<file>:<line>:<col>: " (column optional). Drop the
-        // trailing separator FIRST, then read the numbers off the right — splitting
-        // straight away glued the line number onto the file name, so every build
-        // diagnostic pointed at a path that cannot exist (`../x.cpp:41`) and the
-        // fix loop skipped all of them.
-        let mut loc = path_part.trim_end();
-        if let Some(stripped) = loc.strip_suffix(':') {
-            loc = stripped.trim_end();
+        events
+    }
+
+    /// True when a diagnostic's recorded `file` belongs to `project_root`.
+    ///
+    /// Compilers print paths the way they were invoked, and Meson/ninja invoke them
+    /// RELATIVE to the build directory (`../app/main.cpp`), so a relative path is
+    /// this project's by definition — the memory graph is per-project. An absolute
+    /// path must still sit under the project root, so a shared graph can never have
+    /// another project's diagnostics deleted by mistake.
+    ///
+    /// Getting this wrong is what let ~137 stale BUILD errors (recorded with relative
+    /// paths by an earlier platform-less build) survive every supersede and be
+    /// re-reported by "Fix & Verify" as if the current rpi5 build produced them.
+    fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
+        let file = file.trim();
+        if file.is_empty() {
+            return false;
         }
-        let (head, tail) = loc.rsplit_once(':').unwrap_or(("", loc));
-        let (file, line_no, col) = match head.rsplit_once(':') {
-            // "<file>:<line>:<col>" — two numbers, so the pair is line:column.
-            Some((path, line)) if line.trim().parse::<u64>().is_ok() => (
-                path.trim().to_string(),
-                line.trim().parse::<u64>().ok(),
-                tail.trim().parse::<u64>().ok(),
-            ),
-            // "<file>:<line>" — a single number is the line.
-            _ => (
-                head.trim().to_string(),
-                tail.trim().parse::<u64>().ok(),
-                None,
-            ),
-        };
-        // "fatal error:" is an error, not a warning.
-        let severity = if marker.contains("error") {
-            "error"
+        if file.starts_with('/') {
+            file.starts_with(project_root.trim_end_matches('/'))
         } else {
-            "warning"
-        };
-        events.push(serde_json::json!({
-            "file": file,
-            "level": severity,
-            "line": msg.clone(),
-            "message": msg,
-            "line_number": line_no,
-            "column": col,
-        }));
+            true
+        }
     }
-    events
-}
-
-/// True when a diagnostic's recorded `file` belongs to `project_root`.
-///
-/// Compilers print paths the way they were invoked, and Meson/ninja invoke them
-/// RELATIVE to the build directory (`../app/main.cpp`), so a relative path is
-/// this project's by definition — the memory graph is per-project. An absolute
-/// path must still sit under the project root, so a shared graph can never have
-/// another project's diagnostics deleted by mistake.
-///
-/// Getting this wrong is what let ~137 stale BUILD errors (recorded with relative
-/// paths by an earlier platform-less build) survive every supersede and be
-/// re-reported by "Fix & Verify" as if the current rpi5 build produced them.
-fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
-    let file = file.trim();
-    if file.is_empty() {
-        return false;
-    }
-    if file.starts_with('/') {
-        file.starts_with(project_root.trim_end_matches('/'))
-    } else {
-        true
-    }
-}
-
 
     /// Format: same pattern as build — route to module via a proper message.
     async fn format_project(&self, path: &Path) -> Result<BuildOutput, String> {
@@ -1596,7 +1638,10 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
             })
             .and_then(|cap| cap.config_files.first().cloned())
             .ok_or_else(|| {
-                format!("No build module registered for build system '{}'", build_system)
+                format!(
+                    "No build module registered for build system '{}'",
+                    build_system
+                )
             })?;
 
         let module_tx = self
@@ -1669,22 +1714,18 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
 
         // Modules reply with an MCP-shaped envelope; some (node/meson stubs)
         // reply with a bare `{ "error": "…" }` instead.
-        if let Some(err_text) = reply
-            .get("error")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                reply
-                    .get("result")
-                    .and_then(|r| r.get("isError"))
-                    .and_then(|ie| ie.as_bool())
-                    .filter(|b| *b)
-                    .and_then(|_| {
-                        reply["result"]["content"][0]
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                    })
-            })
-        {
+        if let Some(err_text) = reply.get("error").and_then(|v| v.as_str()).or_else(|| {
+            reply
+                .get("result")
+                .and_then(|r| r.get("isError"))
+                .and_then(|ie| ie.as_bool())
+                .filter(|b| *b)
+                .and_then(|_| {
+                    reply["result"]["content"][0]
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                })
+        }) {
             return Err(err_text.to_string());
         }
 
@@ -1711,11 +1752,11 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
             Ok(ctx) => ctx,
             Err(e) => return serde_json::json!({ "error": e }),
         };
-        let (source, syntax) =
-            match hal_llm_generate_source(&self.llm_tx, ctx.prompt.clone()).await {
-                Ok(pair) => pair,
-                Err(e) => return serde_json::json!({ "error": e }),
-            };
+        let (source, syntax) = match hal_llm_generate_source(&self.llm_tx, ctx.prompt.clone()).await
+        {
+            Ok(pair) => pair,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
         // Guarantee the `.cpp` includes its own declaration header.
         let source = ensure_impl_header_include(&source, &ctx.hpp_name);
         let hpp_path = ctx.impl_dir.join(&ctx.hpp_name);
@@ -1744,11 +1785,26 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
         platform: &str,
         args: &serde_json::Value,
     ) -> serde_json::Value {
-        let class_name = args.get("class_name").and_then(|v| v.as_str()).unwrap_or_default();
-        let hpp_path = args.get("hpp_path").and_then(|v| v.as_str()).unwrap_or_default();
-        let cpp_path = args.get("cpp_path").and_then(|v| v.as_str()).unwrap_or_default();
-        let header = args.get("header").and_then(|v| v.as_str()).unwrap_or_default();
-        let source = args.get("source").and_then(|v| v.as_str()).unwrap_or_default();
+        let class_name = args
+            .get("class_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let hpp_path = args
+            .get("hpp_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let cpp_path = args
+            .get("cpp_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let header = args
+            .get("header")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let source = args
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if hpp_path.is_empty() || cpp_path.is_empty() || header.is_empty() || source.is_empty() {
             return serde_json::json!({ "error": "hal_generate_impl_apply: 'hpp_path', 'cpp_path', 'header' and 'source' are required" });
         }
@@ -1765,12 +1821,16 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 return serde_json::json!({ "error": format!("create {}: {e}", parent.display()) });
             }
         }
-        if let Err(e) = std::fs::write(hpp_path, header).and_then(|_| std::fs::write(cpp_path, source)) {
+        if let Err(e) =
+            std::fs::write(hpp_path, header).and_then(|_| std::fs::write(cpp_path, source))
+        {
             return serde_json::json!({ "error": format!("write pair: {e}") });
         }
         // Remove stale stubs so coverage never ORs their sentinel.
         let impl_dir = std::path::Path::new(root)
-            .join("hal").join("implementations").join(platform);
+            .join("hal")
+            .join("implementations")
+            .join(platform);
         let removed_stubs =
             crate::build::generic_helpers::remove_stale_hal_stubs(&impl_dir, interface);
         // Idempotent meson wiring.
@@ -1794,11 +1854,22 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
         // Build gate.
         let gate = format!("meson compile -C build-{platform} {interface}-{platform}");
         let gate_status = match crate::build::generic_helpers::run_cmd(
-            std::path::Path::new(root), "meson",
-            &["compile", "-C", &format!("build-{platform}"), &format!("{interface}-{platform}")],
-        ).await {
+            std::path::Path::new(root),
+            "meson",
+            &[
+                "compile",
+                "-C",
+                &format!("build-{platform}"),
+                &format!("{interface}-{platform}"),
+            ],
+        )
+        .await
+        {
             Ok(o) if o.success => "build passed".to_string(),
-            Ok(o) => format!("build FAILED:\n{}", o.output.lines().take(20).collect::<Vec<_>>().join("\n")),
+            Ok(o) => format!(
+                "build FAILED:\n{}",
+                o.output.lines().take(20).collect::<Vec<_>>().join("\n")
+            ),
             Err(e) => format!("build gate unavailable: {e}"),
         };
         serde_json::json!({
@@ -1833,9 +1904,18 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("");
                 let opts = BuildOptions {
                     mode: mode.to_string(),
-                    package: args.get("package").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    platform: args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    target: args.get("target").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    package: args
+                        .get("package")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    platform: args
+                        .get("platform")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    target: args
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 };
                 match self.build_project_with_events(Path::new(path), &opts).await {
                     Ok((o, mut events)) => {
@@ -1844,12 +1924,15 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                         // compiler warnings in o.output as plain text (the streamed
                         // events only carry module "finished" markers), so parse
                         // them into diagnostic events when none were streamed.
-                        let has_file_diags =
-                            events.iter().any(|e| e.get("file").and_then(|f| f.as_str()).is_some());
+                        let has_file_diags = events
+                            .iter()
+                            .any(|e| e.get("file").and_then(|f| f.as_str()).is_some());
                         if !has_file_diags {
                             events.append(&mut Self::parse_clang_output(&o.output));
                         }
-                        let _ = self.ingest_diagnostics(&events, "build", Path::new(path)).await;
+                        let _ = self
+                            .ingest_diagnostics(&events, "build", Path::new(path))
+                            .await;
                         // Persist the build status PER TARGET (success/duration +
                         // raw output) so building rock3c and rpi5 store separate
                         // results under the same key the platform list reads back.
@@ -1870,7 +1953,8 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                                 &o.output,
                             )
                             .await;
-                        let mut val = serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}));
+                        let mut val = serde_json::to_value(o)
+                            .unwrap_or(serde_json::json!({"error": "serialize"}));
                         if let serde_json::Value::Object(ref mut m) = val {
                             m.insert("buildEvents".to_string(), serde_json::json!(events));
                         }
@@ -1919,7 +2003,10 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 }
             }
             "build_clean" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let platform = args
                     .get("platform")
                     .and_then(|v| v.as_str())
@@ -1950,9 +2037,19 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 }
             }
             "build_lint" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-                tracing::info!("build_lint: path={:?} exists={}", path, std::path::Path::new(path).exists());
-                let platform = args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                tracing::info!(
+                    "build_lint: path={:?} exists={}",
+                    path,
+                    std::path::Path::new(path).exists()
+                );
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let status_target = self
                     .resolve_status_target(
                         path,
@@ -1962,7 +2059,12 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                     .await;
                 match self.lint_project_streaming(Path::new(path), platform).await {
                     Ok((o, mut events)) => {
-                        tracing::info!("build_lint OK: success={} out_len={} events={}", o.success, o.output.len(), events.len());
+                        tracing::info!(
+                            "build_lint OK: success={} out_len={} events={}",
+                            o.success,
+                            o.output.len(),
+                            events.len()
+                        );
                         // Meson lint returns clang analyzer output as plain text in
                         // `o.output` (the streaming events are usually empty), so
                         // parse the clang diagnostic lines into structured events.
@@ -1970,11 +2072,16 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                         // UI's lint/diagnostics panel show real findings.
                         if events.is_empty() {
                             events.append(&mut Self::parse_clang_output(&o.output));
-                            tracing::info!("build_lint: parsed {} diagnostics from output", events.len());
+                            tracing::info!(
+                                "build_lint: parsed {} diagnostics from output",
+                                events.len()
+                            );
                         }
                         // Persist lint findings as Diagnostic graph nodes so the
                         // Build tab shows them after the lint run.
-                        let _ = self.ingest_diagnostics(&events, "lint", Path::new(path)).await;
+                        let _ = self
+                            .ingest_diagnostics(&events, "lint", Path::new(path))
+                            .await;
                         let _ = self
                             .store_action_status(
                                 "lint",
@@ -1984,7 +2091,8 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                                 o.duration_secs,
                             )
                             .await;
-                        let mut val = serde_json::to_value(&o).unwrap_or(serde_json::json!({"error": "serialize"}));
+                        let mut val = serde_json::to_value(&o)
+                            .unwrap_or(serde_json::json!({"error": "serialize"}));
                         if let serde_json::Value::Object(ref mut m) = val {
                             m.insert("buildEvents".to_string(), serde_json::json!(events));
                         }
@@ -1998,12 +2106,28 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 // checks a developer runs together. Both results are persisted
                 // per target under their own kind so the platform list shows
                 // them independently.
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let opts = BuildOptions {
-                    mode: args.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    package: args.get("package").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    platform: args.get("platform").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                    target: args.get("target").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    mode: args
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    package: args
+                        .get("package")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    platform: args
+                        .get("platform")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    target: args
+                        .get("target")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                 };
                 let status_target = self
                     .resolve_status_target(path, opts.target.as_deref(), opts.platform.as_deref())
@@ -2097,31 +2221,51 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 })
             }
             "build_format" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 match self.format_project(Path::new(path)).await {
-                    Ok(o) => serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"})),
+                    Ok(o) => {
+                        serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}))
+                    }
                     Err(e) => serde_json::json!({ "error": e }),
                 }
             }
             "build_fix" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 match self.fix_project_streaming(Path::new(path)).await {
                     Ok((o, events)) => {
-                        let mut val = serde_json::to_value(&o).unwrap_or(serde_json::json!({"error": "serialize"}));
+                        let mut val = serde_json::to_value(&o)
+                            .unwrap_or(serde_json::json!({"error": "serialize"}));
                         if let serde_json::Value::Object(ref mut m) = val {
                             m.insert("buildEvents".to_string(), serde_json::json!(events.clone()));
                         }
                         // Persist post-fix diagnostics (usually no remaining events).
-                        let _ = self.ingest_diagnostics(&events, "fix", Path::new(path)).await;
+                        let _ = self
+                            .ingest_diagnostics(&events, "fix", Path::new(path))
+                            .await;
                         val
                     }
                     Err(e) => serde_json::json!({ "error": e }),
                 }
             }
             "build_scaffold" => {
-                let project_name = args.get("project_name").and_then(|v| v.as_str()).unwrap_or_default();
-                let build_system = args.get("build_system").and_then(|v| v.as_str()).unwrap_or_default();
-                let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or_default();
+                let project_name = args
+                    .get("project_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let build_system = args
+                    .get("build_system")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let goal = args
+                    .get("goal")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 // Empty platforms => single-target ("host") scaffold.
                 let platforms: Vec<String> = args
                     .get("platforms")
@@ -2132,8 +2276,20 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                             .collect()
                     })
                     .unwrap_or_else(|| vec!["host".to_string()]);
-                match self.scaffold_build_config(project_name, build_system, goal, &platforms, spire_core::build_types::ProjectStructure::Native, false).await {
-                    Ok(out) => serde_json::to_value(out).unwrap_or_else(|_| serde_json::json!({ "error": "scaffold serialization" })),
+                match self
+                    .scaffold_build_config(
+                        project_name,
+                        build_system,
+                        goal,
+                        &platforms,
+                        spire_core::build_types::ProjectStructure::Native,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(out) => serde_json::to_value(out).unwrap_or_else(
+                        |_| serde_json::json!({ "error": "scaffold serialization" }),
+                    ),
                     Err(e) => serde_json::json!({ "error": e }),
                 }
             }
@@ -2141,16 +2297,28 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 serde_json::to_value(&self.capabilities).unwrap_or(serde_json::json!([]))
             }
             "build_dependency_docs" => {
-                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let version = args.get("version").and_then(|v| v.as_str()).unwrap_or("");
                 // Route to the module that owns the requested language, falling
                 // back to Cargo (Rust) which is the primary supported runtime.
-                let lang = args.get("language").and_then(|v| v.as_str()).unwrap_or("Rust");
+                let lang = args
+                    .get("language")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Rust");
                 let module_tx = self
                     .capabilities
                     .iter()
-                    .find(|c| c.language.eq_ignore_ascii_case(lang) || c.build_system.eq_ignore_ascii_case(lang))
-                    .and_then(|c| self.router.get(c.config_files.first().map(|s| s.as_str()).unwrap_or("")))
+                    .find(|c| {
+                        c.language.eq_ignore_ascii_case(lang)
+                            || c.build_system.eq_ignore_ascii_case(lang)
+                    })
+                    .and_then(|c| {
+                        self.router
+                            .get(c.config_files.first().map(|s| s.as_str()).unwrap_or(""))
+                    })
                     .cloned()
                     .or_else(|| self.router.get("Cargo.toml").cloned());
                 match module_tx {
@@ -2165,10 +2333,14 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                             .await;
                         match r.await {
                             Ok(v) => v,
-                            Err(e) => serde_json::json!({ "error": format!("dependency docs response lost: {}", e) }),
+                            Err(e) => {
+                                serde_json::json!({ "error": format!("dependency docs response lost: {}", e) })
+                            }
                         }
                     }
-                    None => serde_json::json!({ "error": "no build module available for dependency docs" }),
+                    None => {
+                        serde_json::json!({ "error": "no build module available for dependency docs" })
+                    }
                 }
             }
             // ── HAL contract helpers (Phase A) ─────────────────────────
@@ -2177,10 +2349,7 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
             // implementations, and diff contract versions — all against the
             // deterministic contract tooling in spire-modules.
             "hal_validate_contract" => {
-                let content = args
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 if content.is_empty() {
                     serde_json::json!({ "error": "hal_validate_contract: 'content' (header source) is required" })
                 } else {
@@ -2202,10 +2371,7 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                     .get("filename")
                     .and_then(|v| v.as_str())
                     .unwrap_or("camera_hal.hpp");
-                let content = args
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 if root.is_empty() || content.is_empty() {
                     serde_json::json!({ "error": "hal_write_contract: 'root' and 'content' are required" })
                 } else {
@@ -2244,9 +2410,18 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
             // hardware profile + library hints + clean impl header + meson
             // build gate). The LLM runs against THIS prompt.
             "hal_build_impl_prompt" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
-                let interface = args.get("interface").and_then(|v| v.as_str()).unwrap_or_default();
-                let platform = args.get("platform").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let interface = args
+                    .get("interface")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if root.is_empty() || interface.is_empty() || platform.is_empty() {
                     serde_json::json!({ "error": "hal_build_impl_prompt: 'root', 'interface' and 'platform' are required" })
                 } else {
@@ -2271,23 +2446,41 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
 
             // Step 4 (LLM half, one-shot): plan → apply in one step.
             "hal_generate_impl" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
-                let interface = args.get("interface").and_then(|v| v.as_str()).unwrap_or_default();
-                let platform = args.get("platform").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let interface = args
+                    .get("interface")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if root.is_empty() || interface.is_empty() || platform.is_empty() {
                     serde_json::json!({ "error": "hal_generate_impl: 'root', 'interface' and 'platform' are required" })
                 } else if self.llm_tx.is_none() {
                     serde_json::json!({ "error": "hal_generate_impl: LLM unavailable — the build manager is not connected to the LLM service (wiring, not a missing API key)" })
                 } else {
-                    let plan = self.hal_generate_plan(
-                        root, interface, platform,
-                        args.get("library_hints").and_then(|v| v.as_str()),
-                    ).await;
+                    let plan = self
+                        .hal_generate_plan(
+                            root,
+                            interface,
+                            platform,
+                            args.get("library_hints").and_then(|v| v.as_str()),
+                        )
+                        .await;
                     if plan.get("error").is_some() {
                         plan
                     } else {
-                        let syntax = plan.get("syntax").cloned().unwrap_or(serde_json::json!("ok"));
-                        let mut result = self.hal_generate_apply(root, interface, platform, &plan).await;
+                        let syntax = plan
+                            .get("syntax")
+                            .cloned()
+                            .unwrap_or(serde_json::json!("ok"));
+                        let mut result = self
+                            .hal_generate_apply(root, interface, platform, &plan)
+                            .await;
                         if let serde_json::Value::Object(ref mut m) = result {
                             m.insert("syntax".to_string(), syntax);
                         }
@@ -2300,42 +2493,58 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
             // header + LLM .cpp) before any write. The UI shows it for approval
             // then calls `hal_generate_impl_apply`.
             "hal_generate_impl_plan" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
-                let interface = args.get("interface").and_then(|v| v.as_str()).unwrap_or_default();
-                let platform = args.get("platform").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let interface = args
+                    .get("interface")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if root.is_empty() || interface.is_empty() || platform.is_empty() {
                     serde_json::json!({ "error": "hal_generate_impl_plan: 'root', 'interface' and 'platform' are required" })
                 } else if self.llm_tx.is_none() {
                     serde_json::json!({ "error": "hal_generate_impl_plan: LLM unavailable — the build manager is not connected to the LLM service (wiring, not a missing API key)" })
                 } else {
                     self.hal_generate_plan(
-                        root, interface, platform,
+                        root,
+                        interface,
+                        platform,
                         args.get("library_hints").and_then(|v| v.as_str()),
-                    ).await
+                    )
+                    .await
                 }
             }
             // Step 4 (LLM half, APPLY): write an APPROVED module pair (header +
             // source), remove stale stubs, wire meson and run the compile gate.
             "hal_generate_impl_apply" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
-                let interface = args.get("interface").and_then(|v| v.as_str()).unwrap_or_default();
-                let platform = args.get("platform").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let interface = args
+                    .get("interface")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if root.is_empty() || interface.is_empty() || platform.is_empty() {
                     serde_json::json!({ "error": "hal_generate_impl_apply: 'root', 'interface' and 'platform' are required" })
                 } else {
-                    self.hal_generate_apply(root, interface, platform, &args).await
+                    self.hal_generate_apply(root, interface, platform, &args)
+                        .await
                 }
             }
 
             "hal_generate_placeholder" => {
-                let summary = args
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let platform = args
-                    .get("platform")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                let platform = args.get("platform").and_then(|v| v.as_str()).unwrap_or("");
                 if summary.is_empty() || platform.is_empty() {
                     serde_json::json!({ "error": "hal_generate_placeholder: 'summary' and 'platform' are required" })
                 } else {
@@ -2351,13 +2560,17 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                                 .map(|(name, _)| name.to_lowercase())
                         })
                         .unwrap_or_else(|| "hal".to_string());
-                    let classes = crate::build::generic_helpers::parse_hal_contract_summary(summary);
+                    let classes =
+                        crate::build::generic_helpers::parse_hal_contract_summary(summary);
                     if classes.is_empty() {
                         serde_json::json!({ "error": "hal_generate_placeholder: summary has no contract methods" })
                     } else {
                         let (class_name, methods) = &classes[0];
                         let source = crate::build::generic_helpers::generate_hal_placeholder_source(
-                            &header_stem, class_name, methods, platform,
+                            &header_stem,
+                            class_name,
+                            methods,
+                            platform,
                         );
                         serde_json::json!({ "class_name": class_name, "source": source })
                     }
@@ -2383,7 +2596,9 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                 } else {
                     let api_dir = std::path::Path::new(root).join("hal").join("api");
                     let impl_dir = std::path::Path::new(root)
-                        .join("hal").join("implementations").join(platform);
+                        .join("hal")
+                        .join("implementations")
+                        .join(platform);
                     let Ok(entries) = std::fs::read_dir(&api_dir) else {
                         return serde_json::json!({ "error": format!("no hal/api found under {}", root) });
                     };
@@ -2391,19 +2606,28 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                     let mut interfaces: Vec<(String, String, String)> = Vec::new();
                     for e in entries.flatten() {
                         let ep = e.path();
-                        let Some(ext) = ep.extension().and_then(|x| x.to_str()) else { continue };
+                        let Some(ext) = ep.extension().and_then(|x| x.to_str()) else {
+                            continue;
+                        };
                         if ext != "hpp" {
                             continue;
                         }
-                        let Ok(content) = std::fs::read_to_string(&ep) else { continue };
+                        let Ok(content) = std::fs::read_to_string(&ep) else {
+                            continue;
+                        };
                         let Ok(summary) =
                             crate::build::generic_helpers::summarize_hal_header(&content)
-                        else { continue };
-                        let Some(stem) = ep.file_stem().and_then(|s| s.to_str()) else { continue };
-                        let class_name = crate::build::generic_helpers::parse_hal_contract_summary(&summary)
-                            .first()
-                            .map(|(name, _)| name.clone())
-                            .unwrap_or_else(|| stem.to_string());
+                        else {
+                            continue;
+                        };
+                        let Some(stem) = ep.file_stem().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        let class_name =
+                            crate::build::generic_helpers::parse_hal_contract_summary(&summary)
+                                .first()
+                                .map(|(name, _)| name.clone())
+                                .unwrap_or_else(|| stem.to_string());
                         interfaces.push((stem.to_string(), summary, class_name));
                     }
                     if interfaces.is_empty() {
@@ -2414,14 +2638,16 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                         let mut written: Vec<String> = Vec::new();
                         let mut failures: Vec<String> = Vec::new();
                         for (stem, summary, class_name) in &interfaces {
-                            let parsed = crate::build::generic_helpers::parse_hal_contract_summary(summary);
+                            let parsed =
+                                crate::build::generic_helpers::parse_hal_contract_summary(summary);
                             let Some((_, methods)) = parsed.first() else {
                                 failures.push(format!("{stem}: no contract methods parsed"));
                                 continue;
                             };
-                            let source = crate::build::generic_helpers::generate_hal_placeholder_source(
-                                stem, class_name, methods, platform,
-                            );
+                            let source =
+                                crate::build::generic_helpers::generate_hal_placeholder_source(
+                                    stem, class_name, methods, platform,
+                                );
                             let target = impl_dir.join(format!("{stem}_stub.cpp"));
                             match std::fs::write(&target, source) {
                                 Ok(()) => written.push(target.display().to_string()),
@@ -2432,7 +2658,10 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                         let meson_path = std::path::Path::new(root).join("hal").join("meson.build");
                         let section = crate::build::generic_helpers::hal_meson_var_section(
                             platform,
-                            &interfaces.iter().map(|(s, _, _)| s.clone()).collect::<Vec<_>>(),
+                            &interfaces
+                                .iter()
+                                .map(|(s, _, _)| s.clone())
+                                .collect::<Vec<_>>(),
                         );
                         let mut meson_status = "wired".to_string();
                         if let Ok(existing) = std::fs::read_to_string(&meson_path) {
@@ -2448,10 +2677,11 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                         // the new target (the analyzer lists placeholders as
                         // implementations — real ones fill them via Stage 1).
 
-                        let analysis_status = match self.analyze_project(std::path::Path::new(root), None).await {
-                            Ok(_) => "re-analyzed (queued impls ready)".to_string(),
-                            Err(e) => format!("re-analyze failed: {e}"),
-                        };
+                        let analysis_status =
+                            match self.analyze_project(std::path::Path::new(root), None).await {
+                                Ok(_) => "re-analyzed (queued impls ready)".to_string(),
+                                Err(e) => format!("re-analyze failed: {e}"),
+                            };
                         serde_json::json!({
                             "platform": platform,
                             "interfaces": interfaces.iter().map(|(s, _, _)| s.clone()).collect::<Vec<_>>(),
@@ -2508,12 +2738,21 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                         .filter_map(|c| c.get(1).map(|m| m.as_str().trim().to_string()))
                         .filter(|s| !s.is_empty() && !s.starts_with(".."))
                         .collect();
-                    let template = existing.iter().find(|p| *p != "toolkit" && *p != "hal" && *p != "host" && *p != "subprojects").cloned();
+                    let template = existing
+                        .iter()
+                        .find(|p| {
+                            *p != "toolkit" && *p != "hal" && *p != "host" && *p != "subprojects"
+                        })
+                        .cloned();
                     let Some(template) = template else {
                         return serde_json::json!({ "error": "hal_add_platform: no existing platform subdir found (add one platform first)" });
                     };
-                    if existing.iter().any(|p| p == platform) || root_path.join(platform).exists()
-                        || root_path.join("hal/implementations").join(platform).exists()
+                    if existing.iter().any(|p| p == platform)
+                        || root_path.join(platform).exists()
+                        || root_path
+                            .join("hal/implementations")
+                            .join(platform)
+                            .exists()
                     {
                         return serde_json::json!({ "error": format!("platform '{platform}' is already present in this project") });
                     }
@@ -2529,15 +2768,27 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                         if let Ok(entries) = std::fs::read_dir(&api_dir) {
                             for e in entries.flatten() {
                                 let ep = e.path();
-                                let Some(ext) = ep.extension().and_then(|x| x.to_str()) else { continue };
+                                let Some(ext) = ep.extension().and_then(|x| x.to_str()) else {
+                                    continue;
+                                };
                                 if ext != "hpp" && ext != "h" {
                                     continue;
                                 }
-                                let Ok(content) = std::fs::read_to_string(&ep) else { continue };
-                                let Ok(summary) = crate::build::generic_helpers::summarize_hal_header(&content)
-                                else { continue };
-                                let Some(stem) = ep.file_stem().and_then(|s| s.to_str()) else { continue };
-                                let class_name = crate::build::generic_helpers::parse_hal_contract_summary(&summary)
+                                let Ok(content) = std::fs::read_to_string(&ep) else {
+                                    continue;
+                                };
+                                let Ok(summary) =
+                                    crate::build::generic_helpers::summarize_hal_header(&content)
+                                else {
+                                    continue;
+                                };
+                                let Some(stem) = ep.file_stem().and_then(|s| s.to_str()) else {
+                                    continue;
+                                };
+                                let class_name =
+                                    crate::build::generic_helpers::parse_hal_contract_summary(
+                                        &summary,
+                                    )
                                     .first()
                                     .map(|(name, _)| name.clone())
                                     .unwrap_or_else(|| stem.to_string());
@@ -2552,7 +2803,8 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                     let mut written: Vec<String> = Vec::new();
                     let mut failures: Vec<String> = Vec::new();
                     for (stem, summary, class_name) in &interfaces {
-                        let parsed = crate::build::generic_helpers::parse_hal_contract_summary(summary);
+                        let parsed =
+                            crate::build::generic_helpers::parse_hal_contract_summary(summary);
                         let Some((_, methods)) = parsed.first() else {
                             failures.push(format!("{stem}: no contract methods parsed"));
                             continue;
@@ -2571,7 +2823,8 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                     let meson_path = root_path.join("hal/meson.build");
                     let mut meson_status = "wired".to_string();
                     let stems: Vec<String> = interfaces.iter().map(|(s, _, _)| s.clone()).collect();
-                    let section = crate::build::generic_helpers::hal_meson_var_section(platform, &stems);
+                    let section =
+                        crate::build::generic_helpers::hal_meson_var_section(platform, &stems);
                     if let Ok(existing) = std::fs::read_to_string(&meson_path) {
                         if !existing.contains(&format!("hal_impl_{platform}_sources")) {
                             let _ = std::fs::write(&meson_path, format!("{existing}\n{section}"));
@@ -2603,9 +2856,13 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                     let mut options_status = "wired".to_string();
                     let options_path = root_path.join("meson_options.txt");
                     if let Ok(opts) = std::fs::read_to_string(&options_path) {
-                        let re = regex::Regex::new(r"(?i)(Valid values\s*:\s*)([A-Za-z0-9_ ,\-]+)").unwrap();
+                        let re = regex::Regex::new(r"(?i)(Valid values\s*:\s*)([A-Za-z0-9_ ,\-]+)")
+                            .unwrap();
                         if let Some(caps) = re.captures(&opts) {
-                            let mut values: Vec<String> = caps.get(2).unwrap().as_str()
+                            let mut values: Vec<String> = caps
+                                .get(2)
+                                .unwrap()
+                                .as_str()
                                 .split(',')
                                 .map(|t| t.trim().to_string())
                                 .filter(|t| !t.is_empty())
@@ -2778,14 +3035,16 @@ executable('{project_name}-{platform}',
                     let agg_cpp = crate::build::generic_helpers::generate_aggregate_hal_source(
                         platform, &agg_class, &accessors,
                     );
-                    if let Err(e) =
-                        std::fs::write(impl_dir.join(format!("ai_trap_hal_{platform}.hpp")), &agg_hpp)
-                    {
+                    if let Err(e) = std::fs::write(
+                        impl_dir.join(format!("ai_trap_hal_{platform}.hpp")),
+                        &agg_hpp,
+                    ) {
                         plat_status = format!("aggregate header write failed: {e}");
                     }
-                    if let Err(e) =
-                        std::fs::write(impl_dir.join(format!("ai_trap_hal_{platform}.cpp")), &agg_cpp)
-                    {
+                    if let Err(e) = std::fs::write(
+                        impl_dir.join(format!("ai_trap_hal_{platform}.cpp")),
+                        &agg_cpp,
+                    ) {
                         plat_status = format!("aggregate source write failed: {e}");
                     }
 
@@ -2915,12 +3174,20 @@ executable('{project_name}-{platform}',
                 let interfaces: Vec<String> = args
                     .get("interfaces")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if root.is_empty() {
                     serde_json::json!({ "error": "hal_fill_plan: \"root\" required" })
                 } else {
-                    crate::actors::hal_fill::plan(std::path::Path::new(&root), &platform, &interfaces)
+                    crate::actors::hal_fill::plan(
+                        std::path::Path::new(&root),
+                        &platform,
+                        &interfaces,
+                    )
                 }
             }
 
@@ -2943,7 +3210,8 @@ executable('{project_name}-{platform}',
                             std::path::Path::new(&root),
                             &plan,
                             Box::pin(analyze),
-                        ).await
+                        )
+                        .await
                     }
                     _ => serde_json::json!({
                         "error": "hal_fill_apply: \"root\" and \"plan\" required"
@@ -2963,7 +3231,8 @@ executable('{project_name}-{platform}',
                 if old_summary.is_empty() || new_summary.is_empty() {
                     serde_json::json!({ "error": "hal_diff_contracts: 'old_summary' and 'new_summary' are required" })
                 } else {
-                    let change = crate::build::generic_helpers::diff_hal_contracts(old_summary, new_summary);
+                    let change =
+                        crate::build::generic_helpers::diff_hal_contracts(old_summary, new_summary);
                     serde_json::json!({
                         "added": change.added,
                         "removed": change.removed,
@@ -2972,19 +3241,31 @@ executable('{project_name}-{platform}',
                 }
             }
             "cpp_syntax_check" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 match std::fs::read_to_string(path) {
                     Ok(content) => serde_json::to_value(
-                        crate::build::generic_helpers::cpp_syntax_check(&content)
-                    ).unwrap_or(serde_json::json!({"error": "cpp_syntax_check serialization"})),
+                        crate::build::generic_helpers::cpp_syntax_check(&content),
+                    )
+                    .unwrap_or(serde_json::json!({"error": "cpp_syntax_check serialization"})),
                     Err(e) => serde_json::json!({"error": format!("read {}: {e}", path)}),
                 }
             }
             "hal_fix_prompt" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let issues = crate::build::generic_helpers::hal_doc_lint_file(
-                    std::path::Path::new(root), path);
+                    std::path::Path::new(root),
+                    path,
+                );
                 let content = std::fs::read_to_string(path).unwrap_or_default();
                 serde_json::json!({
                     "issues": issues,
@@ -2992,61 +3273,97 @@ executable('{project_name}-{platform}',
                 })
             }
             "hal_state" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
-                serde_json::to_value(
-                    crate::build::generic_helpers::compute_hal_state(std::path::Path::new(root))
-                ).unwrap_or(serde_json::json!({"error": "hal_state serialization"}))
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                serde_json::to_value(crate::build::generic_helpers::compute_hal_state(
+                    std::path::Path::new(root),
+                ))
+                .unwrap_or(serde_json::json!({"error": "hal_state serialization"}))
             }
             "hal_doc_lint" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
-                serde_json::to_value(
-                    crate::build::generic_helpers::hal_doc_lint(std::path::Path::new(root))
-                ).unwrap_or(serde_json::json!({"error": "hal_doc_lint serialization"}))
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                serde_json::to_value(crate::build::generic_helpers::hal_doc_lint(
+                    std::path::Path::new(root),
+                ))
+                .unwrap_or(serde_json::json!({"error": "hal_doc_lint serialization"}))
             }
             "hal_docs" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let r = std::path::Path::new(root);
                 serde_json::to_value(crate::build::generic_helpers::hal_report(r))
                     .unwrap_or(serde_json::json!({"error": "hal_docs serialization"}))
             }
             "hal_verify" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 let r = std::path::Path::new(root);
                 serde_json::to_value(crate::build::generic_helpers::hal_verify(r))
                     .unwrap_or(serde_json::json!({"error": "hal_verify serialization"}))
             }
             "hal_sanity_check" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if root.is_empty() {
                     serde_json::json!({ "error": "hal_sanity_check: 'root' is required" })
                 } else {
-                    let report = crate::build::hal_migration::hal_sanity_check(std::path::Path::new(root));
-                    serde_json::to_value(report).unwrap_or_else(|_| serde_json::json!({ "error": "report serialization" }))
+                    let report =
+                        crate::build::hal_migration::hal_sanity_check(std::path::Path::new(root));
+                    serde_json::to_value(report)
+                        .unwrap_or_else(|_| serde_json::json!({ "error": "report serialization" }))
                 }
             }
             "hal_migrate_plan" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if root.is_empty() {
                     serde_json::json!({ "error": "hal_migrate_plan: 'root' is required" })
                 } else {
-                    match crate::build::hal_migration::migrate_hal_plan(std::path::Path::new(root)) {
-                        Ok(plan) => serde_json::to_value(plan).unwrap_or_else(|_| serde_json::json!({ "error": "plan serialization" })),
+                    match crate::build::hal_migration::migrate_hal_plan(std::path::Path::new(root))
+                    {
+                        Ok(plan) => serde_json::to_value(plan).unwrap_or_else(
+                            |_| serde_json::json!({ "error": "plan serialization" }),
+                        ),
                         Err(e) => serde_json::json!({ "error": e }),
                     }
                 }
             }
             "hal_migrate_apply" => {
-                let root = args.get("root").and_then(|v| v.as_str()).unwrap_or_default();
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
                 if root.is_empty() {
                     serde_json::json!({ "error": "hal_migrate_apply: 'root' is required" })
                 } else {
                     let plan_value = args.get("plan").cloned().unwrap_or(serde_json::Value::Null);
-                    let plan: crate::build::hal_migration::HalMigrationPlan = match serde_json::from_value(plan_value) {
-                        Ok(p) => p,
-                        Err(e) => return serde_json::json!({ "error": format!("invalid plan: {e}") }),
-                    };
-                    match crate::build::hal_migration::migrate_hal_apply(std::path::Path::new(root), &plan) {
-                        Ok(res) => serde_json::to_value(res).unwrap_or_else(|_| serde_json::json!({ "error": "result serialization" })),
+                    let plan: crate::build::hal_migration::HalMigrationPlan =
+                        match serde_json::from_value(plan_value) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                return serde_json::json!({ "error": format!("invalid plan: {e}") })
+                            }
+                        };
+                    match crate::build::hal_migration::migrate_hal_apply(
+                        std::path::Path::new(root),
+                        &plan,
+                    ) {
+                        Ok(res) => serde_json::to_value(res).unwrap_or_else(
+                            |_| serde_json::json!({ "error": "result serialization" }),
+                        ),
                         Err(e) => serde_json::json!({ "error": e }),
                     }
                 }
@@ -3135,7 +3452,10 @@ executable('{project_name}-{platform}',
     /// stored analysis. When the caller selected a concrete target (name or
     /// platform), the matching `BuildTarget.build_spec` is returned so the
     /// module executes it directly; otherwise `None` (existing per-tool logic).
-    fn resolve_build_spec(metadata: &BuildMetadata, opts: &BuildOptions) -> Option<spire_core::build_types::BuildSpec> {
+    fn resolve_build_spec(
+        metadata: &BuildMetadata,
+        opts: &BuildOptions,
+    ) -> Option<spire_core::build_types::BuildSpec> {
         let target_matches = |t: &spire_core::build_types::BuildTarget| {
             if let Some(tname) = &opts.target {
                 if !tname.is_empty() && t.name == *tname {
@@ -3155,7 +3475,6 @@ executable('{project_name}-{platform}',
             .find(|t| target_matches(t))
             .and_then(|t| t.build_spec.clone())
     }
-
 
     /// The unified build tools exposed to the LLM.
     fn list_tools() -> Vec<spire_core::actors::ToolInfo> {
@@ -3453,9 +3772,9 @@ impl Actor for BuildManagerActor {
                 // BuildManager for the rest of the session (every later build/
                 // hal call then fails too). Catch it, log it, and answer with an
                 // error instead.
-                let result = match futures::FutureExt::catch_unwind(
-                    std::panic::AssertUnwindSafe(self.call_tool(&tool_name, args)),
-                )
+                let result = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    self.call_tool(&tool_name, args),
+                ))
                 .await
                 {
                     Ok(v) => v,
@@ -3517,8 +3836,12 @@ impl Actor for BuildManagerActor {
                         })
                         .await;
                     match r.await {
-                        Ok(result) => { let _ = reply_to.send(result); }
-                        Err(e) => { let _ = reply_to.send(Err(format!("scaffold response lost: {}", e))); }
+                        Ok(result) => {
+                            let _ = reply_to.send(result);
+                        }
+                        Err(e) => {
+                            let _ = reply_to.send(Err(format!("scaffold response lost: {}", e)));
+                        }
                     }
                 } else {
                     let _ = reply_to.send(Err(format!(
@@ -3611,7 +3934,9 @@ mod tests {
         let model_output = "#include \"hal/api/h264_encoder.hpp\"\n\nnamespace hal { int x; }";
         let out = ensure_impl_header_include(model_output, "h264_encoder_a7s.hpp");
         assert!(
-            out.starts_with("#include \"h264_encoder_a7s.hpp\"\n\n#include \"hal/api/h264_encoder.hpp\""),
+            out.starts_with(
+                "#include \"h264_encoder_a7s.hpp\"\n\n#include \"hal/api/h264_encoder.hpp\""
+            ),
             "must prepend the impl header: {out}"
         );
         assert_eq!(
@@ -3659,7 +3984,10 @@ mod tests {
     fn diagnostic_in_project_accepts_build_dir_relative_paths() {
         let root = "/Users/me/ai-traps";
         // Relative (ninja/clang): this project's by construction.
-        assert!(BuildManagerActor::diagnostic_in_project("../app/main.cpp", root));
+        assert!(BuildManagerActor::diagnostic_in_project(
+            "../app/main.cpp",
+            root
+        ));
         assert!(BuildManagerActor::diagnostic_in_project(
             "../hal/implementations/rock3c/camera_hal_rk.cpp",
             root
@@ -3669,13 +3997,19 @@ mod tests {
             "/Users/me/ai-traps/build-rpi5/../app/main.cpp",
             root
         ));
-        assert!(BuildManagerActor::diagnostic_in_project("/Users/me/ai-traps/app/main.cpp", root));
+        assert!(BuildManagerActor::diagnostic_in_project(
+            "/Users/me/ai-traps/app/main.cpp",
+            root
+        ));
         // Absolute elsewhere: never deleted from a (possibly shared) graph.
         assert!(!BuildManagerActor::diagnostic_in_project(
             "/Users/me/other-project/main.cpp",
             root
         ));
-        assert!(!BuildManagerActor::diagnostic_in_project("/usr/include/stdio.h", root));
+        assert!(!BuildManagerActor::diagnostic_in_project(
+            "/usr/include/stdio.h",
+            root
+        ));
         // A trailing slash on the root must not matter.
         assert!(BuildManagerActor::diagnostic_in_project(
             "/Users/me/ai-traps/x.cpp",
@@ -3719,7 +4053,8 @@ mod tests {
         );
 
         // The plain "error:" form must parse identically.
-        let plain = BuildManagerActor::parse_clang_output("../app/main.cpp:27:5: error: no member\n");
+        let plain =
+            BuildManagerActor::parse_clang_output("../app/main.cpp:27:5: error: no member\n");
         assert_eq!(plain.len(), 1, "{plain:?}");
         assert_eq!(plain[0]["file"], "../app/main.cpp");
         assert_eq!(plain[0]["line_number"], 27);
@@ -3834,9 +4169,7 @@ mod tests {
 
     #[test]
     fn find_config_file_detects_known_names() {
-        let mut manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
         manager.add_module(
             ModuleCapability {
                 name: "cargo".to_string(),
@@ -3848,7 +4181,7 @@ mod tests {
                 supports_lint: true,
                 supports_format: true,
                 supports_fix: true,
-            mcp_servers: vec![],
+                mcp_servers: vec![],
             },
             mpsc::channel(1).0,
         );
@@ -3864,9 +4197,7 @@ mod tests {
 
     #[test]
     fn find_config_file_prefers_cargo_over_makefile_deterministically() {
-        let mut manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
         let add = |manager: &mut BuildManagerActor, name: &str, config: &str| {
             manager.add_module(
                 ModuleCapability {
@@ -3913,9 +4244,7 @@ mod tests {
             CargoBuildModule::new().spawn(rx);
             (tx, ())
         };
-        let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
-            mg_tx,
-        ));
+        let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(mg_tx));
 
         // Register the module (as the FFI bootstrap would).
         let (t, r) = oneshot::channel();
@@ -3945,9 +4274,7 @@ mod tests {
 
     #[tokio::test]
     async fn extension_router_registers_source_extensions() {
-        let mut manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
         manager.add_module(
             ModuleCapability {
                 name: "cargo".to_string(),
@@ -3959,7 +4286,7 @@ mod tests {
                 supports_lint: true,
                 supports_format: true,
                 supports_fix: true,
-            mcp_servers: vec![],
+                mcp_servers: vec![],
             },
             mpsc::channel(1).0,
         );
@@ -3973,9 +4300,7 @@ mod tests {
     /// same `call_tool`/`tools/call` surface the Swift wizard uses.
     #[tokio::test]
     async fn hal_contract_tools_validate_generate_and_diff() {
-        let manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
 
         // 1. Validate a valid abstract-class contract. Canonical HAL contracts
         // declare a virtual destructor (`virtual ~X() = default;`) — the
@@ -3991,12 +4316,18 @@ public:
 };
 "#;
         let valid = manager
-            .call_tool("hal_validate_contract", serde_json::json!({ "content": header }))
+            .call_tool(
+                "hal_validate_contract",
+                serde_json::json!({ "content": header }),
+            )
             .await;
         assert_eq!(valid["valid"], serde_json::json!(true), "valid: {valid}");
         let summary = valid["summary"].as_str().expect("summary field");
         assert!(summary.contains("CameraHAL"), "summary: {summary}");
-        assert!(summary.contains("start"), "summary must list start(): {summary}");
+        assert!(
+            summary.contains("start"),
+            "summary must list start(): {summary}"
+        );
 
         // 2. Reject a non-abstract header.
         let bad = manager
@@ -4016,8 +4347,14 @@ public:
             )
             .await;
         let source = placeholder["source"].as_str().expect("source");
-        assert!(source.contains("CameraHAL::start"), "placeholder: {placeholder}\nsource: {source}");
-        assert!(source.contains("/* TODO: implement for rpi5 */"), "placeholder: {placeholder}\nsource: {source}");
+        assert!(
+            source.contains("CameraHAL::start"),
+            "placeholder: {placeholder}\nsource: {source}"
+        );
+        assert!(
+            source.contains("/* TODO: implement for rpi5 */"),
+            "placeholder: {placeholder}\nsource: {source}"
+        );
 
         // 4. Diff two contract summaries → added + changed.
         let diff = manager
@@ -4029,9 +4366,16 @@ public:
                 }),
             )
             .await;
-        assert_eq!(diff["added"][0], serde_json::json!("teardown"), "diff: {diff}");
+        assert_eq!(
+            diff["added"][0],
+            serde_json::json!("teardown"),
+            "diff: {diff}"
+        );
         assert!(
-            diff["changed"].as_array().map(|a| a.iter().any(|p| p[0] == "capture")).unwrap_or(false),
+            diff["changed"]
+                .as_array()
+                .map(|a| a.iter().any(|p| p[0] == "capture"))
+                .unwrap_or(false),
             "diff must flag capture sig change: {diff}"
         );
     }
@@ -4044,9 +4388,7 @@ public:
 
         let dir = tempdir().unwrap();
         let root = dir.path();
-        let manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
 
         // Valid canonical contract → written to hal/api/camera_hal.hpp.
         let header = r#"#pragma once
@@ -4107,8 +4449,11 @@ public:
 
         // Fixture platform registry mirroring the real seed layout.
         let reg = tempdir().unwrap();
-        let seed = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".spire").join("platforms").join("rpi5.yaml");
+        let seed = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".spire")
+            .join("platforms")
+            .join("rpi5.yaml");
         if !seed.exists() {
             // Skip silently when the seed is absent (fresh environments).
             return;
@@ -4154,9 +4499,7 @@ public:
         )
         .unwrap();
 
-        let manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
         let result = manager
             .call_tool(
                 "hal_build_impl_prompt",
@@ -4169,9 +4512,18 @@ public:
             .await;
 
         let prompt = result["prompt"].as_str().expect("prompt");
-        assert!(prompt.contains("CameraHAL"), "must embed the contract class: {prompt}");
-        assert!(prompt.contains("CameraHalRpi5"), "must embed the concrete impl class: {prompt}");
-        assert!(result["class_name"].as_str() == Some("CameraHalRpi5"), "class_name: {result:?}");
+        assert!(
+            prompt.contains("CameraHAL"),
+            "must embed the contract class: {prompt}"
+        );
+        assert!(
+            prompt.contains("CameraHalRpi5"),
+            "must embed the concrete impl class: {prompt}"
+        );
+        assert!(
+            result["class_name"].as_str() == Some("CameraHalRpi5"),
+            "class_name: {result:?}"
+        );
         assert!(
             prompt.contains("meson compile -C build-rpi5 camera_hal-rpi5"),
             "must embed the per-target gate: {prompt}"
@@ -4206,9 +4558,7 @@ public:
     /// no panic, no partial writes, a clear "LLM unavailable" error.
     #[tokio::test]
     async fn hal_generate_impl_requires_configured_llm() {
-        let manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
         let result = manager
             .call_tool(
                 "hal_generate_impl",
@@ -4232,9 +4582,7 @@ public:
     /// ("HAL interface {stem} has no implementation for platform {plat}").
     #[tokio::test]
     async fn hal_missing_impls_returns_empty_queue_without_analysis() {
-        let manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
         let result = manager
             .call_tool(
                 "hal_missing_impls",
@@ -4273,9 +4621,7 @@ public:
         )
         .unwrap();
 
-        let manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
         let result = manager
             .call_tool(
                 "hal_add_target",
@@ -4300,7 +4646,8 @@ public:
         // Meson wiring for the new platform's source list.
         let meson = std::fs::read_to_string(root.join("hal/meson.build")).unwrap();
         assert!(
-            meson.contains("hal_impl_rpi5_sources = files(") && meson.contains("'implementations/rpi5/camera_hal_stub.cpp'"),
+            meson.contains("hal_impl_rpi5_sources = files(")
+                && meson.contains("'implementations/rpi5/camera_hal_stub.cpp'"),
             "meson wiring: {meson}"
         );
     }
@@ -4324,19 +4671,20 @@ public:
             "struct IVideoScaler {\npublic:\n    virtual ~IVideoScaler() = default;\n    virtual bool scale_nv12(int src_fd, int src_w, int src_h,\n                            int dst_fd, int dst_w, int dst_h) = 0;\n};\n",
         )
         .unwrap();
-        std::fs::write(root.join("hal/meson.build"), "hal_impl_rpi5_sources = files()\n").unwrap();
+        std::fs::write(
+            root.join("hal/meson.build"),
+            "hal_impl_rpi5_sources = files()\n",
+        )
+        .unwrap();
 
         // Plan → apply (none → whole-class stub).
         let plan = crate::actors::hal_fill::plan(root, "rpi5", &[]);
         let items = plan["plan"].as_array().expect("plan items");
         assert_eq!(items.len(), 1, "one video_scaler item: {plan}");
         let analyze = async { Ok(()) };
-        let result = crate::actors::hal_fill::apply(
-            root,
-            &serde_json::json!(items),
-            Box::pin(analyze),
-        )
-        .await;
+        let result =
+            crate::actors::hal_fill::apply(root, &serde_json::json!(items), Box::pin(analyze))
+                .await;
         assert!(
             result["failures"].as_array().unwrap().is_empty(),
             "no 'no classes' failure: {result}"
@@ -4345,18 +4693,28 @@ public:
         // The module-pair definition for a NEW class ("none") lands at
         // `video_scaler_rpi5.cpp` (the concrete derived class, not the contract
         // abstract name), plus its `.hpp` declaration — written atomically.
-        let stub = std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.cpp")).unwrap();
+        let stub =
+            std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.cpp"))
+                .unwrap();
         assert!(stub.contains("SPIRE-HAL-STUB"), "sentinel: {stub}");
         assert!(stub.contains("#pragma message("), "pragma: {stub}");
-        assert!(stub.contains("VideoScalerRpi5::scale_nv12("), "stub body: {stub}");
+        assert!(
+            stub.contains("VideoScalerRpi5::scale_nv12("),
+            "stub body: {stub}"
+        );
         for tok in ["src_fd", "src_w", "src_h", "dst_fd", "dst_w", "dst_h"] {
             assert!(stub.contains(tok), "missing param {tok}: {stub}");
         }
         // The concrete declaration header exists, derived from the contract
         // base (`IVideoScaler`) and declaring the same class name.
-        let header = std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.hpp")).unwrap();
+        let header =
+            std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.hpp"))
+                .unwrap();
         assert!(header.contains("class VideoScalerRpi5"), "header: {header}");
-        assert!(header.contains("IVideoScaler"), "derives contract base: {header}");
+        assert!(
+            header.contains("IVideoScaler"),
+            "derives contract base: {header}"
+        );
         assert!(header.contains("SPIRE-HAL-STUB"), "pair sentinel: {header}");
     }
 
@@ -4390,7 +4748,11 @@ public:
             "bool CameraHalRpi5::start() { return true; }\n",
         )
         .unwrap();
-        std::fs::write(root.join("hal/meson.build"), "hal_impl_rpi5_sources = files()\n").unwrap();
+        std::fs::write(
+            root.join("hal/meson.build"),
+            "hal_impl_rpi5_sources = files()\n",
+        )
+        .unwrap();
 
         // Plan: rpi5 → camera_hal (partial, missing capture) + video_scaler
         // (none → whole-class stub).
@@ -4399,47 +4761,74 @@ public:
         assert_eq!(items.len(), 2, "one partial + one none: {plan}");
 
         let analyze = async { Ok(()) };
-        let result = crate::actors::hal_fill::apply(
-            root,
-            &serde_json::json!(items),
-            Box::pin(analyze),
-        )
-        .await;
-        assert!(result["failures"].as_array().unwrap().is_empty(), "{result}");
+        let result =
+            crate::actors::hal_fill::apply(root, &serde_json::json!(items), Box::pin(analyze))
+                .await;
+        assert!(
+            result["failures"].as_array().unwrap().is_empty(),
+            "{result}"
+        );
 
         // Partial gap stub: sentinel + pragma + the missing method body only.
-        let gap = std::fs::read_to_string(root.join("hal/implementations/rpi5/camera_hal_gap.cpp")).unwrap();
+        let gap = std::fs::read_to_string(root.join("hal/implementations/rpi5/camera_hal_gap.cpp"))
+            .unwrap();
         assert!(gap.contains("SPIRE-HAL-STUB"), "partial sentinel: {gap}");
         assert!(gap.contains("#pragma message("), "partial pragma: {gap}");
-        assert!(gap.contains("CameraHAL::capture(int timeout_ms)"), "partial body: {gap}");
-        assert!(!gap.contains("CameraHAL::start()"), "partial must not re-add start: {gap}");
+        assert!(
+            gap.contains("CameraHAL::capture(int timeout_ms)"),
+            "partial body: {gap}"
+        );
+        assert!(
+            !gap.contains("CameraHAL::start()"),
+            "partial must not re-add start: {gap}"
+        );
 
         // Whole-class module pair: the definition (sentinel + pragma + every
         // contract method, using the CONCRETE derived class name from the new
         // naming scheme) plus the `.hpp` declaration — written atomically.
-        let stub = std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.cpp")).unwrap();
+        let stub =
+            std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.cpp"))
+                .unwrap();
         assert!(stub.contains("SPIRE-HAL-STUB"), "none sentinel: {stub}");
         assert!(stub.contains("#pragma message("), "none pragma: {stub}");
-        assert!(stub.contains("VideoScalerRpi5::resize(int w, int h)"), "none body: {stub}");
-        let header = std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.hpp")).unwrap();
-        assert!(header.contains("class VideoScalerRpi5"), "none header: {header}");
-        assert!(header.contains("VideoScaler"), "derives contract base: {header}");
+        assert!(
+            stub.contains("VideoScalerRpi5::resize(int w, int h)"),
+            "none body: {stub}"
+        );
+        let header =
+            std::fs::read_to_string(root.join("hal/implementations/rpi5/video_scaler_rpi5.hpp"))
+                .unwrap();
+        assert!(
+            header.contains("class VideoScalerRpi5"),
+            "none header: {header}"
+        );
+        assert!(
+            header.contains("VideoScaler"),
+            "derives contract base: {header}"
+        );
 
         // The coverage/fill queue must report BOTH as still needing
         // implementation (the sentinel marks them as stubs, not implemented).
         let cov = crate::build::generic_helpers::hal_interface_coverage(
             &[
                 crate::build::generic_helpers::HalContractMethod {
-                    name: "start".into(), return_type: "bool".into(), params: "".into(),
+                    name: "start".into(),
+                    return_type: "bool".into(),
+                    params: "".into(),
                 },
                 crate::build::generic_helpers::HalContractMethod {
-                    name: "capture".into(), return_type: "std::uint32_t".into(), params: "int timeout_ms".into(),
+                    name: "capture".into(),
+                    return_type: "std::uint32_t".into(),
+                    params: "int timeout_ms".into(),
                 },
             ],
             "camera_hal",
             &root.join("hal/implementations/rpi5"),
         );
-        assert!(!cov.implemented, "partial stub must still be unimplemented: {cov:?}");
+        assert!(
+            !cov.implemented,
+            "partial stub must still be unimplemented: {cov:?}"
+        );
     }
 
     /// Project-level "add platform" round-trip: `hal_add_platform` must scaffold
@@ -4461,8 +4850,11 @@ public:
 
         // Fixture platform registry mirroring the real seed layout.
         let reg = tempdir().unwrap();
-        let seed = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".spire").join("platforms").join("rpi5.yaml");
+        let seed = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".spire")
+            .join("platforms")
+            .join("rpi5.yaml");
         if !seed.exists() {
             // Skip silently when the seed is absent (fresh environments).
             return;
@@ -4528,9 +4920,7 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         .unwrap();
         std::fs::write(root.join("rpi5/main.cpp"), "int main() { return 0; }\n").unwrap();
 
-        let manager = BuildManagerActor::new(
-            mpsc::channel(1).0,
-        );
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
         let result = manager
             .call_tool(
                 "hal_add_platform",
@@ -4542,7 +4932,10 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
             .await;
         // rpi5 is already present → rejected before any write.
         assert!(
-            result["error"].as_str().map(|e| e.contains("already present")).unwrap_or(false),
+            result["error"]
+                .as_str()
+                .map(|e| e.contains("already present"))
+                .unwrap_or(false),
             "must reject an already-present platform, result: {result}"
         );
 
@@ -4567,7 +4960,11 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
             !result["error"].is_string(),
             "rock3c add must succeed, result: {result}"
         );
-        assert_eq!(result["interfaces"][0], serde_json::json!("camera_hal"), "{result}");
+        assert_eq!(
+            result["interfaces"][0],
+            serde_json::json!("camera_hal"),
+            "{result}"
+        );
 
         // 1. Placeholder stub with the SPIRE-HAL-STUB sentinel + #pragma.
         let stub = root.join("hal/implementations/rock3c/camera_hal_stub.cpp");
@@ -4586,19 +4983,26 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
 
         // 3. Root meson.build subdir('rock3c').
         let root_meson = std::fs::read_to_string(root.join("meson.build")).unwrap();
-        assert!(root_meson.contains("subdir('rock3c')"), "root meson: {root_meson}");
+        assert!(
+            root_meson.contains("subdir('rock3c')"),
+            "root meson: {root_meson}"
+        );
 
         // 4. meson_options.txt Valid values include rock3c.
         let opts = std::fs::read_to_string(root.join("meson_options.txt")).unwrap();
         assert!(
-            opts.to_lowercase().contains("valid values: host, rpi5, rock3c"),
+            opts.to_lowercase()
+                .contains("valid values: host, rpi5, rock3c"),
             "options: {opts}"
         );
 
         // 5. <plat>/meson.build: a CLEAN skeleton — the template's RPi5-specific
         // external deps and -DHAVE_RPI5 must NOT be copied in.
         let plat_meson = std::fs::read_to_string(root.join("rock3c/meson.build")).unwrap();
-        assert!(plat_meson.contains("hal_impl_rock3c_sources"), "plat meson: {plat_meson}");
+        assert!(
+            plat_meson.contains("hal_impl_rock3c_sources"),
+            "plat meson: {plat_meson}"
+        );
         for leaked in [
             "libcamera",
             "tensorflow-lite",
@@ -4622,7 +5026,8 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         // Root meson.build must GATE the new subdir on -Dplatform (an
         // unconditional subdir() would build the target for every platform).
         assert!(
-            root_meson.contains("if platform == 'rock3c'") && root_meson.contains("subdir('rock3c')"),
+            root_meson.contains("if platform == 'rock3c'")
+                && root_meson.contains("subdir('rock3c')"),
             "root meson must gate subdir('rock3c'): {root_meson}"
         );
 
@@ -4641,28 +5046,35 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         );
         let ph = std::fs::read_to_string(root.join("app/platform_hal_rock3c.cpp")).unwrap();
         assert!(ph.contains("create_platform_hal"), "platform binding: {ph}");
-        assert!(ph.contains("AiTrapHalRock3c"), "must construct the aggregate: {ph}");
+        assert!(
+            ph.contains("AiTrapHalRock3c"),
+            "must construct the aggregate: {ph}"
+        );
 
-        let agg_hpp = std::fs::read_to_string(
-            root.join("hal/implementations/rock3c/ai_trap_hal_rock3c.hpp"),
-        )
-        .unwrap();
+        let agg_hpp =
+            std::fs::read_to_string(root.join("hal/implementations/rock3c/ai_trap_hal_rock3c.hpp"))
+                .unwrap();
         assert!(
             agg_hpp.contains("class AiTrapHalRock3c : public AiTrapHal"),
             "aggregate header: {agg_hpp}"
         );
-        assert!(agg_hpp.contains("SPIRE-HAL-STUB"), "aggregate sentinel: {agg_hpp}");
-        let agg_cpp = std::fs::read_to_string(
-            root.join("hal/implementations/rock3c/ai_trap_hal_rock3c.cpp"),
-        )
-        .unwrap();
+        assert!(
+            agg_hpp.contains("SPIRE-HAL-STUB"),
+            "aggregate sentinel: {agg_hpp}"
+        );
+        let agg_cpp =
+            std::fs::read_to_string(root.join("hal/implementations/rock3c/ai_trap_hal_rock3c.cpp"))
+                .unwrap();
         assert!(
             agg_cpp.contains("AiTrapHalRock3c::AiTrapHalRock3c()"),
             "aggregate source: {agg_cpp}"
         );
 
         // The platform meson compiles the SHARED generic app, not a local main.
-        assert!(plat_meson.contains("../app/main.cpp"), "plat meson: {plat_meson}");
+        assert!(
+            plat_meson.contains("../app/main.cpp"),
+            "plat meson: {plat_meson}"
+        );
         assert!(
             plat_meson.contains("../app/platform_hal_rock3c.cpp"),
             "plat meson: {plat_meson}"
@@ -4677,8 +5089,8 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
 
     #[tokio::test]
     async fn parse_source_file_routes_to_cargo_module() {
-        use tempfile::tempdir;
         use std::io::Write;
+        use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("main.rs");
@@ -4704,9 +5116,7 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
             CargoBuildModule::new().spawn(rx);
             (tx, ())
         };
-        let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
-            mg_tx,
-        ));
+        let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(mg_tx));
 
         // Register the module.
         let (t, r) = oneshot::channel();
@@ -4748,4 +5158,3 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         assert_eq!(parse_result.content_hash.len(), 64);
     }
 }
-

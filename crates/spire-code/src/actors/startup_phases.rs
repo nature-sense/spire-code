@@ -23,14 +23,14 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::actors::{
-    CoordinatorMessage, LlmMessage, McpClientMessage, MemoryGraphMessage,
-    ProgressMessage, ProgressStatus, ProgressUpdate, ProjectAnalyzerMessage, ProjectQueryMessage,
+    CoordinatorMessage, LlmMessage, McpClientMessage, MemoryGraphMessage, ProgressMessage,
+    ProgressStatus, ProgressUpdate, ProjectAnalyzerMessage, ProjectQueryMessage,
     ProjectSyncMessage, SystemMessage,
 };
 use crate::platform::Platform as SpirePlatform;
-use spire_core::models::embedding::Embedder;
-use spire_core::actors::ActorSystem;
 use spire_actor::{spawn_child_eager, ChildActor, ChildContext};
+use spire_core::actors::ActorSystem;
+use spire_core::models::embedding::Embedder;
 use spire_core::models::memory_graph::{
     AttrNode, RelationshipInput, RelationshipType, StreamOp, StreamOpResult, TransactionRequest,
 };
@@ -592,9 +592,7 @@ impl StartupPhase for PlatformBootstrapPhase {
             .await
             .is_err()
         {
-            return PhaseResult::Failed(
-                "Failed to send BootstrapPlatforms".to_string(),
-            );
+            return PhaseResult::Failed("Failed to send BootstrapPlatforms".to_string());
         }
 
         match rx.await {
@@ -827,90 +825,100 @@ impl StartupPhase for ProjectSyncPhase {
             StartupTask::new(
                 "project_sync",
                 async move {
-            // Check if a Project node already exists (warm start)
-            let has_existing_project = {
-                let (qtx, qrx) = oneshot::channel();
-                if memory_graph_tx
-                    .send(MemoryGraphMessage::QueryAttrNodes {
-                        node_type: Some("Project".to_string()),
-                        subtype: None,
-                        name: None,
-                        limit: Some(1),
-                        reply_to: qtx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    warn!("ProjectSyncPhase: failed to send QueryAttrNodes");
+                    // Check if a Project node already exists (warm start)
+                    let has_existing_project = {
+                        let (qtx, qrx) = oneshot::channel();
+                        if memory_graph_tx
+                            .send(MemoryGraphMessage::QueryAttrNodes {
+                                node_type: Some("Project".to_string()),
+                                subtype: None,
+                                name: None,
+                                limit: Some(1),
+                                reply_to: qtx,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            warn!("ProjectSyncPhase: failed to send QueryAttrNodes");
+                            let _ = tx.send(());
+                            return;
+                        }
+                        match qrx.await {
+                            Ok(nodes) => nodes.map(|n| !n.is_empty()).unwrap_or(false),
+                            Err(_) => false,
+                        }
+                    };
+
+                    if has_existing_project {
+                        info!("ProjectSyncPhase: project node exists, performing startup sync");
+                        let (stx, srx) = oneshot::channel();
+                        if project_sync_tx
+                            .send(ProjectSyncMessage::StartupSync {
+                                project_root: project_root.clone(),
+                                reply_to: stx,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            warn!("ProjectSyncPhase: failed to send StartupSync");
+                        } else {
+                            match srx.await {
+                                Ok(Ok(result)) => {
+                                    info!("ProjectSyncPhase: startup sync complete: {:?}", result)
+                                }
+                                Ok(Err(e)) => {
+                                    warn!("ProjectSyncPhase: startup sync had issues: {}", e)
+                                }
+                                Err(e) => {
+                                    warn!("ProjectSyncPhase: startup sync response error: {}", e)
+                                }
+                            }
+                        }
+                    } else {
+                        info!("ProjectSyncPhase: no project node found, performing full bootstrap");
+                        let (stx, srx) = oneshot::channel();
+                        if project_sync_tx
+                            .send(ProjectSyncMessage::Bootstrap {
+                                project_root: project_root.clone(),
+                                reply_to: stx,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            warn!("ProjectSyncPhase: failed to send Bootstrap");
+                        } else {
+                            match srx.await {
+                                Ok(Ok(result)) => {
+                                    info!("ProjectSyncPhase: bootstrap complete: {:?}", result)
+                                }
+                                Ok(Err(e)) => {
+                                    warn!("ProjectSyncPhase: bootstrap had issues: {}", e)
+                                }
+                                Err(e) => {
+                                    warn!("ProjectSyncPhase: bootstrap response error: {}", e)
+                                }
+                            }
+                        }
+                    }
+
+                    // Write a snapshot after sync
+                    let (stx, srx) = oneshot::channel();
+                    if memory_graph_tx
+                        .send(MemoryGraphMessage::Sync { reply_to: stx })
+                        .await
+                        .is_ok()
+                    {
+                        match srx.await {
+                            Ok(Ok(())) => {
+                                info!("ProjectSyncPhase: snapshot written after project sync")
+                            }
+                            Ok(Err(e)) => warn!("ProjectSyncPhase: snapshot write failed: {}", e),
+                            Err(e) => warn!("ProjectSyncPhase: snapshot response error: {}", e),
+                        }
+                    }
+
+                    info!("ProjectSyncPhase: project sync complete");
                     let _ = tx.send(());
-                    return;
-                }
-                match qrx.await {
-                    Ok(nodes) => nodes.map(|n| !n.is_empty()).unwrap_or(false),
-                    Err(_) => false,
-                }
-            };
-
-            if has_existing_project {
-                info!("ProjectSyncPhase: project node exists, performing startup sync");
-                let (stx, srx) = oneshot::channel();
-                if project_sync_tx
-                    .send(ProjectSyncMessage::StartupSync {
-                        project_root: project_root.clone(),
-                        reply_to: stx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    warn!("ProjectSyncPhase: failed to send StartupSync");
-                } else {
-                    match srx.await {
-                        Ok(Ok(result)) => {
-                            info!("ProjectSyncPhase: startup sync complete: {:?}", result)
-                        }
-                        Ok(Err(e)) => warn!("ProjectSyncPhase: startup sync had issues: {}", e),
-                        Err(e) => warn!("ProjectSyncPhase: startup sync response error: {}", e),
-                    }
-                }
-            } else {
-                info!("ProjectSyncPhase: no project node found, performing full bootstrap");
-                let (stx, srx) = oneshot::channel();
-                if project_sync_tx
-                    .send(ProjectSyncMessage::Bootstrap {
-                        project_root: project_root.clone(),
-                        reply_to: stx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    warn!("ProjectSyncPhase: failed to send Bootstrap");
-                } else {
-                    match srx.await {
-                        Ok(Ok(result)) => {
-                            info!("ProjectSyncPhase: bootstrap complete: {:?}", result)
-                        }
-                        Ok(Err(e)) => warn!("ProjectSyncPhase: bootstrap had issues: {}", e),
-                        Err(e) => warn!("ProjectSyncPhase: bootstrap response error: {}", e),
-                    }
-                }
-            }
-
-            // Write a snapshot after sync
-            let (stx, srx) = oneshot::channel();
-            if memory_graph_tx
-                .send(MemoryGraphMessage::Sync { reply_to: stx })
-                .await
-                .is_ok()
-            {
-                match srx.await {
-                    Ok(Ok(())) => info!("ProjectSyncPhase: snapshot written after project sync"),
-                    Ok(Err(e)) => warn!("ProjectSyncPhase: snapshot write failed: {}", e),
-                    Err(e) => warn!("ProjectSyncPhase: snapshot response error: {}", e),
-                }
-            }
-
-            info!("ProjectSyncPhase: project sync complete");
-            let _ = tx.send(());
                 },
                 rx,
                 system_tx,
@@ -974,46 +982,48 @@ impl StartupPhase for ProjectAnalysisPhase {
             StartupTask::new(
                 "project_analysis",
                 async move {
-            let (atx, arx) = oneshot::channel();
-            if project_analyzer_tx
-                .send(ProjectAnalyzerMessage::Analyze {
-                    project_root: project_root.clone(),
-                    reply_to: atx,
-                })
-                .await
-                .is_err()
-            {
-                warn!("ProjectAnalysisPhase: failed to send Analyze");
-            } else {
-                match arx.await {
-                    Ok(Ok(analysis)) => {
-                        info!(
+                    let (atx, arx) = oneshot::channel();
+                    if project_analyzer_tx
+                        .send(ProjectAnalyzerMessage::Analyze {
+                            project_root: project_root.clone(),
+                            reply_to: atx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        warn!("ProjectAnalysisPhase: failed to send Analyze");
+                    } else {
+                        match arx.await {
+                            Ok(Ok(analysis)) => {
+                                info!(
                             "ProjectAnalysisPhase: analysis complete: {} files, {} dirs, {} build systems",
                             analysis.total_files,
                             analysis.total_dirs,
                             analysis.build_systems.len(),
                         );
 
-                        // Store the analysis result in the graph
-                        if let Err(e) = store_project_analysis(&memory_graph_tx, &analysis).await {
-                            warn!(
+                                // Store the analysis result in the graph
+                                if let Err(e) =
+                                    store_project_analysis(&memory_graph_tx, &analysis).await
+                                {
+                                    warn!(
                                 "ProjectAnalysisPhase: failed to store analysis in graph: {}",
                                 e
                             );
-                        } else {
-                            info!("ProjectAnalysisPhase: analysis stored in graph");
+                                } else {
+                                    info!("ProjectAnalysisPhase: analysis stored in graph");
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                warn!("ProjectAnalysisPhase: analysis failed: {}", e);
+                            }
+                            Err(e) => {
+                                warn!("ProjectAnalysisPhase: analysis response error: {}", e);
+                            }
                         }
                     }
-                    Ok(Err(e)) => {
-                        warn!("ProjectAnalysisPhase: analysis failed: {}", e);
-                    }
-                    Err(e) => {
-                        warn!("ProjectAnalysisPhase: analysis response error: {}", e);
-                    }
-                }
-            }
 
-            let _ = tx.send(());
+                    let _ = tx.send(());
                 },
                 rx,
                 system_tx,
@@ -1073,29 +1083,29 @@ impl StartupPhase for LlmConfigPhase {
             StartupTask::new(
                 "llm_config",
                 async move {
-            // Load global LLM config from ~/.spire/llm-config.json (shared across all projects).
-            let llm_config = spire_core::config::load_global_llm_config();
-            if !llm_config.api_key.is_empty() {
-                info!(
-                    "LlmConfigPhase: loading persisted DeepSeek config: model={}",
-                    llm_config.model
-                );
-                let (ltx, lrx) = oneshot::channel();
-                if llm_tx
-                    .send(LlmMessage::UpdateConfig {
-                        config: llm_config,
-                        reply_to: ltx,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    let _ = lrx.await;
-                }
-            } else {
-                info!("LlmConfigPhase: no persisted DeepSeek config found, using defaults");
-            }
-            info!("LlmConfigPhase: LLM config loaded");
-            let _ = tx.send(());
+                    // Load global LLM config from ~/.spire/llm-config.json (shared across all projects).
+                    let llm_config = spire_core::config::load_global_llm_config();
+                    if !llm_config.api_key.is_empty() {
+                        info!(
+                            "LlmConfigPhase: loading persisted DeepSeek config: model={}",
+                            llm_config.model
+                        );
+                        let (ltx, lrx) = oneshot::channel();
+                        if llm_tx
+                            .send(LlmMessage::UpdateConfig {
+                                config: llm_config,
+                                reply_to: ltx,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            let _ = lrx.await;
+                        }
+                    } else {
+                        info!("LlmConfigPhase: no persisted DeepSeek config found, using defaults");
+                    }
+                    info!("LlmConfigPhase: LLM config loaded");
+                    let _ = tx.send(());
                 },
                 rx,
                 system_tx,
@@ -1464,12 +1474,12 @@ async fn store_project_analysis(
     .into();
 
     send_op(StreamOp::MergeNode(sp_attr_unknown(
-            "Project",
-            None,
-            analysis.project_name.clone(),
-            None,
-            project_props,
-        )))
+        "Project",
+        None,
+        analysis.project_name.clone(),
+        None,
+        project_props,
+    )))
     .await?;
 
     // 2. Create BuildSystem nodes for each detected build system
@@ -1491,12 +1501,12 @@ async fn store_project_analysis(
         .into();
 
         send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "BuildSystem",
-                Some(bs.build_system.clone()),
-                bs.build_system.clone(),
-                None,
-                bs_props,
-            )))
+            "BuildSystem",
+            Some(bs.build_system.clone()),
+            bs.build_system.clone(),
+            None,
+            bs_props,
+        )))
         .await?;
 
         // Link Project → BuildSystem
@@ -1622,72 +1632,83 @@ impl StartupPhase for IntentsBootstrapPhase {
             StartupTask::new(
                 "intents_bootstrap",
                 async move {
-            // Step 1: Bootstrap static intents from config/intents.json
-            let config_path = project_root.join("config").join("intents.json");
-            if config_path.exists() {
-                info!(
-                    "IntentsBootstrapPhase: loading intents from: {}",
-                    config_path.display()
-                );
-                match bootstrap_intents_from_config(&memory_graph_tx, &config_path).await {
-                    Ok(count) => info!(
-                        "IntentsBootstrapPhase: stored {} intent nodes from config",
-                        count
-                    ),
-                    Err(e) => warn!(
+                    // Step 1: Bootstrap static intents from config/intents.json
+                    let config_path = project_root.join("config").join("intents.json");
+                    if config_path.exists() {
+                        info!(
+                            "IntentsBootstrapPhase: loading intents from: {}",
+                            config_path.display()
+                        );
+                        match bootstrap_intents_from_config(&memory_graph_tx, &config_path).await {
+                            Ok(count) => info!(
+                                "IntentsBootstrapPhase: stored {} intent nodes from config",
+                                count
+                            ),
+                            Err(e) => warn!(
                         "IntentsBootstrapPhase: failed to bootstrap intents from config: {}",
                         e
                     ),
-                }
-            } else {
-                info!("IntentsBootstrapPhase: no config/intents.json found, skipping static bootstrap");
-            }
-
-            // Step 2: Bootstrap strategy steps from config/strategy-steps.json
-            let strategy_config_path = project_root.join("config").join("strategy-steps.json");
-            if strategy_config_path.exists() {
-                info!(
-                    "IntentsBootstrapPhase: loading strategy steps from: {}",
-                    strategy_config_path.display()
-                );
-                match bootstrap_strategy_steps(&memory_graph_tx, &strategy_config_path).await {
-                    Ok(count) => info!(
-                        "IntentsBootstrapPhase: stored {} strategy step + provider nodes",
-                        count
-                    ),
-                    Err(e) => warn!(
-                        "IntentsBootstrapPhase: failed to bootstrap strategy steps: {}",
-                        e
-                    ),
-                }
-            } else {
-                info!("IntentsBootstrapPhase: no config/strategy-steps.json found, skipping strategy bootstrap");
-            }
-
-            // Step 3: Discover tools from connected MCP servers
-            match discover_mcp_tools(&memory_graph_tx, &mcp_client_tx).await {
-                Ok(count) => info!("IntentsBootstrapPhase: stored {} MCP tool nodes", count),
-                Err(e) => warn!("IntentsBootstrapPhase: failed to discover MCP tools: {}", e),
-            }
-
-            // Write a snapshot after bootstrap
-            let (stx, srx) = oneshot::channel();
-            if memory_graph_tx
-                .send(MemoryGraphMessage::Sync { reply_to: stx })
-                .await
-                .is_ok()
-            {
-                match srx.await {
-                    Ok(Ok(())) => {
-                        info!("IntentsBootstrapPhase: snapshot written after intents bootstrap")
+                        }
+                    } else {
+                        info!("IntentsBootstrapPhase: no config/intents.json found, skipping static bootstrap");
                     }
-                    Ok(Err(e)) => warn!("IntentsBootstrapPhase: snapshot write failed: {}", e),
-                    Err(e) => warn!("IntentsBootstrapPhase: snapshot response error: {}", e),
-                }
-            }
 
-            info!("IntentsBootstrapPhase: intents bootstrap complete");
-            let _ = tx.send(());
+                    // Step 2: Bootstrap strategy steps from config/strategy-steps.json
+                    let strategy_config_path =
+                        project_root.join("config").join("strategy-steps.json");
+                    if strategy_config_path.exists() {
+                        info!(
+                            "IntentsBootstrapPhase: loading strategy steps from: {}",
+                            strategy_config_path.display()
+                        );
+                        match bootstrap_strategy_steps(&memory_graph_tx, &strategy_config_path)
+                            .await
+                        {
+                            Ok(count) => info!(
+                                "IntentsBootstrapPhase: stored {} strategy step + provider nodes",
+                                count
+                            ),
+                            Err(e) => warn!(
+                                "IntentsBootstrapPhase: failed to bootstrap strategy steps: {}",
+                                e
+                            ),
+                        }
+                    } else {
+                        info!("IntentsBootstrapPhase: no config/strategy-steps.json found, skipping strategy bootstrap");
+                    }
+
+                    // Step 3: Discover tools from connected MCP servers
+                    match discover_mcp_tools(&memory_graph_tx, &mcp_client_tx).await {
+                        Ok(count) => {
+                            info!("IntentsBootstrapPhase: stored {} MCP tool nodes", count)
+                        }
+                        Err(e) => {
+                            warn!("IntentsBootstrapPhase: failed to discover MCP tools: {}", e)
+                        }
+                    }
+
+                    // Write a snapshot after bootstrap
+                    let (stx, srx) = oneshot::channel();
+                    if memory_graph_tx
+                        .send(MemoryGraphMessage::Sync { reply_to: stx })
+                        .await
+                        .is_ok()
+                    {
+                        match srx.await {
+                            Ok(Ok(())) => {
+                                info!("IntentsBootstrapPhase: snapshot written after intents bootstrap")
+                            }
+                            Ok(Err(e)) => {
+                                warn!("IntentsBootstrapPhase: snapshot write failed: {}", e)
+                            }
+                            Err(e) => {
+                                warn!("IntentsBootstrapPhase: snapshot response error: {}", e)
+                            }
+                        }
+                    }
+
+                    info!("IntentsBootstrapPhase: intents bootstrap complete");
+                    let _ = tx.send(());
                 },
                 rx,
                 system_tx,
@@ -1854,12 +1875,12 @@ pub async fn bootstrap_intents_from_config(
         .into();
 
         let result = send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "Standard",
-                Some("intent".to_string()),
-                name.to_string(),
-                Some(description.to_string()),
-                props,
-            )))
+            "Standard",
+            Some("intent".to_string()),
+            name.to_string(),
+            Some(description.to_string()),
+            props,
+        )))
         .await?;
 
         if let StreamOpResult::NodeStored(node) = result {
@@ -1908,12 +1929,12 @@ pub async fn bootstrap_intents_from_config(
         .into();
 
         let result = send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "Blocker",
-                Some("build_error".to_string()),
-                name.to_string(),
-                None,
-                props,
-            )))
+            "Blocker",
+            Some("build_error".to_string()),
+            name.to_string(),
+            None,
+            props,
+        )))
         .await?;
 
         if let StreamOpResult::NodeStored(node) = result {
@@ -1950,12 +1971,12 @@ pub async fn bootstrap_intents_from_config(
         .into();
 
         let result = send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "Standard",
-                Some("fix_strategy".to_string()),
-                name.to_string(),
-                None,
-                props,
-            )))
+            "Standard",
+            Some("fix_strategy".to_string()),
+            name.to_string(),
+            None,
+            props,
+        )))
         .await?;
 
         if let StreamOpResult::NodeStored(node) = result {
@@ -1992,12 +2013,12 @@ pub async fn bootstrap_intents_from_config(
         .into();
 
         let result = send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "Standard",
-                Some("tool".to_string()),
-                name.to_string(),
-                None,
-                props,
-            )))
+            "Standard",
+            Some("tool".to_string()),
+            name.to_string(),
+            None,
+            props,
+        )))
         .await?;
 
         if let StreamOpResult::NodeStored(node) = result {
@@ -2036,12 +2057,12 @@ pub async fn bootstrap_intents_from_config(
         .into();
 
         let result = send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "Standard",
-                Some("build_state".to_string()),
-                name.to_string(),
-                None,
-                props,
-            )))
+            "Standard",
+            Some("build_state".to_string()),
+            name.to_string(),
+            None,
+            props,
+        )))
         .await?;
 
         if let StreamOpResult::NodeStored(node) = result {
@@ -2200,12 +2221,12 @@ async fn discover_mcp_tools(
             .into();
 
             let result = send_op(StreamOp::MergeNode(sp_attr_unknown(
-                    "Standard",
-                    Some("tool".to_string()),
-                    tool_name,
-                    None,
-                    props,
-                )))
+                "Standard",
+                Some("tool".to_string()),
+                tool_name,
+                None,
+                props,
+            )))
             .await?;
 
             if let StreamOpResult::NodeStored(node) = result {
@@ -2329,15 +2350,15 @@ async fn discover_mcp_tools(
                                 .into();
 
                                 let result = send_op(StreamOp::MergeNode(sp_attr_unknown(
-                                        "BuildSystem",
-                                        Some(build_system_name.clone()),
-                                        build_system_name.clone(),
-                                        Some(format!(
+                                    "BuildSystem",
+                                    Some(build_system_name.clone()),
+                                    build_system_name.clone(),
+                                    Some(format!(
                                         "{} build system provided by MCP server '{}'",
                                         build_system_name, server_name
                                     )),
-                                        bs_props,
-                                    )))
+                                    bs_props,
+                                )))
                                 .await?;
 
                                 match result {
@@ -2476,12 +2497,12 @@ pub async fn bootstrap_strategy_steps(
         .into();
 
         send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "ToolProvider",
-                Some("tool_provider".to_string()),
-                name.to_string(),
-                Some(description.to_string()),
-                props,
-            )))
+            "ToolProvider",
+            Some("tool_provider".to_string()),
+            name.to_string(),
+            Some(description.to_string()),
+            props,
+        )))
         .await?;
         count += 1;
     }
@@ -2531,12 +2552,12 @@ pub async fn bootstrap_strategy_steps(
         .into();
 
         send_op(StreamOp::MergeNode(sp_attr_unknown(
-                "StepDefinition",
-                Some("step_definition".to_string()),
-                name.to_string(),
-                Some(description.to_string()),
-                props,
-            )))
+            "StepDefinition",
+            Some("step_definition".to_string()),
+            name.to_string(),
+            Some(description.to_string()),
+            props,
+        )))
         .await?;
         count += 1;
     }

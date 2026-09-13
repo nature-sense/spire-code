@@ -67,7 +67,11 @@ fn spire_app_layout(root: &Path) {
         "// swift-tools-version: 5.10\nimport PackageDescription\n\nlet package = Package(\n    name: \"SpireUI\",\n    platforms: [.macOS(.v14)],\n    products: [.executable(name: \"SpireUI\", targets: [\"SpireUI\"])],\n    targets: [.executableTarget(name: \"SpireUI\", path: \"Sources/SpireUI\")]\n)\n",
     )
     .unwrap();
-    std::fs::write(root.join("ui/swift/Sources/SpireUI/App.swift"), "import SwiftUI\n").unwrap();
+    std::fs::write(
+        root.join("ui/swift/Sources/SpireUI/App.swift"),
+        "import SwiftUI\n",
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -80,10 +84,13 @@ async fn multi_config_directory_analyzes_each_discovered_config() {
     let (swift_cap, swift_tx) = describe_module(&system, SwiftBuildModule::new()).await;
 
     // Real BuildManagerActor with the three modules registered.
-    let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
-        drain_sender::<MemoryGraphMessage>(),
-    ));
-    for (cap, module_tx) in [(cargo_cap, cargo_tx), (make_cap, make_tx), (swift_cap, swift_tx)] {
+    let (bm_tx, _bm_handle) =
+        system.spawn(BuildManagerActor::new(drain_sender::<MemoryGraphMessage>()));
+    for (cap, module_tx) in [
+        (cargo_cap, cargo_tx),
+        (make_cap, make_tx),
+        (swift_cap, swift_tx),
+    ] {
         bm_tx
             .send(BuildManagerMessage::AddModule {
                 capability: cap,
@@ -154,4 +161,3 @@ async fn multi_config_directory_analyzes_each_discovered_config() {
         "every config analyzed exactly once: {build_systems:?}"
     );
 }
-

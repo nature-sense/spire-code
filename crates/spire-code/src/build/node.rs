@@ -18,7 +18,9 @@ use std::path::PathBuf;
 
 use crate::Actor;
 
-use spire_core::build_types::{BuildMetadata, BuildScript, BuildTarget, Dependency, WorkspaceMember};
+use spire_core::build_types::{
+    BuildMetadata, BuildScript, BuildTarget, Dependency, WorkspaceMember,
+};
 
 /// Static Node build module.
 pub struct NodeBuildModule;
@@ -30,7 +32,10 @@ impl NodeBuildModule {
 
     /// Parse a JavaScript/TypeScript source file into AST nodes using
     /// tree-sitter-javascript.
-    fn parse_source_file_with_tree_sitter(&self, file_path: &PathBuf) -> Result<AstParseResult, String> {
+    fn parse_source_file_with_tree_sitter(
+        &self,
+        file_path: &PathBuf,
+    ) -> Result<AstParseResult, String> {
         let content = std::fs::read_to_string(file_path)
             .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
         let content_hash = sha256_hex(&content);
@@ -439,7 +444,6 @@ fn simple_glob_match(pattern: &str, name: &str) -> bool {
 impl Actor for NodeBuildModule {
     type Message = BuildModuleMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             BuildModuleMessage::DescribeCapabilities { reply_to } => {
@@ -454,11 +458,11 @@ impl Actor for NodeBuildModule {
                         "ts".to_string(),
                         "tsx".to_string(),
                     ],
-                supports_clean: true,
-                supports_lint: true,
-                supports_format: true,
-                supports_fix: true,
-                mcp_servers: vec![McpServerDependency {
+                    supports_clean: true,
+                    supports_lint: true,
+                    supports_format: true,
+                    supports_fix: true,
+                    mcp_servers: vec![McpServerDependency {
                         name: "npm-mcp".to_string(),
                         package: "npm-mcp-server".to_string(),
                         install_command: "cargo install npm-mcp-server".to_string(),
@@ -500,7 +504,11 @@ impl Actor for NodeBuildModule {
                 // and emit a single synthetic "finished" event.
                 let result = self.build(&path, &opts).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -568,7 +576,11 @@ impl Actor for NodeBuildModule {
                 // Batch lint + a synthetic finished event (no per-line streaming yet).
                 let result = self.lint(&path, &metadata, platform.as_deref()).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished lint {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished lint {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -589,7 +601,11 @@ impl Actor for NodeBuildModule {
                 // Batch fix + a synthetic finished event.
                 let result = self.fix(&path, &metadata).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished fix {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -599,8 +615,6 @@ impl Actor for NodeBuildModule {
                 });
                 let _ = reply_to.send(result);
             }
-
-
 
             BuildModuleMessage::ParseSourceFile {
                 file_path,
@@ -625,9 +639,11 @@ impl Actor for NodeBuildModule {
   "scripts": { "start": "node src/index.js" },
   "dependencies": {}
 }
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let sc = r#"console.log("Hello from __P__!");
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let _ = reply_to.send(Ok(super::ScaffoldOutput {
                     build_file: "package.json".to_string(),
                     build_content: bc,

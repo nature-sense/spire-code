@@ -16,12 +16,11 @@ use regex::Regex;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use spire_core::actors::Actor;
 use spire_core::models::memory_graph::{
-    AnnotatedError, BuildContext, FixPlan, FixStrategy, ScoredFix,
-    SystemBuildResult,
+    AnnotatedError, BuildContext, FixPlan, FixStrategy, ScoredFix, SystemBuildResult,
 };
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 
 /// Messages for the ErrorAnalyzer actor.
 #[derive(Debug)]

@@ -23,17 +23,17 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 use crate::actors::coordinator::CoordinatorMessage;
-use spire_core::subsystems::llm::llm::LlmMessage;
-use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
-use spire_core::actors::progress::ProgressMessage;
-use spire_core::actors::ActorSystem;
+use crate::actors::startup_phases::{self, PhaseContext, PhaseResult, StartupPhase};
+use crate::actors::{Actor, ActorError};
 use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
 use crate::subsystems::project::project_query::ProjectQueryMessage;
 use crate::subsystems::project::project_sync::ProjectSyncMessage;
-use crate::actors::startup_phases::{self, PhaseContext, PhaseResult, StartupPhase};
-use crate::actors::{Actor, ActorError};
+use spire_core::actors::progress::ProgressMessage;
+use spire_core::actors::ActorSystem;
 use spire_core::models::embedding::Embedder;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
+use spire_core::subsystems::llm::llm::LlmMessage;
+use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 
 // ============================================================================
 // SystemState — lifecycle state machine
@@ -76,9 +76,7 @@ pub enum SystemMessage {
     },
     /// Set the host actor system (for spawning managed StartupTask children).
     /// Must be sent before Initialize.
-    SetActorSystem {
-        system: std::sync::Arc<ActorSystem>,
-    },
+    SetActorSystem { system: std::sync::Arc<ActorSystem> },
 
     /// Start the full initialization sequence.
     /// The SystemActor will drive the state machine by delegating to startup phases.
@@ -98,9 +96,7 @@ pub enum SystemMessage {
     },
 
     /// A sub-phase has completed; `phase` is the completed sub-phase's name.
-    PhaseEvent {
-        phase: String,
-    },
+    PhaseEvent { phase: String },
 
     /// Get system status.
     GetStatus { reply_to: oneshot::Sender<Value> },

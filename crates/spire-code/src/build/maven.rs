@@ -7,9 +7,7 @@ use async_trait::async_trait;
 use std::path::Path;
 
 use super::generic_helpers::parse_source_file_std;
-use super::{
-    BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability, TestOptions,
-};
+use super::{BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability, TestOptions};
 
 use super::generic_helpers::{parse_key_value, run_cmd};
 use crate::Actor;
@@ -54,7 +52,6 @@ impl Default for MavenBuildModule {
 impl Actor for MavenBuildModule {
     type Message = BuildModuleMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             BuildModuleMessage::DescribeCapabilities { reply_to } => {
@@ -64,11 +61,11 @@ impl Actor for MavenBuildModule {
                     build_system: "Maven".to_string(),
                     language: "Java".to_string(),
                     source_extensions: vec!["java".to_string()],
-                supports_clean: true,
-                supports_lint: false,
-                supports_format: false,
-                supports_fix: false,
-                mcp_servers: vec![],
+                    supports_clean: true,
+                    supports_lint: false,
+                    supports_format: false,
+                    supports_fix: false,
+                    mcp_servers: vec![],
                 });
             }
             BuildModuleMessage::Analyze { path, reply_to } => {
@@ -95,7 +92,11 @@ impl Actor for MavenBuildModule {
                 // and emit a single synthetic "finished" event.
                 let result = self.build(&path, &opts).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -141,7 +142,6 @@ impl Actor for MavenBuildModule {
                 let _ = reply_to.send(Err("fix not supported for this module".to_string()));
             }
 
-
             BuildModuleMessage::ParseSourceFile {
                 file_path,
                 reply_to,
@@ -165,7 +165,8 @@ impl Actor for MavenBuildModule {
         System.out.println("Hello from __P__!");
     }
 }
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let _ = reply_to.send(Ok(super::ScaffoldOutput {
                     build_file: "pom.xml".to_string(),
                     build_content: bc,

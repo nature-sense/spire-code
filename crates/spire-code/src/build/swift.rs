@@ -19,8 +19,8 @@ use super::{
 
 use crate::Actor;
 
-use spire_core::build_types::{BuildMetadata, BuildTarget, Dependency};
 use regex::Regex;
+use spire_core::build_types::{BuildMetadata, BuildTarget, Dependency};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -204,8 +204,8 @@ impl SwiftBuildModule {
         let call_re = Regex::new(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
             .map_err(|e| format!("Bad call regex: {e}"))?;
         let skipped_keywords = [
-            "if", "iflet", "guard", "while", "for", "switch", "catch", "return", "repeat",
-            "defer", "where", "in", "try", "case", "continue", "break",
+            "if", "iflet", "guard", "while", "for", "switch", "catch", "return", "repeat", "defer",
+            "where", "in", "try", "case", "continue", "break",
         ];
         for decl in &decls {
             if decl.kind != "function" {
@@ -313,8 +313,11 @@ impl SwiftBuildModule {
     async fn build(&self, path: &Path, _opts: &BuildOptions) -> Result<BuildOutput, String> {
         // `--no-color-diagnostics` strips ANSI escape codes so the log stays
         // clean. Must appear AFTER the subcommand, e.g. `swift build --no-color-diagnostics`.
-        self.run_swift(path, &["build".to_string(), "--no-color-diagnostics".to_string()])
-            .await
+        self.run_swift(
+            path,
+            &["build".to_string(), "--no-color-diagnostics".to_string()],
+        )
+        .await
     }
 
     /// Run `swift package clean`.
@@ -342,13 +345,15 @@ impl SwiftBuildModule {
     /// if swiftformat isn't installed.
     async fn format(&self, path: &Path) -> Result<BuildOutput, String> {
         let path_str = path.to_string_lossy().to_string();
-        self.run_external("swiftformat", &["--lint", &path_str]).await
+        self.run_external("swiftformat", &["--lint", &path_str])
+            .await
     }
 
     /// Run `swiftlint --fix --path <path>` to auto-fix what swiftlint can.
     async fn fix(&self, path: &Path) -> Result<BuildOutput, String> {
         let path_str = path.to_string_lossy().to_string();
-        self.run_external("swiftlint", &["--fix", "--path", &path_str]).await
+        self.run_external("swiftlint", &["--fix", "--path", &path_str])
+            .await
     }
 
     /// Execute an external tool (swiftlint / swiftformat) with a friendly
@@ -440,7 +445,10 @@ impl SwiftBuildModule {
             all_err
         });
 
-        let status = child.wait().await.map_err(|e| format!("{binary} wait failed: {e}"))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("{binary} wait failed: {e}"))?;
         let (out, err) = tokio::join!(stdout_task, stderr_task);
         let stdout = out.map_err(|e| e.to_string())?;
         let stderr = err.map_err(|e| e.to_string())?;
@@ -561,7 +569,10 @@ impl SwiftBuildModule {
             all_err
         });
 
-        let status = child.wait().await.map_err(|e| format!("swift wait failed: {e}"))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("swift wait failed: {e}"))?;
         let (out, err) = tokio::join!(stdout_task, stderr_task);
         let stdout = out.map_err(|e| e.to_string())?;
         let stderr = err.map_err(|e| e.to_string())?;
@@ -691,7 +702,10 @@ fn parse_swiftpm(root: &Path) -> Result<SwiftPmManifest, String> {
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string())
                                 } else {
-                                    range.get("lowerBound").and_then(|v| v.as_str()).map(|s| s.to_string())
+                                    range
+                                        .get("lowerBound")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
                                 }
                             }),
                         kind: Some("remote".to_string()),
@@ -781,7 +795,6 @@ fn parse_xcode_schemes(root: &Path) -> Vec<String> {
 impl Actor for SwiftBuildModule {
     type Message = BuildModuleMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             BuildModuleMessage::DescribeCapabilities { reply_to } => {
@@ -791,11 +804,11 @@ impl Actor for SwiftBuildModule {
                     build_system: "SwiftPM".to_string(),
                     language: "Swift".to_string(),
                     source_extensions: vec!["swift".to_string()],
-                supports_clean: true,
-                supports_lint: true,
-                supports_format: true,
-                supports_fix: true,
-                mcp_servers: vec![McpServerDependency {
+                    supports_clean: true,
+                    supports_lint: true,
+                    supports_format: true,
+                    supports_fix: true,
+                    mcp_servers: vec![McpServerDependency {
                         name: "swiftpm-mcp".to_string(),
                         package: "swiftpm-mcp-server".to_string(),
                         install_command: "cargo install swiftpm-mcp-server".to_string(),
@@ -884,7 +897,9 @@ impl Actor for SwiftBuildModule {
                     "--path".to_string(),
                     path_str,
                 ];
-                let result = self.run_external_streaming("swiftlint", &args, &event_tx).await;
+                let result = self
+                    .run_external_streaming("swiftlint", &args, &event_tx)
+                    .await;
                 let _ = reply_to.send(result);
             }
 
@@ -895,16 +910,12 @@ impl Actor for SwiftBuildModule {
                 ..
             } => {
                 let path_str = path.to_string_lossy().to_string();
-                let args = vec![
-                    "--fix".to_string(),
-                    "--path".to_string(),
-                    path_str,
-                ];
-                let result = self.run_external_streaming("swiftlint", &args, &event_tx).await;
+                let args = vec!["--fix".to_string(), "--path".to_string(), path_str];
+                let result = self
+                    .run_external_streaming("swiftlint", &args, &event_tx)
+                    .await;
                 let _ = reply_to.send(result);
             }
-
-
 
             BuildModuleMessage::ParseSourceFile {
                 file_path,
@@ -929,9 +940,11 @@ let package = Package(
     name: "__P__",
     targets: [.executableTarget(name: "__P__", path: "Sources")]
 )
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let sc = r#"print("Hello from __P__!")
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let _ = reply_to.send(Ok(super::ScaffoldOutput {
                     build_file: "Package.swift".to_string(),
                     build_content: bc,
@@ -1013,7 +1026,10 @@ fn match_bracing(content: &str, open: usize) -> Option<usize> {
 fn extract_swift_return_type(text: &str) -> Option<String> {
     let idx = text.find("->")?;
     let after = &text[idx + 2..];
-    let cut = after.find('{').or_else(|| after.find(';')).unwrap_or(after.len());
+    let cut = after
+        .find('{')
+        .or_else(|| after.find(';'))
+        .unwrap_or(after.len());
     let rt = after[..cut].trim();
     if rt.is_empty() {
         None

@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use super::spec::AppSpec;
 use crate::actors::{
     Actor, BuildManagerMessage, LlmMessage, McpClientMessage, ProjectAnalyzerMessage,
 };
 use crate::build::{BuildOptions, TestOptions};
-use super::spec::AppSpec;
 use spire_core::models::memory_graph::AttrNode;
 use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 
@@ -76,7 +76,6 @@ pub enum StepStatus {
     Completed,
     Failed,
 }
-
 
 /// Result of generating a plan.
 #[derive(Debug, Clone, Serialize)]
@@ -146,7 +145,10 @@ fn parse_step_type(s: &str) -> Option<CreationStepType> {
 /// Backfill sensible defaults for LLM steps that omit required fields —
 /// otherwise a `write_source_file` step with no `content` created an EMPTY
 /// file and a `path`-less step targeted nowhere.
-fn backfill_step_params(step_type: &CreationStepType, mut params: serde_json::Value) -> serde_json::Value {
+fn backfill_step_params(
+    step_type: &CreationStepType,
+    mut params: serde_json::Value,
+) -> serde_json::Value {
     if let serde_json::Value::Object(map) = &mut params {
         match step_type {
             CreationStepType::WriteSourceFile => {
@@ -350,7 +352,11 @@ fn step_array_from_value(v: serde_json::Value) -> Option<Vec<CreationStep>> {
         .enumerate()
         .filter_map(|(i, item)| step_from_value(i, item))
         .collect();
-    if steps.is_empty() { None } else { Some(steps) }
+    if steps.is_empty() {
+        None
+    } else {
+        Some(steps)
+    }
 }
 
 /// Recovery path when the full document JSON parse fails: extract the first
@@ -396,7 +402,12 @@ fn add_dependencies_to_manifest(
 
     let mut added = 0usize;
     for d in deps {
-        let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let name = d
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if name.is_empty() {
             continue;
         }
@@ -407,7 +418,11 @@ fn add_dependencies_to_manifest(
         if already {
             continue;
         }
-        let version = d.get("version").and_then(|v| v.as_str()).unwrap_or("*").trim();
+        let version = d
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .trim();
         let version = if version.is_empty() { "*" } else { version };
         lines.insert(end, format!("{name} = \"{version}\""));
         added += 1;
@@ -481,7 +496,11 @@ fn parse_fill_steps_recover(text: &str) -> Option<Vec<CreationStep>> {
             break;
         }
     }
-    if steps.is_empty() { None } else { Some(steps) }
+    if steps.is_empty() {
+        None
+    } else {
+        Some(steps)
+    }
 }
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -667,13 +686,12 @@ impl ProjectCreationActor {
             .unwrap_or_else(|| "Cargo.toml".to_string());
         // SpireApp projects get the curated framework API surface so the LLM
         // builds on spire-actor/spire-core instead of inventing APIs.
-        let framework_hints = if spec.structure
-            == spire_core::build_types::ProjectStructure::SpireApp
-        {
-            crate::build::generic_helpers::spire_framework_hints()
-        } else {
-            String::new()
-        };
+        let framework_hints =
+            if spec.structure == spire_core::build_types::ProjectStructure::SpireApp {
+                crate::build::generic_helpers::spire_framework_hints()
+            } else {
+                String::new()
+            };
         let prompt = format!(
             r#"You are filling an already-scaffolded {bs} project. The structure is LOCKED.
 Write a JSON object of the form {{"steps": [...]}} where each step is
@@ -739,7 +757,11 @@ Project: name={project_name}, root={root}, goal={goal}
                     response.len(),
                     response
                 );
-                if let Some(log_dir) = spire_core::config::config_dir().join("logs").parent().map(|p| p.to_path_buf()) {
+                if let Some(log_dir) = spire_core::config::config_dir()
+                    .join("logs")
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                {
                     let _ = std::fs::create_dir_all(&log_dir);
                     let _ = std::fs::write(log_dir.join("plan-raw.json"), &response);
                 }
@@ -756,10 +778,7 @@ Project: name={project_name}, root={root}, goal={goal}
                                 s.parameters
                             );
                         }
-                        info!(
-                            "[ProjectCreation] Fill: parsed {} steps",
-                            parsed.len()
-                        );
+                        info!("[ProjectCreation] Fill: parsed {} steps", parsed.len());
                         Ok(PlanGenerationResult {
                             goal: goal.to_string(),
                             language: spec.build_system.clone(),
@@ -779,9 +798,7 @@ Project: name={project_name}, root={root}, goal={goal}
                         // parsing can be inspected and covered by a fixture —
                         // instead of guessing another shape. Removed once the
                         // structured-output fix is verified.
-                        let _ = std::fs::create_dir_all(
-                            std::env::temp_dir().join("spire-fill"),
-                        );
+                        let _ = std::fs::create_dir_all(std::env::temp_dir().join("spire-fill"));
                         let dump_path = std::env::temp_dir()
                             .join("spire-fill")
                             .join("rejected-body.json");
@@ -1146,11 +1163,7 @@ and NEVER repeat any line or block."
     /// AppSpec requirements pass (SpireApp, LLM): derive a VALIDATED AppSpec
     /// JSON contract from the goal (self-healed against `validate()`). Nothing
     /// is written to disk — the later fill/codegen phase consumes the spec.
-    async fn generate_app_spec(
-        &self,
-        project_name: &str,
-        goal: &str,
-    ) -> Result<AppSpec, String> {
+    async fn generate_app_spec(&self, project_name: &str, goal: &str) -> Result<AppSpec, String> {
         let llm_tx = match &self.llm_tx {
             Some(tx) => tx.clone(),
             None => {
@@ -1184,7 +1197,8 @@ and NEVER repeat any line or block."
             .map_err(|e| e.to_string())?;
         // The graph is Spire's single source of truth: persist the validated
         // spec (upsert by name) so later codegen can link artifacts to it.
-        self.store_app_spec_in_graph(project_name, goal, &spec).await;
+        self.store_app_spec_in_graph(project_name, goal, &spec)
+            .await;
         Ok(spec)
     }
 
@@ -1256,10 +1270,7 @@ and NEVER repeat any line or block."
                 if !connected.is_empty() {
                     tool_catalog.clear();
                     for (server, tools) in &connected {
-                        tool_catalog.push_str(&format!(
-                            "**{}**\n",
-                            server
-                        ));
+                        tool_catalog.push_str(&format!("**{}**\n", server));
                         for tool in tools {
                             tool_catalog.push_str(&format!("- {}\n", tool.name));
                         }
@@ -1335,17 +1346,15 @@ Project:
             // timeout(fut).await: Result<T, Elapsed> where
             //   T = r.await: Result<Result<String, ActorError>, RecvError>
             // So the outer Ok yields a Result<Result<...>, ...>; flatten both layers.
-            let response_str: Option<String> = match tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                r,
-            )
-            .await
-            {
+            let llm_reply = tokio::time::timeout(std::time::Duration::from_secs(120), r).await;
+            let response_str: Option<String> = match llm_reply {
                 Ok(inner) => inner.ok().and_then(|inner2| inner2.ok()),
                 Err(_elapsed) => {
-                warn!("[ProjectCreation] LLM plan response timed out - falling back to template");
-                None
-            } // timed out → fall back
+                    warn!(
+                        "[ProjectCreation] LLM plan response timed out - falling back to template"
+                    );
+                    None
+                }
             };
 
             if let Some(response) = response_str {
@@ -1416,8 +1425,7 @@ Project:
                                 match step.step_type {
                                     CreationStepType::WriteBuildConfig => {
                                         if step.parameters.get("path").is_none() {
-                                            step.parameters["path"] =
-                                                serde_json::json!(build_file);
+                                            step.parameters["path"] = serde_json::json!(build_file);
                                         }
                                     }
                                     CreationStepType::WriteSourceFile => {
@@ -1435,7 +1443,10 @@ Project:
                                 step
                             })
                             .collect();
-                        info!("[ProjectCreation] LLM generated {} plan steps", filled.len());
+                        info!(
+                            "[ProjectCreation] LLM generated {} plan steps",
+                            filled.len()
+                        );
                         return PlanGenerationResult {
                             goal: goal.to_string(),
                             language: language.to_string(),
@@ -1571,10 +1582,7 @@ Project:
             steps.push(CreationStep {
                 id: "step-1".into(),
                 step_type: CreationStepType::CreateDirectory,
-                description: format!(
-                    "Create the {} source directory",
-                    source_dir
-                ),
+                description: format!("Create the {} source directory", source_dir),
                 status: StepStatus::Pending,
                 parameters: serde_json::json!({ "path": format!("{}/", source_dir) }),
                 result: None,
@@ -1586,7 +1594,11 @@ Project:
         // legacy local generator only if the module has no scaffold.
         let build_config = self.generate_build_config(language, &project_name, goal);
         steps.push(CreationStep {
-            id: if source_dir.is_empty() { "step-1".into() } else { "step-2".into() },
+            id: if source_dir.is_empty() {
+                "step-1".into()
+            } else {
+                "step-2".into()
+            },
             step_type: CreationStepType::WriteBuildConfig,
             description: format!("Write {} project configuration", build_file),
             status: StepStatus::Pending,
@@ -1599,7 +1611,11 @@ Project:
 
         // 3. Add dependencies (via crates-io MCP — placeholder: the LLM fills these)
         steps.push(CreationStep {
-            id: if source_dir.is_empty() { "step-2".into() } else { "step-3".into() },
+            id: if source_dir.is_empty() {
+                "step-2".into()
+            } else {
+                "step-3".into()
+            },
             step_type: CreationStepType::AddDependency,
             description: "Discover and add project dependencies via crates-io MCP".into(),
             status: StepStatus::Pending,
@@ -1617,7 +1633,11 @@ Project:
             format!("{}/{}", source_dir, source_file)
         };
         steps.push(CreationStep {
-            id: if source_dir.is_empty() { "step-3".into() } else { "step-4".into() },
+            id: if source_dir.is_empty() {
+                "step-3".into()
+            } else {
+                "step-4".into()
+            },
             step_type: CreationStepType::WriteSourceFile,
             description: format!("Write the main source file {}", source_path),
             status: StepStatus::Pending,
@@ -1630,7 +1650,11 @@ Project:
 
         // 5. Parse and validate
         steps.push(CreationStep {
-            id: if source_dir.is_empty() { "step-4".into() } else { "step-5".into() },
+            id: if source_dir.is_empty() {
+                "step-4".into()
+            } else {
+                "step-5".into()
+            },
             step_type: CreationStepType::ParseAndValidate,
             description: "Parse source files to validate syntax via AST modules".into(),
             status: StepStatus::Pending,
@@ -1642,7 +1666,11 @@ Project:
 
         // 6. Build
         steps.push(CreationStep {
-            id: if source_dir.is_empty() { "step-5".into() } else { "step-6".into() },
+            id: if source_dir.is_empty() {
+                "step-5".into()
+            } else {
+                "step-6".into()
+            },
             step_type: CreationStepType::Build,
             description: "Build the project to verify it compiles".into(),
             status: StepStatus::Pending,
@@ -1761,7 +1789,10 @@ Project:
                 info!("[ProjectCreation] Creating directory: {}", path);
                 // Use FilesystemModule::CallTool to create the directory
                 let full_dir = full_path(&path).to_string_lossy().to_string();
-                info!("[ProjectCreation] TOOL call filesystem_create_directory path={}", full_dir);
+                info!(
+                    "[ProjectCreation] TOOL call filesystem_create_directory path={}",
+                    full_dir
+                );
                 let (t, r) = tokio::sync::oneshot::channel();
                 self.filesystem_tx
                     .send(spire_core::modules::FilesystemMessage::CallTool {
@@ -1774,7 +1805,10 @@ Project:
                 let resp = r.await.map_err(|e| e.to_string())?;
                 // Check response for errors
                 if let Some(err) = resp.get("Err").and_then(|v| v.as_str()) {
-                    Ok((format!("Failed to create directory {}: {}", path, err), false))
+                    Ok((
+                        format!("Failed to create directory {}: {}", path, err),
+                        false,
+                    ))
                 } else {
                     Ok((format!("Created directory {}", path), true))
                 }
@@ -1799,9 +1833,7 @@ Project:
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let summary = match crate::build::generic_helpers::summarize_hal_header(
-                    &content,
-                ) {
+                let summary = match crate::build::generic_helpers::summarize_hal_header(&content) {
                     Ok(s) => s,
                     Err(e) => {
                         return Ok(StepExecutionResult {
@@ -1895,7 +1927,11 @@ Project:
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                info!("[ProjectCreation] TOOL call filesystem_write path={} content_len={}", path, content.len());
+                info!(
+                    "[ProjectCreation] TOOL call filesystem_write path={} content_len={}",
+                    path,
+                    content.len()
+                );
                 let full_write_path = full_path(&path).to_string_lossy().to_string();
                 let (t, r) = tokio::sync::oneshot::channel();
                 self.filesystem_tx
@@ -1918,18 +1954,30 @@ Project:
                 //   server_name: String  (e.g. "cratesio-mcp")
                 //   tool_name:   String  (e.g. "search_crates")
                 //   arguments:   object  (tool args)
-                let server_name =
-                    step.parameters.get("server_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let tool_name =
-                    step.parameters.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let server_name = step
+                    .parameters
+                    .get("server_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let tool_name = step
+                    .parameters
+                    .get("tool_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let arguments = step
-                    .parameters.get("arguments")
+                    .parameters
+                    .get("arguments")
                     .and_then(|v| v.as_object())
                     .cloned()
                     .unwrap_or_default();
 
                 if server_name.is_empty() || tool_name.is_empty() {
-                    Ok(("ToolCall step missing server_name or tool_name".to_string(), false))
+                    Ok((
+                        "ToolCall step missing server_name or tool_name".to_string(),
+                        false,
+                    ))
                 } else {
                     // Enforce per-language whitelist: look up the server's
                     // declared allowed_tools from the build modules. If the
@@ -1971,99 +2019,102 @@ Project:
                             false,
                         ))
                     } else {
-                    info!(
-                        "[ProjectCreation] TOOL call {} @ {}",
-                        tool_name, server_name
-                    );
-                    if server_name.starts_with("build/") {
-                        // In-process language-module tool (e.g. build/cargo ->
-                        // CargoBuildModule). No external MCP process involved.
-                        let (t, r) = tokio::sync::oneshot::channel();
-                        let _ = self
-                            .build_manager_tx
-                            .send(BuildManagerMessage::CallTool {
-                                tool_name: tool_name.clone(),
-                                args: serde_json::Value::Object(arguments),
-                                reply_to: t,
-                            })
-                            .await;
-                        match r.await {
-                            Ok(res) => {
-                                let is_error = res
-                                    .get("result")
-                                    .and_then(|r| r.get("isError"))
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                let text = res
-                                    .get("result")
-                                    .and_then(|r| r.get("content"))
-                                    .and_then(|c| c.as_array())
-                                    .and_then(|a| a.first())
-                                    .and_then(|x| x.get("text"))
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if is_error {
-                                    Ok((
-                                        format!(
-                                            "Tool {}/{} returned error: {}",
-                                            server_name, tool_name, text
-                                        ),
-                                        false,
-                                    ))
-                                } else {
-                                    Ok((text, true))
+                        info!(
+                            "[ProjectCreation] TOOL call {} @ {}",
+                            tool_name, server_name
+                        );
+                        if server_name.starts_with("build/") {
+                            // In-process language-module tool (e.g. build/cargo ->
+                            // CargoBuildModule). No external MCP process involved.
+                            let (t, r) = tokio::sync::oneshot::channel();
+                            let _ = self
+                                .build_manager_tx
+                                .send(BuildManagerMessage::CallTool {
+                                    tool_name: tool_name.clone(),
+                                    args: serde_json::Value::Object(arguments),
+                                    reply_to: t,
+                                })
+                                .await;
+                            match r.await {
+                                Ok(res) => {
+                                    let is_error = res
+                                        .get("result")
+                                        .and_then(|r| r.get("isError"))
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let text = res
+                                        .get("result")
+                                        .and_then(|r| r.get("content"))
+                                        .and_then(|c| c.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|x| x.get("text"))
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if is_error {
+                                        Ok((
+                                            format!(
+                                                "Tool {}/{} returned error: {}",
+                                                server_name, tool_name, text
+                                            ),
+                                            false,
+                                        ))
+                                    } else {
+                                        Ok((text, true))
+                                    }
                                 }
+                                Err(e) => Ok((format!("tool call lost: {}", e), false)),
                             }
-                            Err(e) => Ok((format!("tool call lost: {}", e), false)),
-                        }
-                    } else {
-                        // External MCP server tool.
-                        let (t, r) = tokio::sync::oneshot::channel();
-                        let _ = self
-                            .mcp_client_tx
-                            .send(McpClientMessage::CallTool {
-                                server_name: server_name.clone(),
-                                tool_name: tool_name.clone(),
-                                arguments: Some(arguments),
-                                reply_to: t,
-                            })
-                            .await;
-                        match r.await {
-                            Ok(Ok(result)) => {
-                                let text = result
-                                    .content
-                                    .iter()
-                                    .filter_map(|c| {
-                                        if let rust_mcp_sdk::schema::ContentBlock::TextContent(tc) = c {
-                                            Some(tc.text.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                if result.is_error.unwrap_or(false) {
-                                    Ok((
-                                        format!(
-                                            "Tool {}/{} returned error: {}",
-                                            server_name, tool_name, text
-                                        ),
-                                        false,
-                                    ))
-                                } else {
-                                    Ok((text, true))
+                        } else {
+                            // External MCP server tool.
+                            let (t, r) = tokio::sync::oneshot::channel();
+                            let _ = self
+                                .mcp_client_tx
+                                .send(McpClientMessage::CallTool {
+                                    server_name: server_name.clone(),
+                                    tool_name: tool_name.clone(),
+                                    arguments: Some(arguments),
+                                    reply_to: t,
+                                })
+                                .await;
+                            match r.await {
+                                Ok(Ok(result)) => {
+                                    let text = result
+                                        .content
+                                        .iter()
+                                        .filter_map(|c| {
+                                            if let rust_mcp_sdk::schema::ContentBlock::TextContent(
+                                                tc,
+                                            ) = c
+                                            {
+                                                Some(tc.text.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    if result.is_error.unwrap_or(false) {
+                                        Ok((
+                                            format!(
+                                                "Tool {}/{} returned error: {}",
+                                                server_name, tool_name, text
+                                            ),
+                                            false,
+                                        ))
+                                    } else {
+                                        Ok((text, true))
+                                    }
                                 }
+                                _ => Ok((
+                                    format!(
+                                        "MCP tool {}/{} unavailable (server not connected)",
+                                        server_name, tool_name
+                                    ),
+                                    false,
+                                )),
                             }
-                            _ => Ok((
-                                format!(
-                                    "MCP tool {}/{} unavailable (server not connected)",
-                                    server_name, tool_name
-                                ),
-                                false,
-                            )),
                         }
-                    }
                     }
                 }
             }
@@ -2092,11 +2143,7 @@ Project:
                     let manifest = full_path(dep_path.as_deref().unwrap());
                     match add_dependencies_to_manifest(&manifest, &deps) {
                         Ok(added) => Ok((
-                            format!(
-                                "Added {} dependency(s) to {}",
-                                added,
-                                manifest.display()
-                            ),
+                            format!("Added {} dependency(s) to {}", added, manifest.display()),
                             true,
                         )),
                         Err(e) => Ok((
@@ -2109,80 +2156,80 @@ Project:
                         )),
                     }
                 } else {
-                // Query the crates-io MCP server (rust-docs-mcp) for dependency
-                // suggestions matching the goal. The server exposes tools under
-                // the "crates-io" prefix (e.g. crates-io/search).
-                let goal = step
-                    .parameters
-                    .get("goal")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let language = step
-                    .parameters
-                    .get("language")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Rust")
-                    .to_string();
+                    // Query the crates-io MCP server (rust-docs-mcp) for dependency
+                    // suggestions matching the goal. The server exposes tools under
+                    // the "crates-io" prefix (e.g. crates-io/search).
+                    let goal = step
+                        .parameters
+                        .get("goal")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let language = step
+                        .parameters
+                        .get("language")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Rust")
+                        .to_string();
 
-                let (t, r) = tokio::sync::oneshot::channel();
-                let mut args = serde_json::Map::new();
-                if !goal.is_empty() {
-                    args.insert("query".to_string(), serde_json::json!(goal));
-                }
-                info!("[ProjectCreation] TOOL call crates-io/search query={}", goal);
-                let _ = self
-                    .mcp_client_tx
-                    .send(McpClientMessage::CallTool {
-                        server_name: "crates-io".to_string(),
-                        tool_name: "search".to_string(),
-                        arguments: Some(args),
-                        reply_to: t,
-                    })
-                    .await;
-
-                info!("[ProjectCreation] crates-io search returned result");
-                match r.await {
-                    Ok(Ok(result)) => {
-                        // Extract the tool result text from the MCP response.
-                        let text = result
-                            .content
-                            .iter()
-                            .filter_map(|c| {
-                                if let rust_mcp_sdk::schema::ContentBlock::TextContent(tc) = c {
-                                    Some(tc.text.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if text.is_empty() {
-                            Ok((
-                                "Crates-io MCP returned no suggestions".to_string(),
-                                true,
-                            ))
-                        } else {
-                            Ok((
-                                format!(
-                                    "Discovered dependencies for {} via crates-io MCP:\n{}",
-                                    language, text
-                                ),
-                                true,
-                            ))
-                        }
+                    let (t, r) = tokio::sync::oneshot::channel();
+                    let mut args = serde_json::Map::new();
+                    if !goal.is_empty() {
+                        args.insert("query".to_string(), serde_json::json!(goal));
                     }
-                    _ => {
-                        // MCP not connected yet — informational response only.
-                        Ok((
+                    info!(
+                        "[ProjectCreation] TOOL call crates-io/search query={}",
+                        goal
+                    );
+                    let _ = self
+                        .mcp_client_tx
+                        .send(McpClientMessage::CallTool {
+                            server_name: "crates-io".to_string(),
+                            tool_name: "search".to_string(),
+                            arguments: Some(args),
+                            reply_to: t,
+                        })
+                        .await;
+
+                    info!("[ProjectCreation] crates-io search returned result");
+                    match r.await {
+                        Ok(Ok(result)) => {
+                            // Extract the tool result text from the MCP response.
+                            let text = result
+                                .content
+                                .iter()
+                                .filter_map(|c| {
+                                    if let rust_mcp_sdk::schema::ContentBlock::TextContent(tc) = c {
+                                        Some(tc.text.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if text.is_empty() {
+                                Ok(("Crates-io MCP returned no suggestions".to_string(), true))
+                            } else {
+                                Ok((
+                                    format!(
+                                        "Discovered dependencies for {} via crates-io MCP:\n{}",
+                                        language, text
+                                    ),
+                                    true,
+                                ))
+                            }
+                        }
+                        _ => {
+                            // MCP not connected yet — informational response only.
+                            Ok((
                             format!(
                                 "Dependency discovery via crates-io MCP deferred (server may not be connected) for {}",
                                 language
                             ),
                             true,
                         ))
+                        }
                     }
-                }
                 }
             }
 
@@ -2201,7 +2248,10 @@ Project:
                         // Ask BuildManager to parse the source file (routes to the
                         // correct build module — tree-sitter for Rust/JS/Python,
                         // regex parser for Swift).
-                        info!("[ProjectCreation] TOOL call build.parse_and_store file={}", full.display());
+                        info!(
+                            "[ProjectCreation] TOOL call build.parse_and_store file={}",
+                            full.display()
+                        );
                         let (t, r) = tokio::sync::oneshot::channel();
                         self.build_manager_tx
                             .send(BuildManagerMessage::ParseAndStoreSourceFile {
@@ -2243,7 +2293,10 @@ Project:
             }
 
             CreationStepType::Build => {
-                info!("[ProjectCreation] TOOL call build.build path={}", root_dir.display());
+                info!(
+                    "[ProjectCreation] TOOL call build.build path={}",
+                    root_dir.display()
+                );
                 let (t, r) = tokio::sync::oneshot::channel();
                 self.build_manager_tx
                     .send(BuildManagerMessage::BuildProject {
@@ -2263,10 +2316,7 @@ Project:
                         if output.success {
                             Ok((format!("Build OK ({:.2}s)", output.duration_secs), true))
                         } else {
-                            Ok((
-                                format!("Build FAILED:\n{}", output.output),
-                                false,
-                            ))
+                            Ok((format!("Build FAILED:\n{}", output.output), false))
                         }
                     }
                     Ok(Err(e)) => Ok((format!("Build error: {}", e), false)),
@@ -2279,9 +2329,7 @@ Project:
                 self.build_manager_tx
                     .send(BuildManagerMessage::TestProject {
                         path: root_dir.clone(),
-                        opts: TestOptions {
-                            filter: None,
-                        },
+                        opts: TestOptions { filter: None },
                         reply_to: t,
                     })
                     .await
@@ -2349,10 +2397,7 @@ impl Actor for ProjectCreationActor {
                 for (i, step) in plan.steps.iter().enumerate() {
                     info!(
                         "[ProjectCreation]   step[{}] type={:?} desc=\"{}\" params={}",
-                        i,
-                        step.step_type,
-                        step.description,
-                        step.parameters
+                        i, step.step_type, step.description, step.parameters
                     );
                 }
                 let _ = reply_to.send(Ok(plan));
@@ -2372,97 +2417,98 @@ impl Actor for ProjectCreationActor {
                 } else {
                     platforms
                 };
-                let result: Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> = async {
-                    let build_file = match language.to_lowercase().as_str() {
-                        "swift" => "Package.swift",
-                        "python" => "pyproject.toml",
-                        "javascript" | "typescript" | "node" => "package.json",
-                        "go" => "go.mod",
-                        "c++" | "cpp" | "c" | "meson" => "meson.build",
-                        _ => "Cargo.toml",
-                    };
-                    let (t, r) = oneshot::channel();
-                    self.build_manager_tx
-                        .send(BuildManagerMessage::ScaffoldBuildConfig {
-                            project_name: project_name.clone(),
-                            goal: String::new(),
-                            build_file: build_file.to_string(),
-                            platforms: platforms.clone(),
-                            structure,
-                            embedded,
-                            reply_to: t,
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let out = r
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?;
-
-                    let root = root_dir.clone();
-                    let build_system =
-                        ProjectCreationActor::build_system_for_language(&language);
-                    let mut spec = crate::subsystems::build::build_manager::ScaffoldSpec {
-                        structural_files: Vec::new(),
-                        fill_roots: out.fill_roots.clone(),
-                        dependency_sections: out.dependency_sections.clone(),
-                        platform_targets: out.platform_targets.clone(),
-                        build_system: build_system.to_string(),
-                        files: out.files.clone(),
-                        structure: out.structure,
-                        embedded: out.embedded,
-                    };
-                    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-                    for f in &out.files {
-                        let p = root.join(&f.path);
-                        if let Some(parent) = p.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                        }
-                        std::fs::write(&p, &f.content).map_err(|e| e.to_string())?;
-                        if f.structural {
-                            spec.structural_files.push(f.path.clone());
-                        }
-                    }
-                    // Legacy single-file scaffold fallback.
-                    if out.files.is_empty() {
-                        let p = root.join(&out.build_file);
-                        std::fs::create_dir_all(p.parent().unwrap_or(&root))
+                let result: Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> =
+                    async {
+                        let build_file = match language.to_lowercase().as_str() {
+                            "swift" => "Package.swift",
+                            "python" => "pyproject.toml",
+                            "javascript" | "typescript" | "node" => "package.json",
+                            "go" => "go.mod",
+                            "c++" | "cpp" | "c" | "meson" => "meson.build",
+                            _ => "Cargo.toml",
+                        };
+                        let (t, r) = oneshot::channel();
+                        self.build_manager_tx
+                            .send(BuildManagerMessage::ScaffoldBuildConfig {
+                                project_name: project_name.clone(),
+                                goal: String::new(),
+                                build_file: build_file.to_string(),
+                                platforms: platforms.clone(),
+                                structure,
+                                embedded,
+                                reply_to: t,
+                            })
+                            .await
                             .map_err(|e| e.to_string())?;
-                        std::fs::write(&p, &out.build_content).map_err(|e| e.to_string())?;
-                        spec.structural_files.push(out.build_file.clone());
-                        let src = root.join(&out.source_dir);
-                        std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
-                        let sp = src.join(&out.source_file);
-                        std::fs::write(&sp, &out.source_content).map_err(|e| e.to_string())?;
-                        if spec.fill_roots.is_empty() {
-                            spec.fill_roots = vec![out.source_dir.clone()];
+                        let out = r
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .map_err(|e| e.to_string())?;
+
+                        let root = root_dir.clone();
+                        let build_system =
+                            ProjectCreationActor::build_system_for_language(&language);
+                        let mut spec = crate::subsystems::build::build_manager::ScaffoldSpec {
+                            structural_files: Vec::new(),
+                            fill_roots: out.fill_roots.clone(),
+                            dependency_sections: out.dependency_sections.clone(),
+                            platform_targets: out.platform_targets.clone(),
+                            build_system: build_system.to_string(),
+                            files: out.files.clone(),
+                            structure: out.structure,
+                            embedded: out.embedded,
+                        };
+                        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+                        for f in &out.files {
+                            let p = root.join(&f.path);
+                            if let Some(parent) = p.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                            }
+                            std::fs::write(&p, &f.content).map_err(|e| e.to_string())?;
+                            if f.structural {
+                                spec.structural_files.push(f.path.clone());
+                            }
                         }
-                    }
+                        // Legacy single-file scaffold fallback.
+                        if out.files.is_empty() {
+                            let p = root.join(&out.build_file);
+                            std::fs::create_dir_all(p.parent().unwrap_or(&root))
+                                .map_err(|e| e.to_string())?;
+                            std::fs::write(&p, &out.build_content).map_err(|e| e.to_string())?;
+                            spec.structural_files.push(out.build_file.clone());
+                            let src = root.join(&out.source_dir);
+                            std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+                            let sp = src.join(&out.source_file);
+                            std::fs::write(&sp, &out.source_content).map_err(|e| e.to_string())?;
+                            if spec.fill_roots.is_empty() {
+                                spec.fill_roots = vec![out.source_dir.clone()];
+                            }
+                        }
 
-                    // Mandate git: init + .gitignore + initial commit so the
-                    // LLM's fill changes can be diffed and rolled back to this
-                    // pristine scaffold baseline. Non-fatal — scaffolding still
-                    // succeeds when git is unavailable.
-                    if let Err(ge) =
-                        ProjectCreationActor::ensure_scaffold_git(&root, build_system).await
-                    {
-                        warn!("[ProjectCreation] git scaffold baseline skipped: {ge}");
-                    }
+                        // Mandate git: init + .gitignore + initial commit so the
+                        // LLM's fill changes can be diffed and rolled back to this
+                        // pristine scaffold baseline. Non-fatal — scaffolding still
+                        // succeeds when git is unavailable.
+                        if let Err(ge) =
+                            ProjectCreationActor::ensure_scaffold_git(&root, build_system).await
+                        {
+                            warn!("[ProjectCreation] git scaffold baseline skipped: {ge}");
+                        }
 
-                    // Persist the scaffolded structure in the graph.
-                    let (at, ar) = oneshot::channel();
-                    self.build_manager_tx
-                        .send(BuildManagerMessage::AnalyzeProject {
-                            path: root,
-                            config_file: None,
-                            reply_to: at,
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let _ = ar.await.map_err(|e| e.to_string())?;
-                    Ok(spec)
-                }
-                .await;
+                        // Persist the scaffolded structure in the graph.
+                        let (at, ar) = oneshot::channel();
+                        self.build_manager_tx
+                            .send(BuildManagerMessage::AnalyzeProject {
+                                path: root,
+                                config_file: None,
+                                reply_to: at,
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let _ = ar.await.map_err(|e| e.to_string())?;
+                        Ok(spec)
+                    }
+                    .await;
                 // The actor's reply type is anyhow::Result — map the String error.
                 let _ = reply_to.send(result.map_err(anyhow::Error::msg));
             }
@@ -2509,9 +2555,7 @@ impl Actor for ProjectCreationActor {
                 reply_to,
             } => {
                 self.active_spec = Some(spec.clone());
-                let plan = self
-                    .generate_fill_plan(&goal, &root_dir, &spec)
-                    .await;
+                let plan = self.generate_fill_plan(&goal, &root_dir, &spec).await;
                 let _ = reply_to.send(plan.map_err(anyhow::Error::msg));
             }
 
@@ -2555,9 +2599,7 @@ impl Actor for ProjectCreationActor {
                 for step in &steps {
                     info!(
                         "[ProjectCreation] EXECUTING step[{}] type={:?} desc=\"{}\"",
-                        step.id,
-                        step.step_type,
-                        step.description
+                        step.id, step.step_type, step.description
                     );
                     let r = self.execute_step(&root_dir, step).await;
                     let res = r.unwrap_or(StepExecutionResult {
@@ -2567,8 +2609,7 @@ impl Actor for ProjectCreationActor {
                     });
                     info!(
                         "[ProjectCreation]   -> finished success={} msg=\"{}\"",
-                        res.success,
-                        res.message
+                        res.success, res.message
                     );
                     results.push(res);
                 }
@@ -2873,12 +2914,7 @@ mod tests {
     fn plan_generation_creates_ordered_steps() {
         let actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
         let root = PathBuf::from("/tmp/test-project");
-        let plan = actor.generate_plan(
-            "A CLI tool that converts CSV to JSON",
-            &root,
-            "Rust",
-            &[],
-        );
+        let plan = actor.generate_plan("A CLI tool that converts CSV to JSON", &root, "Rust", &[]);
 
         assert_eq!(plan.steps.len(), 6);
         assert_eq!(plan.steps[0].step_type, CreationStepType::CreateDirectory);
@@ -3017,7 +3053,10 @@ mod tests {
         let steps = parse_fill_steps(json).expect("action/arguments body must parse");
         assert_eq!(steps.len(), 5);
         assert_eq!(steps[0].step_type, CreationStepType::AddDependency);
-        assert_eq!(steps[0].parameters["path"], "/Users/steve/naturesense/ai-traps-mcp/Cargo.toml");
+        assert_eq!(
+            steps[0].parameters["path"],
+            "/Users/steve/naturesense/ai-traps-mcp/Cargo.toml"
+        );
         assert_eq!(steps[1].step_type, CreationStepType::CreateDirectory);
         assert_eq!(
             steps[1].parameters["path"],
@@ -3071,7 +3110,10 @@ mod tests {
         let steps = parse_fill_steps(json).expect("step-key body must parse");
         assert_eq!(steps.len(), 4);
         assert_eq!(steps[0].step_type, CreationStepType::AddDependency);
-        assert_eq!(steps[0].parameters["path"], "/Users/steve/naturesense/ai-traps-mcp/Cargo.toml");
+        assert_eq!(
+            steps[0].parameters["path"],
+            "/Users/steve/naturesense/ai-traps-mcp/Cargo.toml"
+        );
         assert_eq!(steps[1].step_type, CreationStepType::WriteSourceFile);
         assert_eq!(
             steps[1].parameters["content"],
@@ -3168,9 +3210,7 @@ public:
             }),
             result: None,
         };
-        let res = rt
-            .block_on(actor.execute_step(&root, &ok_step))
-            .unwrap();
+        let res = rt.block_on(actor.execute_step(&root, &ok_step)).unwrap();
         assert!(
             !res.message.contains("rejected"),
             "valid contract must pass validation (reaches the write stage): {}",
@@ -3189,9 +3229,7 @@ public:
             }),
             result: None,
         };
-        let res = rt
-            .block_on(actor.execute_step(&root, &bad_step))
-            .unwrap();
+        let res = rt.block_on(actor.execute_step(&root, &bad_step)).unwrap();
         assert!(
             res.message.contains("HAL contract rejected"),
             "non-abstract header must be rejected with the contract message: {}",

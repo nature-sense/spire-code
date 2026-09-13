@@ -31,11 +31,11 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::subsystems::build::build_manager::BuildManagerMessage;
-use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use spire_core::actors::Actor;
 use spire_core::analyzer::models::*;
 use spire_core::analyzer::scanner;
 use spire_core::analyzer::tree_builder;
+use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 
 // ============================================================================
 // ProjectAnalysis — the structured output
@@ -156,7 +156,8 @@ impl ProjectAnalyzerActor {
             };
             info!(
                 "ProjectAnalyzer: analyzing via BuildManager: {:?} (build file: {})",
-                target, build_file.display()
+                target,
+                build_file.display()
             );
             let (tx, rx) = oneshot::channel();
             if bm_tx
@@ -196,10 +197,16 @@ impl ProjectAnalyzerActor {
                     out.push(meta);
                 }
                 Ok(Err(e)) => {
-                    warn!("ProjectAnalyzer: BuildManager analysis failed for {:?}: {}", target, e);
+                    warn!(
+                        "ProjectAnalyzer: BuildManager analysis failed for {:?}: {}",
+                        target, e
+                    );
                 }
                 Err(e) => {
-                    warn!("ProjectAnalyzer: BuildManager response lost for {:?}: {}", target, e);
+                    warn!(
+                        "ProjectAnalyzer: BuildManager response lost for {:?}: {}",
+                        target, e
+                    );
                 }
             }
         }
@@ -904,17 +911,8 @@ fn build_architecture_summary(
                 DomainEditability::Shared => "shared",
                 DomainEditability::Fillable => "fillable",
             };
-            let deps: Vec<String> = d
-                .dependencies
-                .iter()
-                .map(|dep| dep.name.clone())
-                .collect();
-            let mut s = format!(
-                "  - {} ({}): editability={}",
-                d.name,
-                d.kind,
-                edit
-            );
+            let deps: Vec<String> = d.dependencies.iter().map(|dep| dep.name.clone()).collect();
+            let mut s = format!("  - {} ({}): editability={}", d.name, d.kind, edit);
             if !d.files.is_empty() {
                 s.push_str(&format!("\n    files: {}", d.files.join(", ")));
             }
@@ -928,7 +926,10 @@ fn build_architecture_summary(
         })
         .collect();
     if !domain_parts.is_empty() {
-        parts.push(format!("Domains (use these as edit scope):\n{}", domain_parts.join("\n")));
+        parts.push(format!(
+            "Domains (use these as edit scope):\n{}",
+            domain_parts.join("\n")
+        ));
     }
 
     // Languages

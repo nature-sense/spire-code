@@ -50,7 +50,9 @@ pub fn build_errors_from(diags: &[RawDiagnostic]) -> ErrorsByFile {
         if d.file.is_empty() || message.is_empty() {
             continue;
         }
-        out.entry(d.file.to_string()).or_default().push(message.to_string());
+        out.entry(d.file.to_string())
+            .or_default()
+            .push(message.to_string());
     }
     out
 }
@@ -145,7 +147,6 @@ fn flatten(warnings: &WarningsByFile) -> Vec<String> {
         .flat_map(|(file, lines)| lines.iter().map(move |l| format!("{file}: {l}")))
         .collect()
 }
-
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -324,9 +325,8 @@ fn should_revert(before: usize, after: usize) -> bool {
 fn has_build_dir(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|rd| {
-            rd.flatten().any(|e| {
-                e.path().is_dir() && e.file_name().to_string_lossy().starts_with("build")
-            })
+            rd.flatten()
+                .any(|e| e.path().is_dir() && e.file_name().to_string_lossy().starts_with("build"))
         })
         .unwrap_or(false)
 }
@@ -581,7 +581,8 @@ pub async fn run_autofix(
                 }
                 continue;
             }
-            if let (Some(orig), Some(path)) = (backups.get(file), resolve_source_path(file, bases)) {
+            if let (Some(orig), Some(path)) = (backups.get(file), resolve_source_path(file, bases))
+            {
                 let _ = std::fs::write(&path, orig);
             }
             report
@@ -651,7 +652,9 @@ pub async fn run_autofix(
                     }
                 }
                 let Some(content) = driver.propose_warning_fix(file, &path, lines).await else {
-                    report.log.push(format!("skip {file}: no warning fix proposed"));
+                    report
+                        .log
+                        .push(format!("skip {file}: no warning fix proposed"));
                     tried_warn.insert(file.clone());
                     continue;
                 };
@@ -696,7 +699,10 @@ pub async fn run_autofix(
                 }
                 report.log.push(format!(
                     "warning round {} rolled back ({} → {} safe warning(s), {} error(s))",
-                    round + 1, report.safe_warnings_before, safe_after, errors_after_round
+                    round + 1,
+                    report.safe_warnings_before,
+                    safe_after,
+                    errors_after_round
                 ));
                 // Re-measure without the reverted edits.
                 let _ = driver.rebuild().await;
@@ -712,7 +718,9 @@ pub async fn run_autofix(
             }
             report.log.push(format!(
                 "warning round {} kept: {} → {} safe warning(s)",
-                round + 1, report.safe_warnings_before, safe_after
+                round + 1,
+                report.safe_warnings_before,
+                safe_after
             ));
             warnings = warnings_after_round;
         }
@@ -783,7 +791,12 @@ mod tests {
                 "a.cpp",
                 "dead store [deadcode.DeadStores]",
             ),
-            diag("lint", "warning", "a.cpp", "null deref [core.NullDereference]"),
+            diag(
+                "lint",
+                "warning",
+                "a.cpp",
+                "null deref [core.NullDereference]",
+            ),
             diag(
                 "lint",
                 "warning",
@@ -972,8 +985,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.cpp"), "int broken( ;\n").unwrap();
 
-        let driver = FakeDriver::new(vec![errs(&[("a.cpp", 3)]), errs(&[("a.cpp", 1)]), errs(&[])])
-            .proposing("a.cpp", "int a() { return 0; }\n");
+        let driver = FakeDriver::new(vec![
+            errs(&[("a.cpp", 3)]),
+            errs(&[("a.cpp", 1)]),
+            errs(&[]),
+        ])
+        .proposing("a.cpp", "int a() { return 0; }\n");
         let report = run_autofix(&driver, &[tmp.path().to_path_buf()], 5).await;
 
         assert!(report.success, "{report:?}");
@@ -1062,10 +1079,7 @@ mod tests {
         std::fs::write(&file, "void f() { int x = 1; }\n").unwrap();
 
         let driver = FakeDriver::new(vec![errs(&[])])
-            .with_warnings(vec![
-                warns(&[("a.cpp", "deadcode.DeadStores")]),
-                warns(&[]),
-            ])
+            .with_warnings(vec![warns(&[("a.cpp", "deadcode.DeadStores")]), warns(&[])])
             .proposing_warning_fix("a.cpp", "void f() {}\n");
 
         let report = run_autofix(&driver, &[tmp.path().to_path_buf()], 5).await;
@@ -1122,7 +1136,10 @@ mod tests {
 
         assert_eq!(report.safe_warnings_before, 0);
         assert_eq!(report.safe_warnings_after, 0);
-        assert_eq!(report.warning_rounds, 0, "nothing may be attempted: {report:?}");
+        assert_eq!(
+            report.warning_rounds, 0,
+            "nothing may be attempted: {report:?}"
+        );
         assert!(report.warnings_fixed.is_empty());
         assert_eq!(report.warnings_held.len(), 2, "{:?}", report.warnings_held);
         assert!(report

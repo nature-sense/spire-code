@@ -7,9 +7,7 @@ use async_trait::async_trait;
 use std::path::Path;
 
 use super::generic_helpers::parse_source_file_std;
-use super::{
-    BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability, TestOptions,
-};
+use super::{BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability, TestOptions};
 
 use super::generic_helpers::{parse_key_value, run_cmd};
 use crate::Actor;
@@ -74,7 +72,6 @@ impl Default for RubyBuildModule {
 impl Actor for RubyBuildModule {
     type Message = BuildModuleMessage;
 
-
     async fn handle(&mut self, msg: Self::Message) {
         match msg {
             BuildModuleMessage::DescribeCapabilities { reply_to } => {
@@ -84,11 +81,11 @@ impl Actor for RubyBuildModule {
                     build_system: "Bundler".to_string(),
                     language: "Ruby".to_string(),
                     source_extensions: vec!["rb".to_string()],
-                supports_clean: true,
-                supports_lint: true,
-                supports_format: false,
-                supports_fix: true,
-                mcp_servers: vec![],
+                    supports_clean: true,
+                    supports_lint: true,
+                    supports_format: false,
+                    supports_fix: true,
+                    mcp_servers: vec![],
                 });
             }
             BuildModuleMessage::Analyze { path, reply_to } => {
@@ -115,7 +112,11 @@ impl Actor for RubyBuildModule {
                 // and emit a single synthetic "finished" event.
                 let result = self.build(&path, &opts).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -175,7 +176,11 @@ impl Actor for RubyBuildModule {
                 // Batch lint + a synthetic finished event (no per-line streaming yet).
                 let result = self.lint(&path, &metadata, platform.as_deref()).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished lint {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished lint {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -196,7 +201,11 @@ impl Actor for RubyBuildModule {
                 // Batch fix + a synthetic finished event.
                 let result = self.fix(&path, &metadata).await;
                 let _ = event_tx.send(super::BuildEvent {
-                    line: format!("Finished fix {} in {:?}s", path.display(), result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)),
+                    line: format!(
+                        "Finished fix {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
                     level: "finished".to_string(),
                     target: None,
                     file: None,
@@ -206,7 +215,6 @@ impl Actor for RubyBuildModule {
                 });
                 let _ = reply_to.send(result);
             }
-
 
             BuildModuleMessage::ParseSourceFile {
                 file_path,
@@ -226,9 +234,11 @@ impl Actor for RubyBuildModule {
             } => {
                 let bc = r#"source "https://rubygems.org"
 gem "rake"
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let sc = r#"puts "Hello from __P__!"
-"#.replace("__P__", &project_name);
+"#
+                .replace("__P__", &project_name);
                 let _ = reply_to.send(Ok(super::ScaffoldOutput {
                     build_file: "Gemfile".to_string(),
                     build_content: bc,

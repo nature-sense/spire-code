@@ -3,11 +3,11 @@
 
 //! Tests for the graph-driven ToolOrchestrator + StepContext + bootstrap pipeline.
 
+use spire_actor::ActorSystem;
+use spire_code::actors::{ToolOrchestrator, ToolOrchestratorMessage};
+use spire_core::models::memory_graph::{AttrNode, BuildError};
 use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use spire_core::subsystems::tools::tool_orchestrator::StepContext;
-use spire_code::actors::{ToolOrchestrator, ToolOrchestratorMessage};
-use spire_actor::ActorSystem;
-use spire_core::models::memory_graph::{BuildError, AttrNode};
 use std::collections::HashMap;
 
 /// Helper to create a mock sender for any actor channel.
@@ -320,12 +320,12 @@ async fn test_bootstrap_strategy_steps_graph_seeding() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("ToolProvider".to_string()),
-                subtype: Some("tool_provider".to_string()),
-                name: Some("vscode-extension".to_string()),
-                limit: Some(10),
-                reply_to: tx,
-            })
+            node_type: Some("ToolProvider".to_string()),
+            subtype: Some("tool_provider".to_string()),
+            name: Some("vscode-extension".to_string()),
+            limit: Some(10),
+            reply_to: tx,
+        })
         .await
         .unwrap();
     let providers = rx.await.unwrap().expect("QueryNodes failed");
@@ -336,12 +336,12 @@ async fn test_bootstrap_strategy_steps_graph_seeding() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("StepDefinition".to_string()),
-                subtype: Some("step_definition".to_string()),
-                name: Some("test-read-step".to_string()),
-                limit: Some(10),
-                reply_to: tx,
-            })
+            node_type: Some("StepDefinition".to_string()),
+            subtype: Some("step_definition".to_string()),
+            name: Some("test-read-step".to_string()),
+            limit: Some(10),
+            reply_to: tx,
+        })
         .await
         .unwrap();
     let steps = rx.await.unwrap().expect("QueryNodes failed");
@@ -385,12 +385,12 @@ async fn test_bootstrap_strategy_steps_depends_on_stored() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("StepDefinition".to_string()),
-                subtype: Some("step_definition".to_string()),
-                name: Some("step-with-deps".to_string()),
-                limit: Some(10),
-                reply_to: tx,
-            })
+            node_type: Some("StepDefinition".to_string()),
+            subtype: Some("step_definition".to_string()),
+            name: Some("step-with-deps".to_string()),
+            limit: Some(10),
+            reply_to: tx,
+        })
         .await
         .unwrap();
     let steps = rx.await.unwrap().expect("QueryNodes failed");
@@ -512,12 +512,12 @@ async fn test_tool_orchestrator_execute_tool_chain_success() {
         memory_graph
             .send(MemoryGraphMessage::StoreAttrNode {
                 node: t_attr_unknown(
-                "Unknown",
-                Some("step_definition".to_string()),
-                step_names[i].to_string(),
-                None,
-                props,
-            ),
+                    "Unknown",
+                    Some("step_definition".to_string()),
+                    step_names[i].to_string(),
+                    None,
+                    props,
+                ),
                 reply_to: tx,
             })
             .await
@@ -764,12 +764,12 @@ async fn test_bootstrap_strategy_steps_twice_is_idempotent() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Unknown".to_string()),
-                subtype: Some("step_definition".to_string()),
-                name: Some("read_error_context".to_string()),
-                limit: Some(10),
-                reply_to: tx,
-            })
+            node_type: Some("Unknown".to_string()),
+            subtype: Some("step_definition".to_string()),
+            name: Some("read_error_context".to_string()),
+            limit: Some(10),
+            reply_to: tx,
+        })
         .await
         .unwrap();
     let nodes = rx.await.unwrap().expect("QueryNodes failed");

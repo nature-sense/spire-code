@@ -16,13 +16,13 @@
 //! advertised — the unit test in `build_manager.rs` only checks the name list,
 //! this one checks the wiring the app actually uses.
 
+use spire_actor::ActorSystem;
 use spire_code::actors::build_default_registry;
 use spire_code::build::{
     BuildModuleMessage, CargoBuildModule, MakeBuildModule, MesonBuildModule, ModuleCapability,
     SwiftBuildModule,
 };
 use spire_code::subsystems::build::{BuildManagerActor, BuildManagerMessage};
-use spire_actor::ActorSystem;
 use spire_core::actors::rag::RagMessage;
 use spire_core::modules::{
     FilesystemMessage, GitMessage, ProcessMessage, SearchMessage, TerminalMessage,
@@ -56,9 +56,7 @@ async fn ui_build_actions_are_routable_through_tools_call() {
     let system = ActorSystem::new();
 
     // A real BuildManagerActor with the real build modules registered.
-    let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(
-        drain::<MemoryGraphMessage>(),
-    ));
+    let (bm_tx, _bm_handle) = system.spawn(BuildManagerActor::new(drain::<MemoryGraphMessage>()));
     let modules = vec![
         describe_module(&system, CargoBuildModule::new()).await,
         describe_module(&system, MesonBuildModule).await,

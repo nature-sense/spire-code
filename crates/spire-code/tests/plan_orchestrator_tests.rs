@@ -4,11 +4,13 @@
 //! Tests for the PlanOrchestrator + Plan/PlanStep graph operations.
 
 use serde_json::Value;
-use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
-use spire_code::subsystems::planning::plan_orchestrator::{PlanOrchestrator, PlanOrchestratorMessage};
 use spire_actor::ActorSystem;
+use spire_code::subsystems::planning::plan_orchestrator::{
+    PlanOrchestrator, PlanOrchestratorMessage,
+};
 use spire_core::models::memory_graph::{AttrNode, NodeUpdate};
 use spire_core::models::memory_graph::{PlanStatus, PlanStepData};
+use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use std::collections::HashMap;
 
 fn mock_sender<T>() -> tokio::sync::mpsc::Sender<T> {
@@ -297,7 +299,8 @@ async fn create_plan_variant(
                 HashMap::from([
                     ("goal".to_string(), Value::String("Test goal".to_string())),
                     ("status".to_string(), Value::String("executing".to_string())),
-                ])),
+                ]),
+            ),
             reply_to: tx,
         })
         .await
@@ -396,9 +399,9 @@ async fn test_plan_status_result_construction() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         memory_graph
             .send(MemoryGraphMessage::GetAttrNode {
-            id: step_id.clone(),
-            reply_to: tx,
-        })
+                id: step_id.clone(),
+                reply_to: tx,
+            })
             .await
             .unwrap();
         let step_node = rx.await.unwrap().unwrap().unwrap();
@@ -442,12 +445,12 @@ async fn test_plan_status_query_returns_all_fields() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Unknown".to_string()),
-                subtype: Some("plan".to_string()),
-                name: Some("query-test-plan".to_string()),
-                limit: None,
-                reply_to: tx,
-            })
+            node_type: Some("Unknown".to_string()),
+            subtype: Some("plan".to_string()),
+            name: Some("query-test-plan".to_string()),
+            limit: None,
+            reply_to: tx,
+        })
         .await
         .unwrap();
     let plans = rx.await.unwrap().expect("QueryNodes failed");
@@ -491,12 +494,12 @@ async fn test_plan_step_dependency_resolution() {
         memory_graph
             .send(MemoryGraphMessage::StoreAttrNode {
                 node: t_attr_unknown(
-                "Unknown",
-                Some("plan_step".to_string()),
-                format!("dep-step-{}", i),
-                Some(format!("Dependency step {}", i)),
-                props,
-            ),
+                    "Unknown",
+                    Some("plan_step".to_string()),
+                    format!("dep-step-{}", i),
+                    Some(format!("Dependency step {}", i)),
+                    props,
+                ),
                 reply_to: tx,
             })
             .await
