@@ -2834,53 +2834,57 @@ impl CoordinatorActor {
                 .send(MemoryGraphMessage::GetMcpConfig { reply_to: t })
                 .await;
             if let Ok(Ok(servers)) = r.await {
-                if !servers.is_empty() {
-                    use spire_core::mcp::client::{McpServerConfig, TransportConfig};
-                    let configs: Vec<McpServerConfig> = servers
-                        .into_iter()
-                        .filter_map(|entry| {
-                            let transport = if let Some(url) = entry.url {
-                                TransportConfig::Http {
-                                    url,
-                                    headers: entry.headers.unwrap_or_default(),
-                                }
-                            } else {
-                                let cmd = entry.command?;
-                                TransportConfig::Stdio {
-                                    command: cmd,
-                                    args: entry.args,
-                                    env: entry.env.unwrap_or_default(),
-                                }
-                            };
-                            Some(McpServerConfig {
-                                name: entry.name,
-                                transport,
-                                autostart: entry.autostart,
-                                build_type: None,
-                            })
+                // Device servers are appended even when the project has no OTHER
+                // MCP servers: a board is a per-project capability, not something
+                // that follows from the graph already carrying MCP config. A guard
+                // here used to skip this whole block for such projects, so their
+                // boards were never registered and the UI had nothing to key the
+                // Device group off.
+                use spire_core::mcp::client::{McpServerConfig, TransportConfig};
+                let configs: Vec<McpServerConfig> = servers
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let transport = if let Some(url) = entry.url {
+                            TransportConfig::Http {
+                                url,
+                                headers: entry.headers.unwrap_or_default(),
+                            }
+                        } else {
+                            let cmd = entry.command?;
+                            TransportConfig::Stdio {
+                                command: cmd,
+                                args: entry.args,
+                                env: entry.env.unwrap_or_default(),
+                            }
+                        };
+                        Some(McpServerConfig {
+                            name: entry.name,
+                            transport,
+                            autostart: entry.autostart,
+                            build_type: None,
                         })
-                        .collect();
-                    let configs = Self::with_device_mcp_configs(configs);
+                    })
+                    .collect();
+                let configs = Self::with_device_mcp_configs(configs);
 
-                    if !configs.is_empty() {
-                        let (t, _r) = tokio::sync::oneshot::channel();
-                        let _ = self
-                            .mcp_client_tx
-                            .send(McpClientMessage::LoadConfigFromGraph {
-                                servers: configs,
-                                reply_to: t,
-                            })
-                            .await;
-                        let (t, r) = tokio::sync::oneshot::channel();
-                        let _ = self
-                            .mcp_client_tx
-                            .send(McpClientMessage::ConnectAll { reply_to: t })
-                            .await;
-                        // Wait for the servers to actually connect before
-                        // continuing — avoids a race where plan generation
-                        // starts before MCP tools are available.
-                        let _ = r.await;
-                    }
+                if !configs.is_empty() {
+                    let (t, _r) = tokio::sync::oneshot::channel();
+                    let _ = self
+                        .mcp_client_tx
+                        .send(McpClientMessage::LoadConfigFromGraph {
+                            servers: configs,
+                            reply_to: t,
+                        })
+                        .await;
+                    let (t, r) = tokio::sync::oneshot::channel();
+                    let _ = self
+                        .mcp_client_tx
+                        .send(McpClientMessage::ConnectAll { reply_to: t })
+                        .await;
+                    // Wait for the servers to actually connect before
+                    // continuing — avoids a race where plan generation
+                    // starts before MCP tools are available.
+                    let _ = r.await;
                 }
             }
 
