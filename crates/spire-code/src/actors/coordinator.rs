@@ -2956,10 +2956,13 @@ impl CoordinatorActor {
                 // Populate first-class target nodes so the graph can be queried
                 // via project/getBuildTarget (deps/platform/files).
                 let _ = populate_target_graph(registry, &analysis.build_systems).await;
-                // Boards this project builds for: reach their device servers in
-                // the background, so on-hardware tools appear once a board is up
-                // (an offline board only logs — it never delays the open).
-                self.connect_devices_in_background(Self::project_platform_ids(&analysis));
+                // Boards are deliberately NOT reached here. Only one board tends
+                // to be up (the one being developed), and the MCP client's
+                // mailbox is serial, so dialing the others would queue-delay the
+                // live one for as long as each dead board takes to time out.
+                // Connecting is an explicit act — `device/connect` from the
+                // Device group, or `ensure_device_connected` on the first
+                // `device/test` / `device/deploy`.
                 serialize_analysis(&analysis)
             }
             Err(e) => serde_json::json!({"error": e}),
@@ -3310,7 +3313,7 @@ impl CoordinatorActor {
     /// Registering is cheap and side-effect free: these configs carry
     /// `autostart: false`, so the MCP client's `ConnectAll` skips them and a
     /// powered-off board can never delay startup. Reaching a board is a
-    /// deliberate act — see [`Self::connect_devices_in_background`].
+    /// deliberate act — `device/connect`, or the first `device/test`.
     fn device_mcp_configs() -> Vec<spire_core::mcp::client::McpServerConfig> {
         crate::platform::Platform::device_platforms()
             .iter()
@@ -3334,70 +3337,19 @@ impl CoordinatorActor {
         configs
     }
 
-    /// Platform ids a project builds for (e.g. `rpi5`, `rock3c`), from its
-    /// analysis. `host` is the development machine and has no board.
-    fn project_platform_ids(analysis: &ProjectAnalysis) -> Vec<String> {
-        let mut ids: Vec<String> = Vec::new();
-        for build in &analysis.build_systems {
-            let candidates = build
-                .platform_targets
-                .iter()
-                .map(String::as_str)
-                .chain(build.targets.iter().map(|target| target.platform.as_str()));
-            for id in candidates {
-                let id = id.trim();
-                if !id.is_empty() && id != "host" && !ids.iter().any(|known| known == id) {
-                    ids.push(id.to_string());
-                }
-            }
-        }
-        ids.sort();
-        ids
-    }
-
-    /// Connect the device MCP servers for `platform_ids` in the background.
-    ///
-    /// Boards are frequently powered off and the MCP client handles messages
-    /// serially, so this stays off the caller's path: an unreachable board only
-    /// logs (the client bounds each `Connect`), and the caller never waits.
-    fn connect_devices_in_background(&self, platform_ids: Vec<String>) {
-        if platform_ids.is_empty() {
-            return;
-        }
-        let mcp_client_tx = self.mcp_client_tx.clone();
-        tokio::spawn(async move {
-            for platform_id in platform_ids {
-                let name = format!("device-{platform_id}");
-                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if mcp_client_tx
-                    .send(McpClientMessage::Connect {
-                        server_name: name.clone(),
-                        reply_to: reply_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                match reply_rx.await {
-                    Ok(Ok(())) => {
-                        tracing::info!("Coordinator: connected device server '{}'", name);
-                    }
-                    // A powered-off or not-yet-deployed board is normal, not an error.
-                    Ok(Err(e)) => {
-                        tracing::info!("Coordinator: device server '{}' offline: {}", name, e);
-                    }
-                    Err(_) => {}
-                }
-            }
-        });
-    }
+    // NOTE: there was a `connect_devices_in_background` here, dialing every
+    // board a project builds for on project open. It was removed once connecting
+    // became an explicit UI action: with one target under development at a time,
+    // the other boards are predictably absent, and the MCP client's serial
+    // mailbox meant those timeouts delayed the live board's first request. Use
+    // `device/connect` (the Device group's button) or `device/test`, which
+    // connects on demand through `ensure_device_connected`.
 
     /// Make sure a device server is connected before talking to it.
     ///
-    /// Project open already connects the boards a project builds for (in the
-    /// background), but the first test can arrive before that finishes — or after
-    /// the MCP client reloaded its config — so this checks and connects on demand.
+    /// Connecting is explicit now (`device/connect` from the Device group), so a
+    /// board may well be offline here — or the MCP client reloaded its config and
+    /// dropped it — hence the check-and-connect on demand.
     async fn ensure_device_connected(&self, server_name: &str) -> Result<(), String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
