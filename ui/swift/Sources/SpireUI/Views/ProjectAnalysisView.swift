@@ -296,7 +296,12 @@ struct ProjectAnalysisView: View {
                 Divider()
             }
 
-            ForEach(ProjectLayout(project: project).root.children) { section in
+            // The layout tree is for NAVIGATION (project / common / HAL / api).
+            // Its `Targets` section lists the same per-platform executables the
+            // "Platform builds" list above already selects and reports state for
+            // — showing them twice made two selectors fight over one selection,
+            // so the tree skips that section.
+            ForEach(ProjectLayout(project: project).root.children.filter { $0.kind != .target }) { section in
                 LayoutTreeNodeView(
                     node: section,
                     depth: 0,

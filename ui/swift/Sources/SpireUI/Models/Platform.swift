@@ -8,6 +8,33 @@ struct Platform: Identifiable, Codable, Hashable {
     let architecture: PlatformArchitecture
     let toolchain: PlatformToolchain
     let sysroot: PlatformSysroot
+    /// The board this platform can reach, when it declares `device:`. Absent for
+    /// the host and for platforms with no board — which is what tells the UI
+    /// whether "Run tests on board" / "Deploy binary" can apply.
+    let device: PlatformDevice?
+}
+
+/// A platform's board (`device:` in `~/.spire/platforms/<id>.yaml`).
+struct PlatformDevice: Codable, Hashable {
+    let mcp: PlatformDeviceMcp?
+    let deploy: PlatformDeploy?
+
+    /// True when this platform declares a reachable MCP endpoint.
+    var hasMcp: Bool {
+        !(mcp?.url.trimmingCharacters(in: .whitespaces) ?? "").isEmpty
+    }
+}
+
+/// The board's MCP endpoint — a `spire-target-mcp` server over Streamable HTTP.
+struct PlatformDeviceMcp: Codable, Hashable {
+    let url: String
+    /// Optional bearer token; the field is never displayed.
+    let token: String?
+}
+
+/// Where deployed binaries are installed on the board (`device.deploy`).
+struct PlatformDeploy: Codable, Hashable {
+    let dest: String
 }
 
 struct PlatformArchitecture: Codable, Hashable {

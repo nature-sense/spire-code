@@ -1113,6 +1113,66 @@ final class SpireBridge {
         }
     }
 
+    // MARK: - Device (on-hardware) commands
+
+    /// The MCP server name a platform's board is registered under.
+    static func deviceServerName(for platform: String) -> String { "device-\(platform)" }
+
+    /// Whether the board for `platform` is connected right now.
+    ///
+    /// Boards are registered `autostart: false` and reached deliberately, so
+    /// "offline" is the normal resting state — the Device actions key off this.
+    func deviceOnline(platform: String) -> Bool {
+        let name = Self.deviceServerName(for: platform)
+        guard let server = mcpServers.first(where: { $0.name == name }) else { return false }
+        return (server.properties?["status"]?.value as? String) == "online"
+    }
+
+    /// Connect the board for `platform`. Bounded on the Rust side (~15s), so an
+    /// unreachable board returns false rather than hanging.
+    func connectDevice(platform: String) async -> Bool {
+        let reply = await deviceCommand("device/connect", params: ["platform": platform])
+        guard let reply, reply["error"] == nil else { return false }
+        // Refresh so `deviceOnline` reflects the new state immediately.
+        await fetchMcpServers()
+        return deviceOnline(platform: platform)
+    }
+
+    /// Deploy a cross-built test binary to the board and run it there.
+    ///
+    /// `path` is relative to the project root (an absolute path works too).
+    /// Returns the board's reply, which carries `passed` and the full result.
+    func runDeviceTests(platform: String, path: String, timeoutSecs: Int = 120) async -> [String: Any]? {
+        await deviceCommand(
+            "device/test",
+            params: ["platform": platform, "path": path, "timeout_secs": timeoutSecs]
+        )
+    }
+
+    /// Install a production binary on the board.
+    ///
+    /// `dest` overrides the platform's `device.deploy.dest` from the registry.
+    func deployDeviceBinary(platform: String, path: String, dest: String? = nil) async -> [String: Any]? {
+        var params: [String: Any] = ["platform": platform, "path": path]
+        if let dest, !dest.trimmingCharacters(in: .whitespaces).isEmpty {
+            params["dest"] = dest
+        }
+        return await deviceCommand("device/deploy", params: params)
+    }
+
+    /// Send a `device/*` command and return its reply object (nil when the
+    /// backend could not be reached).
+    private func deviceCommand(_ method: String, params: [String: Any]) async -> [String: Any]? {
+        do {
+            let body: [String: Any] = ["method": method, "params": params]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            return try JSONSerialization.jsonObject(with: reply) as? [String: Any]
+        } catch {
+            return nil
+        }
+    }
+
     /// Fetch all cross-compilation platforms from the Rust core (graph-backed).
     func fetchPlatforms() async -> [Platform] {
         do {

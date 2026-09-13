@@ -99,6 +99,9 @@ struct MainView: View {
                 .frame(maxHeight: .infinity)
             }
             .onAppear {
+                // The Device group keys off the registered board MCP servers, so
+                // make sure that list is loaded before a target is selected.
+                Task { if bridge.mcpServers.isEmpty { await bridge.fetchMcpServers() } }
                 // HAL projects: default to the project root (no domain selected).
                 if selectedDomain == nil, let hal = project.subprojects.first(where: { $0.structure == "hal" }) {
                     selectedSubproject = hal
@@ -833,6 +836,161 @@ struct ActionPanelView: View {
         return nil
     }
 
+    // ── Device (on-hardware) ──────────────────────────────────────────────
+    // A board is a platform that declares `device:` in the registry. Boards are
+    // frequently powered off, so nothing here dials one until asked: Connect is
+    // explicit, and the two board actions stay disabled until it succeeds.
+    /// True while a board connect is in flight.
+    @State private var connectingDevice = false
+    /// The board action currently running ("test" / "deploy"), if any.
+    @State private var runningDevice: String?
+    /// Result line under the Device group (success, failure, or error text).
+    @State private var deviceNote: String?
+
+    /// The platform whose board the current selection maps to, when that
+    /// platform declares one. No board → no Device group (a host is not a
+    /// device). Keyed off the registered `device-<platform>` MCP servers, which
+    /// is exactly what the backend would connect to.
+    private var selectedDevicePlatform: String? {
+        let candidate = platformForSelectedTarget() ?? selectedDomainName
+        guard let candidate, !candidate.isEmpty, candidate != "host" else { return nil }
+        let server = SpireBridge.deviceServerName(for: candidate)
+        guard bridge.mcpServers.contains(where: { $0.name == server }) else { return nil }
+        return candidate
+    }
+
+    /// The Meson build directory for a platform (`build-<plat>`).
+    private func buildDir(_ platform: String) -> String { "build-\(platform)" }
+
+    /// The cross-built TEST binary for a platform.
+    ///
+    /// Convention: `<build dir>/<platform>/<project>-<platform>-tests`, which is
+    /// what a project's `tests/meson.build` produces for a project named
+    /// `<project>` (ai-traps → `ai-traps-rpi5-tests`). A project that names its
+    /// tests differently gets a "not found" result naming the full path from the
+    /// board, which is self-correcting.
+    private func testBinaryPath(_ platform: String, projectName: String) -> String {
+        let slug = projectName.lowercased().replacingOccurrences(of: " ", with: "-")
+        return "\(buildDir(platform))/\(platform)/\(slug)-\(platform)-tests"
+    }
+
+    /// The Meson executable target that builds for `platform` — the production
+    /// binary that `deploy` installs on the board.
+    private func targetForPlatform(_ platform: String) -> String? {
+        if let name = selectedBuildTarget, !name.isEmpty { return name }
+        for sub in project.subprojects {
+            if let bt = sub.buildTargets.first(where: { $0.platform == platform }) {
+                return bt.name
+            }
+        }
+        return nil
+    }
+
+    /// The production binary's path within the project for `platform`.
+    private func productionBinaryPath(_ platform: String) -> String? {
+        guard let target = targetForPlatform(platform) else { return nil }
+        return "\(buildDir(platform))/\(platform)/\(target)"
+    }
+
+    /// A one-line summary of a board reply (shown under the Device group).
+    private func deviceSummary(_ reply: [String: Any]?, verb: String) -> String {
+        guard let reply else { return "Board unreachable — is spire-target-mcp running?" }
+        if let error = reply["error"] as? String { return error }
+        if verb == "deploy", let dest = reply["dest"] as? String {
+            return "Deployed to \(dest)"
+        }
+        if let passed = reply["passed"] as? Bool {
+            return passed ? "Board tests passed" : "Board tests failed"
+        }
+        return "Done"
+    }
+
+    /// The Device group: connect the board, then run its tests or deploy to it.
+    ///
+    /// Both board actions are gated on the connection: there is nothing useful
+    /// to do to a board that is not answering, and a disabled button says so
+    /// without hiding the capability.
+    @ViewBuilder
+    private func deviceActions(_ platform: String) -> some View {
+        let online = bridge.deviceOnline(platform: platform)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "cpu")
+                    .foregroundStyle(online ? Color.green : theme.textSecondary)
+                Text("Device · \(platform)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(theme.textSecondary)
+                Spacer()
+                Text(online ? "connected" : "offline")
+                    .font(.caption2)
+                    .foregroundStyle(online ? Color.green : theme.textSecondary)
+            }
+
+            Button {
+                Task {
+                    connectingDevice = true
+                    deviceNote = "Connecting to \(platform)…"
+                    let connected = await bridge.connectDevice(platform: platform)
+                    connectingDevice = false
+                    deviceNote = connected
+                        ? "Connected to \(platform)"
+                        : "Could not reach \(platform) — is the board powered on?"
+                }
+            } label: {
+                Label(
+                    connectingDevice ? "Connecting…" : (online ? "Connected" : "Connect to board"),
+                    systemImage: "cable.connector"
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(connectingDevice || online)
+
+            Button {
+                runningDevice = "test"
+                deviceNote = "Deploying and running tests on \(platform)…"
+                Task {
+                    let reply = await bridge.runDeviceTests(
+                        platform: platform,
+                        path: testBinaryPath(platform, projectName: project.name)
+                    )
+                    runningDevice = nil
+                    deviceNote = deviceSummary(reply, verb: "test")
+                    bridge.buildCompletionTick += 1
+                }
+            } label: {
+                Label("Run tests on board", systemImage: "play.circle")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(!online || runningDevice != nil)
+
+            Button {
+                guard let binary = productionBinaryPath(platform) else {
+                    deviceNote = "No build target for \(platform) — build it first"
+                    return
+                }
+                runningDevice = "deploy"
+                deviceNote = "Deploying \(binary) to \(platform)…"
+                Task {
+                    let reply = await bridge.deployDeviceBinary(platform: platform, path: binary)
+                    runningDevice = nil
+                    deviceNote = deviceSummary(reply, verb: "deploy")
+                }
+            } label: {
+                Label("Deploy binary", systemImage: "arrow.down.to.line")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(!online || runningDevice != nil)
+
+            if let deviceNote {
+                Text(deviceNote)
+                    .font(.caption2)
+                    .foregroundStyle(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
     // ── Semantic one-shot generation (Fix → plan → approval → apply) ──
     /// Proposed LLM module pair awaiting approval in the viewer.
     @State private var generatedPlan: HalGenerateImplPlan?
@@ -851,6 +1009,16 @@ struct ActionPanelView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
+                Divider()
+                    .overlay(theme.divider)
+            }
+
+            // ── Device (on-hardware) ──
+            // Appears only when the selection maps to a platform that declares a
+            // board. Connect is deliberate (a board is usually powered off) and
+            // the two board actions wait for it.
+            if let devicePlatform = selectedDevicePlatform {
+                deviceActions(devicePlatform)
                 Divider()
                     .overlay(theme.divider)
             }
