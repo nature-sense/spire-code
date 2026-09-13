@@ -995,6 +995,10 @@ struct ActionPanelView: View {
     @State private var generateBusy = false
     /// Result/error message from the one-shot generation.
     @State private var generateMessage: String?
+    /// Bulk "generate missing implementations" plan, awaiting approval.
+    @State private var fillPlan: [[String: Any]] = []
+    @State private var showFillPlan = false
+    @State private var fillBusy = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1416,6 +1420,7 @@ struct ActionPanelView: View {
     /// card above only cares whether it is finished.
     private var halCard: some View {
         halInterfacesCard
+            .sheet(isPresented: $showFillPlan) { fillPlanSheet }
     }
 
     private var fileActions: some View {
@@ -1446,7 +1451,7 @@ struct ActionPanelView: View {
             HStack(spacing: 6) {
                 Image(systemName: "cpu")
                     .foregroundStyle(theme.accent)
-                Text("HAL Interfaces — \(selectedDomainName ?? "platform")")
+                Text("HAL — \(selectedDomainName ?? "platform")")
                     .font(.callout.weight(.semibold))
                 Spacer()
                 Button {
@@ -1461,6 +1466,19 @@ struct ActionPanelView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Refresh HAL analysis")
+            }
+
+            // The two HAL jobs: CREATE what is missing, and VERIFY what is there.
+            // The per-interface buttons below handle one interface at a time.
+            HStack(spacing: 8) {
+                squareTile("Generate", systemImage: "wand.and.stars",
+                           enabled: !fillBusy,
+                           help: "Plan implementations for every interface still missing on this platform",
+                           action: planMissingImplementations)
+                squareTile("Verify", systemImage: "checkmark.seal",
+                           help: "Run HAL verification and list the issues",
+                           action: verifyHAL)
+                Spacer()
             }
 
             if let generateMessage {
@@ -1515,15 +1533,19 @@ struct ActionPanelView: View {
                                 .foregroundStyle(.orange)
                         }
                         Spacer()
-                        // One-shot semantic fix: plan → approval viewer → apply.
-                        // Green rows (implemented) need no fix.
+                        // CREATE (no implementation yet) vs MODIFY (partial or
+                        // drifted): the same one-shot generate flow, named for
+                        // what it actually does. Green rows need neither.
                         if !implemented {
-                            Button("Fix") {
+                            Button(hasEntry ? "Fix" : "Create") {
                                 fixHALModule(iface)
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.mini)
-                            .disabled(generateBusy)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(generateBusy || fillBusy)
+                            .help(hasEntry
+                                  ? "Regenerate this interface's implementation (plan → approve → write)"
+                                  : "Generate this interface's implementation (plan → approve → write)")
                         }
                     }
                     // Concrete per-interface function detail.
@@ -1568,6 +1590,127 @@ struct ActionPanelView: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(theme.surface))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
+    }
+
+    // MARK: - HAL actions (create / modify / verify)
+
+    /// CREATE — plan an implementation for every interface still missing on this
+    /// platform. Nothing is written until the plan is approved, matching the
+    /// single-interface path below.
+    private func planMissingImplementations() {
+        guard let platform = selectedDomainName, let root = project.root as String? else { return }
+        fillBusy = true
+        generateMessage = nil
+        Task {
+            let (items, err) = await bridge.halFillPlan(root: root, platform: platform)
+            await MainActor.run {
+                fillBusy = false
+                if let err {
+                    generateMessage = "⚠️ " + err
+                    return
+                }
+                guard !items.isEmpty else {
+                    generateMessage = "✅ Nothing missing — every interface is implemented."
+                    return
+                }
+                fillPlan = items
+                showFillPlan = true
+            }
+        }
+    }
+
+    /// Write the approved bulk plan.
+    private func applyFillPlan() {
+        guard let root = project.root as String? else { return }
+        let plan = fillPlan
+        showFillPlan = false
+        fillBusy = true
+        Task {
+            let (written, failures, err) = await bridge.halFillApply(root: root, plan: plan)
+            await MainActor.run {
+                fillBusy = false
+                fillPlan = []
+                if let err {
+                    generateMessage = "⚠️ Apply failed: \(err)"
+                    return
+                }
+                var summary = "✅ Wrote \(written.count) file\(written.count == 1 ? "" : "s")"
+                if !failures.isEmpty { summary += " · \(failures.count) failed" }
+                generateMessage = summary
+                Task { await bridge.refreshHalData(root: root) }
+            }
+        }
+    }
+
+    /// VERIFY — the portal runs `hal_verify` itself and lists the issues.
+    private func verifyHAL() {
+        guard let root = project.root as String? else { return }
+        HALVerificationPortal.open(bridge: bridge, theme: theme, projectRoot: root)
+    }
+
+    /// Approval sheet for the bulk plan: what is missing, and what will be
+    /// written. The same review-before-write rule as the single-interface flow.
+    private var fillPlanSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Generate missing implementations")
+                .font(.title3.weight(.semibold))
+            Text("\(fillPlan.count) interface\(fillPlan.count == 1 ? "" : "s") on \(selectedDomainName ?? "this platform") have no implementation yet.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(fillPlan.enumerated()), id: \.offset) { _, item in
+                        Text(fillPlanItemText(item))
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 220)
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    showFillPlan = false
+                    fillPlan = []
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Generate") { applyFillPlan() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+
+    /// One line per planned interface: `<interface> → <file>`.
+    private func fillPlanItemText(_ item: [String: Any]) -> String {
+        let iface = item["interface"] as? String ?? item["name"] as? String ?? "?"
+        let file = item["file"] as? String ?? item["path"] as? String ?? item["target"] as? String ?? ""
+        return file.isEmpty ? iface : "\(iface)  →  \(file)"
+    }
+
+    /// Square tile for an arbitrary action — the build tiles run build tools, the
+    /// HAL tiles run HAL flows. Same shape, so the two cards read alike.
+    private func squareTile(_ title: String, systemImage: String, enabled: Bool = true,
+                            help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 15, weight: .medium))
+                Text(title)
+                    .font(.caption2.weight(.medium))
+                    .lineLimit(1)
+            }
+            .frame(width: 78, height: 50)
+            .foregroundStyle(enabled ? theme.textPrimary : theme.textSecondary)
+            .background(RoundedRectangle(cornerRadius: 8).fill(theme.buttonBackground))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
+            .opacity(enabled ? 1 : 0.4)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled || runningAction != nil)
+        .help(help)
     }
 
     // MARK: - HAL semantic one-shot generation (Fix → plan → approval → apply)
