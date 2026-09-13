@@ -173,13 +173,28 @@ entry tracks the work end to end.
       stream and treated any status for it as fatal, so *any* spec-compliant
       Streamable HTTP server (the GET endpoint is optional; 400/405 is allowed)
       was unusable with `HTTP error: 400 Bad Request`.
-- [ ] 3. M3 — Test action over the device. For a platform with `device.mcp`:
-      cross-build the test binary → upload it over HTTP → MCP `run_test` →
-      report exit code + output. No `meson`/`test()` machinery is needed on the
-      device — it just runs the ELF. Needs the cross toolchain pinned first: this
-      Mac has only the `aarch64-apple-darwin` target and no aarch64 Linux
-      cross-linker, so `aarch64-unknown-linux-gnu` (+ linker) has to be added
-      before the build→upload→run step can be wired up.
+- [ ] 3. M3 — Test action over the device. Cross-build the test binary → upload
+      it over HTTP → MCP `run_test` → report exit code + output. No `meson`/
+      `test()` machinery is needed on the device — it just runs the ELF. The host
+      side, the test executable and the cross toolchain (below) are what remain.
+  - [x] 3a. Device side — done (2026-09-13, `spire-target-mcp @ af8980f`).
+        `PUT /upload/<name>` stores a binary in the work directory (single name
+        component, `.part`+rename, executable bit) and the `run_test` tool runs
+        it, returning exit code, both streams and duration; failures come back
+        with `isError` and the output intact. A killed run stops the clock at the
+        kill and drains the pipes for at most 2s, so a test that leaves children
+        behind can't hang the call (found by the new end-to-end test: a 1s timeout
+        used to take 31s). 11 unit + 5 end-to-end tests; clippy/fmt clean.
+  - [ ] 3b. Host side — a `device/test` action in spire-code: cross-build → make
+        sure the device server is connected → upload → `run_test` → surface the
+        result. This is also what M4 feeds into.
+  - [ ] 3c. ai-traps — expose a buildable test executable per cross platform (a
+        plain `executable()`, not `test()`: there is no `exe_wrapper` for the Mac
+        and the board is the runner).
+  - [ ] 3d. Toolchain — this Mac has only the `aarch64-apple-darwin` target and no
+        aarch64 Linux cross-linker, so `spire-target-mcp` itself cannot yet be
+        built static for a board (`aarch64-unknown-linux-musl` + linker, or build
+        on the board). Needed before any real-hardware run.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.
