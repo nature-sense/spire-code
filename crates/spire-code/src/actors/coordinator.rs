@@ -1180,6 +1180,9 @@ impl CoordinatorActor {
             "device/test" => {
                 return self.handle_device_test(&params).await;
             }
+            "device/deploy" => {
+                return self.handle_device_deploy(&params).await;
+            }
             "mcp/disconnectAll" => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 if self
@@ -3019,15 +3022,18 @@ impl CoordinatorActor {
         serde_json::json!({ "devices": devices })
     }
 
-    /// `device/test` — deploy a cross-built test binary to a platform's board and
-    /// run it there.
+    /// Resolve, connect and upload for a `device/*` request.
     ///
-    /// The build itself stays with the build tools (`project/build`, the
-    /// meson/cargo modules); this picks the artifact up, pushes it to the board's
-    /// upload endpoint, calls the board's `run_test` tool and returns the board's
-    /// result verbatim (exit code, streams, duration) so a caller — or the M4 fix
-    /// loop — can act on it.
-    async fn handle_device_test(&self, params: &serde_json::Value) -> serde_json::Value {
+    /// The shared front half of `device/test` and `device/deploy`: both name a
+    /// `platform` and a `path` to a cross-built binary, both ship that binary to
+    /// the same upload endpoint, and only then do they differ in which tool they
+    /// call on the board. Returning the staged facts as one object keeps the two
+    /// handlers honest about sharing this — and on failure the returned object is
+    /// the error to hand straight back to the caller.
+    async fn stage_device_artifact(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, serde_json::Value> {
         let platform_id = params
             .get("platform")
             .and_then(|value| value.as_str())
@@ -3035,7 +3041,7 @@ impl CoordinatorActor {
             .trim()
             .to_string();
         if platform_id.is_empty() {
-            return serde_json::json!({"error": "Missing platform"});
+            return Err(serde_json::json!({"error": "Missing platform"}));
         }
 
         let path_param = params
@@ -3045,24 +3051,20 @@ impl CoordinatorActor {
             .trim()
             .to_string();
         if path_param.is_empty() {
-            return serde_json::json!({
+            return Err(serde_json::json!({
                 "error": "Missing path (the test binary to deploy, relative to the project root)"
-            });
+            }));
         }
 
         let Some(platform) = crate::platform::Platform::from_registry(&platform_id) else {
-            return serde_json::json!({
+            return Err(serde_json::json!({
                 "error": format!("platform '{platform_id}' is not in the registry (~/.spire/platforms)")
-            });
+            }));
         };
-        let Some(mcp) = platform
-            .device
-            .as_ref()
-            .and_then(|device| device.mcp.as_ref())
-        else {
-            return serde_json::json!({
+        let Some(mcp) = platform.device.as_ref().and_then(|device| device.mcp.as_ref()) else {
+            return Err(serde_json::json!({
                 "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see ~/.spire/platforms/{platform_id}.yaml")
-            });
+            }));
         };
 
         // Resolve the binary against the project root when there is one, then
@@ -3081,18 +3083,20 @@ impl CoordinatorActor {
             PathBuf::from(&path_param)
         };
         if !binary.is_file() {
-            return serde_json::json!({
+            return Err(serde_json::json!({
                 "error": format!(
                     "test binary not found: {} — build it for {platform_id} first",
                     binary.display()
                 )
-            });
+            }));
         }
 
         let bytes = match std::fs::read(&binary) {
             Ok(bytes) => bytes,
             Err(err) => {
-                return serde_json::json!({"error": format!("read {}: {err}", binary.display())})
+                return Err(
+                    serde_json::json!({"error": format!("read {}: {err}", binary.display())}),
+                )
             }
         };
         let name = params
@@ -3109,18 +3113,53 @@ impl CoordinatorActor {
 
         let server_name = format!("device-{platform_id}");
         if let Err(err) = self.ensure_device_connected(&server_name).await {
-            return serde_json::json!({ "error": err });
+            return Err(serde_json::json!({ "error": err }));
         }
 
         let url = match crate::device::upload_url(&mcp.url, &name) {
             Ok(url) => url,
-            Err(err) => return serde_json::json!({ "error": err }),
+            Err(err) => return Err(serde_json::json!({ "error": err })),
         };
         if let Err(err) =
             crate::device::upload_binary(&url, mcp.token.as_deref(), &name, &bytes).await
         {
-            return serde_json::json!({ "error": err });
+            return Err(serde_json::json!({ "error": err }));
         }
+
+        Ok(serde_json::json!({
+            "platform": platform_id,
+            "server": server_name,
+            "binary": binary.display().to_string(),
+            "upload": { "url": url, "name": name, "bytes": bytes.len() },
+            // Where this board wants production binaries installed, when the
+            // registry says (`device.deploy.dest`) — `device/deploy` uses it.
+            "deploy_dest": platform
+                .device
+                .as_ref()
+                .and_then(|device| device.deploy.as_ref())
+                .map(|deploy| deploy.dest.clone()),
+        }))
+    }
+
+
+    /// `device/test` — deploy a cross-built test binary to a platform's board and
+    /// run it there.
+    ///
+    /// The build itself stays with the build tools (`project/build`, the
+    /// meson/cargo modules); this picks the artifact up, pushes it to the board's
+    /// upload endpoint, calls the board's `run_test` tool and returns the board's
+    /// result verbatim (exit code, streams, duration) so a caller — or the M4 fix
+    /// loop — can act on it.
+    async fn handle_device_test(&self, params: &serde_json::Value) -> serde_json::Value {
+        let staged = match self.stage_device_artifact(params).await {
+            Ok(staged) => staged,
+            Err(err) => return err,
+        };
+        let server_name = staged["server"].as_str().unwrap_or_default().to_string();
+        let name = staged["upload"]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         // Ask the board to run it.
         let mut arguments = serde_json::Map::new();
@@ -3158,10 +3197,10 @@ impl CoordinatorActor {
                     .join("\n");
                 let passed = result.is_error != Some(true);
                 serde_json::json!({
-                    "platform": platform_id,
+                    "platform": staged["platform"],
                     "server": server_name,
-                    "binary": binary.display().to_string(),
-                    "upload": { "url": url, "name": name, "bytes": bytes.len() },
+                    "binary": staged["binary"],
+                    "upload": staged["upload"],
                     "passed": passed,
                     "result": result.structured_content,
                     "output": output,
@@ -3169,6 +3208,98 @@ impl CoordinatorActor {
             }
             Ok(Err(err)) => {
                 serde_json::json!({"error": format!("run_test on '{server_name}' failed: {err}")})
+            }
+            Err(_) => serde_json::json!({"error": "MCP client actor response error"}),
+        }
+    }
+
+    /// `device/deploy` — install a cross-built production binary on a board.
+    ///
+    /// The same front half as `device/test` (resolve → connect → upload), then
+    /// the board's `deploy` tool instead of `run_test`: the artifact is copied
+    /// to a destination the board keeps, replacing any previous copy. That is
+    /// what makes this "deploy" rather than "test" — `run_test` runs an artifact
+    /// out of the scratch work directory and reports.
+    ///
+    /// The destination comes from the request (`dest`), else from the platform's
+    /// `device.deploy.dest` in the registry — which is what gives that field a
+    /// purpose. Starting and supervising what was deployed is trap control (M5).
+    async fn handle_device_deploy(&self, params: &serde_json::Value) -> serde_json::Value {
+        let staged = match self.stage_device_artifact(params).await {
+            Ok(staged) => staged,
+            Err(err) => return err,
+        };
+
+        let dest = params
+            .get("dest")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|dest| !dest.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                staged["deploy_dest"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|dest| !dest.is_empty())
+                    .map(str::to_string)
+            });
+        let Some(dest) = dest else {
+            return serde_json::json!({
+                "error": format!(
+                    "no deploy destination: pass \"dest\", or set device.deploy.dest for platform '{}' in ~/.spire/platforms",
+                    staged["platform"].as_str().unwrap_or_default()
+                )
+            });
+        };
+
+        let server_name = staged["server"].as_str().unwrap_or_default().to_string();
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "path".to_string(),
+            serde_json::json!(staged["upload"]["name"].as_str().unwrap_or_default()),
+        );
+        arguments.insert("dest".to_string(), serde_json::json!(dest));
+        if let Some(install_as) = params.get("install_as") {
+            arguments.insert("name".to_string(), install_as.clone());
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .mcp_client_tx
+            .send(McpClientMessage::CallTool {
+                server_name: server_name.clone(),
+                tool_name: "deploy".to_string(),
+                arguments: Some(arguments),
+                reply_to: tx,
+            })
+            .await
+            .is_err()
+        {
+            return serde_json::json!({"error": "MCP client actor not available"});
+        }
+
+        match rx.await {
+            Ok(Ok(result)) => {
+                let output = result
+                    .content
+                    .iter()
+                    .filter_map(|content| content.as_text_content().ok())
+                    .map(|content| content.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::json!({
+                    "platform": staged["platform"],
+                    "server": server_name,
+                    "binary": staged["binary"],
+                    "upload": staged["upload"],
+                    "dest": dest,
+                    "deployed": result.is_error != Some(true),
+                    "result": result.structured_content,
+                    "output": output,
+                })
+            }
+            Ok(Err(err)) => {
+                serde_json::json!({"error": format!("deploy on '{server_name}' failed: {err}")})
             }
             Err(_) => serde_json::json!({"error": "MCP client actor response error"}),
         }

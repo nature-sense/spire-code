@@ -3439,6 +3439,40 @@ sysroot:
             .contains("not found"),
         "{missing_binary}"
     );
+
+    // device/deploy shares that front half (resolve → connect → upload), so it
+    // validates its inputs identically — no board needed for any of these.
+    let deploy_no_platform =
+        route(&coord_tx, "device/deploy", serde_json::json!({"path": "x"})).await;
+    assert_eq!(deploy_no_platform["error"], "Missing platform");
+
+    let deploy_unknown = route(
+        &coord_tx,
+        "device/deploy",
+        serde_json::json!({"platform": "nope", "path": "x"}),
+    )
+    .await;
+    assert!(
+        deploy_unknown["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not in the registry"),
+        "{deploy_unknown}"
+    );
+
+    let deploy_missing_binary = route(
+        &coord_tx,
+        "device/deploy",
+        serde_json::json!({"platform": "rpi5", "path": "build-rpi5/no-such-tests"}),
+    )
+    .await;
+    assert!(
+        deploy_missing_binary["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not found"),
+        "{deploy_missing_binary}"
+    );
 }
 
 /// M3.4 on hardware: the real `device/test` path against a real board.
