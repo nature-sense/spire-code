@@ -20,6 +20,7 @@ pub use build::{
     MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability, NodeBuildModule,
     ParseSummary, PythonBuildModule, RubyBuildModule, SwiftBuildModule, TestOptions,
 };
+pub mod device;
 pub mod ffi;
 pub mod platform;
 pub mod subsystems;

@@ -1176,6 +1176,10 @@ impl CoordinatorActor {
                     Err(_) => serde_json::json!({"error": "MCP client actor response error"}),
                 }
             }
+            // ── Deploy a test binary to a board and run it there ─────────────
+            "device/test" => {
+                return self.handle_device_test(&params).await;
+            }
             "mcp/disconnectAll" => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 if self
@@ -3000,6 +3004,8 @@ impl CoordinatorActor {
                     "platform_name": platform.name,
                     "server": name,
                     "url": mcp.map(|mcp| mcp.url.clone()),
+                    "upload_endpoint": mcp
+                        .and_then(|mcp| crate::device::upload_endpoint(&mcp.url).ok()),
                     "has_token": mcp
                         .and_then(|mcp| mcp.token.as_deref())
                         .map(|token| !token.trim().is_empty())
@@ -3011,6 +3017,161 @@ impl CoordinatorActor {
             .collect();
 
         serde_json::json!({ "devices": devices })
+    }
+
+    /// `device/test` — deploy a cross-built test binary to a platform's board and
+    /// run it there.
+    ///
+    /// The build itself stays with the build tools (`project/build`, the
+    /// meson/cargo modules); this picks the artifact up, pushes it to the board's
+    /// upload endpoint, calls the board's `run_test` tool and returns the board's
+    /// result verbatim (exit code, streams, duration) so a caller — or the M4 fix
+    /// loop — can act on it.
+    async fn handle_device_test(&self, params: &serde_json::Value) -> serde_json::Value {
+        let platform_id = params
+            .get("platform")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if platform_id.is_empty() {
+            return serde_json::json!({"error": "Missing platform"});
+        }
+
+        let path_param = params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if path_param.is_empty() {
+            return serde_json::json!({
+                "error": "Missing path (the test binary to deploy, relative to the project root)"
+            });
+        }
+
+        let Some(platform) = crate::platform::Platform::from_registry(&platform_id) else {
+            return serde_json::json!({
+                "error": format!("platform '{platform_id}' is not in the registry (~/.spire/platforms)")
+            });
+        };
+        let Some(mcp) = platform
+            .device
+            .as_ref()
+            .and_then(|device| device.mcp.as_ref())
+        else {
+            return serde_json::json!({
+                "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see ~/.spire/platforms/{platform_id}.yaml")
+            });
+        };
+
+        // Resolve the binary against the project root when there is one, then
+        // fall back to the path as given (an absolute path works either way).
+        let root = self
+            .ffi_deps()
+            .ok()
+            .and_then(|(_, state)| state.project_root.lock().unwrap().clone());
+        let candidate = match root.as_ref() {
+            Some(root) => root.join(&path_param),
+            None => PathBuf::from(&path_param),
+        };
+        let binary = if candidate.is_file() {
+            candidate
+        } else {
+            PathBuf::from(&path_param)
+        };
+        if !binary.is_file() {
+            return serde_json::json!({
+                "error": format!(
+                    "test binary not found: {} — build it for {platform_id} first",
+                    binary.display()
+                )
+            });
+        }
+
+        let bytes = match std::fs::read(&binary) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return serde_json::json!({"error": format!("read {}: {err}", binary.display())})
+            }
+        };
+        let name = params
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                binary
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| format!("{platform_id}-tests"));
+
+        let server_name = format!("device-{platform_id}");
+        if let Err(err) = self.ensure_device_connected(&server_name).await {
+            return serde_json::json!({ "error": err });
+        }
+
+        let url = match crate::device::upload_url(&mcp.url, &name) {
+            Ok(url) => url,
+            Err(err) => return serde_json::json!({ "error": err }),
+        };
+        if let Err(err) =
+            crate::device::upload_binary(&url, mcp.token.as_deref(), &name, &bytes).await
+        {
+            return serde_json::json!({ "error": err });
+        }
+
+        // Ask the board to run it.
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("path".to_string(), serde_json::json!(name));
+        if let Some(args) = params.get("args") {
+            arguments.insert("args".to_string(), args.clone());
+        }
+        if let Some(timeout) = params.get("timeout_secs") {
+            arguments.insert("timeout_secs".to_string(), timeout.clone());
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .mcp_client_tx
+            .send(McpClientMessage::CallTool {
+                server_name: server_name.clone(),
+                tool_name: "run_test".to_string(),
+                arguments: Some(arguments),
+                reply_to: tx,
+            })
+            .await
+            .is_err()
+        {
+            return serde_json::json!({"error": "MCP client actor not available"});
+        }
+
+        match rx.await {
+            Ok(Ok(result)) => {
+                let output = result
+                    .content
+                    .iter()
+                    .filter_map(|content| content.as_text_content().ok())
+                    .map(|content| content.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let passed = result.is_error != Some(true);
+                serde_json::json!({
+                    "platform": platform_id,
+                    "server": server_name,
+                    "binary": binary.display().to_string(),
+                    "upload": { "url": url, "name": name, "bytes": bytes.len() },
+                    "passed": passed,
+                    "result": result.structured_content,
+                    "output": output,
+                })
+            }
+            Ok(Err(err)) => {
+                serde_json::json!({"error": format!("run_test on '{server_name}' failed: {err}")})
+            }
+            Err(_) => serde_json::json!({"error": "MCP client actor response error"}),
+        }
     }
 
     /// MCP configs for every platform that declares a device endpoint.
@@ -3099,6 +3260,54 @@ impl CoordinatorActor {
                 }
             }
         });
+    }
+
+    /// Make sure a device server is connected before talking to it.
+    ///
+    /// Project open already connects the boards a project builds for (in the
+    /// background), but the first test can arrive before that finishes — or after
+    /// the MCP client reloaded its config — so this checks and connects on demand.
+    async fn ensure_device_connected(&self, server_name: &str) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .mcp_client_tx
+            .send(McpClientMessage::GetServerDetails { reply_to: tx })
+            .await
+            .is_err()
+        {
+            return Err("MCP client actor not available".to_string());
+        }
+
+        let online = rx.await.unwrap_or_default().into_iter().any(|detail| {
+            detail.name == server_name
+                && detail
+                    .properties
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    == Some("online")
+        });
+        if online {
+            return Ok(());
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .mcp_client_tx
+            .send(McpClientMessage::Connect {
+                server_name: server_name.to_string(),
+                reply_to: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err("MCP client actor not available".to_string());
+        }
+
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(format!("board '{server_name}' is not reachable: {err}")),
+            Err(_) => Err("MCP client actor response error".to_string()),
+        }
     }
 
     /// Re-run a fresh project analysis (always a disk scan, never cached).

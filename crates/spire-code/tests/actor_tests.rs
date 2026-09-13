@@ -3378,4 +3378,65 @@ sysroot:
     );
     let missing = route(&coord_tx, "device/connect", serde_json::json!({})).await;
     assert_eq!(missing["error"], "Missing platform");
+
+    // device/test validates its inputs — and finds the artifact — before it
+    // touches the network, so these paths need no board.
+    let no_platform = route(&coord_tx, "device/test", serde_json::json!({"path": "x"})).await;
+    assert_eq!(no_platform["error"], "Missing platform");
+
+    let no_path = route(
+        &coord_tx,
+        "device/test",
+        serde_json::json!({"platform": "rpi5"}),
+    )
+    .await;
+    assert!(
+        no_path["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Missing path"),
+        "{no_path}"
+    );
+
+    let unknown = route(
+        &coord_tx,
+        "device/test",
+        serde_json::json!({"platform": "nope", "path": "x"}),
+    )
+    .await;
+    assert!(
+        unknown["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not in the registry"),
+        "{unknown}"
+    );
+
+    let host = route(
+        &coord_tx,
+        "device/test",
+        serde_json::json!({"platform": "host", "path": "x"}),
+    )
+    .await;
+    assert!(
+        host["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("device.mcp"),
+        "{host}"
+    );
+
+    let missing_binary = route(
+        &coord_tx,
+        "device/test",
+        serde_json::json!({"platform": "rpi5", "path": "build-rpi5/no-such-tests"}),
+    )
+    .await;
+    assert!(
+        missing_binary["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not found"),
+        "{missing_binary}"
+    );
 }
