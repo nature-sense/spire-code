@@ -271,6 +271,28 @@ entry tracks the work end to end.
         tests differently gets a "not found" naming the full path. A registry
         field would make it explicit. M5 (start/stop/status/logs) is what makes a
         deployed binary actually run, and a rollback possible.
+  - [x] 3h. Board service + the Connect fix — done (2026-09-13).
+        - **`spire-code @ f299509`**: `project/open` only registered the device MCP
+          servers when the graph already carried MCP config
+          (`if !servers.is_empty()`), so a project with none of its own (ai-traps)
+          never got a board registered — and the UI had no Connect button
+          anywhere. `mcp/loadConfig` never had that guard, which is exactly why
+          the actor test passed while the app did not: they exercise different
+          paths. The guard is gone.
+        - The board runs `spire-target-mcp` as a **systemd unit**
+          (`spire-target-mcp/deploy/`, `enabled`), verified by an actual reboot:
+          the board came back serving `/health` in ~15 s with nobody starting it.
+          A one-off `setsid` start dies with the board and looks like a board
+          fault; `systemctl is-enabled` is the thing to check, not `is-active`.
+        - The device binary on the board is current: it exposes 3 tools
+          (`info` / `run_test` / `deploy`). Deploying over a *running* binary
+          fails with `Text file busy` (ETXTBSY), so the service must be stopped
+          first — the restart then drops any client connection.
+        - Verified live from the app: `device-rpi5` loads, `mcp/servers` reports
+          `status=offline tools=0` before Connect, and the Connect button drives
+          `device/connect` → `connected to 'spire-target-mcp' (tools: true)` →
+          `status=online`. This is the first time the whole chain has worked from
+          the UI rather than from a test harness.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.
