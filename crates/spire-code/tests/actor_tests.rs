@@ -3440,3 +3440,87 @@ sysroot:
         "{missing_binary}"
     );
 }
+
+/// M3.4 on hardware: the real `device/test` path against a real board.
+///
+/// Ignored by default, because it needs a live `spire-target-mcp` on the board
+/// named in the platform registry (`~/.spire/platforms/<platform>.yaml`, under
+/// `device.mcp.url`) plus a cross-built test binary. Run it deliberately:
+///
+/// ```sh
+/// SPIRE_LIVE_DEVICE_BINARY=/abs/path/ai-traps-rpi5-tests \
+///   cargo test --test actor_tests live_device -- --ignored --nocapture
+/// ```
+///
+/// This is the loop the M4 fix loop will drive, so it is worth being able to
+/// point at a board on demand rather than only ever exercising a mock.
+#[tokio::test]
+#[ignore = "requires a live board running spire-target-mcp (see ISSUES.md 3f)"]
+#[allow(clippy::await_holding_lock)]
+async fn live_device_test_runs_a_cross_built_binary_on_the_board() {
+    let _guard = spire_code::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+
+    let binary = std::env::var("SPIRE_LIVE_DEVICE_BINARY")
+        .expect("set SPIRE_LIVE_DEVICE_BINARY to the cross-built test binary to deploy");
+    let platform =
+        std::env::var("SPIRE_LIVE_DEVICE_PLATFORM").unwrap_or_else(|_| "rpi5".to_string());
+
+    // Deliberately no PlatformDirEnv override: this test reads the real
+    // registry, which is where the board's `device.mcp.url` lives.
+    let system = ActorSystem::new();
+    let (graph_tx, _) = system.spawn(MemoryGraphActor::new());
+    let graph_data = tempfile::tempdir().expect("graph data dir");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    graph_tx
+        .send(MemoryGraphMessage::Initialize {
+            data_dir: graph_data.path().to_path_buf(),
+            reply_to: ready_tx,
+        })
+        .await
+        .expect("send Initialize");
+    ready_rx
+        .await
+        .expect("graph init reply")
+        .expect("graph init");
+
+    let coord_tx = spawn_coordinator_with_graph(&system, graph_tx, false).await;
+
+    // The board must be declared before anything can reach it.
+    let status = route(&coord_tx, "device/status", serde_json::json!({})).await;
+    let devices = status["devices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no devices in {status}"));
+    assert!(
+        devices
+            .iter()
+            .any(|device| device["platform"] == platform.as_str()),
+        "platform '{platform}' declares no device block in ~/.spire/platforms: {status}"
+    );
+
+    // Loading config (re)registers the device servers; `device/test` connects on
+    // demand from there.
+    let loaded = route(&coord_tx, "mcp/loadConfig", serde_json::json!({})).await;
+    assert_eq!(loaded["success"], true, "loadConfig failed: {loaded}");
+
+    let result = route(
+        &coord_tx,
+        "device/test",
+        serde_json::json!({
+            "platform": platform,
+            "path": binary,
+            "timeout_secs": 120,
+        }),
+    )
+    .await;
+
+    println!("--- device/test ---\n{result}");
+    assert!(result["error"].is_null(), "device/test failed: {result}");
+    assert_eq!(
+        result["passed"], true,
+        "the board reported a failing test: {result}"
+    );
+    assert_eq!(result["platform"], platform.as_str());
+
+    let output = result["output"].as_str().unwrap_or_default();
+    println!("--- board output ---\n{output}");
+}

@@ -219,8 +219,31 @@ entry tracks the work end to end.
         (5.7s) and again in the same form, but a full run showed 4/5 with
         `passes_arguments_and_kills_a_hung_binary` never finishing. Suspect the
         orphaned grandchild holding the capture pipes together with several
-        concurrent device-server processes; needs a proper diagnosis (and
-        possibly `--test-threads` for that file) before the M3.4 hardware run.
+        concurrent device-server processes. Not diagnosed yet, but the
+        `--test-threads=2` workaround held through the M3.4 work (6/6 in 6.2s,
+        including the new 3 MB upload test).
+  - [x] 3f. M3.4 — done (2026-09-13). The loop runs on real hardware: the static
+        musl server deployed to `trap@rpi5.local`, `device.mcp.url` set in the
+        real registry, then
+        `device/test { platform: "rpi5", path: "build-rpi5/rpi5/ai-traps-rpi5-tests" }`
+        → `device-rpi5` → PUT 2298336 B → `run_test` → **passed**, exit 0, 3 ms,
+        `stdout: "ai-traps host tests: OK (30 checks)"`. Two real bugs surfaced,
+        which is exactly what running on a board is for:
+        - **Every real upload was rejected with 413.** Axum caps request bodies
+          at 2 MB, so `handle_upload` never ran and the intended
+          `work::MAX_UPLOAD_BYTES` (128 MB) check was dead code. The unit test
+          missed it by calling `store_upload_in` directly, never crossing axum.
+          Fixed in `spire-target-mcp @ f10a5ce`, with a regression test that
+          uploads 3 MB over real HTTP.
+        - **The board was missing `libyaml-cpp0.8`**, so the cross-built test
+          binary died at the loader (exit 127, `cannot open shared object
+          file`) — the sysroot has the dev package, the board did not have the
+          runtime one. Installed with apt. Any board meant to run these binaries
+          needs the app's runtime dependencies, not just the sysroot's.
+        The proof is repeatable and opt-in (CI still needs no board):
+        `SPIRE_LIVE_DEVICE_BINARY=<path> cargo test --test actor_tests
+        live_device_test -- --ignored --nocapture` → 1 passed in 0.56 s. M4 can
+        drive that same path.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.
