@@ -194,9 +194,17 @@ entry tracks the work end to end.
         itself stays with the build tools; this picks the artifact up. Covered by
         the `device` module's unit tests plus the `device/test` validation paths
         in `test_device_servers_come_from_the_platform_registry`.
-  - [ ] 3c. ai-traps — expose a buildable test executable per cross platform (a
-        plain `executable()`, not `test()`: there is no `exe_wrapper` for the Mac
-        and the board is the runner).
+  - [x] 3c. ai-traps — done (2026-09-13). The platform-independent harness moved
+        to `tests/` (shared, not host-only) and `tests/meson.build` exports
+        `platform_test_sources`; `host/meson.build` and each board now build it.
+        rpi5 / rock3c / a7s produce `ai-traps-<plat>-tests` with their own
+        toolchains (ELF aarch64), `install: false` and no `test()` entry — a cross
+        binary has nothing an `exe_wrapper` could wrap, so the board is the
+        runner. `meson test` on host is unchanged (1/1 OK).
+        So the full invocation becomes:
+        `device/test { platform: "rpi5", path: "build-rpi5/rpi5/ai-traps-rpi5-tests",
+        timeout_secs: 120 }` (a7s → `build-a7s/a7s/ai-traps-a7s-tests`,
+        rock3c → `build-rock3c/rock3c/ai-traps-rock3c-tests`).
   - [ ] 3d. Toolchain — this Mac has only the `aarch64-apple-darwin` target and no
         aarch64 Linux cross-linker, so `spire-target-mcp` itself cannot yet be
         built static for a board (`aarch64-unknown-linux-musl` + linker, or build
