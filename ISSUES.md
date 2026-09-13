@@ -185,9 +185,15 @@ entry tracks the work end to end.
         kill and drains the pipes for at most 2s, so a test that leaves children
         behind can't hang the call (found by the new end-to-end test: a 1s timeout
         used to take 31s). 11 unit + 5 end-to-end tests; clippy/fmt clean.
-  - [ ] 3b. Host side — a `device/test` action in spire-code: cross-build → make
-        sure the device server is connected → upload → `run_test` → surface the
-        result. This is also what M4 feeds into.
+  - [x] 3b. Host side — done (2026-09-13, `spire-code`). `device/test
+        { platform, path, args?, timeout_secs?, name? }` resolves the platform's
+        `device.mcp`, resolves `path` against the project root, ensures the server
+        is connected, PUTs the binary to `/upload/<name>` (bearer token from the
+        YAML when set) and calls `run_test`, returning the board's result
+        verbatim. `device/status` reports the upload endpoint too. The build
+        itself stays with the build tools; this picks the artifact up. Covered by
+        the `device` module's unit tests plus the `device/test` validation paths
+        in `test_device_servers_come_from_the_platform_registry`.
   - [ ] 3c. ai-traps — expose a buildable test executable per cross platform (a
         plain `executable()`, not `test()`: there is no `exe_wrapper` for the Mac
         and the board is the runner).
