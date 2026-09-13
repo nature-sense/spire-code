@@ -6,7 +6,10 @@
 //! `spire-knowledge` crate boundary. The knowledge store only deals with the
 //! generic JSON; the platform YAML schema + typed view live here in spire-core.
 
-use spire_core::build_types::{Platform, PlatformArchitecture, PlatformSysroot, PlatformToolchain};
+use spire_core::build_types::{
+    Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp,
+    PlatformSysroot, PlatformToolchain,
+};
 
 /// Serialize a platform definition into the registry JSON shape the knowledge
 /// crate stores as a `Platform` node.
@@ -15,10 +18,16 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
     let str_list = |v: &[String]| v.iter().map(|s| serde_json::json!(s)).collect::<Vec<_>>();
 
     props.insert("os".into(), serde_json::json!(p.os));
-    props.insert("cpu_family".into(), serde_json::json!(p.architecture.cpu_family));
+    props.insert(
+        "cpu_family".into(),
+        serde_json::json!(p.architecture.cpu_family),
+    );
     props.insert("cpu".into(), serde_json::json!(p.architecture.cpu));
     props.insert("endian".into(), serde_json::json!(p.architecture.endian));
-    props.insert("target_triple".into(), serde_json::json!(p.architecture.target_triple));
+    props.insert(
+        "target_triple".into(),
+        serde_json::json!(p.architecture.target_triple),
+    );
     if let Some(m) = &p.architecture.march {
         props.insert("march".into(), serde_json::json!(m));
     }
@@ -32,14 +41,48 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
     if let Some(pkg) = &p.toolchain.pkgconfig {
         props.insert("pkgconfig".into(), serde_json::json!(pkg));
     }
-    props.insert("c_args_extra".into(), serde_json::json!(str_list(&p.toolchain.c_args_extra)));
-    props.insert("cpp_args_extra".into(), serde_json::json!(str_list(&p.toolchain.cpp_args_extra)));
-    props.insert("linker_args_extra".into(), serde_json::json!(str_list(&p.toolchain.linker_args_extra)));
-    props.insert("needs_exe_wrapper".into(), serde_json::json!(p.toolchain.needs_exe_wrapper));
+    props.insert(
+        "c_args_extra".into(),
+        serde_json::json!(str_list(&p.toolchain.c_args_extra)),
+    );
+    props.insert(
+        "cpp_args_extra".into(),
+        serde_json::json!(str_list(&p.toolchain.cpp_args_extra)),
+    );
+    props.insert(
+        "linker_args_extra".into(),
+        serde_json::json!(str_list(&p.toolchain.linker_args_extra)),
+    );
+    props.insert(
+        "needs_exe_wrapper".into(),
+        serde_json::json!(p.toolchain.needs_exe_wrapper),
+    );
     props.insert("sysroot_root".into(), serde_json::json!(p.sysroot.root));
-    props.insert("sysroot_lib_dirs".into(), serde_json::json!(str_list(&p.sysroot.lib_dirs)));
-    props.insert("sysroot_include_dirs".into(), serde_json::json!(str_list(&p.sysroot.include_dirs)));
-    props.insert("sysroot_pkg_config_libdir".into(), serde_json::json!(str_list(&p.sysroot.pkg_config_libdir)));
+    props.insert(
+        "sysroot_lib_dirs".into(),
+        serde_json::json!(str_list(&p.sysroot.lib_dirs)),
+    );
+    props.insert(
+        "sysroot_include_dirs".into(),
+        serde_json::json!(str_list(&p.sysroot.include_dirs)),
+    );
+    props.insert(
+        "sysroot_pkg_config_libdir".into(),
+        serde_json::json!(str_list(&p.sysroot.pkg_config_libdir)),
+    );
+
+    // Device access (`device:` in the YAML) — optional on-hardware endpoint.
+    if let Some(device) = &p.device {
+        if let Some(mcp) = &device.mcp {
+            props.insert("device_mcp_url".into(), serde_json::json!(mcp.url));
+            if let Some(token) = &mcp.token {
+                props.insert("device_mcp_token".into(), serde_json::json!(token));
+            }
+        }
+        if let Some(deploy) = &device.deploy {
+            props.insert("device_deploy_dest".into(), serde_json::json!(deploy.dest));
+        }
+    }
 
     serde_json::json!({
         "id": p.id,
@@ -52,9 +95,19 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
 /// knowledge crate returns for `Platform` nodes.
 pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
     let id = node.get("id")?.as_str()?.to_string();
-    let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let name = node
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let props = node.get("properties").and_then(|v| v.as_object())?;
-    let get_str = |k: &str| props.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let get_str = |k: &str| {
+        props
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     let get_opt = |k: &str| props.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
     let get_list = |k: &str| {
         props
@@ -98,6 +151,21 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
             lib_dirs: get_list("sysroot_lib_dirs"),
             include_dirs: get_list("sysroot_include_dirs"),
             pkg_config_libdir: get_list("sysroot_pkg_config_libdir"),
+        },
+        device: {
+            let mcp_url = get_str("device_mcp_url");
+            let deploy_dest = get_str("device_deploy_dest");
+            let mcp = (!mcp_url.trim().is_empty()).then(|| PlatformDeviceMcp {
+                url: mcp_url,
+                token: get_opt("device_mcp_token"),
+            });
+            let deploy =
+                (!deploy_dest.trim().is_empty()).then_some(PlatformDeploy { dest: deploy_dest });
+            if mcp.is_none() && deploy.is_none() {
+                None
+            } else {
+                Some(PlatformDevice { mcp, deploy })
+            }
         },
     })
 }

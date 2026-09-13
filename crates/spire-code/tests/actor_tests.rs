@@ -7,26 +7,25 @@
 //! spawn actors directly, send messages via their `mpsc::Sender` channels,
 //! and assert on the responses.
 
-use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
-use spire_code::actors::{
-    self, build_default_registry, BuildOrchestrator, BuildOrchestratorMessage, ChatActor,
-    ChatMessage, CoordinatorActor, CoordinatorMessage, ErrorAnalyzer, ErrorAnalyzerMessage,
-    FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProgressActor, ProgressMessage,
-    ProgressStatus, ProgressUpdate, ProjectBuildActor, SystemActor, SystemMessage, ToolInfo,
-    ToolOrchestratorMessage, ToolRouterActor, ToolsActor, ToolsMessage,
-    BuildManagerActor,
-};
 use spire_actor::registry::ServiceRegistry;
 use spire_actor::ActorSystem;
+use spire_code::actors::{
+    self, build_default_registry, BuildManagerActor, BuildOrchestrator, BuildOrchestratorMessage,
+    ChatActor, ChatMessage, CoordinatorActor, CoordinatorMessage, ErrorAnalyzer,
+    ErrorAnalyzerMessage, FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProgressActor,
+    ProgressMessage, ProgressStatus, ProgressUpdate, ProjectBuildActor, SystemActor, SystemMessage,
+    ToolInfo, ToolOrchestratorMessage, ToolRouterActor, ToolsActor, ToolsMessage,
+};
 use spire_code::build::{
     BuildModuleMessage, CmakeBuildModule, GoBuildModule, GradleBuildModule, MakeBuildModule,
     MavenBuildModule, ModuleCapability, NodeBuildModule, PythonBuildModule, RubyBuildModule,
 };
 use spire_core::models::embedding::{Embedder, Embedding};
 use spire_core::models::memory_graph::{
-    BuildContext, BuildError, NodeUpdate, AttrNode,
-    RelationshipInput, RelationshipType, SystemBuildResult, TraversalDirection, TraversalOptions,
+    AttrNode, BuildContext, BuildError, NodeUpdate, RelationshipInput, RelationshipType,
+    SystemBuildResult, TraversalDirection, TraversalOptions,
 };
+use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -45,13 +44,10 @@ fn mock_sender<T: Send + 'static>() -> tokio::sync::mpsc::Sender<T> {
 /// handlers can be no-ops — what matters is that `workspace/getFolders` etc.
 /// appear in the returned list.
 fn test_tool_registry() -> std::sync::Arc<spire_core::actors::tool_providers::ToolRegistry> {
-    let registry =
-        std::sync::Arc::new(spire_core::actors::tool_providers::ToolRegistry::new());
+    let registry = std::sync::Arc::new(spire_core::actors::tool_providers::ToolRegistry::new());
     for info in spire_code::actors::vscode_tool_definitions() {
         let handler: spire_core::actors::tool_providers::ToolHandler =
-            std::sync::Arc::new(|_args| {
-                Box::pin(async { Ok(serde_json::json!({})) })
-            });
+            std::sync::Arc::new(|_args| Box::pin(async { Ok(serde_json::json!({})) }));
         registry.register(info, handler).unwrap();
     }
     registry
@@ -685,14 +681,9 @@ async fn test_coordinator_tools_list() {
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
     let (system_tx, _) = system.spawn(SystemActor::new());
 
-    let coord_tx = spawn_tools_and_coordinator_with_real_router(
-        &system,
-        chat_tx,
-        mcp_tx,
-        llm_tx,
-        system_tx,
-    )
-    .await;
+    let coord_tx =
+        spawn_tools_and_coordinator_with_real_router(&system, chat_tx, mcp_tx, llm_tx, system_tx)
+            .await;
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     coord_tx
@@ -722,14 +713,9 @@ async fn test_coordinator_system_status() {
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
     let (system_tx, _) = system.spawn(SystemActor::new());
 
-    let coord_tx = spawn_tools_and_coordinator_with_real_router(
-        &system,
-        chat_tx,
-        mcp_tx,
-        llm_tx,
-        system_tx,
-    )
-    .await;
+    let coord_tx =
+        spawn_tools_and_coordinator_with_real_router(&system, chat_tx, mcp_tx, llm_tx, system_tx)
+            .await;
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     coord_tx
@@ -888,12 +874,12 @@ async fn test_build_orchestrator_start_build_creates_session() {
     let (query_tx, query_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Standard".to_string()),
-                subtype: Some("build_session".to_string()),
-                name: None,
-                limit: None,
-                reply_to: query_tx,
-            })
+            node_type: Some("Standard".to_string()),
+            subtype: Some("build_session".to_string()),
+            name: None,
+            limit: None,
+            reply_to: query_tx,
+        })
         .await
         .unwrap();
 
@@ -947,12 +933,12 @@ async fn test_build_orchestrator_start_build_sets_proper_status() {
     let (query_tx, query_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Standard".to_string()),
-                subtype: Some("build_session".to_string()),
-                name: None,
-                limit: None,
-                reply_to: query_tx,
-            })
+            node_type: Some("Standard".to_string()),
+            subtype: Some("build_session".to_string()),
+            name: None,
+            limit: None,
+            reply_to: query_tx,
+        })
         .await
         .unwrap();
 
@@ -979,17 +965,16 @@ async fn test_build_orchestrator_loop_guard() {
 
     // Store a fix_strategy node so lookup doesn't fail
     let fix_strategy = t_attr_unknown(
-                "Unknown",
-                Some("fix_strategy".to_string()),
-                "test-fix-strategy".to_string(),
-                Some("A test fix strategy".to_string()),
-                {
-
+        "Unknown",
+        Some("fix_strategy".to_string()),
+        "test-fix-strategy".to_string(),
+        Some("A test fix strategy".to_string()),
+        {
             let mut map = HashMap::new();
             map.insert("steps".to_string(), serde_json::json!(["step1"]));
             map
-                    },
-            );
+        },
+    );
     let (store_tx, store_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::StoreAttrNode {
@@ -1077,9 +1062,13 @@ async fn seed_error_types_and_fixes(memory_graph: &mpsc::Sender<MemoryGraphMessa
                 serde_json::json!(["error\\[E\\d{4}\\]", "error: could not compile"]),
             ),
             ("severity".to_string(), serde_json::json!("high")),
-            ("fix_strategies".to_string(), serde_json::json!(["fix-type-error"])),
+            (
+                "fix_strategies".to_string(),
+                serde_json::json!(["fix-type-error"]),
+            ),
         ]),
-    ).await;
+    )
+    .await;
 
     seed_error(
         memory_graph,
@@ -1096,9 +1085,13 @@ async fn seed_error_types_and_fixes(memory_graph: &mpsc::Sender<MemoryGraphMessa
                 serde_json::json!(["read_error_context", "analyze_type_mismatch", "apply_fix"]),
             ),
             ("has_rollback".to_string(), serde_json::json!(true)),
-            ("applies_to".to_string(), serde_json::json!(["rustc-compile-error"])),
+            (
+                "applies_to".to_string(),
+                serde_json::json!(["rustc-compile-error"]),
+            ),
         ]),
-    ).await;
+    )
+    .await;
 
     seed_error(
         memory_graph,
@@ -1116,7 +1109,8 @@ async fn seed_error_types_and_fixes(memory_graph: &mpsc::Sender<MemoryGraphMessa
             ),
             ("has_rollback".to_string(), serde_json::json!(true)),
         ]),
-    ).await;
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1376,17 +1370,16 @@ async fn test_build_state_transition_updates_active() {
 
     // Seed a build state node with active=false (use Unknown so properties survive)
     let state_node = t_attr_unknown(
-                "Unknown",
-                Some("build_state".to_string()),
-                "test_build_failed".to_string(),
-                Some("Test build failed state".to_string()),
-                {
-
+        "Unknown",
+        Some("build_state".to_string()),
+        "test_build_failed".to_string(),
+        Some("Test build failed state".to_string()),
+        {
             let mut map = HashMap::new();
             map.insert("active".to_string(), serde_json::json!(false));
             map
-                    },
-            );
+        },
+    );
     let (store_tx, store_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::StoreAttrNode {
@@ -1400,12 +1393,12 @@ async fn test_build_state_transition_updates_active() {
     let (query_tx, query_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Unknown".to_string()),
-                subtype: Some("build_state".to_string()),
-                name: Some("test_build_failed".to_string()),
-                limit: None,
-                reply_to: query_tx,
-            })
+            node_type: Some("Unknown".to_string()),
+            subtype: Some("build_state".to_string()),
+            name: Some("test_build_failed".to_string()),
+            limit: None,
+            reply_to: query_tx,
+        })
         .await
         .unwrap();
 
@@ -1427,17 +1420,16 @@ async fn test_build_state_store_and_query() {
 
     // Store build_failed state
     let state_node = t_attr_unknown(
-                "Unknown",
-                Some("build_state".to_string()),
-                "state_build_failed".to_string(),
-                Some("Build failed state".to_string()),
-                {
-
+        "Unknown",
+        Some("build_state".to_string()),
+        "state_build_failed".to_string(),
+        Some("Build failed state".to_string()),
+        {
             let mut map = HashMap::new();
             map.insert("active".to_string(), serde_json::json!(true));
             map
-                    },
-            );
+        },
+    );
     let (store_tx, store_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::StoreAttrNode {
@@ -1450,17 +1442,16 @@ async fn test_build_state_store_and_query() {
 
     // Store build_completed state
     let state_node2 = t_attr_unknown(
-                "Unknown",
-                Some("build_state".to_string()),
-                "state_build_completed".to_string(),
-                Some("Build completed state".to_string()),
-                {
-
+        "Unknown",
+        Some("build_state".to_string()),
+        "state_build_completed".to_string(),
+        Some("Build completed state".to_string()),
+        {
             let mut map = HashMap::new();
             map.insert("active".to_string(), serde_json::json!(false));
             map
-                    },
-            );
+        },
+    );
     let (store_tx, store_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::StoreAttrNode {
@@ -1475,12 +1466,12 @@ async fn test_build_state_store_and_query() {
     let (query_tx, query_rx) = tokio::sync::oneshot::channel();
     memory_graph
         .send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Unknown".to_string()),
-                subtype: Some("build_state".to_string()),
-                name: None,
-                limit: None,
-                reply_to: query_tx,
-            })
+            node_type: Some("Unknown".to_string()),
+            subtype: Some("build_state".to_string()),
+            name: None,
+            limit: None,
+            reply_to: query_tx,
+        })
         .await
         .unwrap();
 
@@ -1601,12 +1592,12 @@ async fn test_memory_graph_store_and_get_node() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Project",
-                None,
-                "Test Project".to_string(),
-                Some("A test project".to_string()),
-                HashMap::new(),
-            ),
+            "Project",
+            None,
+            "Test Project".to_string(),
+            Some("A test project".to_string()),
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1622,9 +1613,9 @@ async fn test_memory_graph_store_and_get_node() {
     let node_id = stored.id().to_string();
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::GetAttrNode {
-            id: node_id.clone(),
-            reply_to: resp_tx,
-        })
+        id: node_id.clone(),
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let retrieved = resp_rx.await.unwrap().expect("Failed to get node");
@@ -1641,9 +1632,9 @@ async fn test_memory_graph_get_nonexistent_node_returns_none() {
 
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::GetAttrNode {
-            id: "nonexistent-uuid".to_string(),
-            reply_to: resp_tx,
-        })
+        id: "nonexistent-uuid".to_string(),
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let result = resp_rx.await.unwrap().expect("GetNode failed");
@@ -1676,12 +1667,12 @@ async fn test_memory_graph_query_nodes_by_type() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("entity".to_string()),
-                "Entity 1".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("entity".to_string()),
+            "Entity 1".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1691,12 +1682,12 @@ async fn test_memory_graph_query_nodes_by_type() {
     // Query by type
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Project".to_string()),
-                subtype: None,
-                name: None,
-                limit: None,
-                reply_to: resp_tx,
-            })
+        node_type: Some("Project".to_string()),
+        subtype: None,
+        name: None,
+        limit: None,
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let projects = resp_rx.await.unwrap().expect("QueryNodes failed");
@@ -1712,12 +1703,12 @@ async fn test_memory_graph_query_nodes_by_name() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "MySpecialNode".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "MySpecialNode".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1727,12 +1718,12 @@ async fn test_memory_graph_query_nodes_by_name() {
     // Query by name
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: None,
-                subtype: None,
-                name: Some("MySpecialNode".to_string()),
-                limit: None,
-                reply_to: resp_tx,
-            })
+        node_type: None,
+        subtype: None,
+        name: Some("MySpecialNode".to_string()),
+        limit: None,
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let results = resp_rx.await.unwrap().expect("QueryNodes failed");
@@ -1749,12 +1740,12 @@ async fn test_memory_graph_update_node() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "Original".to_string(),
-                Some("Original description".to_string()),
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "Original".to_string(),
+            Some("Original description".to_string()),
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1785,9 +1776,9 @@ async fn test_memory_graph_update_node() {
     // Verify via GetNode — use the updated node's ID (apply_updates generates a new UUID)
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::GetAttrNode {
-            id: updated.id().to_string(),
-            reply_to: resp_tx,
-        })
+        id: updated.id().to_string(),
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     if let Some(retrieved) = resp_rx.await.unwrap().unwrap() {
@@ -1807,12 +1798,12 @@ async fn test_memory_graph_delete_node() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "ToDelete".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "ToDelete".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1833,9 +1824,9 @@ async fn test_memory_graph_delete_node() {
     // Verify it's gone
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::GetAttrNode {
-            id: node_id,
-            reply_to: resp_tx,
-        })
+        id: node_id,
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let result = resp_rx.await.unwrap().unwrap();
@@ -1867,12 +1858,12 @@ async fn test_memory_graph_merge_attr_upsert_keeps_stable_uuid() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::MergeAttrNode {
         node: t_attr_unknown(
-                "Project",
-                None,
-                "UniqueProject".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Project",
+            None,
+            "UniqueProject".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1885,12 +1876,12 @@ async fn test_memory_graph_merge_attr_upsert_keeps_stable_uuid() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::MergeAttrNode {
         node: t_attr_unknown(
-                "Project",
-                None,
-                "UniqueProject".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Project",
+            None,
+            "UniqueProject".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1913,13 +1904,7 @@ async fn test_memory_graph_create_and_get_relationships() {
     // Store two nodes
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
-        node: t_attr_unknown(
-                "Project",
-                None,
-                "Source".to_string(),
-                None,
-                HashMap::new(),
-            ),
+        node: t_attr_unknown("Project", None, "Source".to_string(), None, HashMap::new()),
         reply_to: resp_tx,
     })
     .await
@@ -1929,12 +1914,12 @@ async fn test_memory_graph_create_and_get_relationships() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("entity".to_string()),
-                "Target".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("entity".to_string()),
+            "Target".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -1994,12 +1979,12 @@ async fn test_memory_graph_delete_relationship() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "A".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "A".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2009,12 +1994,12 @@ async fn test_memory_graph_delete_relationship() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "B".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "B".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2070,12 +2055,12 @@ async fn test_memory_graph_traverse_basic() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "A".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "A".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2085,12 +2070,12 @@ async fn test_memory_graph_traverse_basic() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "B".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "B".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2100,12 +2085,12 @@ async fn test_memory_graph_traverse_basic() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "C".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "C".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2276,12 +2261,12 @@ async fn test_memory_graph_sync_does_not_crash() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "SyncTest".to_string(),
-                None,
-                HashMap::new(),
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "SyncTest".to_string(),
+            None,
+            HashMap::new(),
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2346,12 +2331,12 @@ async fn test_memory_graph_custom_properties_preserved_via_get_node() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("intent".to_string()),
-                "build".to_string(),
-                Some("Build the project".to_string()),
-                props,
-            ),
+            "Unknown",
+            Some("intent".to_string()),
+            "build".to_string(),
+            Some("Build the project".to_string()),
+            props,
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2379,9 +2364,9 @@ async fn test_memory_graph_custom_properties_preserved_via_get_node() {
     // Query back via GetNode
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::GetAttrNode {
-            id: stored.id().to_string(),
-            reply_to: resp_tx,
-        })
+        id: stored.id().to_string(),
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let retrieved = resp_rx
@@ -2426,12 +2411,12 @@ async fn test_memory_graph_custom_properties_preserved_via_query_nodes() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("intent".to_string()),
-                "test".to_string(),
-                None,
-                props,
-            ),
+            "Unknown",
+            Some("intent".to_string()),
+            "test".to_string(),
+            None,
+            props,
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2441,12 +2426,12 @@ async fn test_memory_graph_custom_properties_preserved_via_query_nodes() {
     // Query back via QueryNodes
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::QueryAttrNodes {
-                node_type: Some("Unknown".to_string()),
-                subtype: Some("intent".to_string()),
-                name: None,
-                limit: None,
-                reply_to: resp_tx,
-            })
+        node_type: Some("Unknown".to_string()),
+        subtype: Some("intent".to_string()),
+        name: None,
+        limit: None,
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let results = resp_rx.await.unwrap().expect("QueryNodes failed");
@@ -2478,12 +2463,12 @@ async fn test_memory_graph_custom_properties_preserved_via_get_project_context()
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("project".to_string()),
-                "my-project".to_string(),
-                Some("A test project".to_string()),
-                props,
-            ),
+            "Unknown",
+            Some("project".to_string()),
+            "my-project".to_string(),
+            Some("A test project".to_string()),
+            props,
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2518,12 +2503,12 @@ async fn test_memory_graph_custom_properties_preserved_after_update() {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::StoreAttrNode {
         node: t_attr_unknown(
-                "Unknown",
-                Some("custom".to_string()),
-                "update-test".to_string(),
-                None,
-                props,
-            ),
+            "Unknown",
+            Some("custom".to_string()),
+            "update-test".to_string(),
+            None,
+            props,
+        ),
         reply_to: resp_tx,
     })
     .await
@@ -2571,9 +2556,9 @@ async fn test_memory_graph_custom_properties_preserved_after_update() {
     // Verify via GetNode
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::GetAttrNode {
-            id: stored.id().to_string(),
-            reply_to: resp_tx,
-        })
+        id: stored.id().to_string(),
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let retrieved = resp_rx
@@ -2654,14 +2639,17 @@ async fn test_attr_node_store_and_get_roundtrip() {
         read.get("tags"),
         Some(&serde_json::json!(["solid", "parametric"]))
     );
-    assert_eq!(read.get("config"), Some(&serde_json::json!({ "preview": true })));
+    assert_eq!(
+        read.get("config"),
+        Some(&serde_json::json!({ "preview": true }))
+    );
 
     // The envelope preserves the open discriminator (no closed-enum mapping).
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     tx.send(MemoryGraphMessage::GetAttrNode {
-            id: attr.id.clone(),
-            reply_to: resp_tx,
-        })
+        id: attr.id.clone(),
+        reply_to: resp_tx,
+    })
     .await
     .unwrap();
     let node = resp_rx.await.unwrap().unwrap().expect("node should exist");
@@ -2671,7 +2659,6 @@ async fn test_attr_node_store_and_get_roundtrip() {
         Some(&serde_json::json!(["solid", "parametric"]))
     );
 }
-
 
 #[tokio::test]
 async fn test_query_attr_nodes_filters_by_discriminator() {
@@ -2761,12 +2748,22 @@ async fn spawn_coordinator(
     system: &ActorSystem,
     with_ffi_deps: bool,
 ) -> tokio::sync::mpsc::Sender<CoordinatorMessage> {
+    spawn_coordinator_with_graph(system, mock_memory_graph(), with_ffi_deps).await
+}
+
+/// Same as [`spawn_coordinator`], but with a caller-supplied memory graph. Pass
+/// a real `MemoryGraphActor` when the test needs graph-backed state (MCP config,
+/// for instance) rather than a sink that drops every message.
+async fn spawn_coordinator_with_graph(
+    system: &ActorSystem,
+    memory_graph_tx: tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    with_ffi_deps: bool,
+) -> tokio::sync::mpsc::Sender<CoordinatorMessage> {
     let (chat_tx, _) = system.spawn(ChatActor::new());
     let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
     let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
     let (system_tx, _) = system.spawn(SystemActor::new());
-    let memory_graph_tx = mock_memory_graph();
     let project_query_tx = mock_sender();
     let intent_router_tx = mock_sender();
     let plan_orchestrator_tx = mock_sender();
@@ -2805,7 +2802,11 @@ async fn spawn_coordinator(
 }
 
 /// Send a HandleRequest and await the routed response.
-async fn route(sender: &tokio::sync::mpsc::Sender<CoordinatorMessage>, method: &str, params: serde_json::Value) -> serde_json::Value {
+async fn route(
+    sender: &tokio::sync::mpsc::Sender<CoordinatorMessage>,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
     sender
         .send(CoordinatorMessage::HandleRequest {
@@ -2842,7 +2843,12 @@ async fn test_coordinator_routes_ffi_methods_with_deps() {
     assert_eq!(resp["error"], "No project analyzed yet");
 
     // project/buildStatus with a mock graph → null (no persisted status).
-    let resp = route(&coord_tx, "project/buildStatus", serde_json::json!({"path": "x"})).await;
+    let resp = route(
+        &coord_tx,
+        "project/buildStatus",
+        serde_json::json!({"path": "x"}),
+    )
+    .await;
     assert!(resp.is_null());
 
     // A regular coordinator method still works after SetFfiDeps.
@@ -2970,8 +2976,6 @@ async fn test_get_build_target_serves_per_target_deps_only() {
     );
 }
 
-
-
 /// Without SetFfiDeps (the standalone binary), FFI-inline methods return a
 /// clear error instead of being dispatched.
 #[tokio::test]
@@ -2979,11 +2983,15 @@ async fn test_coordinator_ffi_methods_error_without_deps() {
     let system = ActorSystem::new();
     let coord_tx = spawn_coordinator(&system, false).await;
 
-    for method in ["project/open", "AnalyzeProject", "rag/search", "createProject/Plan"] {
+    for method in [
+        "project/open",
+        "AnalyzeProject",
+        "rag/search",
+        "createProject/Plan",
+    ] {
         let resp = route(&coord_tx, method, serde_json::json!({})).await;
         assert_eq!(
-            resp["error"],
-            "FFI dispatch deps not attached (standalone binary)",
+            resp["error"], "FFI dispatch deps not attached (standalone binary)",
             "method {method} should require FFI deps"
         );
     }
@@ -3012,18 +3020,62 @@ async fn test_build_module_operation_capabilities() {
 
     // (capability, supports_lint, supports_format, supports_fix)
     let cases: Vec<(ModuleCapability, bool, bool, bool)> = vec![
-        (describe_module(&system, CmakeBuildModule::new()).await, false, false, false),
-        (describe_module(&system, MakeBuildModule::new()).await, false, false, false),
-        (describe_module(&system, MavenBuildModule::new()).await, false, false, false),
-        (describe_module(&system, GradleBuildModule::new()).await, false, false, false),
-        (describe_module(&system, GoBuildModule::new()).await, true, true, true),
-        (describe_module(&system, NodeBuildModule::new()).await, true, true, true),
-        (describe_module(&system, PythonBuildModule::new()).await, true, true, true),
-        (describe_module(&system, RubyBuildModule::new()).await, true, false, true),
+        (
+            describe_module(&system, CmakeBuildModule::new()).await,
+            false,
+            false,
+            false,
+        ),
+        (
+            describe_module(&system, MakeBuildModule::new()).await,
+            false,
+            false,
+            false,
+        ),
+        (
+            describe_module(&system, MavenBuildModule::new()).await,
+            false,
+            false,
+            false,
+        ),
+        (
+            describe_module(&system, GradleBuildModule::new()).await,
+            false,
+            false,
+            false,
+        ),
+        (
+            describe_module(&system, GoBuildModule::new()).await,
+            true,
+            true,
+            true,
+        ),
+        (
+            describe_module(&system, NodeBuildModule::new()).await,
+            true,
+            true,
+            true,
+        ),
+        (
+            describe_module(&system, PythonBuildModule::new()).await,
+            true,
+            true,
+            true,
+        ),
+        (
+            describe_module(&system, RubyBuildModule::new()).await,
+            true,
+            false,
+            true,
+        ),
     ];
 
     for (cap, lint, format, fix) in cases {
-        assert!(cap.supports_clean, "{} should support clean", cap.build_system);
+        assert!(
+            cap.supports_clean,
+            "{} should support clean",
+            cap.build_system
+        );
         assert_eq!(cap.supports_lint, lint, "{} lint", cap.build_system);
         assert_eq!(cap.supports_format, format, "{} format", cap.build_system);
         assert_eq!(cap.supports_fix, fix, "{} fix", cap.build_system);
@@ -3037,19 +3089,19 @@ async fn test_build_module_operation_capabilities() {
 #[tokio::test]
 async fn test_build_default_registry_registers_project_meta_tools() {
     let registry = build_default_registry(
-        mock_sender(), // transport
-        mock_sender(), // project_query
+        mock_sender(),       // transport
+        mock_sender(),       // project_query
         Some(mock_sender()), // project/build
         Some(mock_sender()), // project/test
         Some(mock_sender()), // project/lint
         Some(mock_sender()), // project/install
-        mock_sender(), // filesystem
-        mock_sender(), // git
-        mock_sender(), // process
-        mock_sender(), // search
-        mock_sender(), // terminal
-        mock_sender(), // build_manager
-        mock_sender(), // rag
+        mock_sender(),       // filesystem
+        mock_sender(),       // git
+        mock_sender(),       // process
+        mock_sender(),       // search
+        mock_sender(),       // terminal
+        mock_sender(),       // build_manager
+        mock_sender(),       // rag
     )
     .await
     .expect("build tool registry");
@@ -3083,19 +3135,19 @@ async fn test_build_default_registry_registers_hal_tools() {
     let (bm_tx, _bm) = system.spawn(BuildManagerActor::new(mock_sender()));
 
     let registry = build_default_registry(
-        mock_sender(),          // transport
-        mock_sender(),          // project_query
-        Some(mock_sender()),    // project/build
-        Some(mock_sender()),    // project/test
-        Some(mock_sender()),    // project/lint
-        Some(mock_sender()),    // project/install
-        mock_sender(),          // filesystem
-        mock_sender(),          // git
-        mock_sender(),          // process
-        mock_sender(),          // search
-        mock_sender(),          // terminal
-        bm_tx,                  // build_manager
-        mock_sender(),          // rag
+        mock_sender(),       // transport
+        mock_sender(),       // project_query
+        Some(mock_sender()), // project/build
+        Some(mock_sender()), // project/test
+        Some(mock_sender()), // project/lint
+        Some(mock_sender()), // project/install
+        mock_sender(),       // filesystem
+        mock_sender(),       // git
+        mock_sender(),       // process
+        mock_sender(),       // search
+        mock_sender(),       // terminal
+        bm_tx,               // build_manager
+        mock_sender(),       // rag
     )
     .await
     .expect("build tool registry");
@@ -3118,7 +3170,9 @@ async fn test_build_default_registry_registers_hal_tools() {
     // Routable through the registry — `None` here means the router would fall
     // through to the MCP catch-all ("no tool found").
     assert!(
-        registry.call("hal_add_platform", serde_json::json!({})).is_some(),
+        registry
+            .call("hal_add_platform", serde_json::json!({}))
+            .is_some(),
         "hal_add_platform must be registered/routable"
     );
 }
@@ -3174,3 +3228,154 @@ async fn test_project_build_root_gating_and_set() {
     );
 }
 
+// ── Device (on-hardware) MCP servers ────────────────────────────────────────
+
+/// Restores `SPIRE_PLATFORM_DIR` when the test ends, pass or fail. The var is
+/// process-global, so a leaked value would leak into every other test.
+struct PlatformDirEnv(Option<String>);
+
+impl PlatformDirEnv {
+    fn at(dir: &std::path::Path) -> Self {
+        let previous = std::env::var("SPIRE_PLATFORM_DIR").ok();
+        std::env::set_var("SPIRE_PLATFORM_DIR", dir);
+        Self(previous)
+    }
+}
+
+impl Drop for PlatformDirEnv {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(dir) => std::env::set_var("SPIRE_PLATFORM_DIR", dir),
+            None => std::env::remove_var("SPIRE_PLATFORM_DIR"),
+        }
+    }
+}
+
+/// A platform that declares `device:` becomes an MCP server: reported by
+/// `device/status` (token withheld), kept registered when MCP config reloads
+/// from the graph, and reached only deliberately — a board that isn't there
+/// fails cleanly and bounded instead of parking the MCP client.
+#[tokio::test]
+// Serializing the process-global `SPIRE_PLATFORM_DIR` is the whole point of the
+// guard, so it is intentionally held across awaits (same as the build_manager
+// fixtures that mutate the registry).
+#[allow(clippy::await_holding_lock)]
+async fn test_device_servers_come_from_the_platform_registry() {
+    let _guard = spire_code::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+
+    let platform_dir = tempfile::tempdir().expect("platform dir");
+    std::fs::write(
+        platform_dir.path().join("rpi5.yaml"),
+        r#"
+id: rpi5
+name: Raspberry Pi 5
+os: linux
+architecture:
+  cpu_family: aarch64
+  cpu: armv8-a
+  endian: little
+  target_triple: aarch64-linux-gnu
+toolchain:
+  c: clang
+  cpp: clang++
+  ar: llvm-ar
+  strip: llvm-strip
+sysroot:
+  root: /opt/cross/sysroot/rpi5
+device:
+  mcp:
+    url: http://127.0.0.1:9/mcp
+    token: board-secret
+  deploy:
+    dest: /home/pi/ai-traps
+"#,
+    )
+    .expect("write rpi5.yaml");
+    // Host-only: no board, so it must never show up as a device.
+    std::fs::write(
+        platform_dir.path().join("host.yaml"),
+        r#"
+id: host
+name: Host
+os: linux
+architecture:
+  cpu_family: x86_64
+  cpu: x86_64
+  endian: little
+  target_triple: x86_64-linux-gnu
+toolchain:
+  c: clang
+  cpp: clang++
+  ar: llvm-ar
+  strip: llvm-strip
+sysroot:
+  root: ""
+"#,
+    )
+    .expect("write host.yaml");
+    let _env = PlatformDirEnv::at(platform_dir.path());
+
+    let system = ActorSystem::new();
+    let (graph_tx, _) = system.spawn(MemoryGraphActor::new());
+    let graph_data = tempfile::tempdir().expect("graph data dir");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    graph_tx
+        .send(MemoryGraphMessage::Initialize {
+            data_dir: graph_data.path().to_path_buf(),
+            reply_to: ready_tx,
+        })
+        .await
+        .expect("send Initialize");
+    ready_rx
+        .await
+        .expect("graph init reply")
+        .expect("graph init");
+
+    let coord_tx = spawn_coordinator_with_graph(&system, graph_tx, false).await;
+
+    // device/status: the registry's boards, with the token withheld.
+    let status = route(&coord_tx, "device/status", serde_json::json!({})).await;
+    let devices = status["devices"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no devices in {status}"))
+        .clone();
+    assert_eq!(devices.len(), 1, "only rpi5 has a board: {status}");
+    assert_eq!(devices[0]["platform"], "rpi5");
+    assert_eq!(devices[0]["server"], "device-rpi5");
+    assert_eq!(devices[0]["url"], "http://127.0.0.1:9/mcp");
+    assert_eq!(devices[0]["has_token"], true);
+    assert_eq!(devices[0]["deploy_dest"], "/home/pi/ai-traps");
+    assert_eq!(devices[0]["connected"], false);
+    assert!(
+        !status.to_string().contains("board-secret"),
+        "the token must never be echoed back: {status}"
+    );
+
+    // Reloading MCP config from the graph must keep the board registered, and
+    // must not try to reach it (autostart=false) — an absent board cannot stall
+    // the reload.
+    let loaded = route(&coord_tx, "mcp/loadConfig", serde_json::json!({})).await;
+    assert_eq!(loaded["success"], true, "loadConfig failed: {loaded}");
+    let servers = route(&coord_tx, "mcp/listServers", serde_json::json!({})).await;
+    let listed = servers.as_array().expect("server list");
+    let device = listed
+        .iter()
+        .find(|server| server["name"] == "device-rpi5")
+        .unwrap_or_else(|| panic!("device-rpi5 missing from {servers}"));
+    assert_eq!(device["properties"]["status"], "offline");
+
+    // An explicit connect to a board that isn't there errors (bounded), and a
+    // missing platform parameter is rejected up-front.
+    let failed = route(
+        &coord_tx,
+        "device/connect",
+        serde_json::json!({"platform": "rpi5"}),
+    )
+    .await;
+    assert!(
+        failed["error"].is_string(),
+        "expected a clean error for an absent board, got {failed}"
+    );
+    let missing = route(&coord_tx, "device/connect", serde_json::json!({})).await;
+    assert_eq!(missing["error"], "Missing platform");
+}

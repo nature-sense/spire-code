@@ -152,10 +152,20 @@ entry tracks the work end to end.
       tool. `tests/roundtrip.rs` spawns the real binary and drives it with the
       same client Spire uses — `initialize → tools/list → tools/call("info")`
       passes — and a curl-driven check of the same sequence passes too.
-- [ ] 2. M2 — registry `device:` block + auto-connect. Add
-      `device: { mcp: { url, token }, deploy: { dest } }` to the platform YAML
-      schema/model (`~/.spire/platforms/*.yaml`) and register the server as an
-      MCP server on project open / platform select.
+- [x] 2. M2 — done (2026-09-13). `Platform` gained an optional
+      `device: { mcp: { url, token }, deploy: { dest } }` block, parsed from the
+      YAML seed and round-tripped through the graph as individual typed
+      properties (`device_mcp_url` / `device_mcp_token` / `device_deploy_dest`).
+      `Platform::device_mcp_config()` turns it into an MCP client config named
+      `device-<id>`, with the token as a bearer header and `autostart: false` so
+      a powered-off board can never stall `ConnectAll`. Every path that reloads
+      MCP config from the graph re-adds the device servers (otherwise they would
+      silently vanish from the server list), `device/status` reports them with
+      the token withheld, and project open background-connects the boards the
+      project actually builds for. `Connect` is now bounded by
+      `CONNECT_TIMEOUT_SECS` so one dead endpoint can't park the MCP client's
+      mailbox. Covered by `platform::tests` (mapping, blank token, host-only) and
+      `test_device_servers_come_from_the_platform_registry` (actor level).
 - [ ] 3. M3 — Test action over the device. For a platform with `device.mcp`:
       cross-build the test binary → upload it over HTTP → MCP `run_test` →
       report exit code + output. No `meson`/`test()` machinery is needed on the

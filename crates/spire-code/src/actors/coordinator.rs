@@ -8,38 +8,36 @@
 
 use async_trait::async_trait;
 use regex::Regex;
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-use spire_core::subsystems::chat::chat::ChatMessage;
+use crate::actors::system::SystemMessage;
 use crate::subsystems::planning::intent_router::{IntentRouterMessage, RouteResult};
-use spire_core::subsystems::llm::llm::LlmMessage;
-use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
-use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use crate::subsystems::planning::plan_orchestrator::PlanOrchestratorMessage;
 use crate::subsystems::project::project_query::ProjectQueryMessage;
-use crate::actors::system::SystemMessage;
 use spire_core::actors::tool_providers::ToolRouterMessage;
 use spire_core::actors::tools::ToolsMessage;
 use spire_core::actors::Actor;
 use spire_core::models::memory_graph::{McpConfigFile, McpServerConfigEntry};
+use spire_core::subsystems::chat::chat::ChatMessage;
+use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
+use spire_core::subsystems::llm::llm::LlmMessage;
+use spire_core::subsystems::mcp::mcp_client::McpClientMessage;
 use spire_core::transport::socket::TransportMessage;
 
 // FFI-inline RPC handlers moved into this single router (see `SetFfiDeps`).
+use crate::ffi::{dummy_tx, populate_target_graph, resolve_project_root, serialize_analysis};
 use crate::subsystems::project::project_analyzer::ProjectAnalysis;
+use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
 use crate::subsystems::project::project_build::ProjectBuildMessage;
 use crate::subsystems::project::project_creation::ProjectCreationMessage;
-use crate::subsystems::project::spec_design::SpecDesignMessage;
 use crate::subsystems::project::project_sync::ProjectSyncMessage;
-use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
+use crate::subsystems::project::spec_design::SpecDesignMessage;
+use spire_actor::registry::ServiceRegistry;
 use spire_core::actors::rag::RagMessage;
 use spire_core::subsystems::tools::file_watcher::{FileChangeNotification, FileWatcherMessage};
-use spire_actor::registry::ServiceRegistry;
-use crate::ffi::{
-    dummy_tx, populate_target_graph, resolve_project_root, serialize_analysis,
-};
 
 /// Messages for the Coordinator actor.
 pub enum CoordinatorMessage {
@@ -143,17 +141,14 @@ impl CoordinatorActor {
     /// prompt -> LLM -> strip fences -> structural syntax check (retry once)
     /// -> return {status, path, proposed_content, issues} for Accept/Reject.
     async fn propose_hal_fix(&self, root: &str, path: &str) -> serde_json::Value {
-        let issues = crate::build::generic_helpers::hal_doc_lint_file(
-            std::path::Path::new(root),
-            path,
-        );
+        let issues =
+            crate::build::generic_helpers::hal_doc_lint_file(std::path::Path::new(root), path);
         if issues.is_empty() {
             return serde_json::json!({ "status": "clean", "path": path });
         }
         let content = std::fs::read_to_string(path).unwrap_or_default();
-        let mut prompt = crate::build::generic_helpers::hal_doc_fix_prompt_whole(
-            path, &content, &issues,
-        );
+        let mut prompt =
+            crate::build::generic_helpers::hal_doc_fix_prompt_whole(path, &content, &issues);
         let mut proposed = String::new();
         // Route through the LLM actor's mailbox (self.llm_tx) so all LLM work
         // shares the single actor-owned config/client. A missing actor returns
@@ -543,7 +538,9 @@ impl CoordinatorActor {
         // Compile FIRST so the loop acts on the CURRENT errors rather than on
         // whatever the previous build happened to leave in the graph. If the build
         // cannot even start, stop before spending a single model call.
-        let built = self.call_tool_json("build_build", driver.build_args()).await;
+        let built = self
+            .call_tool_json("build_build", driver.build_args())
+            .await;
         if let Some(err) = built.get("error").and_then(|v| v.as_str()) {
             return serde_json::json!({
                 "success": false,
@@ -552,8 +549,7 @@ impl CoordinatorActor {
             });
         }
 
-        let mut report =
-            crate::build::autofix::run_autofix(&driver, &bases, max_rounds).await;
+        let mut report = crate::build::autofix::run_autofix(&driver, &bases, max_rounds).await;
         report.platform = platform;
 
         // Name the built executable: Meson places it at <build-<platform>>/<target>,
@@ -561,9 +557,7 @@ impl CoordinatorActor {
         // really there (never a guessed path).
         if report.errors_after == 0 {
             if let (Some(platform), Some(target)) = (report.platform.as_ref(), target.as_ref()) {
-                let candidate = project_root
-                    .join(format!("build-{platform}"))
-                    .join(target);
+                let candidate = project_root.join(format!("build-{platform}")).join(target);
                 if candidate.is_file() {
                     report.artifact = Some(candidate.to_string_lossy().to_string());
                 }
@@ -579,8 +573,7 @@ impl CoordinatorActor {
             report.errors_after
         );
 
-        let mut value =
-            serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        let mut value = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
         if let serde_json::Value::Object(ref mut m) = value {
             m.insert("output".to_string(), serde_json::json!(report.summary()));
             m.insert(
@@ -739,10 +732,7 @@ impl CoordinatorActor {
         // result) for both the bare method and the envelope form.
         let is_build_target_call = method == "project/getBuildTarget"
             || (method == "tools/call"
-                && params
-                    .get("tool")
-                    .and_then(|v| v.as_str())
-                    == Some("project/getBuildTarget"));
+                && params.get("tool").and_then(|v| v.as_str()) == Some("project/getBuildTarget"));
         if is_build_target_call {
             return self.handle_project_get_build_target(method, &params).await;
         }
@@ -1066,10 +1056,12 @@ impl CoordinatorActor {
                                     name: entry.name,
                                     transport,
                                     autostart: entry.autostart,
-                                build_type: None,
+                                    build_type: None,
                                 })
                             })
                             .collect();
+                        let configs = Self::with_device_mcp_configs(configs);
+
                         let (tx2, rx2) = tokio::sync::oneshot::channel();
                         if self
                             .mcp_client_tx
@@ -1147,6 +1139,39 @@ impl CoordinatorActor {
                 }
                 match rx.await {
                     Ok(Ok(())) => serde_json::json!({"success": true}),
+                    Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
+                    Err(_) => serde_json::json!({"error": "MCP client actor response error"}),
+                }
+            }
+            // ── Device (on-hardware) servers — one per platform with `device:` ──
+            "device/status" | "device/list" => {
+                return self.handle_device_status().await;
+            }
+            "device/connect" => {
+                let platform_id = params
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if platform_id.is_empty() {
+                    return serde_json::json!({"error": "Missing platform"});
+                }
+                let server_name = format!("device-{platform_id}");
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if self
+                    .mcp_client_tx
+                    .send(McpClientMessage::Connect {
+                        server_name: server_name.clone(),
+                        reply_to: tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return serde_json::json!({"error": "MCP client actor not available"});
+                }
+                match rx.await {
+                    Ok(Ok(())) => serde_json::json!({"success": true, "server": server_name}),
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
                     Err(_) => serde_json::json!({"error": "MCP client actor response error"}),
                 }
@@ -1513,7 +1538,8 @@ impl CoordinatorActor {
 
                 let system_msg = "You are a helpful AI assistant. When you need to use a tool, respond using the native function-calling mechanism (tool_calls) provided by the API — do not describe tool calls in plain text.".to_string();
 
-                let mut messages: Vec<spire_core::subsystems::chat::chat::ChatMessageData> = Vec::new();
+                let mut messages: Vec<spire_core::subsystems::chat::chat::ChatMessageData> =
+                    Vec::new();
                 messages.push(spire_core::subsystems::chat::chat::ChatMessageData {
                     id: "sys-tools".to_string(),
                     role: "system".to_string(),
@@ -1897,7 +1923,10 @@ impl CoordinatorActor {
                 let coding_max_tokens = params
                     .get("codingMaxTokens")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(spire_core::subsystems::llm::llm::LlmConfig::default().coding_max_tokens as u64) as u32;
+                    .unwrap_or(
+                        spire_core::subsystems::llm::llm::LlmConfig::default().coding_max_tokens
+                            as u64,
+                    ) as u32;
                 let temperature = params
                     .get("temperature")
                     .and_then(|v| v.as_f64())
@@ -1918,8 +1947,10 @@ impl CoordinatorActor {
                             coding_max_tokens,
                             temperature,
                             strict_mode,
-                            planning_model: spire_core::subsystems::llm::llm::LlmConfig::default().planning_model,
-                            coding_model: spire_core::subsystems::llm::llm::LlmConfig::default().coding_model,
+                            planning_model: spire_core::subsystems::llm::llm::LlmConfig::default()
+                                .planning_model,
+                            coding_model: spire_core::subsystems::llm::llm::LlmConfig::default()
+                                .coding_model,
                         },
                         reply_to: tx,
                     })
@@ -1955,8 +1986,7 @@ impl CoordinatorActor {
                             .filter_map(crate::actors::platform_codec::platform_json_to_spire)
                             .collect();
                         if !platforms.is_empty() {
-                            serde_json::to_value(platforms)
-                                .unwrap_or(serde_json::json!([]))
+                            serde_json::to_value(platforms).unwrap_or(serde_json::json!([]))
                         } else {
                             // The startup phase chain may not have seeded the
                             // graph yet (or a fresh DB cleared it). The YAML
@@ -1964,15 +1994,15 @@ impl CoordinatorActor {
                             // fall back to reading it directly so the viewer
                             // always shows the registered platforms.
                             let dir = spire_core::build_types::Platform::default_platform_dir();
-                            let from_seed =
-                                spire_core::build_types::Platform::load_directory(&dir)
-                                    .unwrap_or_default();
-                            serde_json::to_value(from_seed)
-                                .unwrap_or(serde_json::json!([]))
+                            let from_seed = spire_core::build_types::Platform::load_directory(&dir)
+                                .unwrap_or_default();
+                            serde_json::to_value(from_seed).unwrap_or(serde_json::json!([]))
                         }
                     }
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
-                    Err(e) => serde_json::json!({"error": format!("Memory graph response error: {}", e)}),
+                    Err(e) => {
+                        serde_json::json!({"error": format!("Memory graph response error: {}", e)})
+                    }
                 }
             }
 
@@ -2051,9 +2081,7 @@ impl CoordinatorActor {
                     Err(_) => serde_json::json!({"error": "MemoryGraph actor response error"}),
                 }
             }
-            "config/getAll" => {
-                spire_core::config::global_config_json()
-            }
+            "config/getAll" => spire_core::config::global_config_json(),
             "config/set" => {
                 let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 let value_str = params
@@ -2064,10 +2092,11 @@ impl CoordinatorActor {
                 if !key.starts_with("deepseek.") && !key.starts_with("tavily.") {
                     return serde_json::json!({"error": "Only deepseek.* and tavily.* keys supported"});
                 }
-                let new_config = match spire_core::config::set_global_llm_config_key(key, &value_str) {
-                    Ok(cfg) => cfg,
-                    Err(e) => return serde_json::json!({"error": e}),
-                };
+                let new_config =
+                    match spire_core::config::set_global_llm_config_key(key, &value_str) {
+                        Ok(cfg) => cfg,
+                        Err(e) => return serde_json::json!({"error": e}),
+                    };
                 let (tx_llm, rx_llm) = tokio::sync::oneshot::channel();
                 if self
                     .llm_tx
@@ -2371,6 +2400,8 @@ impl CoordinatorActor {
                                     else { tracing::warn!("Coordinator: MCP server '{}' has no transport config, skipping", entry.name); return None; };
                                     Some(spire_core::mcp::client::McpServerConfig { name: entry.name, transport, autostart: entry.autostart, build_type: None })
                                 }).collect();
+                                let configs = Self::with_device_mcp_configs(configs);
+
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 if self
                                     .mcp_client_tx
@@ -2448,6 +2479,8 @@ impl CoordinatorActor {
                                     else { tracing::warn!("Coordinator: MCP server '{}' has no transport config, skipping", entry.name); return None; };
                                     Some(spire_core::mcp::client::McpServerConfig { name: entry.name, transport, autostart: entry.autostart, build_type: None })
                                 }).collect();
+                                let configs = Self::with_device_mcp_configs(configs);
+
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 if self
                                     .mcp_client_tx
@@ -2487,7 +2520,11 @@ impl CoordinatorActor {
 
             // ── Ping / Health ──
             "plan/create" => {
-                let goal = params.get("goal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let goal = params
+                    .get("goal")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if goal.is_empty() {
                     return serde_json::json!({"error": "Missing 'goal' parameter"});
                 }
@@ -2510,49 +2547,78 @@ impl CoordinatorActor {
                         })
                     })
                     .unwrap_or_default();
-                let scope = params.get("scope").and_then(|v| v.as_str()).unwrap_or("project");
+                let scope = params
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("project");
                 let scope_val = if scope == "subproject" {
                     params.get("scope_path").and_then(|v| v.as_str()).map(|p| crate::subsystems::planning::plan_orchestrator::ModificationScope::Subproject { path: p.to_string() })
                 } else {
                     Some(crate::subsystems::planning::plan_orchestrator::ModificationScope::Project)
                 };
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                if self.plan_orchestrator_tx.send(PlanOrchestratorMessage::CreatePlan {
-                    goal,
-                    intent_name: Some("modification".to_string()),
-                    parameters: std::collections::HashMap::new(),
-                    scope: scope_val,
-                    workspace_root: if workspace_root.is_empty() { None } else { Some(workspace_root) },
-                    reply_to: tx,
-                }).await.is_err() {
+                if self
+                    .plan_orchestrator_tx
+                    .send(PlanOrchestratorMessage::CreatePlan {
+                        goal,
+                        intent_name: Some("modification".to_string()),
+                        parameters: std::collections::HashMap::new(),
+                        scope: scope_val,
+                        workspace_root: if workspace_root.is_empty() {
+                            None
+                        } else {
+                            Some(workspace_root)
+                        },
+                        reply_to: tx,
+                    })
+                    .await
+                    .is_err()
+                {
                     return serde_json::json!({"error": "PlanOrchestrator not available"});
                 }
                 match rx.await {
-                    Ok(Ok(plan)) => serde_json::to_value(plan).unwrap_or(serde_json::json!({"error": "Serialization error"})),
-                    Ok(Err(e)) => serde_json::json!({"error": format!("Plan creation failed: {}", e)}),
-                    Err(e) => serde_json::json!({"error": format!("PlanOrchestrator response error: {}", e)}),
+                    Ok(Ok(plan)) => serde_json::to_value(plan)
+                        .unwrap_or(serde_json::json!({"error": "Serialization error"})),
+                    Ok(Err(e)) => {
+                        serde_json::json!({"error": format!("Plan creation failed: {}", e)})
+                    }
+                    Err(e) => {
+                        serde_json::json!({"error": format!("PlanOrchestrator response error: {}", e)})
+                    }
                 }
             }
 
             "plan/approve" => {
-                let plan_id = params.get("plan_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let plan_id = params
+                    .get("plan_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if plan_id.is_empty() {
                     return serde_json::json!({"error": "Missing 'plan_id' parameter"});
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                if self.plan_orchestrator_tx.send(PlanOrchestratorMessage::ApprovePlan {
-                    plan_id,
-                    reply_to: tx,
-                }).await.is_err() {
+                if self
+                    .plan_orchestrator_tx
+                    .send(PlanOrchestratorMessage::ApprovePlan {
+                        plan_id,
+                        reply_to: tx,
+                    })
+                    .await
+                    .is_err()
+                {
                     return serde_json::json!({"error": "PlanOrchestrator not available"});
                 }
                 match rx.await {
                     Ok(Ok(())) => serde_json::json!({"ok": true}),
-                    Ok(Err(e)) => serde_json::json!({"error": format!("Plan approval failed: {}", e)}),
-                    Err(e) => serde_json::json!({"error": format!("PlanOrchestrator response error: {}", e)}),
+                    Ok(Err(e)) => {
+                        serde_json::json!({"error": format!("Plan approval failed: {}", e)})
+                    }
+                    Err(e) => {
+                        serde_json::json!({"error": format!("PlanOrchestrator response error: {}", e)})
+                    }
                 }
             }
-
 
             "ping" => {
                 serde_json::json!({"pong": true})
@@ -2657,7 +2723,10 @@ impl CoordinatorActor {
             Err(e) => return serde_json::json!({"error": e}),
         };
 
-        let root = params.get("root").and_then(|v| v.as_str()).map(PathBuf::from);
+        let root = params
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
         let root = match root {
             Some(r) if !r.as_os_str().is_empty() => r,
             _ => return serde_json::json!({"error": "Missing root"}),
@@ -2716,10 +2785,8 @@ impl CoordinatorActor {
                 .unwrap_or_else(dummy_tx)
                 .send(MemoryGraphMessage::InitializeEmbedder {
                     model_path: None,
-                    embedder: Some(
-                        Arc::new(spire_core::embedder::NoopEmbedder)
-                            as Arc<dyn spire_core::models::embedding::Embedder>,
-                    ),
+                    embedder: Some(Arc::new(spire_core::embedder::NoopEmbedder)
+                        as Arc<dyn spire_core::models::embedding::Embedder>),
                     reply_to: t,
                 })
                 .await;
@@ -2786,6 +2853,8 @@ impl CoordinatorActor {
                             })
                         })
                         .collect();
+                    let configs = Self::with_device_mcp_configs(configs);
+
                     if !configs.is_empty() {
                         let (t, _r) = tokio::sync::oneshot::channel();
                         let _ = self
@@ -2880,10 +2949,156 @@ impl CoordinatorActor {
                 // Populate first-class target nodes so the graph can be queried
                 // via project/getBuildTarget (deps/platform/files).
                 let _ = populate_target_graph(registry, &analysis.build_systems).await;
+                // Boards this project builds for: reach their device servers in
+                // the background, so on-hardware tools appear once a board is up
+                // (an offline board only logs — it never delays the open).
+                self.connect_devices_in_background(Self::project_platform_ids(&analysis));
                 serialize_analysis(&analysis)
             }
             Err(e) => serde_json::json!({"error": e}),
         }
+    }
+
+    /// `device/status` — every platform that declares a board, whether Spire is
+    /// connected to it right now, and where artifacts deploy to.
+    ///
+    /// Tokens are never echoed back, only whether one is configured.
+    async fn handle_device_status(&self) -> serde_json::Value {
+        let online: Vec<String> = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if self
+                .mcp_client_tx
+                .send(McpClientMessage::GetServerDetails { reply_to: tx })
+                .await
+                .is_ok()
+            {
+                rx.await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|detail| {
+                        detail
+                            .properties
+                            .get("status")
+                            .and_then(|status| status.as_str())
+                            == Some("online")
+                    })
+                    .map(|detail| detail.name)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        let devices: Vec<serde_json::Value> = spire_core::build_types::Platform::device_platforms()
+            .iter()
+            .filter_map(|platform| {
+                let device = platform.device.as_ref()?;
+                let mcp = device.mcp.as_ref();
+                let name = platform.device_server_name()?;
+                Some(serde_json::json!({
+                    "platform": platform.id,
+                    "platform_name": platform.name,
+                    "server": name,
+                    "url": mcp.map(|mcp| mcp.url.clone()),
+                    "has_token": mcp
+                        .and_then(|mcp| mcp.token.as_deref())
+                        .map(|token| !token.trim().is_empty())
+                        .unwrap_or(false),
+                    "deploy_dest": device.deploy.as_ref().map(|deploy| deploy.dest.clone()),
+                    "connected": online.iter().any(|online_name| online_name == &name),
+                }))
+            })
+            .collect();
+
+        serde_json::json!({ "devices": devices })
+    }
+
+    /// MCP configs for every platform that declares a device endpoint.
+    ///
+    /// Registering is cheap and side-effect free: these configs carry
+    /// `autostart: false`, so the MCP client's `ConnectAll` skips them and a
+    /// powered-off board can never delay startup. Reaching a board is a
+    /// deliberate act — see [`Self::connect_devices_in_background`].
+    fn device_mcp_configs() -> Vec<spire_core::mcp::client::McpServerConfig> {
+        spire_core::build_types::Platform::device_platforms()
+            .iter()
+            .filter_map(|platform| platform.device_mcp_config())
+            .collect()
+    }
+
+    /// Append the device MCP servers to a config set loaded from the graph.
+    ///
+    /// `LoadConfigFromGraph` replaces the client's entire config set, so every
+    /// path that reloads from the graph has to re-add the device servers —
+    /// otherwise the boards silently vanish from the server list.
+    fn with_device_mcp_configs(
+        mut configs: Vec<spire_core::mcp::client::McpServerConfig>,
+    ) -> Vec<spire_core::mcp::client::McpServerConfig> {
+        for config in Self::device_mcp_configs() {
+            if !configs.iter().any(|existing| existing.name == config.name) {
+                configs.push(config);
+            }
+        }
+        configs
+    }
+
+    /// Platform ids a project builds for (e.g. `rpi5`, `rock3c`), from its
+    /// analysis. `host` is the development machine and has no board.
+    fn project_platform_ids(analysis: &ProjectAnalysis) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for build in &analysis.build_systems {
+            let candidates = build
+                .platform_targets
+                .iter()
+                .map(String::as_str)
+                .chain(build.targets.iter().map(|target| target.platform.as_str()));
+            for id in candidates {
+                let id = id.trim();
+                if !id.is_empty() && id != "host" && !ids.iter().any(|known| known == id) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    /// Connect the device MCP servers for `platform_ids` in the background.
+    ///
+    /// Boards are frequently powered off and the MCP client handles messages
+    /// serially, so this stays off the caller's path: an unreachable board only
+    /// logs (the client bounds each `Connect`), and the caller never waits.
+    fn connect_devices_in_background(&self, platform_ids: Vec<String>) {
+        if platform_ids.is_empty() {
+            return;
+        }
+        let mcp_client_tx = self.mcp_client_tx.clone();
+        tokio::spawn(async move {
+            for platform_id in platform_ids {
+                let name = format!("device-{platform_id}");
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if mcp_client_tx
+                    .send(McpClientMessage::Connect {
+                        server_name: name.clone(),
+                        reply_to: reply_tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        tracing::info!("Coordinator: connected device server '{}'", name);
+                    }
+                    // A powered-off or not-yet-deployed board is normal, not an error.
+                    Ok(Err(e)) => {
+                        tracing::info!("Coordinator: device server '{}' offline: {}", name, e);
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
     }
 
     /// Re-run a fresh project analysis (always a disk scan, never cached).
@@ -2893,7 +3108,10 @@ impl CoordinatorActor {
             Err(e) => return serde_json::json!({"error": e}),
         };
 
-        let custom_root = params.get("root").and_then(|v| v.as_str()).map(PathBuf::from);
+        let custom_root = params
+            .get("root")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
         if let Some(root) = custom_root {
             // Resolve wrapper folders (same auto-descend as project/open) so a
             // refresh/analyze on the OUTER path never re-points the project root.
@@ -2920,7 +3138,9 @@ impl CoordinatorActor {
                     let _ = registry
                         .get::<ProjectBuildMessage>("project.build")
                         .unwrap_or_else(dummy_tx)
-                        .send(ProjectBuildMessage::SetProjectRoot { root: resolved.clone() })
+                        .send(ProjectBuildMessage::SetProjectRoot {
+                            root: resolved.clone(),
+                        })
                         .await;
                     return serialize_analysis(&a);
                 }
@@ -3020,9 +3240,15 @@ impl CoordinatorActor {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let file = node.get("file").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let file = node
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let line = node.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
-                    let column = node.get("column").and_then(|v| v.as_u64()).map(|n| n as u32);
+                    let column = node
+                        .get("column")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32);
                     let severity = node
                         .get("severity")
                         .and_then(|v| v.as_str())
@@ -3122,9 +3348,8 @@ impl CoordinatorActor {
         // Use the analyzer's parsed source files for this target (the exact set
         // compiled for it) instead of guessing directories.
         let target = meta.targets.iter().find(|t| t.name == target_name);
-        let declared_sources: Vec<String> = target
-            .map(|t| t.source_files.to_vec())
-            .unwrap_or_default();
+        let declared_sources: Vec<String> =
+            target.map(|t| t.source_files.to_vec()).unwrap_or_default();
 
         let mut files: Vec<serde_json::Value> = Vec::new();
         if !declared_sources.is_empty() {
@@ -3154,7 +3379,8 @@ impl CoordinatorActor {
                 .unwrap_or_default();
             if scope_dir.is_empty() {
                 crate::ffi::collect_tree_files(&analysis.file_tree, &mut files);
-            } else if let Some(dir_node) = crate::ffi::find_tree_dir(&analysis.file_tree, &scope_dir)
+            } else if let Some(dir_node) =
+                crate::ffi::find_tree_dir(&analysis.file_tree, &scope_dir)
             {
                 crate::ffi::collect_tree_files(dir_node, &mut files);
             }
@@ -3169,10 +3395,12 @@ impl CoordinatorActor {
             .map(|t| t.dependencies.as_slice())
             .unwrap_or(&[])
             .iter()
-            .map(|d| serde_json::json!({
-                "name": d.name,
-                "version": d.version_req,
-            }))
+            .map(|d| {
+                serde_json::json!({
+                    "name": d.name,
+                    "version": d.version_req,
+                })
+            })
             .collect();
 
         serde_json::json!({
@@ -3195,10 +3423,7 @@ impl CoordinatorActor {
     /// createProject/* handlers). `structure` defaults to None (→ Native).
     fn params_structure_embedded(
         params: &serde_json::Value,
-    ) -> (
-        Option<spire_core::build_types::ProjectStructure>,
-        bool,
-    ) {
+    ) -> (Option<spire_core::build_types::ProjectStructure>, bool) {
         let structure = params
             .get("structure")
             .and_then(|v| v.as_str())
@@ -3333,7 +3558,9 @@ impl CoordinatorActor {
         }
         .await;
         match result {
-            Ok(Ok(plan)) => serde_json::to_value(plan).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Ok(plan)) => {
+                serde_json::to_value(plan).unwrap_or(serde_json::json!({"error": "serialize"}))
+            }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
@@ -3395,7 +3622,9 @@ impl CoordinatorActor {
         }
         .await;
         match result {
-            Ok(Ok(spec)) => serde_json::to_value(spec).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Ok(spec)) => {
+                serde_json::to_value(spec).unwrap_or(serde_json::json!({"error": "serialize"}))
+            }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
@@ -3439,7 +3668,9 @@ impl CoordinatorActor {
         }
         .await;
         match result {
-            Ok(Ok(plan)) => serde_json::to_value(plan).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Ok(plan)) => {
+                serde_json::to_value(plan).unwrap_or(serde_json::json!({"error": "serialize"}))
+            }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
@@ -3484,7 +3715,9 @@ impl CoordinatorActor {
         }
         .await;
         match result {
-            Ok(Ok(spec)) => serde_json::to_value(spec).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Ok(spec)) => {
+                serde_json::to_value(spec).unwrap_or(serde_json::json!({"error": "serialize"}))
+            }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
@@ -3531,7 +3764,9 @@ impl CoordinatorActor {
         }
         .await;
         match result {
-            Ok(Ok(steps)) => serde_json::to_value(steps).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Ok(steps)) => {
+                serde_json::to_value(steps).unwrap_or(serde_json::json!({"error": "serialize"}))
+            }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
@@ -3572,7 +3807,9 @@ impl CoordinatorActor {
         }
         .await;
         match result {
-            Ok(Ok(results)) => serde_json::to_value(results).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Ok(results)) => {
+                serde_json::to_value(results).unwrap_or(serde_json::json!({"error": "serialize"}))
+            }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
@@ -3620,7 +3857,9 @@ impl CoordinatorActor {
         }
         .await;
         match result {
-            Ok(Ok(res)) => serde_json::to_value(res).unwrap_or(serde_json::json!({"error": "serialize"})),
+            Ok(Ok(res)) => {
+                serde_json::to_value(res).unwrap_or(serde_json::json!({"error": "serialize"}))
+            }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
@@ -3641,11 +3880,26 @@ impl CoordinatorActor {
 
         match method {
             "rag/search" => {
-                let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let domain = params
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let query = params
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let top_k = params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
                 let (t, r) = tokio::sync::oneshot::channel();
-                let _ = rag_tx.send(RagMessage::Query { domain, query, top_k, reply_to: t }).await;
+                let _ = rag_tx
+                    .send(RagMessage::Query {
+                        domain,
+                        query,
+                        top_k,
+                        reply_to: t,
+                    })
+                    .await;
                 match r.await {
                     Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
@@ -3653,11 +3907,26 @@ impl CoordinatorActor {
                 }
             }
             "rag/find-interfaces" => {
-                let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let domain = params
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let query = params
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let top_k = params.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
                 let (t, r) = tokio::sync::oneshot::channel();
-                let _ = rag_tx.send(RagMessage::FindInterfaces { domain, query, top_k, reply_to: t }).await;
+                let _ = rag_tx
+                    .send(RagMessage::FindInterfaces {
+                        domain,
+                        query,
+                        top_k,
+                        reply_to: t,
+                    })
+                    .await;
                 match r.await {
                     Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
@@ -3711,7 +3980,12 @@ impl CoordinatorActor {
                     .map(PathBuf::from)
                     .unwrap_or_default();
                 let (t, r) = tokio::sync::oneshot::channel();
-                let _ = rag_tx.send(RagMessage::ListManifests { project_root, reply_to: t }).await;
+                let _ = rag_tx
+                    .send(RagMessage::ListManifests {
+                        project_root,
+                        reply_to: t,
+                    })
+                    .await;
                 match r.await {
                     Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
@@ -3724,15 +3998,28 @@ impl CoordinatorActor {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let domain = if domain.is_empty() { None } else { Some(domain) };
+                let domain = if domain.is_empty() {
+                    None
+                } else {
+                    Some(domain)
+                };
                 // The RagActor owns the default domain (mailbox-serialized).
                 let _ = rag_tx.send(RagMessage::SetDefaultDomain { domain }).await;
                 serde_json::json!({"ok": true})
             }
             "rag/list-sources" => {
-                let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let domain = params
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let (t, r) = tokio::sync::oneshot::channel();
-                let _ = rag_tx.send(RagMessage::ListSources { domain, reply_to: t }).await;
+                let _ = rag_tx
+                    .send(RagMessage::ListSources {
+                        domain,
+                        reply_to: t,
+                    })
+                    .await;
                 match r.await {
                     Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
@@ -3752,7 +4039,11 @@ impl CoordinatorActor {
                     .filter(|p| !p.as_os_str().is_empty());
                 let (t, r) = tokio::sync::oneshot::channel();
                 let _ = rag_tx
-                    .send(RagMessage::IngestGraphConfig { manifest_path, project_root, reply_to: t })
+                    .send(RagMessage::IngestGraphConfig {
+                        manifest_path,
+                        project_root,
+                        reply_to: t,
+                    })
                     .await;
                 match r.await {
                     Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
@@ -3773,7 +4064,11 @@ impl CoordinatorActor {
                     .filter(|p| !p.as_os_str().is_empty());
                 let (t, r) = tokio::sync::oneshot::channel();
                 let _ = rag_tx
-                    .send(RagMessage::ReingestGraphConfig { manifest_path, project_root, reply_to: t })
+                    .send(RagMessage::ReingestGraphConfig {
+                        manifest_path,
+                        project_root,
+                        reply_to: t,
+                    })
                     .await;
                 match r.await {
                     Ok(Ok(v)) => serde_json::to_value(v).unwrap_or_default(),
@@ -3835,8 +4130,7 @@ impl CoordinatorActor {
             })
         };
 
-        let mut actor =
-            crate::subsystems::project::spec_design::SpecDesignActor::new(llm);
+        let mut actor = crate::subsystems::project::spec_design::SpecDesignActor::new(llm);
         actor.set_memory_graph(self.memory_graph_tx.clone());
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let _handle = spire_core::actors::Actor::spawn(actor, rx);
