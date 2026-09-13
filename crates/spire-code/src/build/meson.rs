@@ -653,12 +653,12 @@ impl MesonBuildModule {
         // and provision the build dir with `meson setup … --cross-file` if it
         // doesn't exist yet; otherwise fall back to the existing build dir.
         if let Some(plat) = opts.platform.as_deref() {
-            if let Some(spec) = spire_core::platform::CrossSpec::for_platform(plat) {
+            if let Some(spec) = crate::platform::CrossSpec::for_platform(plat) {
                 // Sanity gate: fail fast when the target's sysroot is missing or
                 // unpopulated instead of writing a cross file with
                 // `--sysroot=<nonexistent>` and letting `meson setup` fail late
                 // with a confusing toolchain error.
-                if let Some(platform_def) = spire_core::build_types::Platform::from_registry(plat) {
+                if let Some(platform_def) = crate::platform::Platform::from_registry(plat) {
                     let (ok, reason) = platform_def.sysroot_ok();
                     if !ok {
                         return Err(format!(

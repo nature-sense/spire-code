@@ -152,7 +152,7 @@ fn hal_impl_generation_context(
         .or_else(|| classes.first().map(|(name, _)| name.clone()))
         .unwrap_or_else(|| interface.to_string());
     // Platform registry record → hardware profile.
-    let plat = spire_core::build_types::Platform::from_registry(platform)
+    let plat = crate::platform::Platform::from_registry(platform)
         .ok_or_else(|| format!("platform '{platform}' not in registry (~/.spire/platforms)"))?;
     // Module-pair naming: semantic mode REUSES `<iface>_<plat>` when the name
     // is free or only holds a scaffold stub (so Fix replaces stubs instead of
@@ -2517,7 +2517,8 @@ fn diagnostic_in_project(file: &str, project_root: &str) -> bool {
                     {
                         return serde_json::json!({ "error": format!("platform '{platform}' is already present in this project") });
                     }
-                    let Some(platform_rec) = spire_core::build_types::Platform::from_registry(platform) else {
+                    let Some(platform_rec) = crate::platform::Platform::from_registry(platform)
+                    else {
                         return serde_json::json!({ "error": format!("platform '{platform}' not in registry (~/.spire/platforms)") });
                     };
 

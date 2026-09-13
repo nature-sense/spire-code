@@ -1981,7 +1981,7 @@ impl CoordinatorActor {
                     Ok(Ok(nodes)) => {
                         // Rebuild the typed Platform view from the generic
                         // registry JSON nodes the knowledge crate returned.
-                        let platforms: Vec<spire_core::build_types::Platform> = nodes
+                        let platforms: Vec<crate::platform::Platform> = nodes
                             .iter()
                             .filter_map(crate::actors::platform_codec::platform_json_to_spire)
                             .collect();
@@ -1993,9 +1993,9 @@ impl CoordinatorActor {
                             // seed is the source of truth for the toolchain —
                             // fall back to reading it directly so the viewer
                             // always shows the registered platforms.
-                            let dir = spire_core::build_types::Platform::default_platform_dir();
-                            let from_seed = spire_core::build_types::Platform::load_directory(&dir)
-                                .unwrap_or_default();
+                            let dir = crate::platform::Platform::default_platform_dir();
+                            let from_seed =
+                                crate::platform::Platform::load_directory(&dir).unwrap_or_default();
                             serde_json::to_value(from_seed).unwrap_or(serde_json::json!([]))
                         }
                     }
@@ -2989,7 +2989,7 @@ impl CoordinatorActor {
             }
         };
 
-        let devices: Vec<serde_json::Value> = spire_core::build_types::Platform::device_platforms()
+        let devices: Vec<serde_json::Value> = crate::platform::Platform::device_platforms()
             .iter()
             .filter_map(|platform| {
                 let device = platform.device.as_ref()?;
@@ -3020,7 +3020,7 @@ impl CoordinatorActor {
     /// powered-off board can never delay startup. Reaching a board is a
     /// deliberate act — see [`Self::connect_devices_in_background`].
     fn device_mcp_configs() -> Vec<spire_core::mcp::client::McpServerConfig> {
-        spire_core::build_types::Platform::device_platforms()
+        crate::platform::Platform::device_platforms()
             .iter()
             .filter_map(|platform| platform.device_mcp_config())
             .collect()

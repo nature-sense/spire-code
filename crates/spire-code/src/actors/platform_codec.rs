@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
 
-//! Platform codec — the typed `spire_core::build_types::Platform` ↔ generic registry JSON
+//! Platform codec — the typed `crate::platform::Platform` ↔ generic registry JSON
 //! (`{ "id", "name", "properties": {flat map} }`) conversions that cross the
 //! `spire-knowledge` crate boundary. The knowledge store only deals with the
-//! generic JSON; the platform YAML schema + typed view live here in spire-core.
+//! generic JSON; the platform YAML schema + typed view live in `crate::platform`.
 
-use spire_core::build_types::{
+use crate::platform::{
     Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp,
     PlatformSysroot, PlatformToolchain,
 };
@@ -91,7 +91,7 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
     })
 }
 
-/// Rebuild a `spire_core::build_types::Platform` from the generic registry JSON node the
+/// Rebuild a `crate::platform::Platform` from the generic registry JSON node the
 /// knowledge crate returns for `Platform` nodes.
 pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
     let id = node.get("id")?.as_str()?.to_string();

@@ -21,11 +21,13 @@ pub use build::{
     ParseSummary, PythonBuildModule, RubyBuildModule, SwiftBuildModule, TestOptions,
 };
 pub mod ffi;
+pub mod platform;
 pub mod subsystems;
 
 /// The generic actor trait comes from `spire-actor`; tool metadata and the
-/// shared build/platform types live in `spire-core` (`spire_core::actors`,
-/// `spire_core::build_types`, `spire_core::platform`).
+/// shared build types live in `spire-core` (`spire_core::actors`,
+/// `spire_core::build_types`), while the platform concept (cross-compilation
+/// targets + their boards) lives here in [`platform`].
 pub use spire_core::actors::{Actor, ToolInfo};
 
 /// Test-only lock serializing in-process tests that read or mutate the

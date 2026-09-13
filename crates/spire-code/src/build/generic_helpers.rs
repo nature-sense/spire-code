@@ -921,7 +921,7 @@ pub fn resolve_semantic_hal_impl_names(
 /// precedence over this default. Falls back to a generic pointer when the
 /// platform YAML is missing or carries no `library_hints` key.
 pub fn hal_platform_library_hints(platform: &str) -> String {
-    let dir = spire_core::build_types::Platform::default_platform_dir();
+    let dir = crate::platform::Platform::default_platform_dir();
     let path = dir.join(format!("{platform}.yaml"));
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) {

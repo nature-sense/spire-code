@@ -27,13 +27,13 @@ use crate::actors::{
     ProgressMessage, ProgressStatus, ProgressUpdate, ProjectAnalyzerMessage, ProjectQueryMessage,
     ProjectSyncMessage, SystemMessage,
 };
+use crate::platform::Platform as SpirePlatform;
 use spire_core::models::embedding::Embedder;
 use spire_core::actors::ActorSystem;
 use spire_actor::{spawn_child_eager, ChildActor, ChildContext};
 use spire_core::models::memory_graph::{
     AttrNode, RelationshipInput, RelationshipType, StreamOp, StreamOpResult, TransactionRequest,
 };
-use spire_core::build_types::Platform as SpirePlatform;
 use std::collections::HashMap;
 
 // ============================================================================

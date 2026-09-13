@@ -218,8 +218,8 @@ impl CargoBuildModule {
         // BuildTarget per platform) so the UI renders ONE project — never
         // per-platform subprojects with stub sources.
         if is_workspace && !workspace_members.is_empty() {
-            let plat_dir = spire_core::build_types::Platform::default_platform_dir();
-            let registry = spire_core::build_types::Platform::load_directory(&plat_dir)
+            let plat_dir = crate::platform::Platform::default_platform_dir();
+            let registry = crate::platform::Platform::load_directory(&plat_dir)
                 .ok()
                 .unwrap_or_default();
             let registry_ids: Vec<String> = registry.iter().map(|p| p.id.clone()).collect();
@@ -360,8 +360,8 @@ impl CargoBuildModule {
         if !is_workspace {
             let config_path = path.join(".cargo").join("config.toml");
             if let Ok(config) = std::fs::read_to_string(&config_path) {
-                let plat_dir = spire_core::build_types::Platform::default_platform_dir();
-                if let Ok(all) = spire_core::build_types::Platform::load_directory(&plat_dir) {
+                let plat_dir = crate::platform::Platform::default_platform_dir();
+                if let Ok(all) = crate::platform::Platform::load_directory(&plat_dir) {
                     let mut per_platform: Vec<spire_core::build_types::BuildTarget> = Vec::new();
                     for line in config.lines() {
                         let trimmed = line.trim();
@@ -509,7 +509,7 @@ impl CargoBuildModule {
     /// Resolve the cargo `--target` triple for a registered platform, if any.
     fn target_arg(&self, platform: Option<&str>) -> Option<String> {
         platform
-            .and_then(spire_core::platform::CrossSpec::for_platform)
+            .and_then(crate::platform::CrossSpec::for_platform)
             .map(|c| c.target_triple)
     }
 
@@ -518,14 +518,14 @@ impl CargoBuildModule {
     /// same way Meson does. No-op for host builds / unknown platforms.
     fn write_cargo_config(&self, path: &Path, platform: Option<&str>) -> Result<(), String> {
         let Some(plat) = platform else { return Ok(()) };
-        let Some(spec) = spire_core::platform::CrossSpec::for_platform(plat) else {
+        let Some(spec) = crate::platform::CrossSpec::for_platform(plat) else {
             return Ok(());
         };
         let Some(toml) = spec.cargo_config else { return Ok(()); };
         // Sanity gate: fail fast when the target's sysroot is missing or
         // unpopulated instead of writing a `.cargo/config.toml` whose
         // `--sysroot` points at a nonexistent directory.
-        if let Some(platform_def) = spire_core::build_types::Platform::from_registry(plat) {
+        if let Some(platform_def) = crate::platform::Platform::from_registry(plat) {
             let (ok, reason) = platform_def.sysroot_ok();
             if !ok {
                 return Err(format!(
@@ -831,7 +831,7 @@ fn build_args(opts: &BuildOptions) -> Vec<String> {
     if let Some(triple) = opts
         .platform
         .as_deref()
-        .and_then(spire_core::platform::CrossSpec::for_platform)
+        .and_then(crate::platform::CrossSpec::for_platform)
         .map(|c| c.target_triple)
     {
         args.push("--target".to_string());
@@ -1123,7 +1123,7 @@ impl Actor for CargoBuildModule {
                 ];
                 if let Some(triple) = platform
                     .as_deref()
-                    .and_then(spire_core::platform::CrossSpec::for_platform)
+                    .and_then(crate::platform::CrossSpec::for_platform)
                     .map(|c| c.target_triple)
                 {
                     args.push("--target".to_string());
@@ -1349,7 +1349,7 @@ edition = "2021"
         // names are intentionally empty for now (filled by the LLM/user).
         let mut build_rs = String::new();
         for plat in &cross {
-            if let Some(platform) = spire_core::build_types::Platform::from_registry(plat) {
+            if let Some(platform) = crate::platform::Platform::from_registry(plat) {
                 if !platform.sysroot.lib_dirs.is_empty() {
                     build_rs.push_str(&format!(
                         "if env::var(\"CARGO_CFG_TARGET_ARCH\").ok().as_deref() == Some(\"{arch}\") {{\n",
@@ -1379,7 +1379,7 @@ edition = "2021"
         // .cargo/config.toml with [target.<triple>] blocks for every cross platform.
         let mut cargo_config = String::new();
         for plat in &cross {
-            if let Some(platform) = spire_core::build_types::Platform::from_registry(plat) {
+            if let Some(platform) = crate::platform::Platform::from_registry(plat) {
                 if let Some(toml) = platform.cargo_config() {
                     cargo_config.push_str(&toml);
                     cargo_config.push('\n');
