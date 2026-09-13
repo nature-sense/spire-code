@@ -711,9 +711,6 @@ struct ActionPanelView: View {
     /// True while a hardcoded action is running.
     @State private var runningAction: String?
 
-    /// Compile-error fix sheet (LLM propose → review → apply).
-    @State private var showFixErrors = false
-
     /// The verb of the most recently completed action ("Build", "Test",
     /// "Lint", "Clean", "Fix warnings") — used by the log header once the
     /// running action is cleared.
@@ -1371,55 +1368,23 @@ struct ActionPanelView: View {
         (selectedSubproject?.buildSystem ?? "").lowercased().contains("meson")
     }
 
-    /// Card 1 — the APP: what has been built, the buttons that build/test it, and
+    /// Card 1 — the APP: what has been built, the one action that builds it, and
     /// the board it runs on. Everything here is about the target binary.
     private var appCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             appCardHeader
 
-            // Square tiles: the primary actions get real estate, so they read as
-            // actions rather than as body text.
+            // One principal build action, not a toolbar of near-synonyms.
+            // `build_autofix` IS the build pipeline — compile → fix errors → lint
+            // → fix safe warnings → verify — and it ends with a built binary, so
+            // separate Build/Verify/Lint buttons beside it were redundant.
+            // `Clean` stays: clearing the build dir is a genuinely separate
+            // operation. Tests are deliberately NOT here — a platform's tests run
+            // on the board (see the Device group below), not on the Mac.
             HStack(spacing: 8) {
-                squareActionButton("Build", systemImage: "hammer.fill",
-                                   tool: "build_build", blockedByHAL: true)
-                squareActionButton("Test", systemImage: "checkmark.circle",
-                                   tool: "build_test", blockedByHAL: true)
-                squareActionButton("Verify", systemImage: "checkmark.seal",
-                                   tool: "build_verify", blockedByHAL: true)
-                squareActionButton("Lint", systemImage: "exclamationmark.triangle",
-                                   tool: "build_lint")
-                Spacer()
-            }
-            HStack(spacing: 8) {
+                primaryActionButton
                 squareActionButton("Clean", systemImage: "trash", tool: "build_clean")
-                // Formatting is deliberately SEPARATE from fixing warnings: it
-                // only rewrites formatting (clang-format, gated on a project
-                // .clang-format) and never touches code. `build_fix` used to run
-                // exactly this and could silently reformat the whole tree.
-                squareActionButton("Format", systemImage: "text.alignleft", tool: "build_format")
-                if selectionIsMeson {
-                    // The whole pipeline in one action: compile → fix compile
-                    // errors → lint → fix safely-fixable warnings → verify. Every
-                    // edit is compile-verified and rolled back when it does not
-                    // help; warnings that need judgement are reported, not
-                    // rewritten. "Fix Errors…" stays available for reviewing each
-                    // rewrite before it is written.
-                    squareActionButton("Fix & Verify", systemImage: "wand.and.stars",
-                                       tool: "build_autofix", blockedByHAL: true)
-                    Button {
-                        showFixErrors = true
-                    } label: {
-                        actionLabel("Fix Errors…", systemImage: "square.and.pencil")
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(runningAction != nil)
-                    .help("Review each rewrite before it is written")
-                } else if selectionHasAutoFixer {
-                    squareActionButton("Fix Warnings", systemImage: "wrench.and.screwdriver",
-                                       tool: "build_fix")
-                }
                 Spacer()
-                planButton
             }
 
             // Context: a target whose HAL is not implemented cannot be built in
@@ -1440,18 +1405,6 @@ struct ActionPanelView: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(theme.surface))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
-        .sheet(isPresented: $showFixErrors) {
-            if let sub = selectedSubproject {
-                FixErrorsSheet(
-                    project: project,
-                    subproject: sub,
-                    target: selectedBuildTarget,
-                    onRebuild: { runTool("build_verify") }
-                )
-                .environment(bridge)
-                .environment(theme)
-            }
-        }
         // Refresh the build readout on selection change and after every action.
         .task(id: "\(project.root)|\(selectedBuildTarget ?? "")|\(bridge.buildCompletionTick)") {
             await loadLastBuild()
@@ -1701,6 +1654,24 @@ struct ActionPanelView: View {
     /// Last recorded build for the selected target (nil = unknown / never built).
     @State private var lastBuild: BuildStatus?
 
+    /// The app's principal action: the build+fix pipeline where the toolchain has
+    /// one (`build_autofix` for Meson; `build_fix` where an autofixer exists),
+    /// falling back to a plain build otherwise. This *is* "build" — the steps it
+    /// runs internally are not offered as separate buttons beside it.
+    @ViewBuilder
+    private var primaryActionButton: some View {
+        if selectionIsMeson {
+            squareActionButton("Fix & Verify", systemImage: "wand.and.stars",
+                               tool: "build_autofix", blockedByHAL: true, prominent: true)
+        } else if selectionHasAutoFixer {
+            squareActionButton("Fix Warnings", systemImage: "wrench.and.screwdriver",
+                               tool: "build_fix", blockedByHAL: true, prominent: true)
+        } else {
+            squareActionButton("Build", systemImage: "hammer.fill",
+                               tool: "build_build", blockedByHAL: true, prominent: true)
+        }
+    }
+
     /// Title row of the app card: what this card is, and how the last build went.
     private var appCardHeader: some View {
         HStack(spacing: 6) {
@@ -1782,24 +1753,33 @@ struct ActionPanelView: View {
     ///
     /// `blockedByHAL` marks the actions that only make sense once the platform's
     /// HAL is implemented. They are disabled with a reason rather than hidden, so
-    /// the card still shows what it will be able to do.
+    /// the card still shows what it will be able to do. `prominent` marks the
+    /// card's principal action, which is drawn larger and accented.
     private func squareActionButton(_ title: String, systemImage: String, tool: String,
-                                    blockedByHAL: Bool = false) -> some View {
+                                    blockedByHAL: Bool = false,
+                                    prominent: Bool = false) -> some View {
         let enabled = !(blockedByHAL && halIncomplete)
         return Button {
             runTool(tool)
         } label: {
             VStack(spacing: 4) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 15, weight: .medium))
+                    .font(.system(size: prominent ? 18 : 15, weight: .medium))
                 Text(title)
-                    .font(.caption2.weight(.medium))
+                    .font(.caption2.weight(prominent ? .semibold : .medium))
                     .lineLimit(1)
             }
-            .frame(width: 64, height: 50)
+            .frame(width: prominent ? 96 : 64, height: prominent ? 56 : 50)
             .foregroundStyle(enabled ? theme.textPrimary : theme.textSecondary)
-            .background(RoundedRectangle(cornerRadius: 8).fill(theme.buttonBackground))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 0.5))
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(prominent && enabled ? theme.accentBackground : theme.buttonBackground)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(prominent && enabled ? theme.accent : theme.border,
+                            lineWidth: prominent ? 1 : 0.5)
+            )
             .opacity(enabled ? 1 : 0.4)
         }
         .buttonStyle(.plain)
