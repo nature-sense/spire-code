@@ -3064,7 +3064,11 @@ impl CoordinatorActor {
                 "error": format!("platform '{platform_id}' is not in the registry (~/.spire/platforms)")
             }));
         };
-        let Some(mcp) = platform.device.as_ref().and_then(|device| device.mcp.as_ref()) else {
+        let Some(mcp) = platform
+            .device
+            .as_ref()
+            .and_then(|device| device.mcp.as_ref())
+        else {
             return Err(serde_json::json!({
                 "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see ~/.spire/platforms/{platform_id}.yaml")
             }));
@@ -3143,7 +3147,6 @@ impl CoordinatorActor {
                 .map(|deploy| deploy.dest.clone()),
         }))
     }
-
 
     /// `device/test` — deploy a cross-built test binary to a platform's board and
     /// run it there.

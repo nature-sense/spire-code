@@ -244,6 +244,33 @@ entry tracks the work end to end.
         `SPIRE_LIVE_DEVICE_BINARY=<path> cargo test --test actor_tests
         live_device_test -- --ignored --nocapture` → 1 passed in 0.56 s. M4 can
         drive that same path.
+  - [x] 3g. Deploy + UI — done (2026-09-13). The board has two roles, and they now
+        exist as two commands that share one front half (resolve → connect →
+        upload, `stage_device_artifact`) and differ only in the last step:
+        - `device/test` → `run_test`: run an artifact from the scratch work dir.
+        - `device/deploy` → the new server-side `deploy` tool
+          (`spire-target-mcp @ 16a81d6`): install it at an absolute destination,
+          executable, replaced atomically. Destination from the request `dest`,
+          else `device.deploy.dest` — which is what finally gives that registry
+          field a purpose.
+        The UI catches up (`593b98f`): `Platform` gained `device` (the Swift model
+        had drifted; the wire already carried it), `SpireBridge` gained
+        `deviceOnline` / `connectDevice` / `runDeviceTests` / `deployDeviceBinary`,
+        and the action pane has a **Device group** at the top for the selected
+        target — Connect, then Run tests on board / Deploy binary, gated on the
+        connection with a result line under them. It appears only when the
+        selection maps to a platform that declares a board.
+        Also (in `593b98f`): the left pane showed targets twice — the layout tree's
+        `Targets` section listed the same per-platform executables the "Platform
+        builds" list above it selects and reports state for — so the tree now
+        skips that section and the top list is the single target selector.
+        And the project-open background connect is gone (see below): connecting is
+        explicit now, which is what the "one active target" model implies.
+        Known gap: the test binary's path is a convention
+        (`build-<plat>/<plat>/<project>-<plat>-tests`). A project that names its
+        tests differently gets a "not found" naming the full path. A registry
+        field would make it explicit. M5 (start/stop/status/logs) is what makes a
+        deployed binary actually run, and a rollback possible.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.
