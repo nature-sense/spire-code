@@ -145,6 +145,19 @@ impl ModifyReport {
 /// retried; one that was **kept** stays eligible, because an improving change may
 /// not be finished. Each such retry strictly improves the measure, so it
 /// converges rather than oscillating.
+///
+/// ## What the loop deliberately does not decide
+///
+/// The loop compares each target against *itself*: `accept` sees one target's
+/// before/after pair. It therefore knows nothing about a whole-project regression
+/// guard. `build/autofix.rs` has one — if the total error count rose, it rolls the
+/// entire batch back, including files that individually improved — and that guard
+/// is a property of *that* driver's measure, not of the spine. A driver that needs
+/// one must express it in its own `Observation`/`accept` (e.g. by treating the
+/// batch as the unit of change), rather than expecting the loop to grow a policy.
+/// `autofix::tests::rolls_back_the_whole_round_when_the_project_gets_worse` is the
+/// test that pins this difference, so a naive delegation of `run_autofix` onto this
+/// loop fails loudly instead of quietly keeping a regression.
 pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> ModifyReport {
     let mut report = ModifyReport::default();
     let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
