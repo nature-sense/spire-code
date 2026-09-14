@@ -308,6 +308,24 @@ entry tracks the work end to end.
       rather than a per-file one, which is what `reject_round` is for — with **every
       existing test unchanged** as the evidence that behaviour did not move. Still
       open: `modify/code`; and the HAL `modify-contract` cascade.
+- [x] 3j. M4b — `modify/code`. Change existing code from the user's own words: one plan
+      call (which files, then a rewrite each, through the same single-file path and
+      structural check the compile-fix loop already trusts), then the spine applies and
+      verifies. Verification is layered and says which layer it reached — build + host
+      tests are the gate, target tests run only when the board's MCP server is online,
+      and a run that never reached hardware carries a caveat rather than a claim.
+      Reachable as `modify/code` / the `modify_code` tool. Not yet in the build
+      manager's tool list, so the UI cannot offer it (that is M4d). Neither the LLM plan
+      path nor the target-test leg has been exercised against a live model or a board.
+- [ ] 3k. M4c — HAL `modify-contract` cascade. Not built, but every piece is present,
+      which makes it composition rather than invention: `hal_missing_impls` IS the drift
+      measure (per platform × interface: implemented / partial / missing),
+      `hal_fill::plan` + `hal_fill_apply` already do the gap fill, and
+      `hal_diff_contracts` gives the contract diff the "up" direction needs. So: Obs =
+      gaps + build errors, targets = the missing/partial pairs, apply = hand the plan to
+      `hal_fill_apply` (backing up the files it names first), and any compile errors left
+      over go through the existing `AutofixAdapter`. Acceptance is the criterion the
+      drift analysis already measures: no missing, no drift, builds.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.

@@ -39,7 +39,9 @@ use std::path::PathBuf;
 pub struct ChangeTarget {
     /// Stable identity — a path, an interface name, or anything else unique.
     pub id: String,
-    /// The file this target rewrites.
+    /// Where this target lives. Advisory: a driver that resolves paths itself (the
+    /// autofix adapter) or that applies changes through a tool (the HAL cascade) may
+    /// ignore it, but it is what a driver writing files directly uses.
     pub path: PathBuf,
     /// Why this target exists, for the prompt builder.
     pub context: Vec<String>,
@@ -107,8 +109,12 @@ pub trait ModifyDriver {
         false
     }
 
-    /// Write `content` to the target's file, keeping whatever the driver needs
-    /// to restore the pre-run bytes.
+    /// Apply `content` to `target`, however this driver applies changes — normally by
+    /// writing `target.path`, but a driver may route it elsewhere: the HAL cascade hands
+    /// a gap-fill plan to the tool that writes the implementation files.
+    ///
+    /// Keep whatever is needed to restore the pre-run bytes. `revert` is called whenever
+    /// the change did not earn its place, and it has to put the world back exactly.
     async fn apply(&self, target: &ChangeTarget, content: &str) -> Result<(), String>;
 
     /// Restore the pre-run bytes for `target`.
