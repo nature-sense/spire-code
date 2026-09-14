@@ -350,6 +350,34 @@ impl CoordinatorActor {
         Ok((proposed, false))
     }
 
+    /// Ask the model for text, with no structural assumption about the answer.
+    ///
+    /// `llm_rewrite` validates its reply as C++ — right for a file rewrite, wrong for
+    /// anything else. A list of paths is not C++, so using it there meant the structural
+    /// check *always* failed, which silently burned a retry and then handed back the
+    /// **retry's** answer instead of the model's first one. The fake-endpoint test caught
+    /// exactly that: the caller was reading the wrong reply.
+    async fn llm_text(&self, prompt: String) -> Result<String, String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self
+            .llm_tx
+            .send(crate::actors::LlmMessage::Complete {
+                prompt,
+                role: spire_core::subsystems::llm::llm::LlmModelRole::Coding,
+                reply_to: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err("LLM actor unavailable".to_string());
+        }
+        match reply_rx.await {
+            Ok(Ok(text)) => Ok(crate::build::generic_helpers::strip_code_fences(&text)),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(e) => Err(format!("LLM reply lost: {e}")),
+        }
+    }
+
     /// Warning-fix proposal for the autonomous safe-warning phase.
     ///
     /// Writes nothing. Unlike the interactive flow this refuses a rewrite that
@@ -902,9 +930,10 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorCodeModify<'_> 
 
         // 1. Which files? A plain list keeps the reply small, and the answer is filtered
         //    to the scope: the model chooses from what it was given, it does not get to
-        //    name a path of its own.
+        //    name a path of its own. `llm_text`, not `llm_rewrite`: this answer is a list
+        //    of paths, and checking it as C++ made every reply fail the structural check.
         let listing = crate::build::generic_helpers::modify_scope_prompt(&candidates, prompt);
-        let (reply, _) = self.coord.llm_rewrite(listing).await.ok()?;
+        let reply = self.coord.llm_text(listing).await.ok()?;
         let wanted = crate::build::modify_code::select_files(&reply, scope);
         if wanted.is_empty() {
             return None;
