@@ -11,15 +11,18 @@
 //!
 //! * the **prompt** is whatever justifies the change: compiler diagnostics, a
 //!   drift report, or the user's own words;
-//! * every write is followed by a **verification**, and a change that did not
-//!   improve the measured condition is **restored byte-for-byte**;
+//! * every round of writes is followed by a **verification**, and a change that did
+//!   not improve the measured condition is **restored byte-for-byte**;
 //! * each target that fails is attempted only once (no oscillation), and a run is
 //!   bounded — but a target that *improved* stays eligible, because a partial fix
 //!   is worth continuing (see [`run_modify_loop`]);
 //!
-//! Only the *acceptance rule* is domain-specific, and the driver owns it:
-//! `build/autofix.rs` keeps a file only when its error count strictly went down;
-//! a HAL contract change will require "no drift, contract valid, and it builds".
+//! Only the *acceptance rule* is domain-specific, and the driver owns it — whether a
+//! single change earned its place ([`ModifyDriver::accept`]), and whether the whole
+//! round must be undone regardless ([`ModifyDriver::reject_round`]).
+//! `build/autofix.rs` keeps a file only when its error count strictly went down, and
+//! throws the round away when the project total rose; a HAL contract change will
+//! require "no drift, contract valid, and it builds".
 //!
 //! `build/autofix.rs` is the reference instance this was extracted from — it is
 //! still on its own implementation, and migrating it onto this loop is the
@@ -85,12 +88,24 @@ pub trait ModifyDriver {
     /// touch it (which is a skip, not a failure).
     async fn propose(&self, target: &ChangeTarget) -> Option<String>;
 
-    /// Observe the code as it stands now — before the first write, and again
-    /// after every write.
+    /// Observe the code as it stands now — once before a round's writes, and again
+    /// after them.
     async fn verify(&self) -> Self::Obs;
 
     /// Whether this write earned its place. The driver's rule, not the loop's.
     fn accept(&self, target: &ChangeTarget, before: &Self::Obs, after: &Self::Obs) -> bool;
+
+    /// Whether the **whole round** must be undone, including the writes `accept`
+    /// would have kept.
+    ///
+    /// Off by default: the spine has no opinion about the project as a whole, and a
+    /// per-target rule is the common case. A driver that measures globally opts in —
+    /// `build/autofix.rs` uses it so a round that raised the total error count is
+    /// rolled back in full, including the files that individually improved, because
+    /// a build is judged as a whole.
+    fn reject_round(&self, _before: &Self::Obs, _after: &Self::Obs) -> bool {
+        false
+    }
 
     /// Write `content` to the target's file, keeping whatever the driver needs
     /// to restore the pre-run bytes.
@@ -139,26 +154,18 @@ impl ModifyReport {
     }
 }
 
-/// Run the loop: attempt each target once per round, keeping only the writes the
-/// driver accepts and rolling back the rest.
+/// Run the loop: each round measures once, writes every pending target, measures
+/// again, then keeps what the driver accepted and rolls back the rest.
+///
+/// The **round** is the unit of change, not the target. That is what lets a driver
+/// judge a round as a whole ([`ModifyDriver::reject_round`]), and it keeps the cost
+/// at one verification per round rather than one per target — which matters when a
+/// verification is a compile.
 ///
 /// `max_rounds` bounds the work. A target that is skipped or rolled back is never
 /// retried; one that was **kept** stays eligible, because an improving change may
 /// not be finished. Each such retry strictly improves the measure, so it
 /// converges rather than oscillating.
-///
-/// ## What the loop deliberately does not decide
-///
-/// The loop compares each target against *itself*: `accept` sees one target's
-/// before/after pair. It therefore knows nothing about a whole-project regression
-/// guard. `build/autofix.rs` has one — if the total error count rose, it rolls the
-/// entire batch back, including files that individually improved — and that guard
-/// is a property of *that* driver's measure, not of the spine. A driver that needs
-/// one must express it in its own `Observation`/`accept` (e.g. by treating the
-/// batch as the unit of change), rather than expecting the loop to grow a policy.
-/// `autofix::tests::rolls_back_the_whole_round_when_the_project_gets_worse` is the
-/// test that pins this difference, so a naive delegation of `run_autofix` onto this
-/// loop fails loudly instead of quietly keeping a regression.
 pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> ModifyReport {
     let mut report = ModifyReport::default();
     let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -177,10 +184,15 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
             .log
             .push(format!("round {}: {} target(s)", round + 1, pending.len()));
 
+        // Measure the world, write every pending target, then measure it again. The
+        // before/after pair belongs to the whole round, so `accept` reads the same two
+        // observations `reject_round` does — narrowed to one target.
+        let before = driver.verify().await;
+
+        let mut wrote: Vec<ChangeTarget> = Vec::new();
         for target in pending {
             report.attempted.push(target.id.clone());
 
-            let before = driver.verify().await;
             let Some(content) = driver.propose(&target).await else {
                 tried.insert(target.id.clone()); // declined: never retried
                 report.log.push(format!("skip {}: no proposal", target.id));
@@ -193,8 +205,37 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
                 report.skipped.push(target.id.clone());
                 continue;
             }
+            wrote.push(target);
+        }
+        if wrote.is_empty() {
+            break; // nothing was written, so there is nothing to verify or decide
+        }
 
-            let after = driver.verify().await;
+        let after = driver.verify().await;
+
+        // A rejected round is undone in full — including the writes `accept` would
+        // have kept — and none of it is retried.
+        if driver.reject_round(&before, &after) {
+            for target in &wrote {
+                if let Err(err) = driver.revert(target).await {
+                    report
+                        .log
+                        .push(format!("revert {} failed: {err}", target.id));
+                }
+                tried.insert(target.id.clone());
+                if !report.reverted.contains(&target.id) {
+                    report.reverted.push(target.id.clone());
+                }
+            }
+            report.log.push(format!(
+                "round {} rejected: rolled back {} change(s)",
+                round + 1,
+                wrote.len()
+            ));
+            continue;
+        }
+
+        for target in wrote {
             if driver.accept(&target, &before, &after) {
                 // Kept — and deliberately left eligible for the next round: a
                 // change that improved things may not be finished, and taking it
@@ -215,7 +256,9 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
                 report
                     .log
                     .push(format!("reverted {}: no net gain", target.id));
-                report.reverted.push(target.id.clone());
+                if !report.reverted.contains(&target.id) {
+                    report.reverted.push(target.id.clone());
+                }
             }
         }
     }
@@ -253,6 +296,9 @@ mod tests {
         last: BTreeMap<String, usize>,
         proposals: BTreeMap<String, String>,
         applied: Mutex<BTreeMap<String, String>>,
+        /// When set, the fake judges the round the way autofix does — as a whole —
+        /// instead of only per target.
+        project_guard: bool,
     }
 
     impl Fake {
@@ -269,11 +315,19 @@ mod tests {
                 last,
                 proposals: BTreeMap::new(),
                 applied: Mutex::new(BTreeMap::new()),
+                project_guard: false,
             }
         }
 
         fn proposing(mut self, id: &str, content: &str) -> Self {
             self.proposals.insert(id.to_string(), content.to_string());
+            self
+        }
+
+        /// Opt into autofix's project-level rule: reject the round when the total rose,
+        /// even if a file inside it improved.
+        fn guarding_project(mut self) -> Self {
+            self.project_guard = true;
             self
         }
 
@@ -320,6 +374,14 @@ mod tests {
             let b = before.0.get(&target.id).copied().unwrap_or(0);
             let a = after.0.get(&target.id).copied().unwrap_or(0);
             a < b
+        }
+
+        fn reject_round(&self, before: &Problems, after: &Problems) -> bool {
+            if !self.project_guard {
+                return false; // the default rule: per target only
+            }
+            let total = |p: &Problems| p.0.values().sum::<usize>();
+            total(after) > total(before)
         }
 
         async fn apply(&self, target: &ChangeTarget, content: &str) -> Result<(), String> {
@@ -451,5 +513,39 @@ mod tests {
         assert_eq!(report.kept, vec!["a"], "listed once, not twice");
         assert!(report.reverted.is_empty());
         assert_eq!(driver.on_disk("a"), "better");
+    }
+
+    /// The hook: a driver that measures the project as a whole can throw a round away
+    /// even when a file inside it improved. This is the spine-side form of what
+    /// `autofix::tests::rolls_back_the_whole_round_when_the_project_gets_worse` pins,
+    /// and the reason `reject_round` exists.
+    #[tokio::test]
+    async fn a_rejected_round_undoes_even_an_improving_target() {
+        // a improves (3 → 2) but b regresses (1 → 5). The total rises, so the whole
+        // round goes — including a's fix, which `accept` alone would have kept.
+        let driver = Fake::new(
+            &["a", "b"],
+            obs(&[("a", 3), ("b", 1)]),
+            vec![
+                obs(&[("a", 3), ("b", 1)]), // before the round
+                obs(&[("a", 2), ("b", 5)]), // after it
+            ],
+            obs(&[("a", 2), ("b", 5)]),
+        )
+        .proposing("a", "better")
+        .proposing("b", "worse")
+        .guarding_project();
+        let report = run_modify_loop(&driver, 5).await;
+
+        assert!(report.kept.is_empty(), "the round was rejected: {report:?}");
+        assert_eq!(report.reverted, vec!["a", "b"], "both undone: {report:?}");
+        assert_eq!(
+            driver.on_disk("a"),
+            "original-a",
+            "a's improvement is undone too"
+        );
+        assert_eq!(driver.on_disk("b"), "original-b");
+        assert_eq!(report.rounds, 1, "and nothing is retried: {report:?}");
+        assert!(!report.success);
     }
 }
