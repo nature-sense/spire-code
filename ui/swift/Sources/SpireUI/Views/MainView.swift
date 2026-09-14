@@ -726,6 +726,10 @@ struct ActionPanelView: View {
     /// single live-event consumer.
     @State private var buildViewModel: BuildPanelViewModel?
     @State private var showPlanSheet: Bool = false
+
+    /// Free-text `modify/code` request: the sheet, and what the user typed.
+    @State private var showModify: Bool = false
+    @State private var modifyPrompt: String = ""
     /// Text for the chat prompt input box.
     @State private var chatInput: String = ""
 
@@ -1387,6 +1391,10 @@ struct ActionPanelView: View {
             // on the board (see the Device group below), not on the Mac.
             HStack(spacing: 8) {
                 primaryActionButton
+                // Free-text change: describe it, and it is applied and verified as one
+                // change (rolled back unless the project still builds).
+                squareActionButton("Modify…", systemImage: "pencil.and.outline",
+                                   tool: "modify_code", action: { showModify = true })
                 squareActionButton("Clean", systemImage: "trash", tool: "build_clean")
                 Spacer()
             }
@@ -1421,6 +1429,7 @@ struct ActionPanelView: View {
     private var halCard: some View {
         halInterfacesCard
             .sheet(isPresented: $showFillPlan) { fillPlanSheet }
+            .sheet(isPresented: $showModify) { modifySheet }
     }
 
     private var fileActions: some View {
@@ -1650,6 +1659,44 @@ struct ActionPanelView: View {
 
     /// Approval sheet for the bulk plan: what is missing, and what will be
     /// written. The same review-before-write rule as the single-interface flow.
+    /// Free-text request for `modify_code`.
+    ///
+    /// The change is one intent: it is proposed, applied, and then kept or rolled back as
+    /// a whole. The note under the field says what "verified" will mean, because the
+    /// answer differs depending on whether a board is connected.
+    private var modifySheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Modify code")
+                .font(.headline)
+            Text("Describe the change in your own words. It is applied as one change and kept only if the project still builds and the tests that can run still pass — otherwise it is rolled back. Target tests run when a board is connected.")
+                .font(.caption)
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextEditor(text: $modifyPrompt)
+                .font(.system(.body, design: .monospaced))
+                .frame(minHeight: 130)
+                .padding(4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(theme.border, lineWidth: 0.5)
+                )
+            HStack {
+                Spacer()
+                Button("Cancel") { showModify = false }
+                Button("Modify") {
+                    let request = modifyPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !request.isEmpty else { return }
+                    showModify = false
+                    runTool("modify_code", prompt: request)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(modifyPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 460)
+    }
+
     private var fillPlanSheet: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Generate missing implementations")
@@ -1900,10 +1947,17 @@ struct ActionPanelView: View {
     /// card's principal action, which is drawn larger and accented.
     private func squareActionButton(_ title: String, systemImage: String, tool: String,
                                     blockedByHAL: Bool = false,
-                                    prominent: Bool = false) -> some View {
+                                    prominent: Bool = false,
+                                    action: (() -> Void)? = nil) -> some View {
         let enabled = !(blockedByHAL && halIncomplete)
         return Button {
-            runTool(tool)
+            // A tile that needs something from the user (a prompt) opens its sheet
+            // instead of running the tool straight away.
+            if let action {
+                action()
+            } else {
+                runTool(tool)
+            }
         } label: {
             VStack(spacing: 4) {
                 Image(systemName: systemImage)
@@ -1956,7 +2010,7 @@ struct ActionPanelView: View {
             )
     }
 
-    private func runTool(_ tool: String) {
+    private func runTool(_ tool: String, prompt: String? = nil) {
         guard let sub = selectedSubproject else { return }
 
         // Resolve the subproject directory to an absolute path — EXACTLY the
@@ -1988,7 +2042,7 @@ struct ActionPanelView: View {
             return targets.count > 1 ? targets.first : nil
         }()
         Task {
-            await vm.runTool(tool, path: absPath, language: language, package: sub.name, platform: platform, target: selectedBuildTarget)
+            await vm.runTool(tool, path: absPath, language: language, package: sub.name, platform: platform, target: selectedBuildTarget, prompt: prompt)
             await MainActor.run {
                 // Capture the verb BEFORE clearing the running flag —
                 // actionVerb falls back to "Build" once runningAction is nil.

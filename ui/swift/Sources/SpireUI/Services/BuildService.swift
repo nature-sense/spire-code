@@ -33,7 +33,7 @@ actor BuildService {
     // MARK: - FFI calls
 
     /// Run a build tool (build/lint/fix/clean/test) and return the result.
-    func runTool(_ tool: String, path: String, language: String = "Rust", package: String? = nil, platform: String? = nil, target: String? = nil) async throws -> BuildToolResult {
+    func runTool(_ tool: String, path: String, language: String = "Rust", package: String? = nil, platform: String? = nil, target: String? = nil, prompt: String? = nil) async throws -> BuildToolResult {
         var body: [String: Any] = [
             "method": "tools/call",
             "params": [
@@ -67,6 +67,16 @@ actor BuildService {
             if var params = body["params"] as? [String: Any],
                var args = params["args"] as? [String: Any] {
                 args["target"] = target
+                params["args"] = args
+                body["params"] = params
+            }
+        }
+        // Free-text request for `modify_code`: the user's own words are the prompt, and
+        // what should change is not expressible as a tool name.
+        if let prompt {
+            if var params = body["params"] as? [String: Any],
+               var args = params["args"] as? [String: Any] {
+                args["prompt"] = prompt
                 params["args"] = args
                 body["params"] = params
             }

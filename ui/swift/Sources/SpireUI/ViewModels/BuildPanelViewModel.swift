@@ -48,13 +48,13 @@ final class BuildPanelViewModel {
 
     /// Run a build tool with proper lifecycle state transitions:
     /// idle → loading → success/failure.
-    func runTool(_ tool: String, path: String, language: String = "Rust", package: String? = nil, platform: String? = nil, target: String? = nil) async {
+    func runTool(_ tool: String, path: String, language: String = "Rust", package: String? = nil, platform: String? = nil, target: String? = nil, prompt: String? = nil) async {
         runningTool = tool
         state = .loading
         liveEvents = []
 
         do {
-            let result = try await service.runTool(tool, path: path, language: language, package: package, platform: platform, target: target)
+            let result = try await service.runTool(tool, path: path, language: language, package: package, platform: platform, target: target, prompt: prompt)
             // The live event stream delivers lines incrementally while the tool runs.
             // The result's buildEvents contains the same lines again (collected by the
             // Rust build manager into the RPC payload) — only use them as a fallback
