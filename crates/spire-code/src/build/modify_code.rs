@@ -120,6 +120,32 @@ fn show(passed: Option<bool>) -> String {
     }
 }
 
+/// The paths the model chose from the list it was given.
+///
+/// The scope is a guardrail, not a hint: a reply naming a path outside it — or prose,
+/// or a fence — must not produce an edit. Matching is exact after trimming the
+/// decorations models like to add (bullets, backticks, quotes), because a near-miss
+/// here would mean writing to a file the user did not offer.
+pub fn select_files(reply: &str, scope: &[PathBuf]) -> Vec<PathBuf> {
+    let mut wanted: Vec<PathBuf> = Vec::new();
+    for line in reply.lines() {
+        let line = line
+            .trim()
+            .trim_start_matches(['-', '*', ' '])
+            .trim()
+            .trim_matches(|c| c == '`' || c == '"' || c == '\'');
+        if line.is_empty() || line.eq_ignore_ascii_case("NONE") {
+            continue;
+        }
+        if let Some(path) = scope.iter().find(|p| p.to_string_lossy() == line) {
+            if !wanted.contains(path) {
+                wanted.push(path.clone());
+            }
+        }
+    }
+    wanted
+}
+
 /// Adapts a [`CodeModifyBackend`] and one plan to the modify spine.
 struct CodeDriver<'a> {
     backend: &'a dyn CodeModifyBackend,

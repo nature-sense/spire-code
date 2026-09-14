@@ -689,6 +689,285 @@ impl crate::build::autofix::AutofixDriver for CoordinatorAutofix<'_> {
     }
 }
 
+impl CoordinatorActor {
+    /// Whether the board's MCP server is currently connected — the same signal the
+    /// device card reads (the `Connect` button's result), rather than a new probe.
+    async fn device_online(&self, platform_id: &str) -> bool {
+        let wanted = format!("device-{platform_id}");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .mcp_client_tx
+            .send(McpClientMessage::GetServerDetails { reply_to: tx })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or_default().into_iter().any(|detail| {
+            detail.name == wanted
+                && detail
+                    .properties
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    == Some("online")
+        })
+    }
+
+    /// `modify/code` — change existing code from the user's own words.
+    ///
+    /// The plan is proposed by the model (which files, then a rewrite for each) and
+    /// applied and verified by the spine: the project must still build, and the tests
+    /// that can run must still pass, or the whole plan is rolled back byte-for-byte.
+    /// Target tests run only when a board is connected, and the report says which layer
+    /// verification reached.
+    async fn handle_modify_code(&self, args: &serde_json::Value) -> serde_json::Value {
+        let path = args
+            .get("path")
+            .or_else(|| args.get("root"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let prompt = args
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if path.is_empty() || prompt.is_empty() {
+            return serde_json::json!({
+                "success": false,
+                "error": "modify/code needs 'path' and 'prompt'",
+                "output": "Modify: needs a project path and a prompt; nothing was changed.",
+            });
+        }
+
+        let project_root = crate::build::autofix::find_project_root(std::path::Path::new(path));
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .map(|s| s.to_string());
+        // Same rule as Fix & Verify: without a resolved platform the build could compile
+        // a different target, and the change would be "verified" against the wrong one.
+        let platform = match crate::build::autofix::resolve_platform(
+            &project_root,
+            args.get("platform").and_then(|v| v.as_str()),
+            target.as_deref(),
+        ) {
+            Ok(platform) => platform,
+            Err(reason) => {
+                return serde_json::json!({
+                    "success": false,
+                    "error": reason,
+                    "output": format!("Modify: {reason}"),
+                })
+            }
+        };
+
+        // What the model may consider. When the caller names no scope, the project's own
+        // sources are offered — bounded, because this is a prompt and not an index.
+        let scope: Vec<std::path::PathBuf> = match args.get("scope").and_then(|v| v.as_array()) {
+            Some(list) => list
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .collect(),
+            None => source_files(&project_root, 120),
+        };
+        if scope.is_empty() {
+            return serde_json::json!({
+                "success": false,
+                "error": "no source files to consider",
+                "output": "Modify: found no source files to change; nothing was written.",
+            });
+        }
+
+        tracing::info!(
+            "[COORDINATOR] modify/code: root={} platform={platform:?} files={}",
+            project_root.display(),
+            scope.len()
+        );
+
+        let backend = CoordinatorCodeModify {
+            coord: self,
+            path: path.to_string(),
+            platform,
+            target,
+        };
+        // One round: a plan is a single intent, applied or rolled back as a whole.
+        let report = crate::build::modify_code::run_code_modify(&backend, &prompt, &scope, 1).await;
+
+        serde_json::json!({
+            "success": report.success,
+            "verified": format!("{:?}", report.verified),
+            "files_changed": report.files_changed,
+            "files_reverted": report.files_reverted,
+            "files_skipped": report.files_skipped,
+            "caveats": report.caveats,
+            "output": report.summary(),
+        })
+    }
+}
+
+/// Source files the model may consider when the caller named no scope.
+///
+/// Bounded and shallow on purpose: this is a prompt, not an index. A project with
+/// thousands of files would blow the context long before the extra names helped, and
+/// build outputs would drown the real sources.
+fn source_files(root: &std::path::Path, limit: usize) -> Vec<std::path::PathBuf> {
+    const EXTENSIONS: [&str; 12] = [
+        "cpp", "cc", "cxx", "c", "hpp", "h", "hh", "hxx", "py", "rs", "js", "ts",
+    ];
+    const SKIP: [&str; 8] = [
+        "build",
+        "builddir",
+        "target",
+        "node_modules",
+        ".git",
+        "out",
+        "dist",
+        "venv",
+    ];
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name.starts_with('.')
+                    || name.starts_with("build-")
+                    || SKIP.contains(&name.as_str())
+                {
+                    continue;
+                }
+                stack.push(path);
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| EXTENSIONS.contains(&e))
+                .unwrap_or(false)
+            {
+                found.push(path);
+                if found.len() >= limit {
+                    found.sort();
+                    return found;
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Bridges `modify/code` ([`crate::build::modify_code`]) to the real LLM, build and
+/// device actors.
+struct CoordinatorCodeModify<'a> {
+    coord: &'a CoordinatorActor,
+    /// Path to build, exactly as the UI sent it (may be a subproject).
+    path: String,
+    platform: Option<String>,
+    target: Option<String>,
+}
+
+impl CoordinatorCodeModify<'_> {
+    fn build_args(&self) -> serde_json::Value {
+        let mut args = serde_json::json!({ "path": self.path });
+        if let Some(platform) = &self.platform {
+            args["platform"] = serde_json::json!(platform);
+        }
+        if let Some(target) = &self.target {
+            args["target"] = serde_json::json!(target);
+        }
+        args
+    }
+}
+
+#[async_trait]
+impl crate::build::modify_code::CodeModifyBackend for CoordinatorCodeModify<'_> {
+    async fn plan(
+        &self,
+        prompt: &str,
+        scope: &[std::path::PathBuf],
+    ) -> Option<Vec<crate::build::modify_code::PlannedChange>> {
+        let candidates: Vec<String> = scope
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // 1. Which files? A plain list keeps the reply small, and the answer is filtered
+        //    to the scope: the model chooses from what it was given, it does not get to
+        //    name a path of its own.
+        let listing = crate::build::generic_helpers::modify_scope_prompt(&candidates, prompt);
+        let (reply, _) = self.coord.llm_rewrite(listing).await.ok()?;
+        let wanted = crate::build::modify_code::select_files(&reply, scope);
+        if wanted.is_empty() {
+            return None;
+        }
+
+        // 2. Rewrite each through the same single-file path — and the same structural
+        //    check — the compile-fix loop already trusts. A file whose rewrite does not
+        //    parse is skipped, never written: this runs unattended.
+        let mut changes = Vec::new();
+        for path in wanted {
+            let Ok(current) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let file = path.to_string_lossy().to_string();
+            let file_prompt =
+                crate::build::generic_helpers::modify_code_prompt(&file, &current, prompt);
+            let Ok((proposed, syntax_ok)) = self.coord.llm_rewrite(file_prompt).await else {
+                continue;
+            };
+            if !syntax_ok || proposed.trim().is_empty() || proposed == current {
+                continue;
+            }
+            changes.push(crate::build::modify_code::PlannedChange {
+                file,
+                content: proposed,
+            });
+        }
+        (!changes.is_empty()).then_some(changes)
+    }
+
+    async fn build(&self) -> crate::build::autofix::ErrorsByFile {
+        let _ = self
+            .coord
+            .call_tool_json("build_build", self.build_args())
+            .await;
+        self.coord.build_error_diagnostics_by_file().await
+    }
+
+    async fn host_tests(&self) -> Option<bool> {
+        let result = self
+            .coord
+            .call_tool_json("build_test", self.build_args())
+            .await;
+        result.get("success").and_then(|v| v.as_bool())
+    }
+
+    async fn target_tests(&self) -> Option<bool> {
+        // The leg that decides whether a run is host-only. No board means `None`, which
+        // the report turns into a caveat rather than a failure.
+        let platform = self.platform.as_deref()?;
+        if !self.coord.device_online(platform).await {
+            return None;
+        }
+        let mut args = serde_json::json!({ "platform": platform });
+        if let Some(target) = &self.target {
+            args["target"] = serde_json::json!(target);
+        }
+        // `device/test` resolves, connects, uploads and runs, and reports `passed`.
+        let result = self.coord.call_tool_json("device/test", args).await;
+        result.get("passed").and_then(|v| v.as_bool())
+    }
+}
+
 #[async_trait]
 impl Actor for CoordinatorActor {
     type Message = CoordinatorMessage;
@@ -754,6 +1033,24 @@ impl CoordinatorActor {
                 params.clone()
             };
             return self.handle_build_autofix(&args).await;
+        }
+
+        // `modify/code` — change existing code from the user's own words. It needs the
+        // LLM actor too, so like Fix & Verify it is answered here rather than by the
+        // build manager.
+        if method == "modify/code"
+            || (method == "tools/call"
+                && params.get("tool").and_then(|v| v.as_str()) == Some("modify_code"))
+        {
+            let args = if method == "tools/call" {
+                params
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                params.clone()
+            };
+            return self.handle_modify_code(&args).await;
         }
 
         // All rag/* RPCs route to the RAG actor (shared dispatch deps).
