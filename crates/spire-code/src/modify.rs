@@ -13,8 +13,9 @@
 //!   drift report, or the user's own words;
 //! * every write is followed by a **verification**, and a change that did not
 //!   improve the measured condition is **restored byte-for-byte**;
-//! * each target is attempted at most once (no oscillation), the run is bounded,
-//!   and the result is an honest report.
+//! * each target that fails is attempted only once (no oscillation), and a run is
+//!   bounded — but a target that *improved* stays eligible, because a partial fix
+//!   is worth continuing (see [`run_modify_loop`]);
 //!
 //! Only the *acceptance rule* is domain-specific, and the driver owns it:
 //! `build/autofix.rs` keeps a file only when its error count strictly went down;
