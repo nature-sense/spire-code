@@ -51,6 +51,7 @@ pub use ruby::RubyBuildModule;
 pub mod autofix;
 pub mod meson;
 pub mod modify_code;
+pub mod modify_contract;
 pub use meson::MesonBuildModule;
 pub mod hal_migration;
 pub mod spire_app_scaffold;
