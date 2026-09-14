@@ -293,6 +293,21 @@ entry tracks the work end to end.
           `device/connect` → `connected to 'spire-target-mcp' (tools: true)` →
           `status=online`. This is the first time the whole chain has worked from
           the UI rather than from a test harness.
+- [x] 3i. M4a — the modify spine (`crates/spire-code/src/modify.rs`). One
+      propose → apply → verify → keep-or-roll-back loop, so "modify existing
+      code" is written once rather than beside each caller (autofix, free-text
+      modify, the HAL contract cascade). The **round** is the unit of change: it
+      measures, writes every pending target, measures again, then keeps what the
+      driver accepted — so `reject_round` can judge the *project* before any
+      per-file verdict is trusted, and a verification costs one compile per
+      round rather than one per target. A driver owns the two domain rules
+      (`accept` for one change, `reject_round` for the whole round, off by
+      default); a target that failed is never retried, one that improved stays
+      eligible so a partial fix converges. `build/autofix.rs` phase 1 now runs on
+      it as an `AutofixAdapter` with **every existing test unchanged** as the
+      regression net. Still open: autofix phase 2 (warnings) is on its own loop
+      because its rule is per-round rather than per-file; `modify/code`; and the
+      HAL `modify-contract` cascade.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.
