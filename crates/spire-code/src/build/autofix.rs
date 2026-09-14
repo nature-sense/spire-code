@@ -18,7 +18,7 @@
 //! can be tested exhaustively with a fake driver (see the tests below) while the
 //! coordinator plugs in the real LLM + build actors.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -452,14 +452,31 @@ pub fn resolve_platform(
     Ok(None)
 }
 
-/// What a verification observed. This driver measures compile errors and nothing
-/// else, so the errors are the whole observation.
-#[derive(Clone, Default)]
-struct Errors(ErrorsByFile);
+/// Which of autofix's two passes the loop is running. The spine is the same either
+/// way; only what counts as a target, what a proposal is written from, and what
+/// "the project got worse" means differ.
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    /// Compile errors reported by the build.
+    Errors,
+    /// Safely-fixable analyzer warnings, after a clean compile.
+    Warnings,
+}
 
-impl Observation for Errors {
+/// What a verification observed: the errors the project has, plus the warnings the
+/// linter reported. `warnings` is only measured during the warning phase; the
+/// safely-fixable subset is derived from it with `safe_warnings` where it is read.
+#[derive(Clone, Default)]
+struct AutofixObs {
+    errors: ErrorsByFile,
+    warnings: WarningsByFile,
+}
+
+impl Observation for AutofixObs {
     fn is_clean(&self) -> bool {
-        total(&self.0) == 0
+        // "Clean" means the project compiles. Warnings are a separate concern, and
+        // `AutofixReport::success` has always meant errors only.
+        total(&self.errors) == 0
     }
 }
 
@@ -482,6 +499,12 @@ impl Observation for Errors {
 struct AutofixAdapter<'a> {
     driver: &'a dyn AutofixDriver,
     bases: &'a [PathBuf],
+    /// Which pass this is: compile errors, or safely-fixable warnings.
+    phase: Phase,
+    /// The safely-fixable warning count when the warning phase began. The round gate
+    /// compares against this baseline rather than against the round, so a round that
+    /// fails to improve on an earlier win is rolled back.
+    safe_before: usize,
     /// Built as the loop runs and handed back at the end. The log lines are
     /// autofix's, so the UI and the tests keep reading what they always read.
     report: Mutex<AutofixReport>,
@@ -489,10 +512,10 @@ struct AutofixAdapter<'a> {
     /// state the project had before this run started.
     backups: Mutex<BTreeMap<String, String>>,
     /// What the loop is working from, and where `targets` comes from.
-    current: Mutex<ErrorsByFile>,
+    current: Mutex<AutofixObs>,
     /// The observation at the start of the round, so a rollback can explain itself in
-    /// the error counts a user can see.
-    round_start: Mutex<ErrorsByFile>,
+    /// the counts a user can see.
+    round_start: Mutex<AutofixObs>,
     /// Writes since the previous verification.
     wrote_since_verify: Mutex<usize>,
     /// Files written during the round that just ended, for the rejection log.
@@ -504,19 +527,74 @@ struct AutofixAdapter<'a> {
 }
 
 impl<'a> AutofixAdapter<'a> {
-    fn new(
+    /// The error phase. The build's recorded errors seed the loop, so it knows what
+    /// to work on before its first verification.
+    fn errors(
         driver: &'a dyn AutofixDriver,
         bases: &'a [PathBuf],
         errors: ErrorsByFile,
         report: AutofixReport,
     ) -> Self {
+        let obs = AutofixObs {
+            errors,
+            warnings: WarningsByFile::new(),
+        };
+        Self::build(
+            driver,
+            bases,
+            Phase::Errors,
+            0,
+            obs,
+            report,
+            BTreeMap::new(),
+        )
+    }
+
+    /// The warning phase. The first lint seeds the loop, and its safely-fixable count
+    /// becomes the baseline the round gate is measured against. `backups` are carried
+    /// over from the error phase, so a warning fix still rolls back to the bytes the
+    /// project had before the run started.
+    fn warnings(
+        driver: &'a dyn AutofixDriver,
+        bases: &'a [PathBuf],
+        warnings: WarningsByFile,
+        report: AutofixReport,
+        backups: BTreeMap<String, String>,
+    ) -> Self {
+        let safe_before = total(&safe_warnings(&warnings));
+        let obs = AutofixObs {
+            errors: ErrorsByFile::new(),
+            warnings,
+        };
+        Self::build(
+            driver,
+            bases,
+            Phase::Warnings,
+            safe_before,
+            obs,
+            report,
+            backups,
+        )
+    }
+
+    fn build(
+        driver: &'a dyn AutofixDriver,
+        bases: &'a [PathBuf],
+        phase: Phase,
+        safe_before: usize,
+        obs: AutofixObs,
+        report: AutofixReport,
+        backups: BTreeMap<String, String>,
+    ) -> Self {
         Self {
             driver,
             bases,
+            phase,
+            safe_before,
             report: Mutex::new(report),
-            backups: Mutex::new(BTreeMap::new()),
-            current: Mutex::new(errors.clone()),
-            round_start: Mutex::new(errors),
+            backups: Mutex::new(backups),
+            current: Mutex::new(obs.clone()),
+            round_start: Mutex::new(obs),
             wrote_since_verify: Mutex::new(0),
             last_round_writes: Mutex::new(0),
             needs_rebuild: Mutex::new(false),
@@ -538,28 +616,41 @@ impl<'a> AutofixAdapter<'a> {
     }
 
     /// What `run_autofix` continues with: the report, the backups (the warning phase
-    /// reuses them so a warning fix can still be rolled back), and the final errors.
-    fn into_parts(self) -> (AutofixReport, BTreeMap<String, String>, ErrorsByFile) {
+    /// reuses them so a warning fix can still be rolled back), and the final
+    /// observation.
+    fn into_parts(self) -> (AutofixReport, BTreeMap<String, String>, AutofixObs) {
         let mut report = self.report.into_inner().unwrap();
         report.rounds = self.rounds.into_inner().unwrap();
         let backups = self.backups.into_inner().unwrap();
-        let errors = self.current.into_inner().unwrap();
-        (report, backups, errors)
+        let obs = self.current.into_inner().unwrap();
+        (report, backups, obs)
     }
 }
 
 impl ModifyDriver for AutofixAdapter<'_> {
-    type Obs = Errors;
+    type Obs = AutofixObs;
 
     fn targets(&self) -> Vec<ChangeTarget> {
-        self.current
-            .lock()
-            .unwrap()
-            .keys()
-            .map(|file| {
+        // The warning phase carries the lines to fix in the context, because that is
+        // what the model is asked to work from.
+        let files: Vec<(String, Vec<String>)> = {
+            let current = self.current.lock().unwrap();
+            match self.phase {
+                Phase::Errors => current
+                    .errors
+                    .keys()
+                    .cloned()
+                    .map(|file| (file, Vec::new()))
+                    .collect(),
+                Phase::Warnings => safe_warnings(&current.warnings).into_iter().collect(),
+            }
+        };
+        files
+            .into_iter()
+            .map(|(file, lines)| {
                 let path =
-                    resolve_source_path(file, self.bases).unwrap_or_else(|| PathBuf::from(file));
-                ChangeTarget::new(file.clone(), path)
+                    resolve_source_path(&file, self.bases).unwrap_or_else(|| PathBuf::from(&file));
+                ChangeTarget::new(file, path).with_context(lines)
             })
             .collect()
     }
@@ -586,9 +677,21 @@ impl ModifyDriver for AutofixAdapter<'_> {
                 }
             }
         }
-        match self.driver.propose(file, &path).await {
+        let proposal = match self.phase {
+            Phase::Errors => self.driver.propose(file, &path).await,
+            Phase::Warnings => {
+                self.driver
+                    .propose_warning_fix(file, &path, &target.context)
+                    .await
+            }
+        };
+        match proposal {
             None => {
-                self.skip(file, "no fix proposed".to_string());
+                let what = match self.phase {
+                    Phase::Errors => "no fix proposed",
+                    Phase::Warnings => "no warning fix proposed",
+                };
+                self.skip(file, what.to_string());
                 None
             }
             Some(content) if content.trim().is_empty() => {
@@ -599,7 +702,7 @@ impl ModifyDriver for AutofixAdapter<'_> {
         }
     }
 
-    async fn verify(&self) -> Errors {
+    async fn verify(&self) -> AutofixObs {
         let wrote = {
             let mut w = self.wrote_since_verify.lock().unwrap();
             let n = *w;
@@ -617,13 +720,28 @@ impl ModifyDriver for AutofixAdapter<'_> {
             *self.last_round_writes.lock().unwrap() = wrote;
         }
         if wrote > 0 || stale {
-            // Just wrote, or a rollback invalidated the record: recompile.
-            let fresh = self.driver.rebuild().await;
+            // Just wrote, or a rollback invalidated the record: re-measure.
+            let fresh = match self.phase {
+                Phase::Errors => AutofixObs {
+                    errors: self.driver.rebuild().await,
+                    warnings: WarningsByFile::new(),
+                },
+                // The warning phase's re-measure is what the round gate reads: rebuild
+                // (errors must stay at zero), re-lint, re-read.
+                Phase::Warnings => {
+                    let errors = self.driver.rebuild().await;
+                    let _ = self.driver.lint().await;
+                    AutofixObs {
+                        errors,
+                        warnings: self.driver.warnings().await,
+                    }
+                }
+            };
             *self.current.lock().unwrap() = fresh.clone();
             if wrote == 0 {
                 *self.round_start.lock().unwrap() = fresh.clone();
             }
-            return Errors(fresh);
+            return fresh;
         }
         // A read of what is already recorded — nothing was written since, so the
         // diagnostics still describe the disk.
@@ -631,36 +749,73 @@ impl ModifyDriver for AutofixAdapter<'_> {
         if wrote == 0 {
             *self.round_start.lock().unwrap() = current.clone();
         }
-        Errors(current)
+        current
     }
 
-    fn accept(&self, target: &ChangeTarget, before: &Errors, after: &Errors) -> bool {
-        let b = before.0.get(&target.id).map(|v| v.len()).unwrap_or(0);
-        let a = after.0.get(&target.id).map(|v| v.len()).unwrap_or(0);
-        if should_revert(b, a) {
-            return false;
+    fn accept(&self, target: &ChangeTarget, before: &AutofixObs, after: &AutofixObs) -> bool {
+        match self.phase {
+            Phase::Errors => {
+                let b = before.errors.get(&target.id).map(|v| v.len()).unwrap_or(0);
+                let a = after.errors.get(&target.id).map(|v| v.len()).unwrap_or(0);
+                if should_revert(b, a) {
+                    return false;
+                }
+                let mut report = self.report.lock().unwrap();
+                if !report.files_fixed.iter().any(|f| f == &target.id) {
+                    report.files_fixed.push(target.id.clone());
+                }
+                true
+            }
+            Phase::Warnings => {
+                // The warning gate is per ROUND, not per file (see `reject_round`), so
+                // once the round survives, every file it wrote is kept.
+                let mut report = self.report.lock().unwrap();
+                if !report.warnings_fixed.iter().any(|f| f == &target.id) {
+                    report.warnings_fixed.push(target.id.clone());
+                }
+                true
+            }
         }
-        let mut report = self.report.lock().unwrap();
-        if !report.files_fixed.iter().any(|f| f == &target.id) {
-            report.files_fixed.push(target.id.clone());
-        }
-        true
     }
 
-    fn reject_round(&self, before: &Errors, after: &Errors) -> bool {
-        let (before_total, after_total) = (total(&before.0), total(&after.0));
-        if after_total <= before_total {
-            return false;
-        }
-        // A rewrite can reduce its own file's errors while breaking something else (a
-        // shared header, say), so the project is judged as a whole before any per-file
-        // verdict is trusted.
+    fn reject_round(&self, before: &AutofixObs, after: &AutofixObs) -> bool {
         let writes = *self.last_round_writes.lock().unwrap();
         let round = *self.rounds.lock().unwrap();
-        self.log(format!(
-            "round {round} made the project worse ({before_total} → {after_total} errors); rolled back {writes} file(s)"
-        ));
-        true
+        match self.phase {
+            Phase::Errors => {
+                let (before_total, after_total) = (total(&before.errors), total(&after.errors));
+                if after_total <= before_total {
+                    return false;
+                }
+                // A rewrite can reduce its own file's errors while breaking something
+                // else (a shared header, say), so the project is judged as a whole
+                // before any per-file verdict is trusted.
+                self.log(format!(
+                    "round {round} made the project worse ({before_total} → {after_total} errors); rolled back {writes} file(s)"
+                ));
+                true
+            }
+            Phase::Warnings => {
+                let errors_after = total(&after.errors);
+                let safe_after = total(&safe_warnings(&after.warnings));
+                // Mirrors the error gate: no error may appear AND the safely-fixable
+                // count must actually fall below the level the phase started at.
+                if errors_after > 0 || safe_after >= self.safe_before {
+                    self.log(format!(
+                        "warning round {round} rolled back ({} → {} safe warning(s), {} error(s))",
+                        self.safe_before, safe_after, errors_after
+                    ));
+                    return true;
+                }
+                // Emitted here, not in `accept`: this is the one line per round, and
+                // `accept` runs once per file.
+                self.log(format!(
+                    "warning round {round} kept: {} → {} safe warning(s)",
+                    self.safe_before, safe_after
+                ));
+                false
+            }
+        }
     }
 
     async fn apply(&self, target: &ChangeTarget, content: &str) -> Result<(), String> {
@@ -672,17 +827,31 @@ impl ModifyDriver for AutofixAdapter<'_> {
             self.skip(&target.id, format!("write failed ({e})"));
             return Err(format!("write failed ({e})"));
         }
-        let before = self
-            .round_start
-            .lock()
-            .unwrap()
-            .get(&target.id)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        self.log(format!(
-            "applied fix to {} ({before} error(s) before)",
-            target.id
-        ));
+        match self.phase {
+            Phase::Errors => {
+                let before = self
+                    .round_start
+                    .lock()
+                    .unwrap()
+                    .errors
+                    .get(&target.id)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                self.log(format!(
+                    "applied fix to {} ({before} error(s) before)",
+                    target.id
+                ));
+            }
+            Phase::Warnings => {
+                // The number of warnings the fix was asked to clear, carried on the
+                // target because that is what the model was given.
+                self.log(format!(
+                    "applied warning fix to {} ({} warning(s) reported)",
+                    target.id,
+                    target.context.len()
+                ));
+            }
+        }
         *self.wrote_since_verify.lock().unwrap() += 1;
         Ok(())
     }
@@ -694,28 +863,32 @@ impl ModifyDriver for AutofixAdapter<'_> {
         ) {
             let _ = std::fs::write(&path, orig);
         }
-        let before = self
-            .round_start
-            .lock()
-            .unwrap()
-            .get(&target.id)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        let now = self
-            .current
-            .lock()
-            .unwrap()
-            .get(&target.id)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        self.log(format!("reverted {}: errors {before} → {now}", target.id));
-        let mut report = self.report.lock().unwrap();
-        if !report.files_reverted.iter().any(|f| f == &target.id) {
-            report.files_reverted.push(target.id.clone());
+        match self.phase {
+            Phase::Errors => {
+                let (before, now) = {
+                    let start = self.round_start.lock().unwrap();
+                    let current = self.current.lock().unwrap();
+                    (
+                        start.errors.get(&target.id).map(|v| v.len()).unwrap_or(0),
+                        current.errors.get(&target.id).map(|v| v.len()).unwrap_or(0),
+                    )
+                };
+                self.log(format!("reverted {}: errors {before} → {now}", target.id));
+                let mut report = self.report.lock().unwrap();
+                if !report.files_reverted.iter().any(|f| f == &target.id) {
+                    report.files_reverted.push(target.id.clone());
+                }
+            }
+            Phase::Warnings => {
+                // No per-file line here: the round-level message explains the rollback.
+                let mut report = self.report.lock().unwrap();
+                if !report.warnings_reverted.iter().any(|f| f == &target.id) {
+                    report.warnings_reverted.push(target.id.clone());
+                }
+            }
         }
-        drop(report);
         // The file is back to its original bytes, so the recorded diagnostics no longer
-        // describe it: the next verification must recompile.
+        // describe it: the next verification must re-measure.
         *self.needs_rebuild.lock().unwrap() = true;
         Ok(())
     }
@@ -745,130 +918,34 @@ pub async fn run_autofix(
             .log
             .push("no compile errors reported — skipping the error phase".to_string());
     }
-    let adapter = AutofixAdapter::new(driver, bases, errors, report);
+    let adapter = AutofixAdapter::errors(driver, bases, errors, report);
     let _ = run_modify_loop(&adapter, max_rounds).await;
-    let (mut report, mut backups, errors) = adapter.into_parts();
-    report.errors_after = total(&errors);
+    let (mut report, backups, obs) = adapter.into_parts();
+    report.errors_after = total(&obs.errors);
+    // `report.rounds` is the adapter's count for the phase that just ran. Phase 2
+    // reuses the field for its own count, so this one is kept aside first.
+    let error_rounds = report.rounds;
 
     // ── Phase 2: safely-fixable warnings ─────────────────────────────────────
     // Runs only on a clean compile (fixing warnings on a broken build proves
-    // nothing) and only for warnings classified as behaviour-preserving. The gate
-    // mirrors phase 1: keep the edits only if the project did not get worse —
-    // no error appeared AND the safe-warning count actually fell.
+    // nothing) and only for warnings classified as behaviour-preserving. The same
+    // spine drives it; what differs is the gate, which here is per ROUND rather
+    // than per file — keep the round only if no error appeared AND the
+    // safely-fixable count fell below where the phase began.
     let mut measured: Option<WarningsByFile> = None;
     if report.errors_after == 0 {
         let _ = driver.lint().await;
-        let mut warnings = driver.warnings().await;
+        let warnings = driver.warnings().await;
         report.safe_warnings_before = total(&safe_warnings(&warnings));
-        let mut tried_warn: BTreeSet<String> = BTreeSet::new();
-
-        for round in 0..max_rounds.max(1) {
-            let candidates: Vec<(String, Vec<String>)> = safe_warnings(&warnings)
-                .into_iter()
-                .filter(|(file, _)| !tried_warn.contains(file))
-                .collect();
-            if candidates.is_empty() {
-                break;
-            }
-            report.log.push(format!(
-                "warning round {}: {} file(s) with safely-fixable warnings",
-                round + 1,
-                candidates.len()
-            ));
-
-            let mut wrote: Vec<String> = Vec::new();
-            for (file, lines) in &candidates {
-                let Some(path) = resolve_source_path(file, bases) else {
-                    report.log.push(format!("skip {file}: not found on disk"));
-                    tried_warn.insert(file.clone());
-                    continue;
-                };
-                if !backups.contains_key(file) {
-                    match std::fs::read_to_string(&path) {
-                        Ok(orig) => {
-                            backups.insert(file.clone(), orig);
-                        }
-                        Err(e) => {
-                            report.log.push(format!("skip {file}: cannot read ({e})"));
-                            tried_warn.insert(file.clone());
-                            continue;
-                        }
-                    }
-                }
-                let Some(content) = driver.propose_warning_fix(file, &path, lines).await else {
-                    report
-                        .log
-                        .push(format!("skip {file}: no warning fix proposed"));
-                    tried_warn.insert(file.clone());
-                    continue;
-                };
-                if content.trim().is_empty() {
-                    report.log.push(format!("skip {file}: empty proposal"));
-                    tried_warn.insert(file.clone());
-                    continue;
-                }
-                if let Err(e) = std::fs::write(&path, &content) {
-                    report.log.push(format!("skip {file}: write failed ({e})"));
-                    tried_warn.insert(file.clone());
-                    continue;
-                }
-                report.log.push(format!(
-                    "applied warning fix to {file} ({} warning(s) reported)",
-                    lines.len()
-                ));
-                wrote.push(file.clone());
-            }
-            if wrote.is_empty() {
-                break; // nothing written — no point looping
-            }
-            report.warning_rounds += 1;
-
-            // Re-measure: rebuild (errors must stay at zero), re-lint, re-read.
-            let errors_after_round = total(&driver.rebuild().await);
-            let _ = driver.lint().await;
-            let warnings_after_round = driver.warnings().await;
-            let safe_after = total(&safe_warnings(&warnings_after_round));
-
-            if errors_after_round > 0 || safe_after >= report.safe_warnings_before {
-                for file in &wrote {
-                    if let (Some(orig), Some(path)) =
-                        (backups.get(file), resolve_source_path(file, bases))
-                    {
-                        let _ = std::fs::write(&path, orig);
-                    }
-                    tried_warn.insert(file.clone());
-                    if !report.warnings_reverted.contains(file) {
-                        report.warnings_reverted.push(file.clone());
-                    }
-                }
-                report.log.push(format!(
-                    "warning round {} rolled back ({} → {} safe warning(s), {} error(s))",
-                    round + 1,
-                    report.safe_warnings_before,
-                    safe_after,
-                    errors_after_round
-                ));
-                // Re-measure without the reverted edits.
-                let _ = driver.rebuild().await;
-                let _ = driver.lint().await;
-                warnings = driver.warnings().await;
-                continue;
-            }
-
-            for file in &wrote {
-                if !report.warnings_fixed.contains(file) {
-                    report.warnings_fixed.push(file.clone());
-                }
-            }
-            report.log.push(format!(
-                "warning round {} kept: {} → {} safe warning(s)",
-                round + 1,
-                report.safe_warnings_before,
-                safe_after
-            ));
-            warnings = warnings_after_round;
-        }
-        measured = Some(warnings);
+        let adapter = AutofixAdapter::warnings(driver, bases, warnings, report, backups);
+        let _ = run_modify_loop(&adapter, max_rounds).await;
+        let (mut warnings_report, _backups, obs) = adapter.into_parts();
+        // The adapter counts the rounds IT ran, which is what the warning phase's own
+        // number means; the error phase's count is put back alongside it.
+        warnings_report.warning_rounds = warnings_report.rounds;
+        warnings_report.rounds = error_rounds;
+        report = warnings_report;
+        measured = Some(obs.warnings);
     }
 
     // Final measurement — a lint already ran whenever phase 2 did.
