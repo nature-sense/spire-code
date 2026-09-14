@@ -1355,6 +1355,16 @@ fn cpp_parser() -> tree_sitter::Parser {
     p
 }
 
+/// The C++ tree-sitter parser, for callers that need node SPANS.
+///
+/// `parse_with_tree_sitter` deliberately produces the canonical `AstNode` model, which
+/// carries no byte offsets — so anything doing byte-precise work (locating the node a
+/// diagnostic points at, replacing exactly that span) needs the raw tree instead. Sharing
+/// this parser keeps "which grammar" in one place.
+pub(crate) fn cpp_parser_for_spans() -> tree_sitter::Parser {
+    cpp_parser()
+}
+
 /// Collect the named children of a node into a Vec (uses an internal cursor).
 fn named_children_of<'t>(node: tree_sitter::Node<'t>) -> Vec<tree_sitter::Node<'t>> {
     let mut out = Vec::new();
