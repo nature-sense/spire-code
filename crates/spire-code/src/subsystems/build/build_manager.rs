@@ -3596,6 +3596,33 @@ executable('{project_name}-{platform}',
                 }),
             },
             spire_core::actors::ToolInfo {
+                name: "modify_code".to_string(),
+                description: "Change existing code from a prompt: the model picks the files in scope, rewrites them, and a change is kept only if the project still builds and the tests that can run still pass — otherwise it is rolled back byte-for-byte. Target tests run only when a board is connected, and the result says which layer verification reached.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project or subproject directory path" },
+                        "prompt": { "type": "string", "description": "What to change, in the user's own words" },
+                        "platform": { "type": "string", "description": "Cross-platform target (e.g. rpi5) the change is verified against" },
+                        "scope": { "type": "array", "items": { "type": "string" }, "description": "Files the model may consider; defaults to the project's sources" }
+                    },
+                    "required": ["path", "prompt"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "modify_contract".to_string(),
+                description: "Resolve the HAL contract cascade for a platform: find the interfaces that are missing or drifted, generate their implementations, and keep a round only when the drift fell without breaking the build. Compile errors left in consumers are what Fix & Verify is for.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project directory path" },
+                        "platform": { "type": "string", "description": "Platform whose implementations are generated (required)" },
+                        "target": { "type": "string", "description": "Specific build target within the project" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
                 name: "build_autofix".to_string(),
                 description: "Fix & Verify pipeline: compile, fix compile errors with LLM rewrites, lint, fix safely-fixable warnings (dead stores/unused code), and re-verify — keeping only edits that measurably help and rolling back any that do not, until the project builds cleanly or the round cap is reached. Every write is compile-verified; warnings that need judgement are reported, never rewritten.".to_string(),
                 input_schema: serde_json::json!({
