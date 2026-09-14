@@ -49,6 +49,15 @@ pub struct Gap {
     pub missing: Vec<String>,
     /// Methods whose implementation no longer matches the contract's signature.
     pub drifted: Vec<String>,
+    /// The implementation file exists but is a **stub** (`SPIRE-HAL-STUB`): the methods
+    /// are declared and do nothing.
+    ///
+    /// Reported, but deliberately **not** a unit of drift on its own. Coverage already
+    /// counts a stub's methods as unmet — a body that does nothing is not an
+    /// implementation — so adding a unit here would double-count and make scaffolding an
+    /// interface look *worse* than having nothing at all. That was the integration test's
+    /// finding, and it is the difference between a measure and a mood.
+    pub stub: bool,
 }
 
 impl Gap {
@@ -57,7 +66,7 @@ impl Gap {
         format!("{}/{}", self.platform, self.interface)
     }
 
-    /// How much is wrong with this gap. The measure the round is judged on.
+    /// How much is wrong with this gap: the work the contract still asks for.
     pub fn size(&self) -> usize {
         self.missing.len() + self.drifted.len()
     }
@@ -474,6 +483,39 @@ pub async fn run_contract_modify(
     report
 }
 
+/// The drift measure, read from the real HAL coverage analysis.
+///
+/// This is the mapping between what the project actually contains and the measure the
+/// spine judges rounds on, and it is deliberately part of this module rather than the
+/// coordinator: the coverage analysis and the fill are plain functions over a project
+/// directory, so the cascade's most important seam can be exercised against a real
+/// project tree with no actors, no build, and no model.
+pub fn hal_gaps(root: &std::path::Path, platform: &str) -> Gaps {
+    let coverage = crate::build::generic_helpers::hal_platform_coverage_map(root);
+    let mut open = Vec::new();
+    for (plat, interfaces) in &coverage {
+        if !platform.is_empty() && plat != platform {
+            continue;
+        }
+        for (interface, cov) in interfaces {
+            // `implemented` is false for a stub as well as for a missing file: the
+            // SPIRE-HAL-STUB sentinel exists so coverage can tell "no implementation"
+            // apart from "declared, but does nothing yet". Both are work.
+            if cov.implemented {
+                continue;
+            }
+            open.push(Gap {
+                platform: plat.clone(),
+                interface: interface.clone(),
+                missing: cov.missing_sigs.iter().map(|m| m.name.clone()).collect(),
+                drifted: Vec::new(),
+                stub: cov.has_impl,
+            });
+        }
+    }
+    Gaps { open }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +588,7 @@ mod tests {
             interface: iface.to_string(),
             missing: (0..missing).map(|i| format!("m{i}")).collect(),
             drifted: (0..drifted).map(|i| format!("d{i}")).collect(),
+            stub: false,
         }
     }
 
@@ -708,5 +751,98 @@ mod tests {
         assert_eq!(report.gaps_skipped.len(), 0);
         assert_eq!(backend.applied(), 0, "nothing was filled");
         assert_eq!(report.summary().contains("drift 0 → 0"), true, "{report:?}");
+    }
+
+    /// The measure and the fill against a **real** HAL project tree: no fake, no actors,
+    /// no model.
+    ///
+    /// This is the seam the whole cascade rests on — `hal_gaps` mapping the coverage
+    /// analysis onto the measure, and the fill that `propose`/`apply` drive — and it is
+    /// the one part of the flow that can be exercised end to end without a model or a
+    /// board. Until now it never had been, so this is the first time the cascade has
+    /// touched the real thing.
+    #[tokio::test]
+    async fn measures_and_fills_a_real_hal_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("hal").join("api")).unwrap();
+        std::fs::create_dir_all(root.join("hal").join("implementations").join("rpi5")).unwrap();
+        std::fs::write(
+            root.join("hal").join("api").join("camera.hpp"),
+            "#pragma once\n\nclass CameraHal {\npublic:\n    virtual ~CameraHal() = default;\n    \
+             virtual void start() = 0;\n    virtual int frame_count() const = 0;\n};\n",
+        )
+        .unwrap();
+
+        // Nothing is implemented: the interface is a gap with both methods outstanding.
+        let before = hal_gaps(root, "rpi5");
+        let gap = before
+            .open
+            .iter()
+            .find(|g| g.interface == "camera")
+            .unwrap_or_else(|| panic!("the contract should be a gap: {before:?}"));
+        assert!(gap.missing.len() >= 2, "both methods are missing: {gap:?}");
+        assert!(!gap.stub, "there is no implementation file at all");
+        let drift_before = before.size();
+
+        // Fill it for real: the plan `propose` would return, and the apply `apply` runs.
+        let planned = crate::actors::hal_fill::plan(root, "rpi5", &["camera".to_string()]);
+        let items = planned
+            .get("plan")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !items.is_empty(),
+            "the fill should have work to do: {planned}"
+        );
+
+        let applied = crate::actors::hal_fill::apply(
+            root,
+            &serde_json::Value::Array(items),
+            Box::pin(async { Ok(()) }),
+        )
+        .await;
+        assert_eq!(
+            applied
+                .get("failures")
+                .and_then(|v| v.as_array())
+                .map(|f| f.len()),
+            Some(0),
+            "the fill reported failures: {applied}"
+        );
+
+        // The implementation exists now — but it is a STUB, and that is the finding this
+        // test exists for: the deterministic fill scaffolds, it does not implement.
+        let after = hal_gaps(root, "rpi5");
+        let gap = after
+            .open
+            .iter()
+            .find(|g| g.interface == "camera")
+            .unwrap_or_else(|| panic!("a stub is not an implementation: {after:?}"));
+        assert!(gap.stub, "the file is there and marked pending: {gap:?}");
+        assert!(
+            !gap.missing.is_empty(),
+            "a stub body satisfies none of the contract's methods: {gap:?}"
+        );
+        assert_eq!(
+            after.size(),
+            drift_before,
+            "so the measure does not fall, and the cascade would roll this round back \
+             rather than accept it — closing drift needs the LLM-backed generation \
+             (hal_generate_impl), not the scaffold"
+        );
+
+        // And what landed on disk really is the marked scaffold.
+        let written = std::fs::read_dir(root.join("hal").join("implementations").join("rpi5"))
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            written.contains(crate::build::generic_helpers::SPIRE_HAL_STUB_SENTINEL),
+            "the fill writes the pending sentinel"
+        );
     }
 }
