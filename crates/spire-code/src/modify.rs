@@ -141,8 +141,10 @@ impl ModifyReport {
 /// Run the loop: attempt each target once per round, keeping only the writes the
 /// driver accepts and rolling back the rest.
 ///
-/// `max_rounds` bounds the work. Each target is attempted at most once across the
-/// whole run, so a bad change can never oscillate.
+/// `max_rounds` bounds the work. A target that is skipped or rolled back is never
+/// retried; one that was **kept** stays eligible, because an improving change may
+/// not be finished. Each such retry strictly improves the measure, so it
+/// converges rather than oscillating.
 pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> ModifyReport {
     let mut report = ModifyReport::default();
     let mut tried: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -162,16 +164,17 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
             .push(format!("round {}: {} target(s)", round + 1, pending.len()));
 
         for target in pending {
-            tried.insert(target.id.clone());
             report.attempted.push(target.id.clone());
 
             let before = driver.verify().await;
             let Some(content) = driver.propose(&target).await else {
+                tried.insert(target.id.clone()); // declined: never retried
                 report.log.push(format!("skip {}: no proposal", target.id));
                 report.skipped.push(target.id.clone());
                 continue;
             };
             if let Err(err) = driver.apply(&target, &content).await {
+                tried.insert(target.id.clone());
                 report.log.push(format!("skip {}: {err}", target.id));
                 report.skipped.push(target.id.clone());
                 continue;
@@ -179,13 +182,22 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
 
             let after = driver.verify().await;
             if driver.accept(&target, &before, &after) {
-                report.kept.push(target.id.clone());
+                // Kept — and deliberately left eligible for the next round: a
+                // change that improved things may not be finished, and taking it
+                // further is exactly what verification said is still needed. Each
+                // such retry strictly improves the measure, so it converges (and
+                // `max_rounds` bounds it regardless).
+                if !report.kept.contains(&target.id) {
+                    report.kept.push(target.id.clone());
+                }
             } else {
+                // No gain, or a regression: restore it and never retry.
                 if let Err(err) = driver.revert(&target).await {
                     report
                         .log
                         .push(format!("revert {} failed: {err}", target.id));
                 }
+                tried.insert(target.id.clone());
                 report
                     .log
                     .push(format!("reverted {}: no net gain", target.id));
@@ -219,6 +231,10 @@ mod tests {
     /// the script, and falls back to `last` once the script runs out.
     struct Fake {
         ids: Vec<String>,
+        /// The world as it currently stands — seeded from `initial` and replaced
+        /// by every `verify()`. `targets()` reads this, exactly like the real
+        /// drivers read the graph: an already-clean file is not a target.
+        current: Mutex<BTreeMap<String, usize>>,
         script: Mutex<Vec<BTreeMap<String, usize>>>,
         last: BTreeMap<String, usize>,
         proposals: BTreeMap<String, String>,
@@ -228,11 +244,13 @@ mod tests {
     impl Fake {
         fn new(
             ids: &[&str],
+            initial: BTreeMap<String, usize>,
             script: Vec<BTreeMap<String, usize>>,
             last: BTreeMap<String, usize>,
         ) -> Self {
             Self {
                 ids: ids.iter().map(|s| s.to_string()).collect(),
+                current: Mutex::new(initial),
                 script: Mutex::new(script),
                 last,
                 proposals: BTreeMap::new(),
@@ -259,8 +277,10 @@ mod tests {
         type Obs = Problems;
 
         fn targets(&self) -> Vec<ChangeTarget> {
+            let current = self.current.lock().unwrap();
             self.ids
                 .iter()
+                .filter(|id| current.get(*id).copied().unwrap_or(0) > 0)
                 .map(|id| ChangeTarget::new(id.clone(), format!("/tmp/{id}")))
                 .collect()
         }
@@ -270,12 +290,16 @@ mod tests {
         }
 
         async fn verify(&self) -> Problems {
-            let mut script = self.script.lock().unwrap();
-            if script.is_empty() {
-                Problems(self.last.clone())
-            } else {
-                Problems(script.remove(0))
-            }
+            let next = {
+                let mut script = self.script.lock().unwrap();
+                if script.is_empty() {
+                    self.last.clone()
+                } else {
+                    script.remove(0)
+                }
+            };
+            *self.current.lock().unwrap() = next.clone();
+            Problems(next)
         }
 
         fn accept(&self, target: &ChangeTarget, before: &Problems, after: &Problems) -> bool {
@@ -308,6 +332,7 @@ mod tests {
     async fn keeps_a_change_that_helps() {
         let driver = Fake::new(
             &["a"],
+            obs(&[("a", 3)]),
             vec![obs(&[("a", 3)]), obs(&[("a", 0)])],
             obs(&[("a", 0)]),
         )
@@ -326,6 +351,7 @@ mod tests {
     async fn rolls_back_a_change_that_does_not_help() {
         let driver = Fake::new(
             &["a"],
+            obs(&[("a", 2)]),
             vec![obs(&[("a", 2)]), obs(&[("a", 2)])],
             obs(&[("a", 2)]),
         )
@@ -343,6 +369,7 @@ mod tests {
     async fn rolls_back_a_regression() {
         let driver = Fake::new(
             &["a"],
+            obs(&[("a", 1)]),
             vec![obs(&[("a", 1)]), obs(&[("a", 4)])],
             obs(&[("a", 4)]),
         )
@@ -356,7 +383,12 @@ mod tests {
     /// No proposal is a skip, not a failure, and the target is not retried.
     #[tokio::test]
     async fn skips_a_target_with_no_proposal() {
-        let driver = Fake::new(&["a"], vec![obs(&[("a", 1)])], obs(&[("a", 1)]));
+        let driver = Fake::new(
+            &["a"],
+            obs(&[("a", 1)]),
+            vec![obs(&[("a", 1)])],
+            obs(&[("a", 1)]),
+        );
         let report = run_modify_loop(&driver, 5).await;
 
         assert_eq!(report.skipped, vec!["a"]);
@@ -364,11 +396,13 @@ mod tests {
         assert_eq!(report.rounds, 1, "a skip must not spin: {report:?}");
     }
 
-    /// A target is attempted at most once, so a run cannot oscillate.
+    /// A change that gains nothing is rolled back and NOT retried, so a run
+    /// cannot oscillate on a target the model keeps getting wrong.
     #[tokio::test]
-    async fn attempts_each_target_once() {
+    async fn does_not_retry_a_failed_change() {
         let driver = Fake::new(
             &["a"],
+            obs(&[("a", 1)]),
             vec![obs(&[("a", 1)]), obs(&[("a", 1)])],
             obs(&[("a", 1)]),
         )
@@ -377,5 +411,31 @@ mod tests {
 
         assert_eq!(report.attempted, vec!["a"], "listed once: {report:?}");
         assert_eq!(report.rounds, 1);
+    }
+
+    /// An improving change that does not FINISH the job is kept *and* retried in
+    /// the next round, so the run converges — the behaviour `build/autofix.rs`
+    /// depends on (its own test pins 3 → 1 → 0 in two rounds).
+    #[tokio::test]
+    async fn keeps_retrying_an_improving_target_until_clean() {
+        let driver = Fake::new(
+            &["a"],
+            obs(&[("a", 3)]),
+            vec![
+                obs(&[("a", 3)]),
+                obs(&[("a", 1)]),
+                obs(&[("a", 1)]),
+                obs(&[("a", 0)]),
+            ],
+            obs(&[("a", 0)]),
+        )
+        .proposing("a", "better");
+        let report = run_modify_loop(&driver, 5).await;
+
+        assert!(report.success, "{report:?}");
+        assert_eq!(report.rounds, 2, "3 → 1 → 0: {report:?}");
+        assert_eq!(report.kept, vec!["a"], "listed once, not twice");
+        assert!(report.reverted.is_empty());
+        assert_eq!(driver.on_disk("a"), "better");
     }
 }
