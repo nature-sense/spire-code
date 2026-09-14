@@ -3043,6 +3043,56 @@ pub fn compile_fix_prompt(path: &str, content: &str, errors: &[String]) -> Strin
     out
 }
 
+/// Prompt for `modify/code`: carry out a free-text request by rewriting this file.
+///
+/// Deliberately narrow, in the same spirit as `compile_fix_prompt`: the request is the
+/// only reason to touch anything, so the model is told to leave the rest of the file
+/// byte-identical. A free-text request is exactly where a model is most tempted to
+/// "improve" neighbouring code, and that is the opposite of what a verified,
+/// rollback-safe change is for.
+pub fn modify_code_prompt(path: &str, content: &str, request: &str) -> String {
+    let mut out = String::new();
+    out.push_str("Change this C/C++ file by rewriting the WHOLE file, to carry out the request.\n");
+    out.push_str(&format!("File: {path}\n\nRequest:\n{request}\n\n"));
+    out.push_str(&format!("Current content:\n```cpp\n{content}\n```\n\n"));
+    out.push_str(
+        "Return ONLY the complete file inside a single ```cpp block.\n\
+         Make the smallest change that carries out the request, and keep every other \
+         line, signature, include and behaviour byte-identical: do NOT reformat, do NOT \
+         reorder includes, do NOT rename anything the request did not name, and add no \
+         commentary outside the code block. If the request needs no change in this file, \
+         return the file exactly as it is.",
+    );
+    out
+}
+
+/// Prompt for the file-selection step of `modify/code`: which of these files does the
+/// request touch?
+///
+/// The answer is a plain list of paths, for two reasons. The reply stays small and
+/// cheap to parse instead of holding several files' contents in one answer; and each
+/// rewrite then goes through the same single-file path — and the same structural check
+/// — that the compile-fix loop already trusts, so nothing new is written unattended
+/// without being parsed first.
+pub fn modify_scope_prompt(files: &[String], request: &str) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "A change has been requested. List ONLY the files below that must be edited to \
+         carry it out.\n\nRequest:\n",
+    );
+    out.push_str(request);
+    out.push_str("\n\nFiles:\n");
+    for file in files {
+        out.push_str(&format!("- {file}\n"));
+    }
+    out.push_str(
+        "\nAnswer with one file path per line, exactly as written above, and nothing \
+         else. No explanations, no bullets, no code fences. If no file needs to change, \
+         answer with the single word NONE.",
+    );
+    out
+}
+
 /// Prompt for the safe-warning phase: clear exactly the listed warnings without
 /// changing behaviour.
 ///
