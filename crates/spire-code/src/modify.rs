@@ -182,7 +182,9 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
                 report.kept.push(target.id.clone());
             } else {
                 if let Err(err) = driver.revert(&target).await {
-                    report.log.push(format!("revert {} failed: {err}", target.id));
+                    report
+                        .log
+                        .push(format!("revert {} failed: {err}", target.id));
                 }
                 report
                     .log
@@ -224,7 +226,11 @@ mod tests {
     }
 
     impl Fake {
-        fn new(ids: &[&str], script: Vec<BTreeMap<String, usize>>, last: BTreeMap<String, usize>) -> Self {
+        fn new(
+            ids: &[&str],
+            script: Vec<BTreeMap<String, usize>>,
+            last: BTreeMap<String, usize>,
+        ) -> Self {
             Self {
                 ids: ids.iter().map(|s| s.to_string()).collect(),
                 script: Mutex::new(script),
@@ -287,10 +293,7 @@ mod tests {
         }
 
         async fn revert(&self, target: &ChangeTarget) -> Result<(), String> {
-            self.applied
-                .lock()
-                .unwrap()
-                .remove(&target.id);
+            self.applied.lock().unwrap().remove(&target.id);
             Ok(())
         }
     }
@@ -303,8 +306,12 @@ mod tests {
     /// is reported.
     #[tokio::test]
     async fn keeps_a_change_that_helps() {
-        let driver = Fake::new(&["a"], vec![obs(&[("a", 3)]), obs(&[("a", 0)])], obs(&[("a", 0)]))
-            .proposing("a", "fixed");
+        let driver = Fake::new(
+            &["a"],
+            vec![obs(&[("a", 3)]), obs(&[("a", 0)])],
+            obs(&[("a", 0)]),
+        )
+        .proposing("a", "fixed");
         let report = run_modify_loop(&driver, 5).await;
 
         assert!(report.success, "{report:?}");
@@ -317,8 +324,12 @@ mod tests {
     /// A change that does not reduce the problem count is rolled back.
     #[tokio::test]
     async fn rolls_back_a_change_that_does_not_help() {
-        let driver = Fake::new(&["a"], vec![obs(&[("a", 2)]), obs(&[("a", 2)])], obs(&[("a", 2)]))
-            .proposing("a", "nonsense");
+        let driver = Fake::new(
+            &["a"],
+            vec![obs(&[("a", 2)]), obs(&[("a", 2)])],
+            obs(&[("a", 2)]),
+        )
+        .proposing("a", "nonsense");
         let report = run_modify_loop(&driver, 5).await;
 
         assert!(!report.success);
@@ -330,8 +341,12 @@ mod tests {
     /// A regression (more problems than before) is rolled back too.
     #[tokio::test]
     async fn rolls_back_a_regression() {
-        let driver = Fake::new(&["a"], vec![obs(&[("a", 1)]), obs(&[("a", 4)])], obs(&[("a", 4)]))
-            .proposing("a", "worse");
+        let driver = Fake::new(
+            &["a"],
+            vec![obs(&[("a", 1)]), obs(&[("a", 4)])],
+            obs(&[("a", 4)]),
+        )
+        .proposing("a", "worse");
         let report = run_modify_loop(&driver, 5).await;
 
         assert_eq!(report.reverted, vec!["a"]);
@@ -352,8 +367,12 @@ mod tests {
     /// A target is attempted at most once, so a run cannot oscillate.
     #[tokio::test]
     async fn attempts_each_target_once() {
-        let driver = Fake::new(&["a"], vec![obs(&[("a", 1)]), obs(&[("a", 1)])], obs(&[("a", 1)]))
-            .proposing("a", "still broken");
+        let driver = Fake::new(
+            &["a"],
+            vec![obs(&[("a", 1)]), obs(&[("a", 1)])],
+            obs(&[("a", 1)]),
+        )
+        .proposing("a", "still broken");
         let report = run_modify_loop(&driver, 5).await;
 
         assert_eq!(report.attempted, vec!["a"], "listed once: {report:?}");
