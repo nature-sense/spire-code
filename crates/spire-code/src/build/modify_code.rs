@@ -69,28 +69,34 @@ pub trait CodeModifyBackend: Send + Sync {
     async fn build(&self) -> ErrorsByFile;
 
     /// Run the host tests. `None` when there is nothing to run.
-    async fn host_tests(&self) -> Option<usize>;
+    async fn host_tests(&self) -> Option<bool>;
 
     /// Run the target tests on the connected board. `None` when no board is connected
     /// for the selected platform, which is what makes verification host-only.
-    async fn target_tests(&self) -> Option<usize>;
+    async fn target_tests(&self) -> Option<bool>;
 }
 
-/// The measured state of the project: what compiles, and what passes.
+/// The measured state of the project: what compiles, and whether the tests passed.
+///
+/// The test legs are **pass/fail**, not counts. The build tools report `success` plus
+/// free-form output, with no structured failure count to read — and parsing the
+/// runner's text would be framework-specific, in the one place where a mis-parse would
+/// either hide a regression or invent one. Pass/fail is exactly enough for the only
+/// question the loop asks: "did this get worse?" means passed → failed.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct CodeObs {
     build_errors: ErrorsByFile,
-    /// Host test failures; `None` when there was nothing to run.
-    host_failures: Option<usize>,
-    /// Target test failures; `None` when no board was connected to run them on.
-    target_failures: Option<usize>,
+    /// Host tests: `Some(true)` passed, `Some(false)` failed, `None` nothing to run.
+    host_tests_passed: Option<bool>,
+    /// Target tests: `None` when no board was connected, so they never ran.
+    target_tests_passed: Option<bool>,
 }
 
 impl Observation for CodeObs {
     fn is_clean(&self) -> bool {
         total(&self.build_errors) == 0
-            && self.host_failures.map_or(true, |f| f == 0)
-            && self.target_failures.map_or(true, |f| f == 0)
+            && self.host_tests_passed != Some(false)
+            && self.target_tests_passed != Some(false)
     }
 }
 
@@ -98,16 +104,20 @@ fn total(errors: &ErrorsByFile) -> usize {
     errors.values().map(|v| v.len()).sum()
 }
 
-/// A test leg got worse only when it ran *both* times and the count rose: a leg that
-/// could not run cannot have regressed, and saying otherwise would roll back honest
-/// work for want of hardware.
-fn worse(before: Option<usize>, after: Option<usize>) -> bool {
-    matches!((before, after), (Some(b), Some(a)) if a > b)
+/// A test leg got worse only when it passed *and then failed*. A leg that never ran
+/// cannot have regressed, and treating it as a regression would roll back honest work
+/// for want of hardware.
+fn worse(before: Option<bool>, after: Option<bool>) -> bool {
+    matches!((before, after), (Some(true), Some(false)))
 }
 
-/// Render a test count for the log, distinguishing "passed" from "never ran".
-fn show(count: Option<usize>) -> String {
-    count.map_or_else(|| "not run".to_string(), |n| n.to_string())
+/// Render a test leg for the log, distinguishing "passed" from "never ran".
+fn show(passed: Option<bool>) -> String {
+    match passed {
+        Some(true) => "passed".to_string(),
+        Some(false) => "FAILED".to_string(),
+        None => "not run".to_string(),
+    }
 }
 
 /// Adapts a [`CodeModifyBackend`] and one plan to the modify spine.
@@ -143,24 +153,24 @@ impl CodeDriver<'_> {
         report.rounds = rounds;
         report.build_errors_before = total(&before.build_errors);
         report.build_errors_after = total(&after.build_errors);
-        report.host_failures_before = before.host_failures;
-        report.host_failures_after = after.host_failures;
-        report.target_failures_before = before.target_failures;
-        report.target_failures_after = after.target_failures;
+        report.host_tests_passed_before = before.host_tests_passed;
+        report.host_tests_passed_after = after.host_tests_passed;
+        report.target_tests_passed_before = before.target_tests_passed;
+        report.target_tests_passed_after = after.target_tests_passed;
 
         // Layered verification, stated plainly rather than left to be inferred.
-        report.verified = if after.target_failures.is_some() {
+        report.verified = if after.target_tests_passed.is_some() {
             Verified::WithTarget
         } else {
             Verified::HostOnly
         };
-        if after.target_failures.is_none() {
+        if after.target_tests_passed.is_none() {
             report.caveats.push(
                 "no board connected: verified against the host only, target tests not run"
                     .to_string(),
             );
         }
-        if after.host_failures.is_none() {
+        if after.host_tests_passed.is_none() {
             report
                 .caveats
                 .push("no host tests to run for this project".to_string());
@@ -191,10 +201,10 @@ pub struct ModifyCodeReport {
     pub files_skipped: Vec<String>,
     pub build_errors_before: usize,
     pub build_errors_after: usize,
-    pub host_failures_before: Option<usize>,
-    pub host_failures_after: Option<usize>,
-    pub target_failures_before: Option<usize>,
-    pub target_failures_after: Option<usize>,
+    pub host_tests_passed_before: Option<bool>,
+    pub host_tests_passed_after: Option<bool>,
+    pub target_tests_passed_before: Option<bool>,
+    pub target_tests_passed_after: Option<bool>,
     /// What could not be checked, in the user's words.
     pub caveats: Vec<String>,
     pub log: Vec<String>,
@@ -213,10 +223,10 @@ impl ModifyCodeReport {
             files_skipped: Vec::new(),
             build_errors_before: 0,
             build_errors_after: 0,
-            host_failures_before: None,
-            host_failures_after: None,
-            target_failures_before: None,
-            target_failures_after: None,
+            host_tests_passed_before: None,
+            host_tests_passed_after: None,
+            target_tests_passed_before: None,
+            target_tests_passed_after: None,
             caveats: Vec::new(),
             log: Vec::new(),
             error: None,
@@ -251,10 +261,10 @@ impl ModifyCodeReport {
             "verify: build {} → {} error(s), host tests {} → {}, target tests {} → {}\n",
             self.build_errors_before,
             self.build_errors_after,
-            show(self.host_failures_before),
-            show(self.host_failures_after),
-            show(self.target_failures_before),
-            show(self.target_failures_after),
+            show(self.host_tests_passed_before),
+            show(self.host_tests_passed_after),
+            show(self.target_tests_passed_before),
+            show(self.target_tests_passed_after),
         ));
         for caveat in &self.caveats {
             out.push_str(&format!("note: {caveat}\n"));
@@ -303,8 +313,8 @@ impl ModifyDriver for CodeDriver<'_> {
         }
         let obs = CodeObs {
             build_errors: self.backend.build().await,
-            host_failures: self.backend.host_tests().await,
-            target_failures: self.backend.target_tests().await,
+            host_tests_passed: self.backend.host_tests().await,
+            target_tests_passed: self.backend.target_tests().await,
         };
         {
             let mut before = self.before.lock().unwrap();
@@ -328,20 +338,20 @@ impl ModifyDriver for CodeDriver<'_> {
 
     fn reject_round(&self, before: &CodeObs, after: &CodeObs) -> bool {
         let build_worse = total(&after.build_errors) > total(&before.build_errors);
-        let host_worse = worse(before.host_failures, after.host_failures);
-        let target_worse = worse(before.target_failures, after.target_failures);
+        let host_worse = worse(before.host_tests_passed, after.host_tests_passed);
+        let target_worse = worse(before.target_tests_passed, after.target_tests_passed);
         if !(build_worse || host_worse || target_worse) {
             return false;
         }
         let mut report = self.report.lock().unwrap();
         report.log.push(format!(
-            "rolled back: build errors {} → {}, host failures {} → {}, target failures {} → {}",
+            "rolled back: build errors {} → {}, host tests {} → {}, target tests {} → {}",
             total(&before.build_errors),
             total(&after.build_errors),
-            show(before.host_failures),
-            show(after.host_failures),
-            show(before.target_failures),
-            show(after.target_failures),
+            show(before.host_tests_passed),
+            show(after.host_tests_passed),
+            show(before.target_tests_passed),
+            show(after.target_tests_passed),
         ));
         true
     }
@@ -447,8 +457,8 @@ mod tests {
     struct Fake {
         plan: Option<Vec<PlannedChange>>,
         builds: Mutex<Vec<ErrorsByFile>>,
-        host: Mutex<Vec<Option<usize>>>,
-        target: Mutex<Vec<Option<usize>>>,
+        host: Mutex<Vec<Option<bool>>>,
+        target: Mutex<Vec<Option<bool>>>,
         build_calls: Mutex<usize>,
     }
 
@@ -482,12 +492,12 @@ mod tests {
             self
         }
 
-        fn hosting(self, host: Vec<Option<usize>>) -> Self {
+        fn hosting(self, host: Vec<Option<bool>>) -> Self {
             *self.host.lock().unwrap() = host;
             self
         }
 
-        fn targeting(self, target: Vec<Option<usize>>) -> Self {
+        fn targeting(self, target: Vec<Option<bool>>) -> Self {
             *self.target.lock().unwrap() = target;
             self
         }
@@ -508,11 +518,11 @@ mod tests {
             step(&self.builds)
         }
 
-        async fn host_tests(&self) -> Option<usize> {
+        async fn host_tests(&self) -> Option<bool> {
             step(&self.host)
         }
 
-        async fn target_tests(&self) -> Option<usize> {
+        async fn target_tests(&self) -> Option<bool> {
             step(&self.target)
         }
     }
@@ -547,7 +557,7 @@ mod tests {
 
         let backend = Fake::new(vec![errs(&[]), errs(&[])])
             .planning(vec![(name.clone(), fixed.to_string())])
-            .hosting(vec![Some(0), Some(0)])
+            .hosting(vec![Some(true), Some(true)])
             .targeting(vec![None, None]);
         let report = run_code_modify(&backend, "fix it", &[tmp.path().to_path_buf()], 3).await;
 
@@ -574,7 +584,7 @@ mod tests {
 
         let backend = Fake::new(vec![errs(&[]), errs(&[("a.cpp", 2)])])
             .planning(vec![(name.clone(), "int broken( ;\n".to_string())])
-            .hosting(vec![Some(0), Some(0)])
+            .hosting(vec![Some(true), Some(true)])
             .targeting(vec![None, None]);
         let report = run_code_modify(&backend, "break it", &[tmp.path().to_path_buf()], 3).await;
 
@@ -598,15 +608,15 @@ mod tests {
 
         let backend = Fake::new(vec![errs(&[]), errs(&[])])
             .planning(vec![(name.clone(), "int changed;\n".to_string())])
-            .hosting(vec![Some(0), Some(3)])
+            .hosting(vec![Some(true), Some(false)])
             .targeting(vec![None, None]);
         let report =
             run_code_modify(&backend, "break the tests", &[tmp.path().to_path_buf()], 3).await;
 
         assert!(!report.success);
         assert_eq!(report.files_reverted, vec![name]);
-        assert_eq!(report.host_failures_before, Some(0));
-        assert_eq!(report.host_failures_after, Some(3));
+        assert_eq!(report.host_tests_passed_before, Some(true));
+        assert_eq!(report.host_tests_passed_after, Some(false));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "int original;\n");
     }
 
@@ -617,13 +627,13 @@ mod tests {
 
         let backend = Fake::new(vec![errs(&[]), errs(&[])])
             .planning(vec![(name.clone(), "int changed;\n".to_string())])
-            .hosting(vec![Some(0), Some(0)])
-            .targeting(vec![Some(0), Some(0)]);
+            .hosting(vec![Some(true), Some(true)])
+            .targeting(vec![Some(true), Some(true)]);
         let report = run_code_modify(&backend, "change it", &[tmp.path().to_path_buf()], 3).await;
 
         assert!(report.success, "{report:?}");
         assert_eq!(report.verified, Verified::WithTarget);
-        assert_eq!(report.target_failures_after, Some(0));
+        assert_eq!(report.target_tests_passed_after, Some(true));
         assert!(
             !report
                 .caveats
@@ -643,8 +653,8 @@ mod tests {
 
         let backend = Fake::new(vec![errs(&[]), errs(&[])])
             .planning(vec![(name.clone(), "int changed;\n".to_string())])
-            .hosting(vec![Some(0), Some(0)])
-            .targeting(vec![Some(0), Some(2)]);
+            .hosting(vec![Some(true), Some(true)])
+            .targeting(vec![Some(true), Some(false)]);
         let report = run_code_modify(
             &backend,
             "break it on the board",
@@ -655,7 +665,7 @@ mod tests {
 
         assert!(!report.success);
         assert_eq!(report.files_reverted, vec![name]);
-        assert_eq!(report.target_failures_after, Some(2));
+        assert_eq!(report.target_tests_passed_after, Some(false));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "int original;\n");
     }
 
@@ -683,7 +693,7 @@ mod tests {
 
         let backend = Fake::new(vec![errs(&[]), errs(&[])])
             .planning(vec![(name, "int changed;\n".to_string())])
-            .hosting(vec![Some(0), Some(0)])
+            .hosting(vec![Some(true), Some(true)])
             .targeting(vec![None, None]);
         let report = run_code_modify(&backend, "change it", &[tmp.path().to_path_buf()], 3).await;
 
