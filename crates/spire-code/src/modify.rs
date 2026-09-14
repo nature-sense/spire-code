@@ -118,6 +118,8 @@ pub trait ModifyDriver {
 /// What a run did, and whether it left the code clean.
 #[derive(Debug, Default)]
 pub struct ModifyReport {
+    /// Rounds that actually applied at least one change. A round where every
+    /// proposal was declined or unwritable changed nothing, so it does not count.
     pub rounds: usize,
     /// Every target the loop attempted, in order (kept + reverted).
     pub attempted: Vec<String>,
@@ -179,7 +181,6 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
         if pending.is_empty() {
             break;
         }
-        report.rounds = round + 1;
         report
             .log
             .push(format!("round {}: {} target(s)", round + 1, pending.len()));
@@ -210,6 +211,10 @@ pub async fn run_modify_loop<D: ModifyDriver>(driver: &D, max_rounds: usize) -> 
         if wrote.is_empty() {
             break; // nothing was written, so there is nothing to verify or decide
         }
+        // A round counts as one only when it actually changed something: a round in
+        // which every proposal was declined or unwritable did not. This is the same
+        // definition `AutofixReport::rounds` uses, so the two reports line up.
+        report.rounds = round + 1;
 
         let after = driver.verify().await;
 
@@ -469,7 +474,7 @@ mod tests {
 
         assert_eq!(report.skipped, vec!["a"]);
         assert!(report.kept.is_empty() && report.reverted.is_empty());
-        assert_eq!(report.rounds, 1, "a skip must not spin: {report:?}");
+        assert_eq!(report.rounds, 0, "nothing was written, so no round counted");
     }
 
     /// A change that gains nothing is rolled back and NOT retried, so a run
