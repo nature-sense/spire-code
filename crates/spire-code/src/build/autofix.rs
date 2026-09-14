@@ -20,6 +20,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use crate::modify::{run_modify_loop, ChangeTarget, ModifyDriver, Observation};
 
 /// Diagnostic lines currently recorded for a file, keyed by that file.
 pub type ErrorsByFile = BTreeMap<String, Vec<String>>;
@@ -449,6 +452,275 @@ pub fn resolve_platform(
     Ok(None)
 }
 
+/// What a verification observed. This driver measures compile errors and nothing
+/// else, so the errors are the whole observation.
+#[derive(Clone, Default)]
+struct Errors(ErrorsByFile);
+
+impl Observation for Errors {
+    fn is_clean(&self) -> bool {
+        total(&self.0) == 0
+    }
+}
+
+/// Expose autofix's error phase to the general modify spine.
+///
+/// The spine owns the control flow — rounds, the tried set, rolling back a change
+/// that earned nothing, and rejecting a round before any per-file verdict — while
+/// everything autofix-specific stays here: the report, the log wording, the byte
+/// backups, and the two acceptance rules.
+///
+/// ## The rebuild cadence is part of the contract
+///
+/// [`AutofixDriver::errors`] *reads* the diagnostics already recorded, while
+/// `rebuild` recompiles. The spine verifies once before a round's writes and once
+/// after, so this dispatches on exactly that: read before, rebuild after, and also
+/// rebuild whenever a rollback has left the recorded diagnostics describing a file
+/// that is no longer on disk. That keeps the number of compiles identical to the
+/// hand-written loop this replaced — which is what lets the driver's existing tests
+/// stand as the migration's regression net.
+struct AutofixAdapter<'a> {
+    driver: &'a dyn AutofixDriver,
+    bases: &'a [PathBuf],
+    /// Built as the loop runs and handed back at the end. The log lines are
+    /// autofix's, so the UI and the tests keep reading what they always read.
+    report: Mutex<AutofixReport>,
+    /// The ORIGINAL bytes of each file, taken once, so a rollback always restores the
+    /// state the project had before this run started.
+    backups: Mutex<BTreeMap<String, String>>,
+    /// What the loop is working from, and where `targets` comes from.
+    current: Mutex<ErrorsByFile>,
+    /// The observation at the start of the round, so a rollback can explain itself in
+    /// the error counts a user can see.
+    round_start: Mutex<ErrorsByFile>,
+    /// Writes since the previous verification.
+    wrote_since_verify: Mutex<usize>,
+    /// Files written during the round that just ended, for the rejection log.
+    last_round_writes: Mutex<usize>,
+    /// Set by a rollback: the recorded diagnostics no longer describe the disk.
+    needs_rebuild: Mutex<bool>,
+    /// Rounds that changed something — what `AutofixReport::rounds` means.
+    rounds: Mutex<usize>,
+}
+
+impl<'a> AutofixAdapter<'a> {
+    fn new(
+        driver: &'a dyn AutofixDriver,
+        bases: &'a [PathBuf],
+        errors: ErrorsByFile,
+        report: AutofixReport,
+    ) -> Self {
+        Self {
+            driver,
+            bases,
+            report: Mutex::new(report),
+            backups: Mutex::new(BTreeMap::new()),
+            current: Mutex::new(errors.clone()),
+            round_start: Mutex::new(errors),
+            wrote_since_verify: Mutex::new(0),
+            last_round_writes: Mutex::new(0),
+            needs_rebuild: Mutex::new(false),
+            rounds: Mutex::new(0),
+        }
+    }
+
+    fn log(&self, line: String) {
+        self.report.lock().unwrap().log.push(line);
+    }
+
+    /// Record that a file could not be attempted, with autofix's wording.
+    fn skip(&self, file: &str, why: String) {
+        self.log(format!("skip {file}: {why}"));
+        let mut report = self.report.lock().unwrap();
+        if !report.files_skipped.iter().any(|f| f == file) {
+            report.files_skipped.push(file.to_string());
+        }
+    }
+
+    /// What `run_autofix` continues with: the report, the backups (the warning phase
+    /// reuses them so a warning fix can still be rolled back), and the final errors.
+    fn into_parts(self) -> (AutofixReport, BTreeMap<String, String>, ErrorsByFile) {
+        let mut report = self.report.into_inner().unwrap();
+        report.rounds = self.rounds.into_inner().unwrap();
+        let backups = self.backups.into_inner().unwrap();
+        let errors = self.current.into_inner().unwrap();
+        (report, backups, errors)
+    }
+}
+
+impl ModifyDriver for AutofixAdapter<'_> {
+    type Obs = Errors;
+
+    fn targets(&self) -> Vec<ChangeTarget> {
+        self.current
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|file| {
+                let path =
+                    resolve_source_path(file, self.bases).unwrap_or_else(|| PathBuf::from(file));
+                ChangeTarget::new(file.clone(), path)
+            })
+            .collect()
+    }
+
+    async fn propose(&self, target: &ChangeTarget) -> Option<String> {
+        let file = &target.id;
+        let Some(path) = resolve_source_path(file, self.bases) else {
+            self.skip(file, "not found on disk".to_string());
+            return None;
+        };
+        // Back up the ORIGINAL bytes once, before the model can touch them.
+        {
+            let mut backups = self.backups.lock().unwrap();
+            if !backups.contains_key(file) {
+                match std::fs::read_to_string(&path) {
+                    Ok(orig) => {
+                        backups.insert(file.clone(), orig);
+                    }
+                    Err(e) => {
+                        drop(backups);
+                        self.skip(file, format!("cannot read ({e})"));
+                        return None;
+                    }
+                }
+            }
+        }
+        match self.driver.propose(file, &path).await {
+            None => {
+                self.skip(file, "no fix proposed".to_string());
+                None
+            }
+            Some(content) if content.trim().is_empty() => {
+                self.skip(file, "empty proposal".to_string());
+                None
+            }
+            Some(content) => Some(content),
+        }
+    }
+
+    async fn verify(&self) -> Errors {
+        let wrote = {
+            let mut w = self.wrote_since_verify.lock().unwrap();
+            let n = *w;
+            *w = 0;
+            n
+        };
+        let stale = {
+            let mut s = self.needs_rebuild.lock().unwrap();
+            let v = *s;
+            *s = false;
+            v
+        };
+        if wrote > 0 {
+            *self.rounds.lock().unwrap() += 1;
+            *self.last_round_writes.lock().unwrap() = wrote;
+        }
+        if wrote > 0 || stale {
+            // Just wrote, or a rollback invalidated the record: recompile.
+            let fresh = self.driver.rebuild().await;
+            *self.current.lock().unwrap() = fresh.clone();
+            if wrote == 0 {
+                *self.round_start.lock().unwrap() = fresh.clone();
+            }
+            return Errors(fresh);
+        }
+        // A read of what is already recorded — nothing was written since, so the
+        // diagnostics still describe the disk.
+        let current = self.current.lock().unwrap().clone();
+        if wrote == 0 {
+            *self.round_start.lock().unwrap() = current.clone();
+        }
+        Errors(current)
+    }
+
+    fn accept(&self, target: &ChangeTarget, before: &Errors, after: &Errors) -> bool {
+        let b = before.0.get(&target.id).map(|v| v.len()).unwrap_or(0);
+        let a = after.0.get(&target.id).map(|v| v.len()).unwrap_or(0);
+        if should_revert(b, a) {
+            return false;
+        }
+        let mut report = self.report.lock().unwrap();
+        if !report.files_fixed.iter().any(|f| f == &target.id) {
+            report.files_fixed.push(target.id.clone());
+        }
+        true
+    }
+
+    fn reject_round(&self, before: &Errors, after: &Errors) -> bool {
+        let (before_total, after_total) = (total(&before.0), total(&after.0));
+        if after_total <= before_total {
+            return false;
+        }
+        // A rewrite can reduce its own file's errors while breaking something else (a
+        // shared header, say), so the project is judged as a whole before any per-file
+        // verdict is trusted.
+        let writes = *self.last_round_writes.lock().unwrap();
+        let round = *self.rounds.lock().unwrap();
+        self.log(format!(
+            "round {round} made the project worse ({before_total} → {after_total} errors); rolled back {writes} file(s)"
+        ));
+        true
+    }
+
+    async fn apply(&self, target: &ChangeTarget, content: &str) -> Result<(), String> {
+        let Some(path) = resolve_source_path(&target.id, self.bases) else {
+            self.skip(&target.id, "not found on disk".to_string());
+            return Err("not found on disk".to_string());
+        };
+        if let Err(e) = std::fs::write(&path, content) {
+            self.skip(&target.id, format!("write failed ({e})"));
+            return Err(format!("write failed ({e})"));
+        }
+        let before = self
+            .round_start
+            .lock()
+            .unwrap()
+            .get(&target.id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        self.log(format!(
+            "applied fix to {} ({before} error(s) before)",
+            target.id
+        ));
+        *self.wrote_since_verify.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    async fn revert(&self, target: &ChangeTarget) -> Result<(), String> {
+        if let (Some(orig), Some(path)) = (
+            self.backups.lock().unwrap().get(&target.id).cloned(),
+            resolve_source_path(&target.id, self.bases),
+        ) {
+            let _ = std::fs::write(&path, orig);
+        }
+        let before = self
+            .round_start
+            .lock()
+            .unwrap()
+            .get(&target.id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let now = self
+            .current
+            .lock()
+            .unwrap()
+            .get(&target.id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        self.log(format!("reverted {}: errors {before} → {now}", target.id));
+        let mut report = self.report.lock().unwrap();
+        if !report.files_reverted.iter().any(|f| f == &target.id) {
+            report.files_reverted.push(target.id.clone());
+        }
+        drop(report);
+        // The file is back to its original bytes, so the recorded diagnostics no longer
+        // describe it: the next verification must recompile.
+        *self.needs_rebuild.lock().unwrap() = true;
+        Ok(())
+    }
+}
+
 /// Run the autonomous loop: apply a fix per error file, rebuild, keep what
 /// helped and roll back what did not.
 ///
@@ -461,149 +733,21 @@ pub async fn run_autofix(
     max_rounds: usize,
 ) -> AutofixReport {
     let mut report = AutofixReport::default();
-    let mut errors = driver.errors().await;
+
+    // Phase 1 runs on the general modify spine: it owns the rounds, the tried set, the
+    // rollback rules, and the order of the verdicts — reject the round before any
+    // per-file verdict is trusted. Everything autofix-specific lives in the adapter
+    // above: the report, the log wording, the byte backups, and the two rules.
+    let errors = driver.errors().await;
     report.errors_before = total(&errors);
     if report.errors_before == 0 {
         report
             .log
             .push("no compile errors reported — skipping the error phase".to_string());
     }
-
-    let mut tried: BTreeSet<String> = BTreeSet::new();
-    let mut backups: BTreeMap<String, String> = BTreeMap::new();
-
-    for round in 0..max_rounds.max(1) {
-        let candidates: Vec<String> = errors
-            .keys()
-            .filter(|f| !tried.contains(*f))
-            .cloned()
-            .collect();
-        if candidates.is_empty() {
-            break;
-        }
-        report.log.push(format!(
-            "round {}: {} file(s) with errors",
-            round + 1,
-            candidates.len()
-        ));
-
-        let mut wrote: Vec<String> = Vec::new();
-        for file in &candidates {
-            let Some(path) = resolve_source_path(file, bases) else {
-                report.log.push(format!("skip {file}: not found on disk"));
-                tried.insert(file.clone());
-                report.files_skipped.push(file.clone());
-                continue;
-            };
-            // Back up the ORIGINAL bytes once, so a rollback always restores the
-            // state the project had before this run started.
-            if !backups.contains_key(file) {
-                match std::fs::read_to_string(&path) {
-                    Ok(orig) => {
-                        backups.insert(file.clone(), orig);
-                    }
-                    Err(e) => {
-                        report.log.push(format!("skip {file}: cannot read ({e})"));
-                        tried.insert(file.clone());
-                        report.files_skipped.push(file.clone());
-                        continue;
-                    }
-                }
-            }
-            let before = errors.get(file).map(|v| v.len()).unwrap_or(0);
-            let Some(content) = driver.propose(file, &path).await else {
-                report.log.push(format!("skip {file}: no fix proposed"));
-                tried.insert(file.clone());
-                report.files_skipped.push(file.clone());
-                continue;
-            };
-            if content.trim().is_empty() {
-                report.log.push(format!("skip {file}: empty proposal"));
-                tried.insert(file.clone());
-                report.files_skipped.push(file.clone());
-                continue;
-            }
-            if let Err(e) = std::fs::write(&path, &content) {
-                report.log.push(format!("skip {file}: write failed ({e})"));
-                tried.insert(file.clone());
-                report.files_skipped.push(file.clone());
-                continue;
-            }
-            report
-                .log
-                .push(format!("applied fix to {file} ({before} error(s) before)"));
-            wrote.push(file.clone());
-        }
-
-        if wrote.is_empty() {
-            break; // nothing written — no point looping
-        }
-        report.rounds += 1;
-
-        // One rebuild per round, then a per-file verdict: diagnostics are
-        // per-file, so a bad fix stays attributable even in a batch.
-        let after = driver.rebuild().await;
-
-        // Whole-round guard first: a rewrite can reduce its own file's errors
-        // while breaking something else (a shared header, say). If the project got
-        // worse overall, undo everything this round wrote instead of trusting the
-        // per-file bookkeeping.
-        let before_total = total(&errors);
-        let after_total = total(&after);
-        if after_total > before_total {
-            for file in &wrote {
-                if let (Some(orig), Some(path)) =
-                    (backups.get(file), resolve_source_path(file, bases))
-                {
-                    let _ = std::fs::write(&path, orig);
-                }
-                tried.insert(file.clone());
-                if !report.files_reverted.contains(file) {
-                    report.files_reverted.push(file.clone());
-                }
-            }
-            report.log.push(format!(
-                "round {} made the project worse ({before_total} → {after_total} errors); rolled back {} file(s)",
-                round + 1,
-                wrote.len()
-            ));
-            errors = driver.rebuild().await;
-            continue;
-        }
-
-        let mut rolled_back = false;
-        for file in &wrote {
-            let before = errors.get(file).map(|v| v.len()).unwrap_or(0);
-            let now = after.get(file).map(|v| v.len()).unwrap_or(0);
-            if !should_revert(before, now) {
-                if !report.files_fixed.contains(file) {
-                    report.files_fixed.push(file.clone());
-                }
-                continue;
-            }
-            if let (Some(orig), Some(path)) = (backups.get(file), resolve_source_path(file, bases))
-            {
-                let _ = std::fs::write(&path, orig);
-            }
-            report
-                .log
-                .push(format!("reverted {file}: errors {before} → {now}"));
-            if !report.files_reverted.contains(file) {
-                report.files_reverted.push(file.clone());
-            }
-            // A rolled-back file is never attempted again: a fix that keeps
-            // failing would otherwise oscillate until the round cap.
-            tried.insert(file.clone());
-            rolled_back = true;
-        }
-        // The measurement is stale once a file has been rolled back.
-        errors = if rolled_back {
-            driver.rebuild().await
-        } else {
-            after
-        };
-    }
-
+    let adapter = AutofixAdapter::new(driver, bases, errors, report);
+    let _ = run_modify_loop(&adapter, max_rounds).await;
+    let (mut report, mut backups, errors) = adapter.into_parts();
     report.errors_after = total(&errors);
 
     // ── Phase 2: safely-fixable warnings ─────────────────────────────────────
