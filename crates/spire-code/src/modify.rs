@@ -24,10 +24,10 @@
 //! throws the round away when the project total rose; a HAL contract change will
 //! require "no drift, contract valid, and it builds".
 //!
-//! `build/autofix.rs` is the reference instance this was extracted from — it is
-//! still on its own implementation, and migrating it onto this loop is the
-//! follow-up (kept separate, so the working Fix & Verify was not destabilised in
-//! the same step that introduced the abstraction).
+//! `build/autofix.rs` is the reference instance this was extracted from, and both of
+//! its phases — errors, then warnings after a clean compile — now run on this loop.
+//! Its existing test suite is unchanged, which is the evidence that the migration
+//! did not move its behaviour.
 
 use std::path::PathBuf;
 
