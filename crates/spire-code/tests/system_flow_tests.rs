@@ -106,6 +106,14 @@ async fn system(llm_url: &str) -> System {
     }));
     let (system_tx, _) = system.spawn(SystemActor::new());
 
+    // The build manager needs the LLM too: `hal_generate_impl` answers "LLM unavailable —
+    // the build manager is not connected to the LLM service" without it (ffi.rs:315).
+    let _ = bm_tx
+        .send(BuildManagerMessage::SetLlm {
+            llm_tx: llm_tx.clone(),
+        })
+        .await;
+
     // The REAL tool registry: this is what `tools/call` resolves against, so a tool that
     // is not reachable from here is a tool the UI cannot call.
     let project_query_tx = mock_sender();
@@ -453,6 +461,62 @@ async fn modify_code_applies_a_prompted_change_and_keeps_it() {
     assert!(
         written.contains(rewritten),
         "the rewrite has to be on disk, not just in the report: {written:?}"
+    );
+}
+
+/// A Meson C++ project that also carries a HAL contract with NO implementation — the shape
+/// the contract cascade exists for: the contract declares an interface, the platform does
+/// not implement it.
+fn hal_project() -> tempfile::TempDir {
+    let tmp = meson_project("int main() { return 0; }\n");
+    std::fs::create_dir_all(tmp.path().join("hal").join("api")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("hal").join("implementations").join("host")).unwrap();
+    std::fs::write(
+        tmp.path().join("hal").join("api").join("camera.hpp"),
+        "#pragma once\n\nclass CameraHal {\npublic:\n    virtual ~CameraHal() = default;\n    \
+         virtual void start() = 0;\n};\n",
+    )
+    .unwrap();
+    tmp
+}
+
+/// The contract cascade at system level: the real coverage analysis finds a real HAL gap,
+/// and the run must NOT claim to have closed it.
+///
+/// The model answers `NONE` here (the fake endpoint's default), so generation yields
+/// nothing. That is the honest case to pin: a flow that reported success on an unresolved
+/// gap would be worse than one that failed, because it would be believed.
+#[tokio::test]
+async fn modify_contract_reports_a_real_gap_it_could_not_close() {
+    let tmp = hal_project();
+    let path = tmp.path().to_string_lossy().to_string();
+    let sys = system(&fake_llm(vec![])).await;
+
+    sys.call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    sys.tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+
+    let report = sys
+        .tool(
+            "modify_contract",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+
+    // The real coverage analysis saw the contract and found nothing implementing it.
+    let drift = report["drift_before"].as_u64().unwrap_or(0);
+    assert!(
+        drift > 0,
+        "the fixture's unimplemented contract should be drift: {report}"
+    );
+    // And the run says so, rather than reporting a success it did not achieve.
+    assert_eq!(report["success"], serde_json::json!(false), "{report}");
+    assert!(
+        report["gaps_remaining"].to_string().contains("camera"),
+        "the unresolved interface should still be listed: {report}"
     );
 }
 
