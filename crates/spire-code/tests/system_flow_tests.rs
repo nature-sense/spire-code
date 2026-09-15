@@ -13,12 +13,13 @@ mod common;
 
 use common::{fake_llm, mock_sender};
 use spire_actor::registry::ServiceRegistry;
-use spire_actor::ActorSystem;
+use spire_actor::{Actor, ActorSystem};
 use spire_code::actors::{
-    build_default_registry, BuildManagerActor, ChatActor, CoordinatorActor, CoordinatorMessage,
-    FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProjectAnalyzerActor,
+    build_default_registry, BuildManagerActor, BuildManagerMessage, ChatActor, CoordinatorActor,
+    CoordinatorMessage, FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProjectAnalyzerActor,
     ProjectAnalyzerMessage, ProjectQueryMessage, SystemActor, ToolRouterActor, ToolsActor,
 };
+use spire_code::build::{BuildModuleMessage, MesonBuildModule};
 use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use tokio::sync::mpsc;
 
@@ -52,6 +53,40 @@ impl System {
         )
         .await
     }
+}
+
+/// Spawn a build module and return its sender — `ffi.rs` keeps this private, so the
+/// harness keeps its own copy (a handful of lines, and the system test fails loudly if the
+/// handshake ever changes).
+fn spawn_module<A: Actor>(actor: A) -> mpsc::Sender<A::Message> {
+    let (tx, rx) = mpsc::channel::<A::Message>(32);
+    actor.spawn(rx);
+    tx
+}
+
+/// Ask a module what it can do, then register it with the build manager.
+///
+/// Without this the manager has an **empty router** (`router: HashMap::new()`), and answers
+/// "No known build config" for a project it ought to recognise — because it has no module
+/// with which to recognise it.
+async fn register_build_module(
+    cap_name: &str,
+    module_tx: mpsc::Sender<BuildModuleMessage>,
+    bm_tx: &mpsc::Sender<BuildManagerMessage>,
+) {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let _ = module_tx
+        .send(BuildModuleMessage::DescribeCapabilities { reply_to: reply_tx })
+        .await;
+    let capability = reply_rx
+        .await
+        .unwrap_or_else(|_| panic!("module '{cap_name}' did not describe its capabilities"));
+    let _ = bm_tx
+        .send(BuildManagerMessage::AddModule {
+            capability,
+            module_tx,
+        })
+        .await;
 }
 
 async fn system(llm_url: &str) -> System {
@@ -123,6 +158,13 @@ async fn system(llm_url: &str) -> System {
     let _ = registry.register::<MemoryGraphMessage>("memory_graph", memory_graph_tx.clone());
     let _ = registry.register::<MemoryGraphMessage>("knowledge_graph", memory_graph_tx.clone());
     let _ = registry.register::<ProjectQueryMessage>("project.query", project_query_tx);
+    // The language modules. The manager starts with an EMPTY router, so a project's build
+    // system is recognised only once its module is registered — the step that made
+    // `build_analyze` answer "No known build config". Meson is what this fixture needs; the
+    // rest get registered as the scenarios widen.
+    let meson_tx = spawn_module(MesonBuildModule::new());
+    let _ = registry.register::<BuildModuleMessage>("build_module_meson", meson_tx.clone());
+    register_build_module("meson", meson_tx, &bm_tx).await;
     let _ = coord_tx
         .send(CoordinatorMessage::SetFfiDeps {
             registry,
@@ -232,15 +274,11 @@ fn meson_project(source: &str) -> tempfile::TempDir {
 /// If this fails, no "Fix & Verify fixed a bug" test built on top of it would mean
 /// anything — the failure would be the harness, not the flow.
 ///
-/// **Ignored: the harness is not wired all the way yet.** Nailed down so far, in order:
-/// `project/open` (the handlers resolve against the root it remembers) → `AnalyzeProject`
-/// → `build_analyze` (the build manager keeps its OWN analysis, separate from the project
-/// one). It currently stops there, with "No known build config": the language modules
-/// (meson, cargo, …) are spawned and registered by `ffi.rs` (lines 345-382) and this
-/// harness has not spawned them, so the manager has no router to detect a project with.
-/// That is the next piece of wiring, and it is the reason this test exists: none of these
-/// ORDERING requirements is visible to a unit test.
-#[ignore = "harness incomplete: the build modules must be spawned + registered as ffi.rs does"]
+/// The order matters, and none of it is discoverable from a unit test: `project/open` (the
+/// handlers resolve against the root it remembers) → `AnalyzeProject` → `build_analyze`
+/// (the build manager keeps its OWN analysis, separate from the project one) → `build_build`.
+/// The build modules must be registered too, or the manager has no router to recognise a
+/// project with.
 #[tokio::test]
 async fn a_real_cpp_project_analyses_and_builds() {
     let tmp = meson_project("int main() { return 0; }\n");
