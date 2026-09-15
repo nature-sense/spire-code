@@ -315,9 +315,15 @@ entry tracks the work end to end.
       tests are the gate, target tests run only when the board's MCP server is online,
       and a run that never reached hardware carries a caveat rather than a claim.
       Reachable as `modify/code` / the `modify_code` tool. Not yet in the build
-      manager's tool list, so the UI cannot offer it (that is M4d). Neither the LLM plan
-      path nor the target-test leg has been exercised against a live model or a board.
-- [ ] 3k. M4c — HAL `modify-contract` cascade. Not built, but every piece is present,
+      manager's tool list, so the UI cannot offer it (that is M4d). The target-test leg
+      has not been exercised against a board. Its plan path has not itself run against a
+      live model, but that is no longer an unknown: `system_flow_tests` proves the whole
+      path against a real compiler, and `a_real_model_fixes_a_real_defect` drives Fix &
+      Verify with the REAL `LlmConfig` (via `load_global_llm_config()`) and a live
+      DeepSeek call — gated by `#[ignore]` and a runtime key check, asserting structure
+      (a change that builds) and never exact text, since a real model may solve the same
+      defect differently every run.
+- [x] 3k. M4c — HAL `modify-contract` cascade. Built: every piece was already present,
       which makes it composition rather than invention: `hal_missing_impls` IS the drift
       measure (per platform × interface: implemented / partial / missing),
       `hal_fill::plan` + `hal_fill_apply` already do the gap fill, and
@@ -325,7 +331,24 @@ entry tracks the work end to end.
       gaps + build errors, targets = the missing/partial pairs, apply = hand the plan to
       `hal_fill_apply` (backing up the files it names first), and any compile errors left
       over go through the existing `AutofixAdapter`. Acceptance is the criterion the
-      drift analysis already measures: no missing, no drift, builds.
+      drift analysis already measures: no missing, no drift, builds. Proven at system
+      level up to the honest failure: `modify_contract_reports_a_real_gap_it_could_not_close`
+      runs it against a real contract with no implementation and checks that the run
+      reports the drift it could NOT close (`success: false`, the interface still listed)
+      rather than claiming a fill it never performed. The successful generation path still
+      needs a live model — `hal_generate_impl` is what it calls.
+- [x] 3l. System-level flow tests — `crates/spire-code/tests/system_flow_tests.rs`. The
+      flow unit tests prove each flow's decisions; `modify_code_llm_tests` proves one
+      flow's LLM plumbing. Neither proves the WIRING or the real toolchain. This harness
+      spawns the real actors as `ffi.rs` does — knowledge graph, build manager, tool
+      registry, plus the three deps attached by MESSAGE rather than at construction
+      (`SetFfiDeps`, the build-module handshake, `SetLlm`) — and replaces only the model's
+      TEXT. Nine tests: the registry, the real build manager, dispatch, a real Meson
+      project building, Fix & Verify fixing a real defect, `modify/code` keeping a prompted
+      change, `modify/code` rolling one back, the cascade reporting drift it could not
+      close, and the gated live-model run. It found three defects the fakes could not: a
+      double-counted diagnostic stub, a wrong-reply bug, and `success: true` on a
+      rolled-back change.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
       first-class prompt→generate→verify slice.

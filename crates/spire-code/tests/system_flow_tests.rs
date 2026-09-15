@@ -89,7 +89,21 @@ async fn register_build_module(
         .await;
 }
 
+/// The harness with the model replaced: same wiring, a scripted endpoint.
 async fn system(llm_url: &str) -> System {
+    system_with_llm(LlmConfig {
+        api_url: llm_url.to_string(),
+        api_key: "test-key".to_string(),
+        ..LlmConfig::default()
+    })
+    .await
+}
+
+/// The same system, with whatever `LlmConfig` the caller supplies — including the REAL one
+/// from `~/.spire/llm-config.json`. That is how the live-model test reaches DeepSeek without
+/// a key ever appearing in this file: `load_global_llm_config()` is the same loader the app
+/// calls at startup (startup_phases.rs:1087), so the test sees exactly what the app sees.
+async fn system_with_llm(llm_config: LlmConfig) -> System {
     let system = ActorSystem::new();
 
     // Real, because these two are what the Spine actually talks to: the graph the
@@ -99,11 +113,7 @@ async fn system(llm_url: &str) -> System {
 
     let (chat_tx, _) = system.spawn(ChatActor::new());
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
-    let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig {
-        api_url: llm_url.to_string(),
-        api_key: "test-key".to_string(),
-        ..LlmConfig::default()
-    }));
+    let (llm_tx, _) = system.spawn(LlmActor::new(llm_config));
     let (system_tx, _) = system.spawn(SystemActor::new());
 
     // The build manager needs the LLM too: `hal_generate_impl` answers "LLM unavailable —
@@ -568,5 +578,118 @@ async fn modify_code_rolls_back_a_change_that_breaks_the_build() {
         std::fs::read_to_string(&source).unwrap(),
         original,
         "the original bytes must be back on disk"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// The one question the eight above cannot answer: does a REAL model fix a real defect?
+//
+// Everything else in this file holds the model's text constant, so that the plumbing is
+// what is on trial. This test inverts that: the plumbing is known good, and the model's
+// QUALITY is the only variable left. It is the one question a deterministic assertion
+// cannot answer — a real model may legitimately solve this differently every run — so what
+// is asserted below is STRUCTURE (a change that builds, verified by the same compiler),
+// never exact text.
+//
+// Gated twice, on purpose: `#[ignore]` so a plain `cargo test` never spends money or
+// network, and a runtime check so that even `--ignored` skips cleanly with no key
+// configured. The key is read through `load_global_llm_config()` — the same call the app
+// makes at startup — so it never lives in this file, and the test passes or skips on the
+// machine's own configuration. Run it with:
+//
+//     cargo test -p spire-code --test system_flow_tests -- --ignored
+// ─────────────────────────────────────────────────────────────────────────────────────
+#[ignore = "live model: spends real DeepSeek calls — run explicitly with `--ignored`"]
+#[tokio::test]
+async fn a_real_model_fixes_a_real_defect() {
+    // ── The gate ──
+    let llm_config = spire_core::config::load_global_llm_config();
+    if llm_config.api_key.is_empty() {
+        eprintln!("skipped: no deepseek.api_key in ~/.spire/llm-config.json");
+        return;
+    }
+    eprintln!(
+        "live model: {} at {}",
+        llm_config.coding_model, llm_config.api_url
+    );
+
+    let fixed = "int main() { return 0; }\n";
+    let tmp = meson_project(fixed);
+    let path = tmp.path().to_string_lossy().to_string();
+    let source = tmp.path().join("main.cpp");
+
+    // The REAL config: real url, real key, real model. No scripted reply, no fake endpoint.
+    let sys = system_with_llm(llm_config).await;
+
+    // The baseline, in the order the system requires.
+    sys.call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    sys.tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+    let clean = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_eq!(
+        clean["success"],
+        serde_json::json!(true),
+        "the fixture must build before anything is done to it: {clean}"
+    );
+
+    // Break it for real — the SAME defect the deterministic test uses, so the only
+    // difference between the two runs is who does the fixing.
+    std::fs::write(&source, "int main( { return 0; }\n").unwrap();
+    let broken = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_ne!(
+        broken["success"],
+        serde_json::json!(true),
+        "the defect must actually break the build, or the fix below proves nothing: {broken}"
+    );
+
+    // Fix & Verify with the real model in the loop. The timeout is a guard, not an
+    // expectation: a reasoning model answering several diagnostics is slow, and a hung
+    // call should read as "the network or the API", never as a defect in the flow.
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        sys.tool(
+            "build_autofix",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        ),
+    )
+    .await
+    .expect("the live model call timed out — network/API, not the flow");
+
+    assert_eq!(
+        report["success"],
+        serde_json::json!(true),
+        "the live model did not fix a one-brace defect: {report}"
+    );
+    // Structure, not text: the model may seat the brace differently or restructure the
+    // function, and both are legitimate. What must hold is that the defect is gone from
+    // disk and the project builds.
+    let written = std::fs::read_to_string(&source).unwrap();
+    assert!(
+        !written.contains("int main( {"),
+        "the defect is still on disk: {written:?}"
+    );
+    let rebuilt = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_eq!(
+        rebuilt["success"],
+        serde_json::json!(true),
+        "what the model wrote does not build: {rebuilt}"
     );
 }
