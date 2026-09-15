@@ -327,3 +327,79 @@ async fn a_real_cpp_project_analyses_and_builds() {
         "the fixture must build before anything is built on it: {built}"
     );
 }
+
+/// The Spine's core promise, at system level: a real defect, found by a real compiler,
+/// fixed, verified against that compiler, and kept.
+///
+/// Only the model's *text* is replaced — the reply is scripted. Everything else is
+/// production code: the real build manager compiles, the real graph holds the diagnostic,
+/// and the real autofix loop proposes, applies, rebuilds and decides.
+#[tokio::test]
+async fn fix_and_verify_fixes_a_real_defect() {
+    let fixed = "int main() { return 0; }\n";
+    let tmp = meson_project(fixed);
+    let path = tmp.path().to_string_lossy().to_string();
+    let source = tmp.path().join("main.cpp");
+
+    // What the model will answer, scripted. It repeats if asked again, so a retry is
+    // harmless.
+    let sys = system(&fake_llm(vec![format!("```cpp\n{fixed}```\n")])).await;
+
+    // The baseline, in the order the system requires.
+    sys.call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    sys.tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+    let clean = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_eq!(clean["success"], serde_json::json!(true), "{clean}");
+
+    // Break it for real: a brace the compiler will refuse.
+    std::fs::write(&source, "int main( { return 0; }\n").unwrap();
+    let broken = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_ne!(
+        broken["success"],
+        serde_json::json!(true),
+        "the injected defect must actually break the build, or nothing below means \
+         anything: {broken}"
+    );
+
+    // Fix & Verify, end to end.
+    let report = sys
+        .tool(
+            "build_autofix",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+
+    assert_eq!(report["success"], serde_json::json!(true), "{report}");
+    // Not an exact count: a missing brace produces several g++ errors, so what matters is
+    // that the run ends with none AND names what it fixed.
+    let output = report["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains("→ 0"),
+        "the run should end with no errors left: {report}"
+    );
+    assert!(
+        output.contains("error fixes kept"),
+        "and should say which files it fixed: {report}"
+    );
+    // `contains`, not equality: unwrapping the model's code fence trims the trailing
+    // newline, and what matters is that the brace is back on disk.
+    let written = std::fs::read_to_string(&source).unwrap();
+    assert!(
+        written.contains("int main() { return 0; }"),
+        "the fix has to be on disk, not just in the report: {written:?}"
+    );
+}
