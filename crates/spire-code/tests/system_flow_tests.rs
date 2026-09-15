@@ -403,3 +403,106 @@ async fn fix_and_verify_fixes_a_real_defect() {
         "the fix has to be on disk, not just in the report: {written:?}"
     );
 }
+
+/// `modify/code` at system level: a prompt in the user's words, a scripted plan, and a real
+/// verification against a real compiler.
+///
+/// The preamble is the same one Fix & Verify needed — which is the point of widening here:
+/// it shows the harness generalises to a second flow rather than being fitted to one.
+#[tokio::test]
+async fn modify_code_applies_a_prompted_change_and_keeps_it() {
+    let tmp = meson_project("int main() { return 0; }\n");
+    let path = tmp.path().to_string_lossy().to_string();
+    let source = tmp.path().join("main.cpp");
+    let name = source.to_string_lossy().to_string();
+    let rewritten = "int main() { return 42; }";
+
+    // The two answers `plan` needs, in order: which files to touch, then the rewrite.
+    let sys = system(&fake_llm(vec![
+        name.clone(),
+        format!("```cpp\n{rewritten}\n```\n"),
+    ]))
+    .await;
+
+    sys.call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    sys.tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+
+    let report = sys
+        .tool(
+            "modify_code",
+            serde_json::json!({
+                "path": path,
+                "prompt": "make main return 42",
+                "platform": "host",
+                "scope": [name.clone()],
+            }),
+        )
+        .await;
+
+    assert_eq!(report["success"], serde_json::json!(true), "{report}");
+    assert_eq!(
+        report["files_changed"],
+        serde_json::json!([name]),
+        "the file the model named should be the one changed: {report}"
+    );
+    let written = std::fs::read_to_string(&source).unwrap();
+    assert!(
+        written.contains(rewritten),
+        "the rewrite has to be on disk, not just in the report: {written:?}"
+    );
+}
+
+/// The Spine's other half: a change that makes the project **worse** is rolled back, and the
+/// file is left exactly as it was.
+///
+/// The rewrite parses — so the structural check passes it through — but it does not compile,
+/// which is precisely the case the build-verification step exists to catch.
+#[tokio::test]
+async fn modify_code_rolls_back_a_change_that_breaks_the_build() {
+    let original = "int main() { return 0; }\n";
+    let tmp = meson_project(original);
+    let path = tmp.path().to_string_lossy().to_string();
+    let source = tmp.path().join("main.cpp");
+    let name = source.to_string_lossy().to_string();
+
+    let sys = system(&fake_llm(vec![
+        name.clone(),
+        "```cpp\nint main() { return undefined_function(); }\n```\n".to_string(),
+    ]))
+    .await;
+
+    sys.call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    sys.call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    sys.tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+
+    let report = sys
+        .tool(
+            "modify_code",
+            serde_json::json!({
+                "path": path,
+                "prompt": "break it",
+                "platform": "host",
+                "scope": [name.clone()],
+            }),
+        )
+        .await;
+
+    assert_eq!(report["success"], serde_json::json!(false), "{report}");
+    assert_eq!(
+        report["files_reverted"],
+        serde_json::json!([name]),
+        "the change should have been rolled back: {report}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        original,
+        "the original bytes must be back on disk"
+    );
+}

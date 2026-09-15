@@ -202,7 +202,13 @@ impl CodeDriver<'_> {
                 .push("no host tests to run for this project".to_string());
         }
 
-        report.success = after.is_clean() && report.error.is_none();
+        // `success` means "the change the user asked for landed", not merely "the project is
+        // healthy": a rolled-back change leaves a healthy project and did NOT do what was
+        // asked, so a green tick for it would be a lie. The unit tests always meant this —
+        // the fake kept re-reporting the broken state, so reality disagreed with them and
+        // nothing noticed until a system test ran the real thing.
+        report.success =
+            after.is_clean() && report.error.is_none() && !report.files_changed.is_empty();
         report.log.push(match report.verified {
             Verified::WithTarget => "verified: build, host tests, and target tests".to_string(),
             Verified::HostOnly => {
@@ -216,7 +222,8 @@ impl CodeDriver<'_> {
 /// What a `modify/code` run did.
 #[derive(Debug, Clone)]
 pub struct ModifyCodeReport {
-    /// True when the code built and every test that ran passed.
+    /// True when the change was KEPT and the project is healthy. A rolled-back change is not
+    /// a success, however clean the project it left behind.
     pub success: bool,
     /// How far verification reached. Never overstate this.
     pub verified: Verified,
