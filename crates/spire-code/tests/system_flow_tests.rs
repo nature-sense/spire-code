@@ -12,12 +12,14 @@
 mod common;
 
 use common::{fake_llm, mock_sender};
+use spire_actor::registry::ServiceRegistry;
 use spire_actor::ActorSystem;
 use spire_code::actors::{
     build_default_registry, BuildManagerActor, ChatActor, CoordinatorActor, CoordinatorMessage,
-    LlmActor, LlmConfig, McpClientActor, SystemActor, ToolRouterActor, ToolsActor,
+    FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProjectAnalyzerActor,
+    ProjectAnalyzerMessage, ProjectQueryMessage, SystemActor, ToolRouterActor, ToolsActor,
 };
-use spire_core::subsystems::graph::memory_graph::MemoryGraphActor;
+use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use tokio::sync::mpsc;
 
 /// The app's actor graph, minus what a headless run cannot have (the IDE transport, live
@@ -99,13 +101,38 @@ async fn system(llm_url: &str) -> System {
         mcp_tx,
         llm_tx,
         system_tx,
-        memory_graph_tx,
-        project_query_tx,
+        memory_graph_tx.clone(),
+        project_query_tx.clone(),
         mock_sender(),
         tool_router_tx,
         mock_sender(),
         mock_sender(),
     ));
+
+    // ── The FFI dispatch deps ──
+    // The analysis and project handlers resolve their actors from a REGISTRY, not from
+    // constructor arguments, and answer "FFI dispatch deps not attached" without it. The
+    // app attaches this at init (ffi.rs:779); a headless run has to attach it the same way.
+    // Getting this wrong is invisible until a handler is called, which is exactly the kind
+    // of gap these tests exist to close.
+    let registry = std::sync::Arc::new(ServiceRegistry::new());
+    let (project_analyzer_tx, _) = system.spawn(ProjectAnalyzerActor::new());
+    let _ = registry.register::<ProjectAnalyzerMessage>("project.analyzer", project_analyzer_tx);
+    let _ = registry
+        .register::<spire_code::actors::BuildManagerMessage>("build.manager", bm_tx.clone());
+    let _ = registry.register::<MemoryGraphMessage>("memory_graph", memory_graph_tx.clone());
+    let _ = registry.register::<MemoryGraphMessage>("knowledge_graph", memory_graph_tx.clone());
+    let _ = registry.register::<ProjectQueryMessage>("project.query", project_query_tx);
+    let _ = coord_tx
+        .send(CoordinatorMessage::SetFfiDeps {
+            registry,
+            state: std::sync::Arc::new(FfiSharedState {
+                project_root: std::sync::Mutex::new(None),
+                analysis: std::sync::Mutex::new(None),
+                watcher_out_tx: mock_sender(),
+            }),
+        })
+        .await;
 
     System { coord: coord_tx }
 }
@@ -169,5 +196,96 @@ async fn modify_code_is_dispatched_and_refuses_an_empty_request() {
             .unwrap_or_default()
             .contains("'path' and 'prompt'"),
         "the handler's own guard should answer: {reply}"
+    );
+}
+
+/// A minimal Meson C++ project, configured for a native build in `build-host`.
+///
+/// The fixture sets the build directory up with the real toolchain and then hands over, so
+/// what the tests exercise is the *workflow* (analyse → build → fix) rather than the
+/// project's own discovery rules.
+fn meson_project(source: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("meson.build"),
+        "project('spine-fixture', 'cpp')\nexecutable('fixture', 'main.cpp')\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("main.cpp"), source).unwrap();
+
+    let out = std::process::Command::new("meson")
+        .args(["setup", "build-host"])
+        .current_dir(tmp.path())
+        .output()
+        .expect("meson must be installed for the system tests");
+    assert!(
+        out.status.success(),
+        "meson setup failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    tmp
+}
+
+/// The floor for everything above it: a real C++ project compiles through the real
+/// toolchain, along the same path the app uses.
+///
+/// If this fails, no "Fix & Verify fixed a bug" test built on top of it would mean
+/// anything — the failure would be the harness, not the flow.
+///
+/// **Ignored: the harness is not wired all the way yet.** Nailed down so far, in order:
+/// `project/open` (the handlers resolve against the root it remembers) → `AnalyzeProject`
+/// → `build_analyze` (the build manager keeps its OWN analysis, separate from the project
+/// one). It currently stops there, with "No known build config": the language modules
+/// (meson, cargo, …) are spawned and registered by `ffi.rs` (lines 345-382) and this
+/// harness has not spawned them, so the manager has no router to detect a project with.
+/// That is the next piece of wiring, and it is the reason this test exists: none of these
+/// ORDERING requirements is visible to a unit test.
+#[ignore = "harness incomplete: the build modules must be spawned + registered as ffi.rs does"]
+#[tokio::test]
+async fn a_real_cpp_project_analyses_and_builds() {
+    let tmp = meson_project("int main() { return 0; }\n");
+    let path = tmp.path().to_string_lossy().to_string();
+    let sys = system(&fake_llm(vec![])).await;
+
+    // The app's own order: OPEN the project first — the handlers resolve against the root
+    // that `project/open` remembers — and then analyse it.
+    let opened = sys
+        .call("project/open", serde_json::json!({ "root": path }))
+        .await;
+    assert!(
+        !opened.to_string().contains("\"error\""),
+        "project/open failed: {opened}"
+    );
+
+    let analysed = sys
+        .call("AnalyzeProject", serde_json::json!({ "path": path }))
+        .await;
+    assert!(
+        !analysed.to_string().contains("\"error\""),
+        "analysis failed: {analysed}"
+    );
+
+    // The build manager keeps its OWN analysis (populated by `build_analyze`), separate
+    // from the project analysis the coordinator holds. Building without it answers "No
+    // stored analysis" — a real ordering requirement, and exactly the sort of thing a
+    // system test finds and a unit test cannot.
+    let build_analysis = sys
+        .tool("build_analyze", serde_json::json!({ "path": path }))
+        .await;
+    assert!(
+        !build_analysis.to_string().contains("\"error\""),
+        "build_analyze failed: {build_analysis}"
+    );
+
+    let built = sys
+        .tool(
+            "build_build",
+            serde_json::json!({ "path": path, "platform": "host" }),
+        )
+        .await;
+    assert_eq!(
+        built["success"],
+        serde_json::json!(true),
+        "the fixture must build before anything is built on it: {built}"
     );
 }
