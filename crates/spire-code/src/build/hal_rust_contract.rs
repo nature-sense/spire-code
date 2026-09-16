@@ -153,6 +153,167 @@ pub fn missing_trait_methods_rust(
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────
+// Coverage, in the shape `hal_missing_impls` already consumes
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+use crate::build::generic_helpers::HalInterfaceCoverage;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// The Rust HAL's coverage map, in the same shape as `hal_platform_coverage_map`.
+///
+/// A **sibling** to that C++ function rather than a branch inside it. The C++ path is proven
+/// and carries the whole HAL workflow; the embedded work must not put it at risk to add
+/// itself, so the two produce the same type and the caller merges them. A project mid-
+/// migration can legitimately have both.
+pub fn rust_platform_coverage_map(
+    root: &Path,
+) -> BTreeMap<String, BTreeMap<String, HalInterfaceCoverage>> {
+    // 1. Contracts: `hal/api/*.rs` (and the toolkit mirror). The file STEM is the interface
+    //    key, matching the C++ convention — so `led.rs` is the `led` interface whatever its
+    //    trait happens to be called.
+    let mut contracts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for dir in [
+        root.join("hal").join("api"),
+        root.join("toolkit").join("src").join("hal").join("api"),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let required: Vec<String> = required_trait_methods_rust(&content)
+                .into_iter()
+                .flat_map(|(_, methods)| methods)
+                .collect();
+            // A file with no trait, or a trait with no required methods, is not a contract.
+            if required.is_empty() {
+                continue;
+            }
+            contracts.insert(stem.to_string(), required);
+        }
+    }
+    if contracts.is_empty() {
+        return BTreeMap::new();
+    }
+
+    // 2. Platform dirs — the same discovery the C++ path uses: the canonical
+    //    `hal/implementations/<plat>/`, plus the legacy top-level `<plat>/hal/`.
+    let mut platform_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let canonical = root.join("hal").join("implementations");
+    if let Ok(entries) = std::fs::read_dir(&canonical) {
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            if let Some(plat) = entry.file_name().to_str() {
+                if !plat.starts_with('.') {
+                    platform_dirs
+                        .entry(plat.to_string())
+                        .or_insert_with(|| entry.path());
+                }
+            }
+        }
+    }
+    let skip = [
+        "toolkit",
+        "hal",
+        "build",
+        "build-native",
+        "subprojects",
+        ".git",
+    ];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Hidden dirs and meson build dirs (`build-rpi5`) are not platforms.
+            if skip.contains(&name) || name.starts_with('.') || name.starts_with("build") {
+                continue;
+            }
+            let legacy = path.join("hal");
+            if legacy.is_dir() {
+                platform_dirs.entry(name.to_string()).or_insert(legacy);
+            }
+        }
+    }
+
+    // 3. Coverage per platform × interface.
+    let mut coverage: BTreeMap<String, BTreeMap<String, HalInterfaceCoverage>> = BTreeMap::new();
+    for (plat, dir) in platform_dirs {
+        // Every trait this platform implements and what it provides — read once per platform
+        // rather than once per contract.
+        let mut impls: Vec<(String, Vec<String>)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    impls.extend(extract_impl_methods_rust(&content));
+                }
+            }
+        }
+        // The trait may be capitalised while the stem is not (`led.rs` → `trait Led`), so the
+        // match is case-insensitive. The C++ path gets the same freedom from file stems.
+        let provided_for = |stem: &str| -> Vec<String> {
+            impls
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(stem))
+                .flat_map(|(_, methods)| methods.clone())
+                .collect()
+        };
+
+        let mut iface_map: BTreeMap<String, HalInterfaceCoverage> = BTreeMap::new();
+        for (stem, required) in &contracts {
+            let provided = provided_for(stem);
+            let missing: Vec<String> = required
+                .iter()
+                .filter(|method| !provided.contains(method))
+                .cloned()
+                .collect();
+            iface_map.insert(
+                stem.clone(),
+                HalInterfaceCoverage {
+                    implemented: missing.is_empty(),
+                    // `has_impl` asks whether the trait is implemented AT ALL, not whether any
+                    // method was found: `impl Led for X {}` is a real (partial) impl, and
+                    // conflating it with "no impl" would send the fill flow off to scaffold a
+                    // type that already exists. Its own test caught exactly that.
+                    has_impl: impls
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(stem)),
+                    is_stub: false,
+                    missing,
+                    // No Rust fill path exists yet, so signatures are not collected. Leaving
+                    // them empty is honest; inventing blank ones would look like a contract
+                    // that had been read and found complete.
+                    missing_sigs: Vec::new(),
+                    drifted: Vec::new(),
+                },
+            );
+        }
+        coverage.insert(plat, iface_map);
+    }
+    coverage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +394,59 @@ pub trait Led {
         let drift = missing_trait_methods_rust(contract, imp);
         assert_eq!(drift.len(), 1, "only A is unimplemented: {drift:?}");
         assert_eq!(drift[0].0, "A");
+    }
+
+    /// The coverage map on a real temp project — this is the shape `hal_missing_impls`
+    /// renders, so it is the contract between the Rust branch and the rest of Spire.
+    #[test]
+    fn a_rust_contract_becomes_coverage_the_way_a_cpp_one_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("hal/api")).unwrap();
+        std::fs::write(
+            root.join("hal/api/led.rs"),
+            "pub trait Led {\n    fn set(&mut self, on: bool);\n}\n",
+        )
+        .unwrap();
+
+        // One platform that declares the trait and implements nothing: the PARTIAL case,
+        // which the fill flow adds methods to.
+        let partial = root.join("hal/implementations/esp32c6");
+        std::fs::create_dir_all(&partial).unwrap();
+        std::fs::write(partial.join("led.rs"), "impl Led for GpioLed {}\n").unwrap();
+
+        // And one that is complete.
+        let complete = root.join("hal/implementations/host");
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::write(
+            complete.join("led.rs"),
+            "impl Led for FakeLed {\n    fn set(&mut self, _on: bool) {}\n}\n",
+        )
+        .unwrap();
+
+        let map = rust_platform_coverage_map(root);
+
+        let c6 = &map["esp32c6"]["led"];
+        assert_eq!(c6.missing, vec!["set".to_string()], "the gap must be named");
+        assert!(c6.has_impl, "a file exists, so this is partial, not absent");
+        assert!(!c6.implemented, "a declared-but-empty impl is not coverage");
+
+        let host = &map["host"]["led"];
+        assert!(host.missing.is_empty(), "{:?}", host.missing);
+        assert!(host.implemented, "a complete impl must count");
+        assert!(host.has_impl);
+
+        // The interface key is the file STEM, matching the C++ convention — which is exactly
+        // what lets both languages land in one map.
+        assert!(map["esp32c6"].contains_key("led"));
+    }
+
+    /// A project with no Rust contracts contributes an empty map, so merging it into the C++
+    /// coverage is a no-op rather than a source of phantom interfaces.
+    #[test]
+    fn a_project_without_rust_contracts_contributes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(rust_platform_coverage_map(tmp.path()).is_empty());
     }
 }

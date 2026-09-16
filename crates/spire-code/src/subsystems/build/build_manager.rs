@@ -3166,9 +3166,20 @@ executable('{project_name}-{platform}',
                 if root.is_empty() {
                     serde_json::json!({ "error": "hal_missing_impls: 'root' (project dir) is required" })
                 } else {
-                    let coverage = crate::build::generic_helpers::hal_platform_coverage_map(
+                    let mut coverage = crate::build::generic_helpers::hal_platform_coverage_map(
                         std::path::Path::new(root),
                     );
+                    // Rust HAL contracts are recognised beside the C++ ones: `hal/api/*.rs`
+                    // is the same convention with a different language, so the two maps MERGE
+                    // rather than one replacing the other — and a project mid-migration
+                    // legitimately has both.
+                    for (plat, ifaces) in
+                        crate::build::hal_rust_contract::rust_platform_coverage_map(
+                            std::path::Path::new(root),
+                        )
+                    {
+                        coverage.entry(plat).or_default().extend(ifaces);
+                    }
                     let (_by_platform, by_interface) =
                         crate::build::generic_helpers::flatten_hal_coverage(&coverage);
                     // Encode per-platform × interface gaps: {implemented, missing, drifted}.
