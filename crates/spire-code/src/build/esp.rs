@@ -554,7 +554,119 @@ mod tests {
             Some("esp32c6"),
             "MCU comes from the platform, not from discovery — it is never optional"
         );
-        assert_eq!(env("PATH"), None);
+        assert_eq!(
+            env("PATH"),
+            None,
+            "an empty PATH entry would look deliberate"
+        );
         assert_eq!(env("LIBCLANG_PATH"), None);
+    }
+
+    /// Sets `SPIRE_PLATFORM_DIR` for the duration and restores it on drop.
+    ///
+    /// The var is process-global, so a stale value pointing at a deleted fixture would break
+    /// any registry-reading test that ran later. `crate::PLATFORM_DIR_TEST_LOCK` serializes
+    /// these against the other writers/readers in the crate.
+    struct PlatformDir(Option<String>);
+
+    impl PlatformDir {
+        fn set(dir: &Path) -> Self {
+            let previous = std::env::var("SPIRE_PLATFORM_DIR").ok();
+            std::env::set_var("SPIRE_PLATFORM_DIR", dir);
+            Self(previous)
+        }
+    }
+
+    impl Drop for PlatformDir {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(prev) => std::env::set_var("SPIRE_PLATFORM_DIR", prev),
+                None => std::env::remove_var("SPIRE_PLATFORM_DIR"),
+            }
+        }
+    }
+
+    /// `EspBuildModule` executed for the first time — on the part that needs no toolchain.
+    ///
+    /// It has never run a real build (that needs espup plus ESP-IDF and minutes), so what is
+    /// pinned here is the capability itself, because two of its fields are safety properties:
+    /// **no config files** is what stops it shadowing cargo, and the `supports_*` flags are
+    /// what make the manager refuse lint/clean/fix *before* routing — each of which would
+    /// otherwise run against the wrong chip.
+    #[tokio::test]
+    async fn the_esp_module_claims_no_config_file_and_refuses_the_operations_it_lacks() {
+        let mut module = EspBuildModule::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        module
+            .handle(BuildModuleMessage::DescribeCapabilities { reply_to: tx })
+            .await;
+
+        let cap = rx.await.expect("the module answers DescribeCapabilities");
+        assert_eq!(cap.name, "esp-idf");
+        assert!(
+            cap.config_files.is_empty(),
+            "claiming Cargo.toml would replace the cargo module for every Rust project: {:?}",
+            cap.config_files
+        );
+        for (operation, supported) in [
+            ("clean", cap.supports_clean),
+            ("lint", cap.supports_lint),
+            ("format", cap.supports_format),
+            ("fix", cap.supports_fix),
+        ] {
+            assert!(
+                !supported,
+                "'{operation}' must be refused up front, not performed for the wrong chip"
+            );
+        }
+    }
+
+    /// `run_esp_build`'s three refusals — the whole function minus the invocation.
+    ///
+    /// These are the paths that matter most for safety: each one declines *before* anything
+    /// could be built for the wrong target, and each names what was wrong. No toolchain and no
+    /// board is needed to prove them, which is exactly why they are worth proving.
+    #[tokio::test]
+    async fn run_esp_build_refuses_before_it_could_build_for_the_wrong_chip() {
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("platform dir");
+        std::fs::write(
+            dir.path().join("rpi5.yaml"),
+            "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  \
+             cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
+             target_triple: aarch64-linux-gnu\n",
+        )
+        .unwrap();
+        let _env = PlatformDir::set(dir.path());
+
+        // 1. No platform at all: the caller has to say which chip, because there is no
+        //    sensible default and guessing one would target the wrong silicon.
+        let err = run_esp_build(Path::new("/tmp/does-not-matter"), &BuildOptions::default())
+            .await
+            .expect_err("a build without a platform must refuse");
+        assert!(
+            err.contains("platform"),
+            "the error should name the gap: {err}"
+        );
+
+        // 2. A real platform that is not esp-idf: refuse rather than build it as if it were.
+        let linux = BuildOptions {
+            platform: Some("rpi5".to_string()),
+            ..Default::default()
+        };
+        let err = run_esp_build(Path::new("/tmp/does-not-matter"), &linux)
+            .await
+            .expect_err("a linux platform must not be built by this module");
+        assert!(err.contains("not an esp-idf platform"), "{err}");
+
+        // 3. An id that is not in the registry at all.
+        let unknown = BuildOptions {
+            platform: Some("no-such-board".to_string()),
+            ..Default::default()
+        };
+        let err = run_esp_build(Path::new("/tmp/does-not-matter"), &unknown)
+            .await
+            .expect_err("an unknown platform must refuse");
+        assert!(err.contains("unknown platform"), "{err}");
     }
 }
