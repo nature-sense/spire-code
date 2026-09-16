@@ -360,3 +360,50 @@ entry tracks the work end to end.
       contracts, new toolkits, and from-scratch projects (not yet exercised —
       all work so far has been on the pre-existing ai-traps project).
 
+## 8. Embedded targets — ESP32 first, via a reusable HAL + actor framework
+
+Unlike ai-traps (one project), the HAL and actor framework here are **reusable across
+projects**: a project depends on `spire-hal` and never on a vendor SDK.
+
+- [x] 8a. `spire-hal` core — done (2026-09-16, `spire-hal @ d4b7455`, new sibling repo).
+      The seam, before any board. `no_std` and dependency-free on purpose: the first
+      backend (ESP32 via `esp-idf-hal`) is `std`, but the next family (RP2040 via
+      `embassy-rp`) is not, so the abstraction has to hold without std or it is an ESP32
+      API with a nicer name. A `std` backend may implement `no_std` traits; the reverse is
+      impossible. `actor::{Actor, Mailbox, SendError, Spawner}` is deliberately the same
+      SHAPE as the host's `spire_actor::Actor` (a `Message` type and a `handle`), differing
+      only in the runtime — `async`/tokio on the host, synchronous/**FreeRTOS** on device.
+      `Spawner` is the executor seam and a backend's only obligation. Contracts start with
+      `hal::{Led, DelayMs}` plus `HalError` (ours, not `std::io::Error`, because a trait
+      signature is a promise to every family). `cargo check --lib` proves the no_std
+      property and 4 tests prove the claim: a `Blink` actor that borrows the *traits* runs
+      unchanged against two independently written HAL implementations, driven only through
+      a `core`-only mailbox ring (so an allocator-free backend is demonstrably possible).
+- [ ] 8b. `spire-hal-esp32` — the backend, wrapping `esp-idf-hal` (`std`), one cargo feature
+      per chip variant, FreeRTOS actor executor. **Blocked on the toolchain**: neither
+      `espup` nor `idf.py` nor any xtensa/riscv rustup target is installed on this machine,
+      so it cannot be compiled or verified here — unlike the core, which is host-checkable.
+      Installing espup + the ESP-IDF toolchain is the prerequisite to starting it.
+- [ ] 8c. Platform + build. **The variant is a compile-time property, so: one YAML per
+      chip, not one per family.** esp32c6 ≠ esp32 — different target triple, different
+      `IDF_TARGET`, different cargo feature, and Xtensa vs RISC-V are different toolchains
+      entirely, so a variant is a distinct cross-compilation target in exactly the way rpi5
+      differs from rock3c. The model already carries the two essentials:
+      `architecture.target_triple` (`riscv32imac-esp-espidf`) and `architecture.cpu` (which
+      *is* the IDF target). What is genuinely missing: a `family` field for grouping (one
+      backend crate serves c3/c6/s3/…), the flash command, and the fact that `toolchain` /
+      `sysroot` are **required** today — so a Rust target needs dummy C values. Measured
+      cost of adding the fields: 7 construction sites, including the graph codec
+      (`actors/platform_codec.rs:123`), which must persist each new field as an individual
+      typed property per that module's rule. Flash is host-side over **USB**
+      (`espflash` / `idf.py`), deliberately not the network MCP leg (the MCP path is not
+      viable for a fresh board). Build maps `{cpu, triple}` → `IDF_TARGET` + `--target` +
+      `--features`.
+- [ ] 8d. Generalise the drift tooling to Rust. tree-sitter-rust is already in
+      `ast_parser.rs` (`rust_language_config`), so a `trait` becomes the contract and a
+      missing `impl` becomes drift — reusing the existing implemented/missing/drifted shape
+      that `hal_missing_impls` already computes for C++ classes. This is what makes the
+      embedded work HAL-*based* rather than merely Rust: the same cascade
+      (contract → drift → fill → cross-build → flash → run) then closes on firmware.
+
+
