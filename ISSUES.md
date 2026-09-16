@@ -379,11 +379,23 @@ projects**: a project depends on `spire-hal` and never on a vendor SDK.
       property and 4 tests prove the claim: a `Blink` actor that borrows the *traits* runs
       unchanged against two independently written HAL implementations, driven only through
       a `core`-only mailbox ring (so an allocator-free backend is demonstrably possible).
-- [ ] 8b. `spire-hal-esp32` — the backend, wrapping `esp-idf-hal` (`std`), one cargo feature
-      per chip variant, FreeRTOS actor executor. **Blocked on the toolchain**: neither
-      `espup` nor `idf.py` nor any xtensa/riscv rustup target is installed on this machine,
-      so it cannot be compiled or verified here — unlike the core, which is host-checkable.
-      Installing espup + the ESP-IDF toolchain is the prerequisite to starting it.
+- [x] 8b. `spire-hal-esp32` — the backend, wrapping `esp-idf-hal` 0.47 (`std`), FreeRTOS actor
+      executor via `spire-hal-std`. **Compiles for two RISC-V variants**: esp32c6
+      (`riscv32imac-esp-espidf`, 1.6 s incremental) and esp32p4 (`riscv32imafc-esp-espidf`,
+      2 m 06 s the first time, because ESP-IDF is built per MCU) — both with no errors and no
+      warnings, on top of a fully built ESP-IDF. The two files written unverified were both
+      wrong in exactly the ways predicted, and are fixed: `PinDriver<'d, MODE>` carries only
+      the MODE in 0.47, so `GpioLed` has **no pin type parameter** and the pin appears only on
+      `new` (the abstraction finally doing what it claims); and `FreeRtos::delay_ms` is an
+      inherent method, not a trait one, so the `Delay` import was unused.
+      **Correction to the line above: there is no per-chip cargo feature.** The chip is the
+      **`MCU` environment variable** that esp-idf-sys reads, which is exactly why a variant is
+      a platform entry (8c) rather than a feature flag. The working command is
+      `MCU=<chip> cargo build -Zbuild-std=std,panic_abort --target <triple>`, with espup's
+      `esp` toolchain supplying **both** cargo and rustc on PATH (letting cargo find its own
+      rustc silently uses stable, and `-Z` then fails with an error about a *flag*), plus
+      `source ~/export-esp.sh` for LIBCLANG_PATH. Rationale and the three failed attempts are
+      in that repo's README, since each failure names something other than its real cause.
 - [ ] 8c. Platform + build. **The variant is a compile-time property, so: one YAML per
       chip, not one per family.** esp32c6 ≠ esp32 — different target triple, different
       `IDF_TARGET`, different cargo feature, and Xtensa vs RISC-V are different toolchains
@@ -403,6 +415,12 @@ projects**: a project depends on `spire-hal` and never on a vendor SDK.
       `esp-idf-sys` reads. The same source confirms every triple used here: esp32 →
       `xtensa-esp32-espidf`, esp32s3 → `xtensa-esp32s3-espidf`, esp32c6 →
       `riscv32imac-esp-espidf`, and esp32p4 → `riscv32imafc-esp-espidf` (note the `f`).
+      **The platform half of this is done** (`platform.rs` + codec + seeds for esp32, esp32s3,
+      esp32c6, esp32p4 — all validated, and the p4 entry compiles through to the backend).
+      What remains is the **build half**: an `EspBuildModule` that emits the invocation above
+      (`-Zbuild-std=std,panic_abort`, espup's `esp` toolchain, `source ~/export-esp.sh` for
+      LIBCLANG_PATH) and a host-side USB `espflash` step. Note for it: **ESP-IDF is built per
+      MCU**, so the first build for a new chip costs minutes while later ones are seconds.
 - [x] 8d. The Rust drift measure — `build/hal_rust_contract.rs`. tree-sitter-rust was already
       a dependency and `trait_item`/`impl_item` already mapped in `rust_language_config`, so
       this was wiring rather than new machinery: `missing_trait_methods_rust(contract, impl)`
