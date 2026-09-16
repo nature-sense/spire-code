@@ -44,13 +44,41 @@ pub struct Platform {
     /// Discriminator: "linux" today; "esp-idf", "rp2040", "none", … later.
     pub os: String,
     pub architecture: PlatformArchitecture,
+    /// The C cross-toolchain.
+    ///
+    /// Optional in the YAML on purpose: a **Rust** target (`os: "esp-idf"`) has no C
+    /// toolchain, and forcing one to carry dummy compilers would be a trap for the model
+    /// filling the file in. Defaults to the `clang`/`llvm-*` set. A C target that omits it
+    /// is still gated by [`Platform::sysroot_ok`], so this adds permission, not risk.
+    #[serde(default)]
     pub toolchain: PlatformToolchain,
+    /// Target sysroot — the root file system of the target machine.
+    ///
+    /// Optional for the same reason, and *gated* rather than trusted: an empty or
+    /// unpopulated root is refused for a cross-build by [`Platform::sysroot_ok`].
+    #[serde(default)]
     pub sysroot: PlatformSysroot,
     /// Optional on-hardware access for this target: the board's MCP endpoint
     /// (the `spire-target-mcp` server) and where artifacts land on it. Absent
     /// for host-only targets, which have no board to talk to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<PlatformDevice>,
+    /// Board **family** this variant belongs to (`esp32`, `rp2040`, …).
+    ///
+    /// Grouping only. One backend crate serves a whole family (`spire-hal-esp32` builds
+    /// for esp32/esp32s3/esp32c6 through cargo features), but the unit of *compilation* is
+    /// always the **variant**, because the target triple is: esp32c6 ≠ esp32 in exactly the
+    /// way rpi5 ≠ rock3c.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Rust toolchain, for targets whose build is not a C cross-compile (`os: "esp-idf"`).
+    ///
+    /// Absent for the C platforms, whose toolchain is [`PlatformToolchain`]. Kept separate
+    /// rather than as more optional fields on that struct: an ESP32 target has no `c`/`cpp`/
+    /// `ar`, and pretending it does would put dummy compilers in a YAML for the model to
+    /// trip over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust: Option<PlatformRust>,
 }
 
 /// How Spire reaches a board to run things on it (`device:` in the platform
@@ -73,6 +101,30 @@ impl PlatformDevice {
             .map(|mcp| !mcp.url.trim().is_empty())
             .unwrap_or(false)
     }
+}
+
+/// The Rust toolchain for a non-C target (`os: "esp-idf"`).
+///
+/// Every field here is a **compile-time** fact, which is why a variant is a distinct
+/// platform: the triple selects the rustup target, and `esp32` vs `esp32c6` also differ in
+/// architecture family (Xtensa vs RISC-V), so this is not a runtime switch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlatformRust {
+    /// The rustup target triple, e.g. `riscv32imac-esp-espidf`.
+    ///
+    /// Espressif spells this differently from the IDF target, so both are carried rather
+    /// than one being derived from the other.
+    pub target: String,
+    /// The vendor build target, e.g. `esp32c6` — which is both `IDF_TARGET` and the
+    /// `esp-idf-hal` cargo feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idf_target: Option<String>,
+    /// How the artifact reaches the board **over USB** (`espflash`, `idf.py`).
+    ///
+    /// A host-side step on purpose: the network MCP leg is not viable for a board that is
+    /// not yet running anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash: Option<String>,
 }
 
 /// The board's MCP endpoint (`device.mcp`) — a `spire-target-mcp` server.
@@ -761,9 +813,97 @@ sysroot:
             },
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
+            family: None,
+            rust: None,
             device: None,
         };
         assert!(platform.meson_cross_file().is_none());
+    }
+
+    /// An embedded **variant** parses, and carries the facts that make it a distinct
+    /// compilation target: its family (what a single backend crate keys off), the rustup
+    /// triple, the IDF target (which is also the cargo feature) and the USB flash command.
+    ///
+    /// Two variants of one family are loaded together on purpose: same `family: esp32`, but
+    /// `xtensa-esp32s3-espidf` vs `riscv32imac-esp-espidf` — Xtensa and RISC-V are different
+    /// toolchains, so these are two platforms, not one with a runtime switch. That is why
+    /// the unit of `Platform` is the variant.
+    #[test]
+    fn load_esp32_variants_from_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "esp32c6.yaml",
+            r#"
+id: esp32c6
+name: ESP32-C6
+os: esp-idf
+family: esp32
+architecture:
+  cpu_family: riscv
+  cpu: esp32c6
+  endian: little
+  target_triple: riscv32imac-esp-espidf
+rust:
+  target: riscv32imac-esp-espidf
+  idf_target: esp32c6
+  flash: espflash
+"#,
+        );
+        write_yaml(
+            tmp.path(),
+            "esp32s3.yaml",
+            r#"
+id: esp32s3
+name: ESP32-S3
+os: esp-idf
+family: esp32
+architecture:
+  cpu_family: xtensa
+  cpu: esp32s3
+  endian: little
+  target_triple: xtensa-esp32s3-espidf
+rust:
+  target: xtensa-esp32s3-espidf
+  idf_target: esp32s3
+  flash: espflash
+"#,
+        );
+
+        let c6 = Platform::load(tmp.path().join("esp32c6.yaml")).unwrap();
+        assert_eq!(c6.os, "esp-idf");
+        assert_eq!(c6.family.as_deref(), Some("esp32"));
+        let rust = c6
+            .rust
+            .as_ref()
+            .expect("an esp-idf platform carries a rust toolchain");
+        assert_eq!(rust.target, "riscv32imac-esp-espidf");
+        assert_eq!(rust.idf_target.as_deref(), Some("esp32c6"));
+        assert_eq!(rust.flash.as_deref(), Some("espflash"));
+        // Not a C cross-compile: the C toolchain block is absent from the YAML and the
+        // cross-file path must not invent one.
+        assert!(c6.meson_cross_file().is_none());
+
+        // One family, two compilation targets.
+        let all = Platform::load_directory(tmp.path()).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter().all(|p| p.family.as_deref() == Some("esp32")),
+            "both variants share the family: {all:?}"
+        );
+        assert!(
+            all.iter().all(|p| p.rust.is_some()),
+            "and each carries its own toolchain"
+        );
+        let triples: Vec<&str> = all
+            .iter()
+            .map(|p| p.architecture.target_triple.as_str())
+            .collect();
+        assert!(
+            triples.contains(&"riscv32imac-esp-espidf")
+                && triples.contains(&"xtensa-esp32s3-espidf"),
+            "different architectures are different platforms: {triples:?}"
+        );
     }
 
     /// Target-level sysroot sanity: a nonexistent or unpopulated sysroot must be
@@ -796,6 +936,8 @@ sysroot:
                 include_dirs: Vec::new(),
                 pkg_config_libdir: Vec::new(),
             },
+            family: None,
+            rust: None,
             device: None,
         };
         let (ok, reason) = missing.sysroot_ok();
@@ -823,6 +965,8 @@ sysroot:
                 include_dirs: Vec::new(),
                 pkg_config_libdir: Vec::new(),
             },
+            family: None,
+            rust: None,
             device: None,
         };
         let (ok, reason) = placeholder.sysroot_ok();
@@ -850,6 +994,8 @@ sysroot:
                 include_dirs: Vec::new(),
                 pkg_config_libdir: Vec::new(),
             },
+            family: None,
+            rust: None,
             device: None,
         };
         assert!(populated.sysroot_ok().0, "populated root must pass");
@@ -869,6 +1015,8 @@ sysroot:
             },
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
+            family: None,
+            rust: None,
             device: None,
         };
         assert!(host.sysroot_ok().0, "host must pass");
@@ -1018,6 +1166,8 @@ sysroot:
             },
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
+            family: None,
+            rust: None,
             device: None,
         };
 

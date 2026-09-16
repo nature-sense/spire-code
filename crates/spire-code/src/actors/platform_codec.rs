@@ -8,7 +8,7 @@
 
 use crate::platform::{
     Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp,
-    PlatformSysroot, PlatformToolchain,
+    PlatformRust, PlatformSysroot, PlatformToolchain,
 };
 
 /// Serialize a platform definition into the registry JSON shape the knowledge
@@ -81,6 +81,21 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
         }
         if let Some(deploy) = &device.deploy {
             props.insert("device_deploy_dest".into(), serde_json::json!(deploy.dest));
+        }
+    }
+
+    // Board family + the Rust toolchain (`os: "esp-idf"`). Both optional, so a C platform
+    // carries neither and its stored shape is unchanged.
+    if let Some(family) = &p.family {
+        props.insert("family".into(), serde_json::json!(family));
+    }
+    if let Some(rust) = &p.rust {
+        props.insert("rust_target".into(), serde_json::json!(rust.target));
+        if let Some(idf) = &rust.idf_target {
+            props.insert("rust_idf_target".into(), serde_json::json!(idf));
+        }
+        if let Some(flash) = &rust.flash {
+            props.insert("rust_flash".into(), serde_json::json!(flash));
         }
     }
 
@@ -167,5 +182,114 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
                 Some(PlatformDevice { mcp, deploy })
             }
         },
+        family: get_opt("family"),
+        // An empty `rust_target` means "no Rust toolchain", not a platform with a blank
+        // one — the `device` block above follows the same rule.
+        rust: {
+            let target = get_str("rust_target");
+            (!target.trim().is_empty()).then(|| PlatformRust {
+                target,
+                idf_target: get_opt("rust_idf_target"),
+                flash: get_opt("rust_flash"),
+            })
+        },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{
+        Platform, PlatformArchitecture, PlatformRust, PlatformSysroot, PlatformToolchain,
+    };
+
+    /// An embedded variant, as the struct the CLI and the seed loader produce.
+    fn esp32c6() -> Platform {
+        Platform {
+            id: "esp32c6".into(),
+            name: "ESP32-C6".into(),
+            os: "esp-idf".into(),
+            architecture: PlatformArchitecture {
+                cpu_family: "riscv".into(),
+                cpu: "esp32c6".into(),
+                endian: "little".into(),
+                target_triple: "riscv32imac-esp-espidf".into(),
+                march: None,
+            },
+            toolchain: PlatformToolchain::default(),
+            sysroot: PlatformSysroot::default(),
+            device: None,
+            family: Some("esp32".into()),
+            rust: Some(PlatformRust {
+                target: "riscv32imac-esp-espidf".into(),
+                idf_target: Some("esp32c6".into()),
+                flash: Some("espflash".into()),
+            }),
+        }
+    }
+
+    fn rpi5() -> Platform {
+        Platform {
+            id: "rpi5".into(),
+            name: "Raspberry Pi 5".into(),
+            os: "linux".into(),
+            architecture: PlatformArchitecture {
+                cpu_family: "aarch64".into(),
+                cpu: "armv8-a".into(),
+                endian: "little".into(),
+                target_triple: "aarch64-linux-gnu".into(),
+                march: None,
+            },
+            toolchain: PlatformToolchain::default(),
+            sysroot: PlatformSysroot::default(),
+            device: None,
+            family: None,
+            rust: None,
+        }
+    }
+
+    /// The codec is the graph boundary: anything it drops, the rest of the app cannot see.
+    /// A variant's family and Rust toolchain must survive the trip BOTH ways, stored as
+    /// individual typed properties — never a nested JSON fragment, per this module's rule.
+    #[test]
+    fn an_esp32_variant_round_trips_through_the_registry_shape() {
+        let json = platform_to_registry_json(&esp32c6());
+        let props = json.get("properties").expect("properties");
+
+        assert_eq!(props.get("family").expect("family"), "esp32");
+        assert_eq!(
+            props.get("rust_target").expect("rust_target"),
+            "riscv32imac-esp-espidf"
+        );
+        assert_eq!(props.get("rust_idf_target").expect("idf target"), "esp32c6");
+        assert_eq!(props.get("rust_flash").expect("flash"), "espflash");
+        assert!(
+            props.get("rust").is_none(),
+            "individual typed properties, not a blob: {props}"
+        );
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert_eq!(back.family.as_deref(), Some("esp32"));
+        let rust = back.rust.expect("the rust toolchain must survive");
+        assert_eq!(rust.target, "riscv32imac-esp-espidf");
+        assert_eq!(rust.idf_target.as_deref(), Some("esp32c6"));
+        assert_eq!(rust.flash.as_deref(), Some("espflash"));
+    }
+
+    /// A C platform carries neither field, so the shape the existing registry already holds
+    /// is unchanged by this work — which is what makes it safe to land.
+    #[test]
+    fn a_c_platform_stores_no_embeddable_properties() {
+        let json = platform_to_registry_json(&rpi5());
+        let props = json.get("properties").expect("properties");
+        assert!(props.get("family").is_none(), "{props}");
+        assert!(props.get("rust_target").is_none(), "{props}");
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert!(back.family.is_none(), "no family is not a blank family");
+        assert!(
+            back.rust.is_none(),
+            "an empty target is no toolchain at all"
+        );
+    }
 }
