@@ -4184,6 +4184,75 @@ mod tests {
         }
     }
 
+    /// The point of platform routing: an ESP32 build must reach the platform module, and
+    /// **every other project must keep reaching its config module**.
+    ///
+    /// The second half is the one that matters. A routing change that quietly claimed
+    /// ordinary Rust projects would be far worse than having no routing at all — that is the
+    /// failure this whole mechanism exists to avoid, so it is asserted, not assumed.
+    #[test]
+    fn a_build_routes_by_platform_only_when_a_platform_module_exists() {
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("platform dir");
+        std::fs::write(
+            dir.path().join("esp32c6.yaml"),
+            "id: esp32c6\nname: ESP32-C6\nos: esp-idf\narchitecture:\n  \
+             cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
+             target_triple: riscv32imac-esp-espidf\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("rpi5.yaml"),
+            "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  \
+             cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
+             target_triple: aarch64-linux-gnu\n",
+        )
+        .unwrap();
+        let _env = SpirePlatformDirGuard::set(dir.path());
+
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
+        // The platform module (as the ESP32 one registers itself) — and note it claims no
+        // config file, which is what makes the next registration possible.
+        manager.add_platform_module("esp-idf".to_string(), mpsc::channel(1).0);
+        manager.add_module(
+            ModuleCapability {
+                name: "cargo".to_string(),
+                config_files: vec!["Cargo.toml".to_string()],
+                build_system: "Cargo".to_string(),
+                language: "Rust".to_string(),
+                source_extensions: vec!["rs".to_string()],
+                mcp_servers: Vec::new(),
+                supports_clean: true,
+                supports_lint: true,
+                supports_format: true,
+                supports_fix: true,
+            },
+            mpsc::channel(1).0,
+        );
+
+        // The esp-idf case: the platform module wins even though cargo owns the config file.
+        assert_eq!(
+            manager.route_for("Cargo.toml", Some("esp32c6")),
+            BuildRoute::Platform("esp-idf".to_string())
+        );
+
+        // Everywhere else, nothing changes — including for a Linux *cross* target, which is
+        // also a Cargo project with a platform set.
+        assert_eq!(
+            manager.route_for("Cargo.toml", Some("rpi5")),
+            BuildRoute::Config("Cargo.toml".to_string())
+        );
+        assert_eq!(
+            manager.route_for("Cargo.toml", None),
+            BuildRoute::Config("Cargo.toml".to_string())
+        );
+        // An unknown platform id must not swallow the route either.
+        assert_eq!(
+            manager.route_for("Cargo.toml", Some("no-such-board")),
+            BuildRoute::Config("Cargo.toml".to_string())
+        );
+    }
+
     /// Per-platform HAL library hints must come from the registry YAML
     /// (`library_hints:`) instead of a hardcoded map, with a generic fallback
     /// when the platform YAML is absent or carries no hint.
