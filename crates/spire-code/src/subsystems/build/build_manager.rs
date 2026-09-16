@@ -297,6 +297,20 @@ pub enum BuildManagerMessage {
         capability: ModuleCapability,
         module_tx: mpsc::Sender<BuildModuleMessage>,
     },
+    /// Register a module as the handler for a **platform `os`** (e.g. `"esp-idf"`), in
+    /// preference to whichever module owns the config file.
+    ///
+    /// Separate from `AddModule` on purpose. The config router assumes one config file maps to
+    /// exactly one module, and that breaks for a platform-specific build system: an ESP32
+    /// project is *also* a `Cargo.toml` project, so a module claiming that file would silently
+    /// **replace** the cargo module and send every Rust project in Spire down the ESP32 path.
+    /// Declaring the platform routes on what actually differs instead.
+    ///
+    /// A module registered this way claims **no** config files.
+    AddPlatformModule {
+        os: String,
+        module_tx: mpsc::Sender<BuildModuleMessage>,
+    },
     /// Analyze a project → produce + store BuildMetadata.
     AnalyzeProject {
         path: PathBuf,
@@ -388,6 +402,12 @@ pub struct BuildManagerActor {
     router: HashMap<String, mpsc::Sender<BuildModuleMessage>>,
     /// Router: source file extension → module sender (for AST parsing).
     extension_router: HashMap<String, mpsc::Sender<BuildModuleMessage>>,
+    /// Router: platform `os` → module sender, for builds whose selected platform names one.
+    ///
+    /// Consulted *before* [`Self::router`]: a platform-specific module wins over the module
+    /// that owns the config file, because the platform is what the invocation actually
+    /// depends on (an ESP32 build is still a `Cargo.toml` project).
+    platform_router: HashMap<String, mpsc::Sender<BuildModuleMessage>>,
     /// Capabilities of all registered modules.
     capabilities: Vec<ModuleCapability>,
     /// Sender to the MemoryGraph actor for analysis state.
@@ -403,11 +423,32 @@ pub struct BuildManagerActor {
     llm_tx: Option<mpsc::Sender<LlmMessage>>,
 }
 
+/// Which registered module should handle a build.
+///
+/// The decision is its own type so it can be asserted in a test and named in a log, rather
+/// than being an implicit `.or_else()` a reader has to infer.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildRoute {
+    /// A module that declared itself the handler for this platform `os`.
+    Platform(String),
+    /// The module that owns the config file — the pre-existing behaviour.
+    Config(String),
+}
+
+/// The `os` of a registered platform, or `None` when the id is unknown.
+///
+/// A free function so the routing decision does not depend on the actor, which is what makes
+/// `route_for` testable against a temporary platform directory.
+fn platform_os_of(platform_id: &str) -> Option<String> {
+    crate::platform::Platform::from_registry(platform_id).map(|p| p.os)
+}
+
 impl BuildManagerActor {
     pub fn new(memory_graph_tx: mpsc::Sender<MemoryGraphMessage>) -> Self {
         Self {
             router: HashMap::new(),
             extension_router: HashMap::new(),
+            platform_router: HashMap::new(),
             capabilities: Vec::new(),
             memory_graph_tx,
             event_tx: None,
@@ -456,6 +497,32 @@ impl BuildManagerActor {
             self.router.len(),
             self.router.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// Register a platform-specific module (see `AddPlatformModule`).
+    fn add_platform_module(&mut self, os: String, module_tx: mpsc::Sender<BuildModuleMessage>) {
+        tracing::info!("BuildManager: module registered for platform os '{os}'");
+        self.platform_router.insert(os, module_tx);
+    }
+
+    /// Which registered module should handle a build of `config` under `platform`.
+    ///
+    /// The decision is its own type so it can be asserted in a test and named in a log,
+    /// rather than being an implicit `.or_else()` someone has to infer.
+    fn route_for(&self, config: &str, platform: Option<&str>) -> BuildRoute {
+        if let Some(os) = platform.and_then(platform_os_of) {
+            if self.platform_router.contains_key(&os) {
+                return BuildRoute::Platform(os);
+            }
+        }
+        BuildRoute::Config(config.to_string())
+    }
+
+    fn sender_for(&self, route: &BuildRoute) -> Option<&mpsc::Sender<BuildModuleMessage>> {
+        match route {
+            BuildRoute::Platform(os) => self.platform_router.get(os),
+            BuildRoute::Config(config) => self.router.get(config),
+        }
     }
 
     /// Find which registered config file applies to a path.
@@ -1147,10 +1214,13 @@ impl BuildManagerActor {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        // A platform-specific module wins over the config file's owner: the platform is what
+        // the invocation actually depends on, and an ESP32 build is still a Cargo.toml project.
+        let route = self.route_for(&config, opts.platform.as_deref());
+        let module_tx = self.sender_for(&route).ok_or_else(|| match &route {
+            BuildRoute::Platform(os) => format!("No module registered for platform '{}'", os),
+            BuildRoute::Config(config) => format!("No module registered for {}", config),
+        })?;
 
         let build_spec = Self::resolve_build_spec(&metadata, opts);
         let (tx, rx) = oneshot::channel();
@@ -3748,6 +3818,10 @@ impl Actor for BuildManagerActor {
                 module_tx,
             } => {
                 self.add_module(capability, module_tx);
+            }
+
+            BuildManagerMessage::AddPlatformModule { os, module_tx } => {
+                self.add_platform_module(os, module_tx);
             }
 
             BuildManagerMessage::AnalyzeProject {
