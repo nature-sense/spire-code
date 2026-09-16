@@ -23,9 +23,9 @@ use crate::subsystems::project::project_install::{ProjectInstallActor, ProjectIn
 use crate::subsystems::project::project_lint::{ProjectLintActor, ProjectLintMessage};
 use crate::subsystems::project::project_test::{ProjectTestActor, ProjectTestMessage};
 use crate::{
-    BuildModuleMessage, CargoBuildModule, CmakeBuildModule, GoBuildModule, GradleBuildModule,
-    MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability, NodeBuildModule,
-    PythonBuildModule, RubyBuildModule, SwiftBuildModule,
+    BuildModuleMessage, CargoBuildModule, CmakeBuildModule, EspBuildModule, GoBuildModule,
+    GradleBuildModule, MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability,
+    NodeBuildModule, PythonBuildModule, RubyBuildModule, SwiftBuildModule,
 };
 use spire_core::actors::rag::{RagActor, RagMessage};
 use spire_core::actors::tool_providers::ToolRouterActor;
@@ -344,6 +344,18 @@ fn init_actor_system() {
         let cargo_module_tx = spawn_module(CargoBuildModule::new());
         let _ = registry.register::<BuildModuleMessage>("build_module_cargo", cargo_module_tx.clone());
         let cap = register_build_module("cargo", cargo_module_tx, &bm_tx).await;
+        // The ESP32 module registers BY PLATFORM, not by config file. An esp-idf project is
+        // *also* a `Cargo.toml` project, so claiming that file would replace the cargo module
+        // in the router and send every Rust project in Spire down the ESP32 path. Declaring
+        // `os: "esp-idf"` routes on what actually differs — the invocation.
+        let esp_module_tx = spawn_module(EspBuildModule::new());
+        let _ = registry.register::<BuildModuleMessage>("build_module_esp", esp_module_tx.clone());
+        let _ = bm_tx
+            .send(BuildManagerMessage::AddPlatformModule {
+                os: "esp-idf".to_string(),
+                module_tx: esp_module_tx,
+            })
+            .await;
         module_mcp_servers.push(cap);
 
         let node_module_tx = spawn_module(NodeBuildModule::new());

@@ -20,8 +20,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::build::BuildOptions;
+use crate::build::{BuildModuleMessage, BuildOptions, BuildOutput, ModuleCapability};
 use crate::platform::Platform;
+use spire_actor::Actor;
+use spire_core::build_types::BuildSpec;
 
 /// The rustup toolchain `espup` installs. A *custom* toolchain, so `rustup target add`
 /// cannot add to it; it carries `rust-src` (hence `-Zbuild-std`) instead.
@@ -146,6 +148,156 @@ pub fn libclang_path_in(toolchain_dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// The module
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The ESP32 build module.
+///
+/// Registered with `AddPlatformModule { os: "esp-idf" }` and **never** with a config file:
+/// an esp-idf project is *also* a `Cargo.toml` project, so claiming that file would replace
+/// the cargo module for every Rust project in Spire (see `AddPlatformModule`).
+///
+/// Analysis is deliberately not its job either — a `Cargo.toml` analyses the same way for
+/// either target, so the cargo module keeps that, and only the *invocation* differs here.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EspBuildModule;
+
+impl EspBuildModule {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl Actor for EspBuildModule {
+    type Message = BuildModuleMessage;
+
+    async fn handle(&mut self, msg: Self::Message) {
+        match msg {
+            BuildModuleMessage::DescribeCapabilities { reply_to } => {
+                let _ = reply_to.send(ModuleCapability {
+                    name: "esp-idf".to_string(),
+                    // Empty on purpose: routing is by platform, not by config file.
+                    config_files: Vec::new(),
+                    build_system: "Cargo (esp-idf)".to_string(),
+                    language: "Rust".to_string(),
+                    source_extensions: vec!["rs".to_string()],
+                    mcp_servers: Vec::new(),
+                    // Declared false so the manager refuses these *before* routing to us: a
+                    // clean or lint here would run against the wrong target, which is worse
+                    // than refusing.
+                    supports_clean: false,
+                    supports_lint: false,
+                    supports_format: false,
+                    supports_fix: false,
+                });
+            }
+
+            BuildModuleMessage::Build {
+                path,
+                opts,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to.send(run_esp_build(&path, &opts).await);
+            }
+
+            BuildModuleMessage::BuildStreaming {
+                path,
+                opts,
+                event_tx,
+                reply_to,
+                ..
+            } => {
+                let result = run_esp_build(&path, &opts).await;
+                // One synthetic finished line, mirroring how the other modules fall back when
+                // they cannot stream per-line. Worth knowing: the first build for a chip
+                // downloads and compiles ESP-IDF itself, so this can take minutes.
+                let _ = event_tx.send(crate::build::BuildEvent {
+                    line: format!(
+                        "Finished {} in {:?}s",
+                        path.display(),
+                        result.as_ref().map(|o| o.duration_secs).unwrap_or(0.0)
+                    ),
+                    level: "finished".to_string(),
+                    target: None,
+                    file: None,
+                    line_number: None,
+                    message: None,
+                    detail: None,
+                });
+                let _ = reply_to.send(result);
+            }
+
+            _ => {
+                // Everything else (test/lint/clean/fix/parse/analyze/scaffold) either has its
+                // capability declared false above — so the manager refuses it before routing —
+                // or belongs to the cargo module. Warn rather than reply, so a future routing
+                // change surfaces here instead of being silently swallowed.
+                tracing::warn!(
+                    "EspBuildModule: a message it does not implement was routed here; \
+                     the build manager should have refused or routed it elsewhere"
+                );
+            }
+        }
+    }
+}
+
+/// Run an esp-idf build for `opts.platform`, through the **shared** process runner.
+///
+/// Reusing `run_build_spec` rather than spawning a `Command` here means environment
+/// handling, duration measurement and exit-code reporting behave exactly as they do for
+/// every other build module.
+pub async fn run_esp_build(path: &Path, opts: &BuildOptions) -> Result<BuildOutput, String> {
+    let platform_id = opts
+        .platform
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .ok_or_else(|| "an esp-idf build needs a platform, e.g. \"esp32c6\"".to_string())?;
+    let platform = Platform::from_registry(platform_id)
+        .ok_or_else(|| format!("unknown platform '{platform_id}'"))?;
+    let plan = esp_plan(&platform, opts)
+        .ok_or_else(|| format!("platform '{platform_id}' is not an esp-idf platform"))?;
+
+    crate::build::generic_helpers::run_build_spec(path, &spec_from_plan(plan)).await
+}
+
+/// The [`BuildSpec`] an [`EspPlan`] becomes, with the two environment requirements added.
+///
+/// Both are easy to miss and neither failure names its real cause, which is why they live
+/// here rather than in a shell script someone has to remember to source.
+pub(crate) fn spec_from_plan(plan: EspPlan) -> BuildSpec {
+    let mut env = plan.env;
+
+    // The esp toolchain's `cargo` **and** `rustc` must both win. Letting cargo find its own
+    // rustc silently picks the stable one, and `-Zbuild-std` then fails with an error about a
+    // *flag* rather than about the toolchain that should have accepted it.
+    if let Some(bin) = esp_toolchain_bin() {
+        let mut path = bin.to_string_lossy().to_string();
+        if let Ok(existing) = std::env::var("PATH") {
+            path.push(':');
+            path.push_str(&existing);
+        }
+        env.push(("PATH".to_string(), path));
+    }
+
+    // Without this, bindgen inside esp-idf-sys fails with an error that never mentions bindgen.
+    if let Some(lib) = libclang_path() {
+        env.push((
+            "LIBCLANG_PATH".to_string(),
+            lib.to_string_lossy().to_string(),
+        ));
+    }
+
+    BuildSpec {
+        command: "cargo".to_string(),
+        arguments: plan.args,
+        working_dir: String::new(),
+        env,
+    }
 }
 
 #[cfg(test)]
