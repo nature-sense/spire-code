@@ -525,6 +525,27 @@ impl BuildManagerActor {
         }
     }
 
+    /// The module a build-like request for `config` should go to, honouring platform routing.
+    ///
+    /// **The single decision point.** Nine call sites used to repeat this lookup and its error
+    /// message by hand, which is how a routing change ends up applied to eight of them — and
+    /// the shadowing bug this replaced was exactly a site that had not been updated.
+    ///
+    /// `platform` is `None` on the paths that have not been threaded yet: they keep the config
+    /// router's behaviour exactly as it was, and upgrading one is now a one-line change here
+    /// rather than an edit at every call site.
+    fn module_tx_for(
+        &self,
+        config: &str,
+        platform: Option<&str>,
+    ) -> Result<&mpsc::Sender<BuildModuleMessage>, String> {
+        let route = self.route_for(config, platform);
+        self.sender_for(&route).ok_or_else(|| match &route {
+            BuildRoute::Platform(os) => format!("No module registered for platform '{}'", os),
+            BuildRoute::Config(config) => format!("No module registered for {}", config),
+        })
+    }
+
     /// Find which registered config file applies to a path.
     /// For a file path, use its basename. For a directory, look for a known
     /// config file inside it.
@@ -1165,10 +1186,9 @@ impl BuildManagerActor {
                 .find_config_file(path)
                 .ok_or_else(|| format!("No known build config found for {}", path.display()))?,
         };
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {config}"))?;
+        // Through the same single decision point as `build_project`. Platform threading for
+        // this path is a one-line change here once its `opts` is plumbed.
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         module_tx
@@ -1216,11 +1236,7 @@ impl BuildManagerActor {
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
         // A platform-specific module wins over the config file's owner: the platform is what
         // the invocation actually depends on, and an ESP32 build is still a Cargo.toml project.
-        let route = self.route_for(&config, opts.platform.as_deref());
-        let module_tx = self.sender_for(&route).ok_or_else(|| match &route {
-            BuildRoute::Platform(os) => format!("No module registered for platform '{}'", os),
-            BuildRoute::Config(config) => format!("No module registered for {}", config),
-        })?;
+        let module_tx = self.module_tx_for(&config, opts.platform.as_deref())?;
 
         let build_spec = Self::resolve_build_spec(&metadata, opts);
         let (tx, rx) = oneshot::channel();
@@ -1259,10 +1275,7 @@ impl BuildManagerActor {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         let (build_event_tx, mut build_event_rx) =
@@ -1358,10 +1371,7 @@ impl BuildManagerActor {
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
         self.check_capability(&config, "lint", |c| c.supports_lint)?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         let (build_event_tx, mut build_event_rx) =
@@ -1427,10 +1437,7 @@ impl BuildManagerActor {
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
         self.check_capability(&config, "fix", |c| c.supports_fix)?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         let (build_event_tx, mut build_event_rx) =
@@ -1496,10 +1503,7 @@ impl BuildManagerActor {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         module_tx
@@ -1539,10 +1543,7 @@ impl BuildManagerActor {
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
         self.check_capability(&config, "clean", |c| c.supports_clean)?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         module_tx
@@ -1668,10 +1669,7 @@ impl BuildManagerActor {
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
         self.check_capability(&config, "format", |c| c.supports_format)?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         module_tx
@@ -1714,10 +1712,7 @@ impl BuildManagerActor {
                 )
             })?;
 
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         module_tx
@@ -1764,10 +1759,7 @@ impl BuildManagerActor {
                     build_system
                 )
             })?;
-        let module_tx = self
-            .router
-            .get(&config)
-            .ok_or_else(|| format!("No module registered for {}", config))?;
+        let module_tx = self.module_tx_for(&config, None)?;
 
         let (tx, rx) = oneshot::channel();
         module_tx
