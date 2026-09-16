@@ -403,11 +403,19 @@ projects**: a project depends on `spire-hal` and never on a vendor SDK.
       `esp-idf-sys` reads. The same source confirms every triple used here: esp32 →
       `xtensa-esp32-espidf`, esp32s3 → `xtensa-esp32s3-espidf`, esp32c6 →
       `riscv32imac-esp-espidf`, and esp32p4 → `riscv32imafc-esp-espidf` (note the `f`).
-- [ ] 8d. Generalise the drift tooling to Rust. tree-sitter-rust is already in
-      `ast_parser.rs` (`rust_language_config`), so a `trait` becomes the contract and a
-      missing `impl` becomes drift — reusing the existing implemented/missing/drifted shape
-      that `hal_missing_impls` already computes for C++ classes. This is what makes the
-      embedded work HAL-*based* rather than merely Rust: the same cascade
-      (contract → drift → fill → cross-build → flash → run) then closes on firmware.
+- [x] 8d. The Rust drift measure — `build/hal_rust_contract.rs`. tree-sitter-rust was already
+      a dependency and `trait_item`/`impl_item` already mapped in `rust_language_config`, so
+      this was wiring rather than new machinery: `missing_trait_methods_rust(contract, impl)`
+      asks the same question `extract_contract_methods_cpp` asks for C++ — which contract
+      methods has this implementation not provided? Three semantics worth naming, each with a
+      test, because each is a way to be wrong: a method with a **default body** is not owed
+      (reporting it would be a false positive the fill path would then generate code for); an
+      inherent `impl Foo` is not a contract and does not satisfy one; and
+      `impl hal::Led for X` must match `trait Led` by its last path segment. A trait with no
+      impl at all reports every required method — the cascade's starting state. 7 tests.
+      **Not yet wired into `hal_missing_impls`**: that path is proven against C++ and gets the
+      Rust branch *beside* it rather than a rewrite around it.
+      This is what makes the embedded work HAL-*based* rather than merely Rust: with it, the
+      same cascade (contract → drift → fill → cross-build → flash → run) closes on firmware.
 
 
