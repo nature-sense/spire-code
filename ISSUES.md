@@ -397,8 +397,12 @@ projects**: a project depends on `spire-hal` and never on a vendor SDK.
       (`actors/platform_codec.rs:123`), which must persist each new field as an individual
       typed property per that module's rule. Flash is host-side over **USB**
       (`espflash` / `idf.py`), deliberately not the network MCP leg (the MCP path is not
-      viable for a fresh board). Build maps `{cpu, triple}` → `IDF_TARGET` + `--target` +
-      `--features`.
+      viable for a fresh board). Build maps `{cpu, triple}` → `MCU=<cpu>` + `--target <triple>`
+      — **not** `--features`: verified against esp-idf-hal 0.47 / esp-idf-sys 0.38, the
+      esp-idf crates have NO per-chip features, and the chip is the `MCU` env var that
+      `esp-idf-sys` reads. The same source confirms every triple used here: esp32 →
+      `xtensa-esp32-espidf`, esp32s3 → `xtensa-esp32s3-espidf`, esp32c6 →
+      `riscv32imac-esp-espidf`, and esp32p4 → `riscv32imafc-esp-espidf` (note the `f`).
 - [ ] 8d. Generalise the drift tooling to Rust. tree-sitter-rust is already in
       `ast_parser.rs` (`rust_language_config`), so a `trait` becomes the contract and a
       missing `impl` becomes drift — reusing the existing implemented/missing/drifted shape
