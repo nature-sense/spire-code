@@ -54,6 +54,7 @@ pub mod modify_code;
 pub mod modify_contract;
 pub mod targeted_edit;
 pub use meson::MesonBuildModule;
+pub mod esp;
 pub mod hal_migration;
 pub mod hal_rust_contract;
 pub mod spire_app_scaffold;
