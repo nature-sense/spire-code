@@ -382,6 +382,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
         }
     }
+    {
+        use spire_code::Actor as _;
+        // Registered BY PLATFORM, not by config file. An esp-idf project is *also* a
+        // `Cargo.toml` project, so claiming that file would replace the cargo module above
+        // and send every Rust project down the ESP32 path.
+        let (esp_tx, esp_rx) =
+            tokio::sync::mpsc::channel::<spire_code::build::BuildModuleMessage>(8);
+        spire_code::build::EspBuildModule::new().spawn(esp_rx);
+        let _ = bm_tx
+            .send(BuildManagerMessage::AddPlatformModule {
+                os: "esp-idf".to_string(),
+                module_tx: esp_tx,
+            })
+            .await;
+    }
 
     // ── Spawn the project build actor (orchestrates multi-system builds) ──
     // Spawned after the transport so it can push real-time chat notifications
