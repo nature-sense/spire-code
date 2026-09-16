@@ -270,22 +270,42 @@ pub async fn run_esp_build(path: &Path, opts: &BuildOptions) -> Result<BuildOutp
 /// Both are easy to miss and neither failure names its real cause, which is why they live
 /// here rather than in a shell script someone has to remember to source.
 pub(crate) fn spec_from_plan(plan: EspPlan) -> BuildSpec {
+    spec_from_parts(
+        plan,
+        esp_toolchain_bin().as_deref(),
+        libclang_path().as_deref(),
+        std::env::var("PATH").ok().as_deref(),
+    )
+}
+
+/// The conversion itself, with the three environment lookups passed in.
+///
+/// Split out so it can be tested deterministically: `esp_toolchain_bin` and `libclang_path`
+/// read `$HOME`, so a test calling them would pass or fail on whether *this* machine happens
+/// to have espup — failing for a reason unrelated to the logic under test.
+pub(crate) fn spec_from_parts(
+    plan: EspPlan,
+    toolchain_bin: Option<&Path>,
+    libclang: Option<&Path>,
+    inherited_path: Option<&str>,
+) -> BuildSpec {
     let mut env = plan.env;
 
-    // The esp toolchain's `cargo` **and** `rustc` must both win. Letting cargo find its own
-    // rustc silently picks the stable one, and `-Zbuild-std` then fails with an error about a
-    // *flag* rather than about the toolchain that should have accepted it.
-    if let Some(bin) = esp_toolchain_bin() {
+    // The esp toolchain's `cargo` **and** `rustc` must both win, and the bin must come FIRST:
+    // letting cargo find its own rustc silently picks the stable one, and `-Zbuild-std` then
+    // fails with an error about a *flag* rather than about the toolchain that should have
+    // accepted it.
+    if let Some(bin) = toolchain_bin {
         let mut path = bin.to_string_lossy().to_string();
-        if let Ok(existing) = std::env::var("PATH") {
+        if let Some(existing) = inherited_path {
             path.push(':');
-            path.push_str(&existing);
+            path.push_str(existing);
         }
         env.push(("PATH".to_string(), path));
     }
 
     // Without this, bindgen inside esp-idf-sys fails with an error that never mentions bindgen.
-    if let Some(lib) = libclang_path() {
+    if let Some(lib) = libclang {
         env.push((
             "LIBCLANG_PATH".to_string(),
             lib.to_string_lossy().to_string(),
@@ -476,5 +496,65 @@ mod tests {
             .join("lib");
         std::fs::create_dir_all(&lib).unwrap();
         assert_eq!(libclang_path_in(&toolchain), Some(lib));
+    }
+
+    /// The invocation is only correct if these two are present, and *both* failures are
+    /// silent about their cause — so they are pinned here rather than discovered on a board.
+    #[test]
+    fn the_spec_carries_mcu_the_toolchain_and_libclang() {
+        let plan = esp_plan(&c6(), &BuildOptions::default()).expect("plan");
+        let spec = spec_from_parts(
+            plan,
+            Some(Path::new("/home/x/.rustup/toolchains/esp/bin")),
+            Some(Path::new("/home/x/clang/lib")),
+            Some("/usr/bin:/bin"),
+        );
+
+        assert_eq!(spec.command, "cargo");
+        assert!(
+            spec.arguments
+                .contains(&"-Zbuild-std=std,panic_abort".to_string()),
+            "{:?}",
+            spec.arguments
+        );
+
+        let env = |key: &str| {
+            spec.env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(env("MCU").as_deref(), Some("esp32c6"), "the chip is MCU");
+        // FIRST, not merely present: letting cargo find its own rustc picks stable, and
+        // -Zbuild-std then fails complaining about a flag.
+        assert_eq!(
+            env("PATH").as_deref(),
+            Some("/home/x/.rustup/toolchains/esp/bin:/usr/bin:/bin"),
+            "the toolchain bin must be prepended to the inherited PATH"
+        );
+        assert_eq!(env("LIBCLANG_PATH").as_deref(), Some("/home/x/clang/lib"));
+    }
+
+    /// And when they cannot be resolved, nothing is emitted for them: an empty `PATH` entry
+    /// or a blank `LIBCLANG_PATH` would be worse than absent, because it would look
+    /// deliberate and send the next reader hunting for a configuration mistake.
+    #[test]
+    fn the_spec_omits_environment_it_could_not_resolve() {
+        let plan = esp_plan(&c6(), &BuildOptions::default()).expect("plan");
+        let spec = spec_from_parts(plan, None, None, None);
+
+        let env = |key: &str| {
+            spec.env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            env("MCU").as_deref(),
+            Some("esp32c6"),
+            "MCU comes from the platform, not from discovery — it is never optional"
+        );
+        assert_eq!(env("PATH"), None);
+        assert_eq!(env("LIBCLANG_PATH"), None);
     }
 }
