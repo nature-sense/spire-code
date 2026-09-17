@@ -25,7 +25,7 @@ use crate::subsystems::project::project_test::{ProjectTestActor, ProjectTestMess
 use crate::{
     BuildModuleMessage, CargoBuildModule, CmakeBuildModule, EspBuildModule, GoBuildModule,
     GradleBuildModule, MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability,
-    NodeBuildModule, PythonBuildModule, RubyBuildModule, SwiftBuildModule,
+    NodeBuildModule, PythonBuildModule, Rp2040BuildModule, RubyBuildModule, SwiftBuildModule,
 };
 use spire_core::actors::rag::{RagActor, RagMessage};
 use spire_core::actors::tool_providers::ToolRouterActor;
@@ -353,6 +353,10 @@ fn init_actor_system() {
         let cargo_module_tx = spawn_module(CargoBuildModule::new());
         let _ = registry.register::<BuildModuleMessage>("build_module_cargo", cargo_module_tx.clone());
         let cap = register_build_module("cargo", cargo_module_tx, &bm_tx).await;
+        // Pushed where it is produced, like every other module's below. It used to be pushed after
+        // the esp block instead (which pushed cargo's servers twice and the platform module's not
+        // at all) — the ordering hid it, because the two registrations are adjacent.
+        module_mcp_servers.push(cap);
         // The ESP32 module registers BY PLATFORM, not by config file. An esp-idf project is
         // *also* a `Cargo.toml` project, so claiming that file would replace the cargo module
         // in the router and send every Rust project in Spire down the ESP32 path. Declaring
@@ -365,11 +369,30 @@ fn init_actor_system() {
         let _ = bm_tx
             .send(BuildManagerMessage::AddPlatformModule {
                 os: "esp-idf".to_string(),
-                capability: esp_cap,
+                capability: esp_cap.clone(),
                 module_tx: esp_module_tx,
             })
             .await;
-        module_mcp_servers.push(cap);
+        // The esp capability, alongside the module it belongs to.
+        module_mcp_servers.push(esp_cap);
+
+        // The rp2040 module registers the same way and for the same reason: its projects are also
+        // `Cargo.toml` projects, so what differs is the invocation (a `thumbv6m` target, no
+        // vendor SDK, a different flasher) — and that is what `os: "rp2040"` routes on.
+        let rp2040_module_tx = spawn_module(Rp2040BuildModule::new());
+        let _ = registry.register::<BuildModuleMessage>(
+            "build_module_rp2040",
+            rp2040_module_tx.clone(),
+        );
+        let rp2040_cap = describe_module("rp2040", &rp2040_module_tx).await;
+        let _ = bm_tx
+            .send(BuildManagerMessage::AddPlatformModule {
+                os: "rp2040".to_string(),
+                capability: rp2040_cap.clone(),
+                module_tx: rp2040_module_tx,
+            })
+            .await;
+        module_mcp_servers.push(rp2040_cap);
 
         let node_module_tx = spawn_module(NodeBuildModule::new());
         let _ = registry.register::<BuildModuleMessage>("build_module_node", node_module_tx.clone());

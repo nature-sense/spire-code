@@ -407,6 +407,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
         }
     }
+    {
+        use spire_code::Actor as _;
+        // Registered BY PLATFORM, for the same reason as the esp module above: an rp2040 project
+        // is *also* a `Cargo.toml` project, so what differs is the invocation (a `thumbv6m`
+        // target, no vendor SDK, a different flasher) — and that is what `os: "rp2040"` routes on.
+        let (rp2040_tx, rp2040_rx) =
+            tokio::sync::mpsc::channel::<spire_code::build::BuildModuleMessage>(8);
+        spire_code::build::Rp2040BuildModule::new().spawn(rp2040_rx);
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = rp2040_tx
+            .send(spire_code::build::BuildModuleMessage::DescribeCapabilities { reply_to: t })
+            .await;
+        if let Ok(cap) = r.await {
+            let _ = bm_tx
+                .send(BuildManagerMessage::AddPlatformModule {
+                    os: "rp2040".to_string(),
+                    capability: cap,
+                    module_tx: rp2040_tx,
+                })
+                .await;
+        }
+    }
 
     // ── Spawn the project build actor (orchestrates multi-system builds) ──
     // Spawned after the transport so it can push real-time chat notifications

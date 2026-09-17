@@ -202,60 +202,10 @@ pub fn esp_artifact_path(
     package: Option<&str>,
     explicit: Option<&Path>,
 ) -> Option<PathBuf> {
-    if let Some(explicit) = explicit {
-        // Relative paths are relative to the project, like every other path in a build request.
-        return Some(if explicit.is_absolute() {
-            explicit.to_path_buf()
-        } else {
-            root.join(explicit)
-        });
-    }
+    // The derivation itself is shared with the other platform modules; what is esp-specific is
+    // where the triple comes from (this platform's `rust.target`).
     let rust = platform.rust.as_ref()?;
-    let name = package
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .or_else(|| cargo_package_name(root))?;
-    let profile = if mode.eq_ignore_ascii_case("release") {
-        "release"
-    } else {
-        "debug"
-    };
-    Some(
-        root.join("target")
-            .join(&rust.target)
-            .join(profile)
-            .join(name),
-    )
-}
-
-/// `[package] name` from the project's `Cargo.toml`, or `None`.
-///
-/// A crate's binary is named after its package unless a `[[bin]]` section overrides it — and
-/// when it does, the derived path simply does not exist and the refusal names the path it
-/// looked for, which is more useful than silently flashing nothing.
-fn cargo_package_name(root: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
-    let mut in_package = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        if let Some(value) = trimmed.strip_prefix("name") {
-            if let Some(value) = value.trim_start().strip_prefix('=') {
-                let name = value.trim().trim_matches('"').trim();
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
-            }
-        }
-    }
-    None
+    crate::build::generic_helpers::cargo_artifact_path(root, &rust.target, mode, package, explicit)
 }
 
 /// `~/.rustup/toolchains/esp/bin` — where `espup` puts the toolchain whose `cargo` *and*
@@ -619,21 +569,10 @@ pub(crate) fn spec_from_parts(
 /// the build it needs neither the esp toolchain on `PATH` nor `LIBCLANG_PATH`. Setting them
 /// here would be cargo-cult, and a `PATH` that hides the user's own tools is a real failure
 /// mode, not a theoretical one.
-pub(crate) fn spec_from_command(mut command: Vec<String>) -> BuildSpec {
-    // `esp_flash_command` always names a program, so the first element is the program; the
-    // empty case is handled rather than asserted so a future caller that passes nothing gets
-    // an empty command that fails visibly, not a panic in the flash path.
-    let arguments = if command.is_empty() {
-        Vec::new()
-    } else {
-        command.split_off(1)
-    };
-    BuildSpec {
-        command: command.into_iter().next().unwrap_or_default(),
-        arguments,
-        working_dir: String::new(),
-        env: Vec::new(),
-    }
+pub(crate) fn spec_from_command(command: Vec<String>) -> BuildSpec {
+    // Delegates: the conversion is shared with the other platform modules, and this name is kept
+    // because esp's tests and flash path ask for it in esp's terms.
+    crate::build::generic_helpers::build_spec_from_command(command)
 }
 
 #[cfg(test)]

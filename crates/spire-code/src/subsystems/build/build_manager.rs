@@ -4470,6 +4470,25 @@ mod tests {
         }
     }
 
+    /// The capability a platform module advertises: it claims **no** config file (routing is by
+    /// platform) and it is one of the modules that flashes. The rp2040 module's, as it registers
+    /// itself — the two platform modules must not shadow each other.
+    fn rp2040_module_capability() -> ModuleCapability {
+        ModuleCapability {
+            name: "rp2040".to_string(),
+            config_files: Vec::new(),
+            build_system: "Cargo (rp2040)".to_string(),
+            language: "Rust".to_string(),
+            source_extensions: vec!["rs".to_string()],
+            mcp_servers: Vec::new(),
+            supports_flash: true,
+            supports_clean: false,
+            supports_lint: false,
+            supports_format: false,
+            supports_fix: false,
+        }
+    }
+
     /// The capability of a config-file module: owns `Cargo.toml`, flashes nothing.
     fn cargo_capability() -> ModuleCapability {
         ModuleCapability {
@@ -4505,6 +4524,14 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            dir.path().join("rp2040.yaml"),
+            "id: rp2040\nname: Raspberry Pi Pico\nos: rp2040\nfamily: rp2040\narchitecture:\n  \
+             cpu_family: arm\n  cpu: rp2040\n  endian: little\n  \
+             target_triple: thumbv6m-none-eabi\nrust:\n  target: thumbv6m-none-eabi\n  \
+             idf_target: RP2040\n  flash: picotool\n",
+        )
+        .unwrap();
+        std::fs::write(
             dir.path().join("rpi5.yaml"),
             "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  \
              cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
@@ -4514,11 +4541,16 @@ mod tests {
         let _env = SpirePlatformDirGuard::set(dir.path());
 
         let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
-        // The platform module (as the ESP32 one registers itself) — and note it claims no
-        // config file, which is what makes the next registration possible.
+        // The platform modules (as the ESP32 and rp2040 ones register themselves) — and note
+        // they claim no config file, which is what makes the next registration possible.
         manager.add_platform_module(
             "esp-idf".to_string(),
             esp_module_capability(),
+            mpsc::channel(1).0,
+        );
+        manager.add_platform_module(
+            "rp2040".to_string(),
+            rp2040_module_capability(),
             mpsc::channel(1).0,
         );
         manager.add_module(
@@ -4542,6 +4574,13 @@ mod tests {
         assert_eq!(
             manager.route_for("Cargo.toml", Some("esp32c6")),
             BuildRoute::Platform("esp-idf".to_string())
+        );
+
+        // And the second platform module is reached just as directly: routing is by `os`, so
+        // neither platform can shadow the other however many there are.
+        assert_eq!(
+            manager.route_for("Cargo.toml", Some("rp2040")),
+            BuildRoute::Platform("rp2040".to_string())
         );
 
         // Everywhere else, nothing changes — including for a Linux *cross* target, which is
@@ -4579,6 +4618,14 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            dir.path().join("rp2040.yaml"),
+            "id: rp2040\nname: Raspberry Pi Pico\nos: rp2040\nfamily: rp2040\narchitecture:\n  \
+             cpu_family: arm\n  cpu: rp2040\n  endian: little\n  \
+             target_triple: thumbv6m-none-eabi\nrust:\n  target: thumbv6m-none-eabi\n  \
+             idf_target: RP2040\n  flash: picotool\n",
+        )
+        .unwrap();
+        std::fs::write(
             dir.path().join("rpi5.yaml"),
             "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  \
              cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
@@ -4593,12 +4640,21 @@ mod tests {
             esp_module_capability(),
             mpsc::channel(1).0,
         );
+        manager.add_platform_module(
+            "rp2040".to_string(),
+            rp2040_module_capability(),
+            mpsc::channel(1).0,
+        );
         manager.add_module(cargo_capability(), mpsc::channel(1).0);
 
         // A flash-capable platform module is routed exactly as a build would be.
         assert_eq!(
             manager.route_for_flash("Cargo.toml", "esp32c6"),
             Ok(BuildRoute::Platform("esp-idf".to_string()))
+        );
+        assert_eq!(
+            manager.route_for_flash("Cargo.toml", "rp2040"),
+            Ok(BuildRoute::Platform("rp2040".to_string()))
         );
 
         // A board with no flash step: the message names both the platform and its os, so a

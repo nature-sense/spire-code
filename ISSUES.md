@@ -637,9 +637,36 @@ build/flash leg.
         generate → gate → write and asserts `hal_missing_impls` then reports `implemented` with
         `is_stub: false`; the other answers with the placeholder kept and asserts the refusal plus a
         byte-identical file.
-- [ ] 9d. **rp2040 platform + build/flash.** A registry entry (`os: rp2040`,
-      `family: rp2040`, `target: thumbv6m-none-eabi`, flash via `elf2uf2`/`probe-rs`, its own
-      `library_hints`) and an rp2040 build module — no `-Zbuild-std`, no ESP-IDF.
+- [x] 9d. **rp2040 platform + build/flash** (done 2026-09-17). A registry entry
+      (`~/.spire/platforms/rp2040.yaml`: `os: rp2040`, `family: rp2040`,
+      `target: thumbv6m-none-eabi`, `rust.idf_target: RP2040` for `probe-rs --chip`,
+      `rust.flash: picotool`, its own `library_hints`) and `build/rp2040.rs` — a module registered
+      with `AddPlatformModule { os: "rp2040" }` beside the esp one, in both the app path (`ffi.rs`)
+      and the standalone binary, claiming no config file so a plain Rust project still reaches
+      cargo. The plan is `cargo build --target <triple>` and **nothing else**: no `-Zbuild-std` (the
+      target has a prebuilt `core`), no vendor SDK, no environment at all — which is why the module
+      is a fraction of the esp one's size. Flash supports the three tools boards are actually
+      flashed with, each from `rust.flash`: `picotool` (the BOOTSEL USB interface, no probe and no
+      mount — the default), `probe-rs` (a debug probe, with `--chip` from the platform because it
+      cannot infer one from an ELF), and `elf2uf2-rs` (a UF2 to a mounted volume, `-d` to deploy or
+      an explicit `INPUT OUTPUT`); a fourth name is refused rather than run, so a YAML typo fails as
+      "this module does not know that tool" instead of as a shell error.
+      The extraction this needed went into `generic_helpers` (`cargo_package_name`,
+      `cargo_artifact_path`, `build_spec_from_command`) with esp's functions kept as thin delegates,
+      so the proven esp module's tests did not move.
+      Verified live: the real registry entry parses through the real code (`is_embedded: true`, the
+      plan, the chip spelling, the hints), and the planned invocation
+      (`cargo build --target thumbv6m-none-eabi`, no flags) **builds a `no_std` crate on stable**
+      once the toolchain is right. That check found a real environment trap: this machine's `cargo`
+      *and* `rustc` on `PATH` are Homebrew's (`/opt/homebrew/Cellar/rust/1.98.0`, whose sysroot has
+      only the host target) while rustup's stable toolchain has `thumbv6m` installed — so cargo fails
+      with "can't find crate for `core` … may not be installed" and suggests installing a target that
+      is already installed. The module therefore checks the **sysroot `rustc --print sysroot`
+      reports** rather than rustup's target list, and the refusal distinguishes the two cases: not
+      installed anywhere (`rustup target add …`), or installed for rustup's toolchain but not for the
+      one about to run (name the sysroot, and say to put `rustup which cargo`'s directory first on
+      `PATH` — the fix, verified on this machine). A toolchain that cannot be asked is not a refusal:
+      cargo's own error is better than a guess.
 - [ ] 9e. **UI.** "Embedded HAL (Rust)" in `ProjectWizardView` with an embedded-platform
       multi-select showing each platform's hints, and `HALVerificationPortal` showing Rust drift
       per backend.

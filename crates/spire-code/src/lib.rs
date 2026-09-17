@@ -18,8 +18,8 @@ pub use build::{
     AstEdgeData, AstNodeData, AstParseResult, BuildModuleMessage, BuildOptions, BuildOutput,
     CargoBuildModule, CmakeBuildModule, EspBuildModule, GoBuildModule, GradleBuildModule,
     LanguageConfig, MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability,
-    NodeBuildModule, ParseSummary, PythonBuildModule, RubyBuildModule, SwiftBuildModule,
-    TestOptions,
+    NodeBuildModule, ParseSummary, PythonBuildModule, Rp2040BuildModule, RubyBuildModule,
+    SwiftBuildModule, TestOptions,
 };
 pub mod device;
 pub mod ffi;

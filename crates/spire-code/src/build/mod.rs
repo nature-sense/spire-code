@@ -56,6 +56,8 @@ pub mod targeted_edit;
 pub use meson::MesonBuildModule;
 pub mod esp;
 pub use esp::EspBuildModule;
+pub mod rp2040;
+pub use rp2040::Rp2040BuildModule;
 pub mod embedded_hal_fill;
 pub mod embedded_hal_scaffold;
 pub mod hal_migration;

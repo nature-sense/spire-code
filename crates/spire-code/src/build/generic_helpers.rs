@@ -8,7 +8,7 @@
 //! `description` from a simple `key = value` config file, optionally scoped to
 //! a `[section]` (empty section = whole file).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command;
@@ -60,6 +60,101 @@ pub async fn run_cmd_with_env(
         },
         exit_code: output.status.code(),
     })
+}
+
+/// `[package] name` from the project's `Cargo.toml`, or `None`.
+///
+/// A crate's binary is named after its package unless a `[[bin]]` section overrides it — and when
+/// it does, the derived path simply does not exist and the caller's refusal names the path it
+/// looked for, which is more useful than running whatever it found.
+///
+/// Read by hand rather than with a TOML parser: it is one key, and the modules that need it already
+/// read their manifests this way.
+pub fn cargo_package_name(root: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("name") {
+            if let Some(value) = value.trim_start().strip_prefix('=') {
+                let name = value.trim().trim_matches('"').trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The binary a `cargo build --target <triple>` writes, or `None` when its name cannot be known.
+///
+/// `target/<triple>/<profile>/<name>`: the triple is a **subdirectory** because `--target` was
+/// passed (a host build puts the binary straight in `target/<profile>/`), and the profile is
+/// `release` only for a release build — flashing a debug artifact from the release path, or the
+/// reverse, is a wrong-binary flash that no tool would catch.
+///
+/// `explicit` wins when given (a `[[bin]]` name, or an artifact some other step produced);
+/// otherwise the name is `package`, falling back to the `[package] name` in `Cargo.toml`.
+///
+/// Shared by the platform build modules (esp-idf, rp2040): both cross-compile with `--target`, so
+/// both derive the artifact the same way and only the invocation differs.
+pub fn cargo_artifact_path(
+    root: &Path,
+    triple: &str,
+    mode: &str,
+    package: Option<&str>,
+    explicit: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = explicit {
+        // Relative paths are relative to the project, like every other path in a build request.
+        return Some(if explicit.is_absolute() {
+            explicit.to_path_buf()
+        } else {
+            root.join(explicit)
+        });
+    }
+    let name = package
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .or_else(|| cargo_package_name(root))?;
+    let profile = if mode.eq_ignore_ascii_case("release") {
+        "release"
+    } else {
+        "debug"
+    };
+    Some(root.join("target").join(triple).join(profile).join(name))
+}
+
+/// A host `[program, args…]` as a [`BuildSpec`] — the counterpart to a `cargo` invocation.
+///
+/// **No environment**, deliberately: a flasher is a host binary (cargo-installed), so unlike a
+/// cross-build it needs neither a toolchain on `PATH` nor a vendor SDK's variables. Setting them
+/// here would be cargo-cult, and a `PATH` that hides the user's own tools is a real failure mode
+/// rather than a theoretical one.
+pub fn build_spec_from_command(mut command: Vec<String>) -> BuildSpec {
+    // The builders always name a program, so the first element is the program; the empty case is
+    // handled rather than asserted so a future caller that passes nothing gets an empty command
+    // that fails visibly, not a panic in a flash path.
+    let arguments = if command.is_empty() {
+        Vec::new()
+    } else {
+        command.split_off(1)
+    };
+    BuildSpec {
+        command: command.into_iter().next().unwrap_or_default(),
+        arguments,
+        working_dir: String::new(),
+        env: Vec::new(),
+    }
 }
 
 /// Execute a normalized `BuildSpec` invocation: `working_dir` (relative to the
