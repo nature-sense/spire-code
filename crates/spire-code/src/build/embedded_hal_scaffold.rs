@@ -56,6 +56,15 @@ pub(crate) struct FamilySpec {
     /// executor. An rp2040 has no OS at all: that backend supplies its own `Spawner`, which is
     /// why it does not depend on the `-std` crate.
     pub(crate) uses_std_executor: bool,
+    /// How this family is actually built, for the README — the command that was made to work, with
+    /// the one thing that fails in a way that does not name its cause.
+    ///
+    /// Per family, because the two are nothing alike: an esp-idf build needs the espup toolchain,
+    /// `-Zbuild-std` and `MCU`, while an rp2040 build needs only a target that is installed. It is
+    /// *data* rather than a paragraph in the README template so that a project which gains a board
+    /// later (`embedded_hal_add_platform`) can append this family's block instead of the tool
+    /// silently leaving the README describing one board. `__CRATE__` is the backend crate's name.
+    pub(crate) readme_build: &'static str,
 }
 
 /// The vendor HAL for a board family, or `None` when this scaffold does not know it.
@@ -71,6 +80,12 @@ pub(crate) fn family_spec(family: &str) -> Option<FamilySpec> {
                           # `esp_idf_hal::sys`. There are no per-chip features — the chip is the\n\
                           # `MCU` environment variable esp-idf-sys reads, plus `--target`.",
             uses_std_executor: true,
+            readme_build: "# esp32 family (std, esp-idf). Needs the espup `esp` toolchain and\n\
+                           # ESP-IDF, and LIBCLANG_PATH (Spire sets it; by hand, `source\n\
+                           # ~/export-esp.sh` first). The FIRST build compiles ESP-IDF itself and\n\
+                           # takes minutes; later builds are seconds.\n\
+                           MCU=esp32 cargo build --target xtensa-esp32-espidf \\\n\
+                           \x20   -Zbuild-std=std,panic_abort -p __CRATE__",
         }),
         "rp2040" => Some(FamilySpec {
             vendor_crate: "rp2040-hal",
@@ -94,6 +109,8 @@ pub(crate) fn family_spec(family: &str) -> Option<FamilySpec> {
                           # `embedded-hal` 1.x and `cortex-m` 0.7 are here because rp2040-hal's GPIO\n\
                           # and delay methods *are* their traits and it re-exports neither.",
             uses_std_executor: false,
+            readme_build: "# rp2040 family (no_std).\n\
+                           cargo build --target thumbv6m-none-eabi -p __CRATE__",
         }),
         _ => None,
     }
@@ -247,15 +264,33 @@ structure = "embedded_hal"
     .replace("__HAL__", hal)
 }
 
+/// One family's README build block, templated with the backend crate's name.
+///
+/// Shared by the scaffold (which renders all of a project's families) and
+/// `embedded_hal_add_platform` (which appends the one family a project just gained) — so a README
+/// written at creation and one grown later cannot disagree about how a board is built.
+pub(crate) fn readme_family_block(hal: &str, family: &str, spec: &FamilySpec) -> String {
+    spec.readme_build
+        .replace("__CRATE__", &format!("{hal}-{family}"))
+}
+
 /// The README: what the shape is, and how each family is actually built.
 ///
 /// The commands are the ones that were made to work, because each fails in a way that does not
-/// name its real cause — a README that just says "build it" is how that knowledge gets lost.
+/// name its real cause — a README that just says "build it" is how that knowledge gets lost. They
+/// are rendered **per selected family** (`FamilySpec::readme_build`): a one-board project must not
+/// advertise another board's toolchain, and a board added later must be able to extend the same
+/// section rather than find it hard-coded.
 fn readme(display: &str, hal: &str, families: &[(String, FamilySpec)]) -> String {
     let rows: String = families
         .iter()
         .map(|(family, _)| format!("- `crates/{hal}-{family}` — the {family} backend\n"))
         .collect();
+    let builds: String = families
+        .iter()
+        .map(|(family, spec)| readme_family_block(hal, family, spec))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     r#"# __DISPLAY__ — embedded HAL
 
 One **contract**, one **backend per board family**: firmware depends on `__HAL__` and never on a
@@ -282,18 +317,13 @@ Each family needs its own toolchain and target triple: the platform registry ent
 chip. Spire passes both when it builds the project; by hand:
 
 ```sh
-# esp32 family (std, esp-idf). Needs the espup `esp` toolchain and ESP-IDF, and LIBCLANG_PATH
-# (Spire sets it; by hand, `source ~/export-esp.sh` first).
-MCU=esp32 cargo build --target xtensa-esp32-espidf -Zbuild-std=std,panic_abort -p __HAL__-esp32
-
-# rp2040 family (no_std).
-cargo build --target thumbv6m-none-eabi -p __HAL__-rp2040
+__BUILDS__
 ```
 
-The FIRST esp32 build compiles ESP-IDF itself and takes minutes; later builds are seconds.
 "#
     .replace("__DISPLAY__", display)
     .replace("__ROWS__", &rows)
+    .replace("__BUILDS__", &builds)
     .replace("__HAL__", hal)
 }
 
@@ -765,6 +795,33 @@ mod tests {
         );
         assert_eq!(out.structure, ProjectStructure::EmbeddedHal);
         assert!(out.embedded, "the wizard sets embedded for this type");
+
+        // The README describes *this* project: the esp32 family's own build command, with the crate
+        // name filled in — and not the other family's toolchain, which this project does not have.
+        // (It used to name both families whichever board was chosen, which is a README that lies.)
+        let readme = out
+            .files
+            .iter()
+            .find(|f| f.path == "README.md")
+            .expect("the scaffold writes a README")
+            .content
+            .clone();
+        assert!(
+            readme.contains("MCU=esp32 cargo build --target xtensa-esp32-espidf"),
+            "{readme}"
+        );
+        assert!(
+            readme.contains("-Zbuild-std=std,panic_abort -p weather-hal-esp32"),
+            "the crate name is completed, not left as a placeholder:\n{readme}"
+        );
+        assert!(
+            !readme.contains("thumbv6m-none-eabi"),
+            "another family's toolchain has no business here:\n{readme}"
+        );
+        assert!(
+            !readme.contains("__BUILDS__") && !readme.contains("__HAL__"),
+            "no template placeholder survives:\n{readme}"
+        );
     }
 
     /// Both families: the marker the analyzer reads, one backend each, and — the part that is

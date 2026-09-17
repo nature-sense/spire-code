@@ -27,6 +27,7 @@ struct EmbeddedHalBackendsSection: View {
     @State private var plan: [[String: Any]] = []
     @State private var status: String?
     @State private var busy = false
+    @State private var showingContract = false
 
     /// The boards this project could still add: embedded, with a family no backend crate covers yet,
     /// one entry per family (two variants of a board are one backend, so offering both would offer
@@ -78,6 +79,16 @@ struct EmbeddedHalBackendsSection: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(busy || rows.isEmpty)
+
+                // A contract is work for *every* backend, so authoring one belongs where the
+                // backends are listed: after a write, the rows above gain an interface.
+                Button {
+                    showingContract = true
+                } label: {
+                    Label("New contract", systemImage: "doc.badge.plus")
+                }
+                .buttonStyle(.bordered)
+                .disabled(busy)
 
                 // Adding a board is the other half of authoring: it emits the backend crate and its
                 // workspace member, after which the rows above gain a family and the plan gains a
@@ -142,6 +153,13 @@ struct EmbeddedHalBackendsSection: View {
             let platforms = await bridge.fetchPlatforms()
             boards = platforms
             families = Set(platforms.filter(\.embedded).compactMap(\.family))
+        }
+        .sheet(isPresented: $showingContract) {
+            EmbeddedHalContractSheet(projectRoot: projectRoot) {
+                // A new contract is new work for every backend, and every backend's build gate
+                // reads the same measure — so the rows and the platform status both catch up here.
+                await bridge.refreshHalData(root: projectRoot)
+            }
         }
     }
 

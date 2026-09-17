@@ -1539,6 +1539,46 @@ final class SpireBridge {
         return ((json["plan"] as? [[String: Any]]) ?? [], nil)
     }
 
+    /// Rust embedded-HAL authoring — **validate a contract**, before anything is written.
+    ///
+    /// Read-only, and the same gate `embeddedHalWriteContract` passes: the rules are what the drift
+    /// measure needs (it parses, it declares an implementable trait, it implements nothing, no name
+    /// twice), so a contract that validates here is one the measure will see. `summary["traits"]` is
+    /// what the sheet lists; `error` is the refusal, in the user's terms.
+    func embeddedHalValidateContract(content: String) async -> (summary: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool("embedded_hal_validate_contract", args: ["content": content]) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        // The tool reports a refusal as `valid: false` *with* an error string; both spellings mean
+        // the same thing to the caller, so they are folded here rather than in every view.
+        if json["valid"] as? Bool == false {
+            return (nil, (json["error"] as? String) ?? "the contract is not valid")
+        }
+        return (json, nil)
+    }
+
+    /// Rust embedded-HAL authoring — **write a contract**, declaring and re-exporting its module so
+    /// the drift measure can see it.
+    ///
+    /// `result["wired"]` says whether `hal/mod.rs` needed changing, `unchanged` that the file was
+    /// already there byte for byte, and the errors are the tool's: a contract that would replace one
+    /// backends implement is refused rather than silently rewritten.
+    func embeddedHalWriteContract(root: String, filename: String, content: String) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "embedded_hal_write_contract",
+            args: ["root": root, "filename": filename, "content": content]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
     /// Rust embedded-HAL authoring — **add a board**: the backend crate for that platform's family
     /// (emitted by the scaffold's own code path) plus the workspace member line that makes it part of
     /// the project.

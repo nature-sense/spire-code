@@ -16,7 +16,7 @@ use std::path::Path;
 
 use serde_json::json;
 
-use crate::build::embedded_hal_scaffold::family_spec;
+use crate::build::embedded_hal_scaffold::{family_spec, FamilySpec};
 use crate::build::hal_rust_contract::{
     extract_impl_methods_rust, required_trait_methods_rust, rust_syntax_check,
 };
@@ -385,6 +385,19 @@ pub(crate) fn add_platform(root: &Path, platform_id: &str) -> Result<serde_json:
     std::fs::write(&manifest_path, out)
         .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
 
+    // The README lists each family and how it is built. A board added later must extend that
+    // section rather than leave it describing only the boards that existed at creation — and the
+    // block comes from the same per-family data the scaffold renders from, so the two cannot
+    // disagree about the command. A README that cannot be read or found is *reported*, not
+    // guessed at: appending a build command to a file whose shape is unknown would be worse than
+    // saying so.
+    let readme_note = match extend_readme(root, &hal, &family, &spec) {
+        Ok(()) => format!("README.md: added this family's crate and build command"),
+        Err(reason) => format!(
+            "README.md was not updated ({reason}) — add the `{family}` backend's build command there"
+        ),
+    };
+
     Ok(json!({
         "platform": platform_id,
         "family": family,
@@ -392,8 +405,50 @@ pub(crate) fn add_platform(root: &Path, platform_id: &str) -> Result<serde_json:
         "crate": format!("{hal}-{family}"),
         "written": written,
         "workspace_member": member,
-        "note": "README.md's per-family build commands were not updated — add this family's there",
+        "note": readme_note,
     }))
+}
+
+/// Add this family to an existing README: a bullet in the crate list, and its build block inside
+/// the "Build a backend" shell fence.
+///
+/// Both insertions are anchored on the structure the README template produces — the last bullet of
+/// the crate list, and the closing fence of the last ```sh block — because there is no parser here
+/// and a wrong guess would corrupt a file the user reads. A README that does not match that shape is
+/// refused with a reason, which the caller reports as a note.
+fn extend_readme(root: &Path, hal: &str, family: &str, spec: &FamilySpec) -> Result<(), String> {
+    let path = root.join("README.md");
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("cannot read it: {e}"))?;
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+
+    let bullet = format!("- `crates/{hal}-{family}` — the {family} backend");
+    if lines.iter().any(|l| l.trim() == bullet) {
+        return Ok(()); // already described: a retry must not duplicate the list
+    }
+    let Some(last_bullet) = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("- `crates/"))
+    else {
+        return Err("its crate list was not found".to_string());
+    };
+    lines.insert(last_bullet + 1, bullet);
+
+    // The closing fence of the last ```sh block: insert before it, so the block stays one block.
+    let block = crate::build::embedded_hal_scaffold::readme_family_block(hal, family, spec);
+    let Some(close) = lines
+        .iter()
+        .rposition(|l| l.trim() == "```")
+        .filter(|close| lines[..*close].iter().any(|l| l.trim() == "```sh"))
+    else {
+        return Err("its build-command block was not found".to_string());
+    };
+    let mut inserted: Vec<String> = vec![String::new()];
+    inserted.extend(block.lines().map(str::to_string));
+    lines.splice(close..close, inserted);
+
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(&path, out).map_err(|e| format!("cannot write it: {e}"))
 }
 
 #[cfg(test)]
@@ -635,6 +690,40 @@ mod tests {
         assert!(backends.contains_key("rp2040"), "{backends:?}");
         assert!(backends.contains_key("esp32"), "{backends:?}");
 
+        // The README grows with the project: the crate list gains the family, and the *same*
+        // per-family build block the scaffold renders appears in the build section — so the one
+        // document a user reads by hand is not left describing only the boards chosen at creation.
+        let readme = read(root, "README.md");
+        assert!(
+            readme.contains("- `crates/weather-hal-rp2040` — the rp2040 backend"),
+            "the board it was created with is still listed:\n{readme}"
+        );
+        assert!(
+            readme.contains("- `crates/weather-hal-esp32` — the esp32 backend"),
+            "the added board is listed:\n{readme}"
+        );
+        assert!(
+            readme.contains("cargo build --target thumbv6m-none-eabi -p weather-hal-rp2040"),
+            "its own build command:\n{readme}"
+        );
+        assert!(
+            readme.contains("MCU=esp32 cargo build --target xtensa-esp32-espidf"),
+            "and the new family's, inside the same fence:\n{readme}"
+        );
+        assert!(
+            readme.contains("MCU=esp32 cargo build --target xtensa-esp32-espidf \\\n    -Zbuild-std=std,panic_abort -p weather-hal-esp32"),
+            "with the crate line actually completed:\n{readme}"
+        );
+        assert!(
+            !readme.contains("__CRATE__") && !readme.contains("__BUILDS__"),
+            "no template placeholder survives into the user's README:\n{readme}"
+        );
+        assert_eq!(
+            readme.matches("MCU=esp32 cargo build").count(),
+            1,
+            "a retry must not duplicate the block:\n{readme}"
+        );
+
         // A family that is already there is refused, so a second call cannot fork the crate.
         let err = add_platform(root, "esp32s3").expect_err("same family, already present");
         assert!(err.contains("already has a backend crate"), "{err}");
@@ -645,6 +734,29 @@ mod tests {
 
         let err = add_platform(root, "no-such-board").expect_err("unknown id");
         assert!(err.contains("unknown platform"), "{err}");
+    }
+
+    /// A project whose README is missing or unrecognizable is **reported**, not guessed at: the tool
+    /// still adds the crate, and the note says exactly what it could not do.
+    #[test]
+    fn a_readme_that_cannot_be_extended_is_reported_rather_than_guessed_at() {
+        let f = Fixture::new("weather");
+        let root = f.root();
+        std::fs::remove_file(root.join("README.md")).unwrap();
+        let added = add_platform(root, "esp32c6").expect("the crate is still added");
+        let note = added["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("README.md was not updated"),
+            "the note must say what did not happen: {added}"
+        );
+        assert!(
+            note.contains("cannot read it"),
+            "and why, in the README's own terms: {added}"
+        );
+        assert!(
+            root.join("crates/weather-hal-esp32/src/lib.rs").exists(),
+            "the crate itself is unaffected"
+        );
     }
 
     /// A project with no contract crate is refused by name rather than half-written: every write

@@ -130,6 +130,33 @@ func addableBoardsOffersOneEntryPerAbsentFamily() throws {
     #expect(fresh.map(\.id) == ["esp32c6", "rp2040"], "\(fresh.map(\.id))")
 }
 
+/// The validation summary the contract sheet lists.
+///
+/// Pinned against the tool's exact payload: `widget.embedded_hal_validate_contract`'s answer is what
+/// the sheet renders as "this is what the measure will see", so a field that stopped decoding would
+/// show an empty list — and an empty list disables the Write button, which would look like a refusal
+/// rather than a bug.
+@Test("A contract validation summary describes its traits")
+func contractValidationSummaryDescribesTraits() throws {
+    let summary: [String: Any] = [
+        "valid": true,
+        "trait_count": 2,
+        "method_count": 3,
+        "traits": [
+            ["trait": "Sensor", "methods": ["read_deci_celsius"]],
+            ["trait": "Sink", "methods": ["write", "flush"]],
+        ],
+    ]
+    let lines = EmbeddedHalContractSheet.describeTraits(summary: summary)
+    #expect(lines == ["Sensor — read_deci_celsius", "Sink — write, flush"], "\(lines)")
+
+    // A trait with no required methods cannot reach here (the tool refuses it), but the display must
+    // not print a dangling dash if one ever does.
+    let bare = EmbeddedHalContractSheet.describeTraits(summary: ["traits": [["trait": "Marker"]]])
+    #expect(bare == ["Marker"], "\(bare)")
+    #expect(EmbeddedHalContractSheet.describeTraits(summary: [:]).isEmpty)
+}
+
 @Test("Bridge initialises without crashing")
 func bridgeInit() {
     let bridge = SpireBridge()
