@@ -694,8 +694,26 @@ build/flash leg.
         re-measures, after which the UI re-reads coverage. The C++ pair-file flow is untouched
         beside it.
       Verified: `swift build` and `swift test` pass with the new decode test, and 306 lib tests pass.
-      The wizard's `createProject/Plan` → `Scaffold` → `ExecutePlan` route through the FFI is still
-      not driven end to end, which is the next thing to do by hand.
+      **Driven end to end at last** — `tests/embedded_hal_creation_tests.rs` walks the wizard's own
+      route (`createProject/Plan` → `createProject/Scaffold` → `hal_missing_impls` →
+      `embedded_hal_fill_plan`) through the real coordinator, the real build manager with its real
+      cargo module, the real filesystem module and a real platform registry, with **no model
+      wired at all**. It asserts the deterministic plan (is_template, contract + both backends
+      written, build gate last), the workspace on disk (the declared marker, six files), the fresh
+      backends measuring as `stub`/`is_stub`, and the fill plan naming one file per family with the
+      board's own hints and the contract source in the prompt.
+      Driving it found two things a compile could not:
+      - **The wizard's Plan button does not use `createProject/GeneratePlan`** — it calls
+        `createProject/Plan` (`PlanScaffold`), which went straight to the **LLM fill plan** for every
+        structure, so 9e's "the plan is deterministic" was true of a route the UI never calls. Worse
+        for this structure, that fill plan's roots include the *contract crate*: a model writing
+        there edits the one thing every backend depends on. `PlanScaffold` now dispatches on the
+        structure and returns the deterministic scaffold plan for the embedded HAL — so the plan
+        needs no model, and the contract is never handed to one. (SpireApp keeps its LLM fill plan
+        deliberately: there the fill *is* the goal.)
+      - `hal_missing_impls` reported `kind: "partial"` for a backend that is a fresh stub, because
+        it tested `implemented` before `is_stub`. `kind` now says `stub` when a placeholder is
+        present — the same word the maturity chips use, so the payload and the UI agree.
 
 Design notes worth keeping: the contract stays **`no_std`** and **synchronous** (`Spawner` is
 the backend's only obligation, so the rp2040 backend supplies its own synchronous scheduler and

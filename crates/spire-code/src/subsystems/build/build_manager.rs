@@ -3374,7 +3374,13 @@ executable('{project_name}-{platform}',
                         let mut m: std::collections::BTreeMap<String, serde_json::Value> =
                             std::collections::BTreeMap::new();
                         for (iface, cov) in ifaces {
-                            let kind = if cov.implemented {
+                            // `stub` is checked before `partial`: a placeholder that declares every
+                            // method is neither implemented nor a genuine partial — it is a
+                            // generated stub, and the queue has to say which so a reader can tell
+                            // "nothing written yet" from "some of it is written".
+                            let kind = if cov.is_stub {
+                                "stub"
+                            } else if cov.implemented {
                                 "implemented"
                             } else if cov.has_impl {
                                 "partial"

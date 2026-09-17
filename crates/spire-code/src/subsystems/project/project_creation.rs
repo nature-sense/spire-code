@@ -2560,7 +2560,19 @@ impl Actor for ProjectCreationActor {
                         )
                         .await?;
                     self.active_spec = Some(spec.clone());
-                    let plan = self.generate_fill_plan(&goal, &root_dir, &spec).await?;
+                    let plan = match spec.structure {
+                        // The embedded HAL is filled by the **drift cascade**, one backend file at
+                        // a time, from a prompt that carries the platform's own hints — never by a
+                        // generic fill plan: that plan's roots include the contract crate, and a
+                        // model writing there would edit the one thing every backend depends on.
+                        // Its plan is therefore the scaffold's writes plus a gate, and it needs no
+                        // model at all.
+                        spire_core::build_types::ProjectStructure::EmbeddedHal => {
+                            self.embedded_hal_template_plan(&goal, &root_dir, &language, &platforms)
+                                .await
+                        }
+                        _ => self.generate_fill_plan(&goal, &root_dir, &spec).await?,
+                    };
                     Ok(PlanScaffoldResult { plan, spec })
                 }
                 .await;
