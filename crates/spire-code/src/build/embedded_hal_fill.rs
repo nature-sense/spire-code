@@ -894,7 +894,9 @@ mod tests {
     /// a `lib.rs` that only re-exports.
     #[test]
     fn a_split_backend_names_the_file_that_holds_the_impl() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry();
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
@@ -939,7 +941,9 @@ mod tests {
     /// has to come from the placeholder bodies.
     #[test]
     fn a_scaffolded_backend_is_one_pending_plan_item() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry();
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
@@ -1027,7 +1031,9 @@ mod tests {
     /// empties it.
     #[test]
     fn a_filled_backend_is_not_in_the_plan() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry();
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
@@ -1048,7 +1054,9 @@ mod tests {
     /// the case where one was written by hand.
     #[test]
     fn an_unknown_family_is_refused_rather_than_prompted() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry();
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
@@ -1084,7 +1092,9 @@ mod tests {
     /// which is what the model should see.
     #[test]
     fn a_platform_of_another_family_contributes_no_hints() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry();
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 

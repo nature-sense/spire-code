@@ -898,7 +898,9 @@ mod tests {
     /// board, which is the point: every one of these declines *before* a device is touched.
     #[tokio::test]
     async fn run_esp_flash_refuses_before_it_could_flash_the_wrong_thing() {
-        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("platform dir");
         std::fs::write(
             dir.path().join("esp32c6.yaml"),
@@ -1231,7 +1233,9 @@ mod tests {
     /// board is needed to prove them, which is exactly why they are worth proving.
     #[tokio::test]
     async fn run_esp_build_refuses_before_it_could_build_for_the_wrong_chip() {
-        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("platform dir");
         std::fs::write(
             dir.path().join("rpi5.yaml"),

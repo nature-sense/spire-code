@@ -585,7 +585,7 @@ impl Spawner for StdSpawner {
 /// The manifest is **structural** — the vendor dependency and the executor choice are not the
 /// model's to invent — while `src/lib.rs` is fillable (`fill_role: HalImplementation`):
 /// implementing the contract for this board is exactly what the fill phase is for.
-fn backend_files(
+pub(crate) fn backend_files(
     hal: &str,
     hal_id: &str,
     family: &str,
@@ -739,7 +739,9 @@ mod tests {
     /// not a cargo feature, so a backend serves a family however many variants are selected.
     #[test]
     fn one_backend_per_family_not_per_variant() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry(&[
             ("esp32c6", "esp-idf", Some("esp32")),
             ("esp32s3", "esp-idf", Some("esp32")),
@@ -769,7 +771,9 @@ mod tests {
     /// easiest to get wrong — which executor each uses.
     #[test]
     fn both_families_get_a_backend_and_the_marker_the_analyzer_reads() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry(&[
             ("esp32c6", "esp-idf", Some("esp32")),
             ("rp2040", "rp2040", Some("rp2040")),
@@ -854,7 +858,9 @@ mod tests {
     /// build is worse than no crate, because it fails long after the choice was made.
     #[test]
     fn unknown_and_non_embedded_platforms_are_refused() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry(&[
             ("rpi5", "linux", None),
             ("esp32h2", "esp-idf", Some("esp32h2")),
@@ -889,7 +895,9 @@ mod tests {
     #[test]
     #[ignore = "writes the scaffold to a real directory for a real cargo build"]
     fn dump_scaffold_for_a_real_build() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry(&[
             ("esp32c6", "esp-idf", Some("esp32")),
             ("rp2040", "rp2040", Some("rp2040")),

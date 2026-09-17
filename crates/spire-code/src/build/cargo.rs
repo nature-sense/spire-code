@@ -1938,7 +1938,9 @@ mod tests {
     fn scaffold_layout_multi_emits_single_crate_with_per_target_config() {
         // Serialize against `SPIRE_PLATFORM_DIR` mutating tests (build_manager
         // fixtures) — `from_registry` reads that process-global env var.
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let out = CargoBuildModule::new()
             .scaffold_layout(
                 "demo",
@@ -1986,7 +1988,9 @@ mod tests {
     fn scaffolding_multi_platform_roundtrips_through_analyze() {
         // Serialize against `SPIRE_PLATFORM_DIR` mutating tests (build_manager
         // fixtures) — the analyzer reads that process-global env var.
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Write the scaffolded files to a temp dir, then verify the analyzer
         // sees ONE crate (not a workspace) with the crate's single lib target.
         let tmp = tempfile::tempdir().unwrap();
@@ -2031,7 +2035,9 @@ mod tests {
     /// makes and the app then fails to recognize.
     #[test]
     fn embedded_hal_scaffold_is_recognized_by_the_analyzer() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = tempfile::tempdir().unwrap();
         std::fs::write(
             reg.path().join("esp32c6.yaml"),

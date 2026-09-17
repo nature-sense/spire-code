@@ -37,5 +37,11 @@ pub use spire_core::actors::{Actor, ToolInfo};
 /// process-global `SPIRE_PLATFORM_DIR` env var (`build_manager` fixtures set
 /// it; cargo/meson scaffold tests read it via `Platform::from_registry`).
 /// Acquire it for the duration of any test touching `SPIRE_PLATFORM_DIR`.
+///
+/// Take it **tolerantly** — `lock().unwrap_or_else(|poisoned| poisoned.into_inner())`, not
+/// `lock().unwrap()` — because a plain `unwrap` keeps a failure expensive: the first test to panic
+/// while holding the lock poisons it, and every later taker then panics with "PoisonError" instead
+/// of its own assertion. That turns one real failure into a wall of unrelated ones, which is what
+/// happened when this lock was first shared by three modules' tests.
 #[doc(hidden)]
 pub static PLATFORM_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

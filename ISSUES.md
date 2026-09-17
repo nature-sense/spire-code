@@ -581,11 +581,11 @@ build/flash leg.
       and no cross toolchain (`default-members` excludes the backends), and a test runs the
       emitter and then `analyze` to prove the marker written in one module is the marker read by
       another. Backend *builds* wait on 9c/9d (the fill, and the rp2040 platform).
-- [ ] 9c. **Rust contract authoring + fill, hint-injected.** The Rust analogues of the `hal_*`
+- [x] 9c. **Rust contract authoring + fill, hint-injected.** The Rust analogues of the `hal_*`
       tools (`_validate/_write_contract`, `_add_platform`, `_fill_plan/_fill_apply`,
       `_missing_impls`) whose prompts read the platform's `library_hints` (+ a Rust hardware
-      profile) so a generated `impl` uses that board's real peripherals. Half done — the measure,
-      the plan and the apply leg, which are the pieces the rest builds on:
+      profile) so a generated `impl` uses that board's real peripherals. Done in four parts — the
+      measure, the plan, the apply leg and the authoring trio:
       - **The measure reads the new layout, and a stub is not coverage** (done 2026-09-17).
         `rust_platform_coverage_map` now knows the embedded-HAL tree as well as the C++ one:
         contracts from `crates/<prefix>-hal/src/hal/*.rs` (the same stem-keyed interface
@@ -637,6 +637,47 @@ build/flash leg.
         generate → gate → write and asserts `hal_missing_impls` then reports `implemented` with
         `is_stub: false`; the other answers with the placeholder kept and asserts the refusal plus a
         byte-identical file.
+      - **`_validate`/`_write_contract`/`_add_platform`** (done 2026-09-17). The Rust trio that
+        authors the two halves of a project that are not a backend — its contracts and its boards
+        (`build/embedded_hal_contract.rs`). The C++ pair's safety rule carries over: validate first,
+        and an invalid contract never touches disk. The rules are not style — each is a way the file
+        would be invisible to the drift measure: it must parse (same tree-sitter parser the measure
+        uses), declare at least one trait with at least one **required** method (a trait whose
+        methods are all defaulted is skipped by the measure, so accepting it hands back a contract
+        that behaves as absent), declare no `impl` (an implementation in the interface file would be
+        reported as *every* board's), and not declare one name twice (ambiguous at the
+        `use hal::{…}` every backend writes).
+        Where the C++ tools edit `meson.build`, these edit the two files the Rust layout depends on
+        for visibility, and that is the part worth having: `write_contract` adds
+        `pub mod <stem>;` **and** `pub use <stem>::<Trait>;` to `hal/mod.rs` (beside the existing
+        groups rather than appended), and `add_platform` adds the **workspace member** line. Without
+        those, a written contract and a new backend crate are both invisible — the project would look
+        *finished* rather than broken. `add_platform` also refuses what the scaffold refuses (a
+        family with no vendor facts, a non-embedded `os`, an unknown id) and one more: a family that
+        already has a backend crate, so a second call cannot fork it. The backend crate itself comes
+        from the **scaffold's own emitter** — one code path, so a platform added later gets exactly
+        the pinned deps (`embedded-hal = "1"`, `cortex-m = "0.7"`) and the `unimplemented!()` stubs
+        that took a compiler to discover.
+        Two refusals on the write are deliberate: an existing file with **different** content is not
+        replaced (a contract is what every backend implements — editing it is a deliberate act), and
+        an **identical** file is a no-op with the module list still checked, so a retry after an
+        interrupted authoring converges instead of erroring.
+        Verified end to end, no model: `a_new_contract_and_a_new_board_both_become_fill_work` drives
+        the real route — scaffold (rp2040) → plan (1 item) → validate + write `sensor.rs` →
+        add `esp32c6` → plan again (**2 items**) — and asserts the new backend owes the interface
+        just authored (`stub`), not merely that files exist; the unit tests assert the same through
+        `embedded_hal_layout`, the function the measure uses. Unit tests there also pin every refusal
+        above, the idempotent re-write, and that a project without a contract crate is refused by
+        name rather than half-written.
+        Two test-infrastructure findings came out of it. The shared `PLATFORM_DIR_TEST_LOCK` is now
+        taken **tolerantly** (`unwrap_or_else(|poisoned| poisoned.into_inner())`): a plain `unwrap`
+        let one failing test poison it, and every later taker then panicked with "PoisonError" — one
+        real failure turned into ten unrelated ones, which is exactly how it presented. And the
+        fixture discipline (a registry *and* the lock *and* an env guard) is what makes these tests
+        pass together, not just alone.
+        Still open: nothing calls these three tools from the UI — the wizard's "Rust backends"
+        section could carry "Add board", and contract authoring is a tool-call away rather than a
+        window. The C++ `hal_*` pair is untouched beside them.
 - [x] 9d. **rp2040 platform + build/flash** (done 2026-09-17). A registry entry
       (`~/.spire/platforms/rp2040.yaml`: `os: rp2040`, `family: rp2040`,
       `target: thumbv6m-none-eabi`, `rust.idf_target: RP2040` for `probe-rs --chip`,

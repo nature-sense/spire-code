@@ -535,6 +535,135 @@ async fn a_scaffolded_backend_builds_after_one_repair_round() {
     );
 }
 
+/// Authoring the *other* two halves of a project — a new contract and a new board — and checking
+/// that both turn into work rather than into files nobody measures.
+///
+/// This is the route the C++ `hal_write_contract`/`hal_add_platform` pair serves, for the Rust
+/// layout. The trap it exists for is quiet: a contract file that `hal/mod.rs` does not declare, and a
+/// backend crate the workspace manifest does not list, are both invisible to the drift measure — the
+/// project would look *finished* rather than broken.
+#[tokio::test]
+async fn a_new_contract_and_a_new_board_both_become_fill_work() {
+    let platforms = registry();
+    std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path().join("weather");
+    let wizard = Wizard::build().await;
+
+    let scaffold = wizard
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "weather",
+                "rootDir": root.to_string_lossy(),
+                "language": "Rust",
+                "platforms": ["rp2040"],
+                "structure": "embedded_hal",
+            }),
+        )
+        .await;
+    assert!(scaffold.get("error").is_none(), "{scaffold}");
+
+    // One board: one backend file to fill, owing the scaffold's two interfaces.
+    let before = wizard
+        .tool(
+            "embedded_hal_fill_plan",
+            serde_json::json!({ "root": root.to_string_lossy() }),
+        )
+        .await;
+    let items = before["plan"].as_array().expect("fill items");
+    assert_eq!(items.len(), 1, "{before}");
+
+    // ── A new contract ───────────────────────────────────────────────────────────────────────
+    let sensor = "//! A temperature sensor on this family's I2C bus.\n\
+                  //!\n\
+                  //! The bus itself is configured by the family's backend; this trait only reads.\n\
+                  pub trait Sensor {\n\
+                  \x20   /// The last reading, in tenths of a degree Celsius (negative below zero).\n\
+                  \x20   fn read_deci_celsius(&mut self) -> i32;\n\
+                  }\n";
+    let validated = wizard
+        .tool(
+            "embedded_hal_validate_contract",
+            serde_json::json!({ "content": sensor }),
+        )
+        .await;
+    assert_eq!(validated["valid"], serde_json::json!(true), "{validated}");
+    assert_eq!(validated["traits"][0]["trait"], serde_json::json!("Sensor"));
+
+    let written = wizard
+        .tool(
+            "embedded_hal_write_contract",
+            serde_json::json!({
+                "root": root.to_string_lossy(),
+                "filename": "sensor.rs",
+                "content": sensor,
+            }),
+        )
+        .await;
+    assert_eq!(written["valid"], serde_json::json!(true), "{written}");
+    assert_eq!(
+        written["wired"],
+        serde_json::json!(true),
+        "a contract nothing declares is invisible to the measure: {written}"
+    );
+    let module = std::fs::read_to_string(root.join("crates/weather-hal/src/hal/mod.rs")).unwrap();
+    assert!(module.contains("pub mod sensor;"), "{module}");
+    assert!(module.contains("pub use sensor::Sensor;"), "{module}");
+
+    // ── A new board ──────────────────────────────────────────────────────────────────────────
+    let added = wizard
+        .tool(
+            "embedded_hal_add_platform",
+            serde_json::json!({
+                "root": root.to_string_lossy(),
+                "platform": "esp32c6",
+            }),
+        )
+        .await;
+    assert_eq!(added["family"], serde_json::json!("esp32"), "{added}");
+    assert!(
+        std::fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap()
+            .contains("\"crates/weather-hal-esp32\","),
+        "the workspace member is what makes the crate part of the project"
+    );
+
+    // ── Both are now work, not files ─────────────────────────────────────────────────────────
+    let after = wizard
+        .tool(
+            "embedded_hal_fill_plan",
+            serde_json::json!({ "root": root.to_string_lossy() }),
+        )
+        .await;
+    let items = after["plan"].as_array().expect("fill items");
+    assert_eq!(items.len(), 2, "one item per backend file: {after}");
+    let esp32 = items
+        .iter()
+        .find(|i| i["family"] == serde_json::json!("esp32"))
+        .unwrap_or_else(|| panic!("the new board must be planned for: {after}"));
+    let pending: Vec<&str> = esp32["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["interface"].as_str())
+        .collect();
+    assert!(
+        pending.contains(&"sensor"),
+        "the contract just authoring is owed by the new backend: {esp32}"
+    );
+    assert_eq!(
+        esp32["pending"][0]["status"],
+        serde_json::json!("stub"),
+        "and it is work, not a claim: {esp32}"
+    );
+    let prompt = esp32["prompt"].as_str().unwrap_or_default();
+    assert!(
+        prompt.contains("RISC-V RV32IMAC via esp-idf-hal"),
+        "the new board's own hints reach the prompt: {prompt}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────
 // The whole loop, live: fill → build → repair with the compiler's words → build again
 // ─────────────────────────────────────────────────────────────────────────────────────

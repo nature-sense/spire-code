@@ -3756,6 +3756,73 @@ executable('{project_name}-{platform}',
                 }
             }
 
+            // Authoring a Rust contract: validate, then write it *and wire it* — a contract file
+            // nothing declares is invisible to the drift measure, which is the failure this pair
+            // exists to prevent (`hal_validate_contract`/`hal_write_contract` for the Rust layout).
+            "embedded_hal_validate_contract" => {
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if content.is_empty() {
+                    serde_json::json!({ "error": "embedded_hal_validate_contract: 'content' (Rust source) is required" })
+                } else {
+                    match crate::build::embedded_hal_contract::validate_contract(content) {
+                        Ok(summary) => summary,
+                        Err(e) => serde_json::json!({ "valid": false, "error": e }),
+                    }
+                }
+            }
+
+            "embedded_hal_write_contract" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let filename = args
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if root.is_empty() || filename.is_empty() || content.is_empty() {
+                    serde_json::json!({
+                        "error": "embedded_hal_write_contract: 'root', 'filename' and 'content' are required"
+                    })
+                } else {
+                    match crate::build::embedded_hal_contract::write_contract(
+                        std::path::Path::new(root),
+                        filename,
+                        content,
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => serde_json::json!({ "valid": false, "error": e }),
+                    }
+                }
+            }
+
+            // Adding a board family to an existing project: the backend crate comes from the
+            // scaffold's own emitter, plus the workspace member line that makes it exist.
+            "embedded_hal_add_platform" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let platform = args
+                    .get("platform")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if root.is_empty() || platform.is_empty() {
+                    serde_json::json!({
+                        "error": "embedded_hal_add_platform: 'root' (project dir) and 'platform' (registry id) are required"
+                    })
+                } else {
+                    match crate::build::embedded_hal_contract::add_platform(
+                        std::path::Path::new(root),
+                        platform,
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => serde_json::json!({ "error": e }),
+                    }
+                }
+            }
+
             "hal_diff_contracts" => {
                 let old_summary = args
                     .get("old_summary")
@@ -4292,6 +4359,22 @@ executable('{project_name}-{platform}',
                   "plan": { "description": "The embedded_hal_fill_plan result, or its `plan` array" }
               }),
               &["root", "plan"]),
+            t("embedded_hal_validate_contract", "Validate a Rust embedded-HAL contract's source before it is written (parses, declares at least one implementable trait, no implementation).",
+              serde_json::json!({ "content": { "type": "string" } }),
+              &["content"]),
+            t("embedded_hal_write_contract", "Validate and write a Rust embedded-HAL contract into the contract crate, declaring and re-exporting its module so the drift measure can see it.",
+              serde_json::json!({
+                  "root": { "type": "string" },
+                  "filename": { "type": "string", "description": "e.g. `sensor.rs` or `sensor` — the module name in the contract crate" },
+                  "content": { "type": "string" }
+              }),
+              &["root", "filename", "content"]),
+            t("embedded_hal_add_platform", "Add a board family to an existing Rust embedded-HAL project: a backend crate (from the scaffold's own emitter) and its workspace member.",
+              serde_json::json!({
+                  "root": { "type": "string" },
+                  "platform": { "type": "string", "description": "Platform registry id (e.g. esp32c6); its `family` decides the crate" }
+              }),
+              &["root", "platform"]),
             t("hal_diff_contracts", "Diff two HAL contract summaries (added/removed/changed methods).",
               serde_json::json!({ "old_summary": { "type": "object" }, "new_summary": { "type": "object" } }),
               &["old_summary", "new_summary"]),
@@ -4753,7 +4836,9 @@ mod tests {
     /// failure this whole mechanism exists to avoid, so it is asserted, not assumed.
     #[test]
     fn a_build_routes_by_platform_only_when_a_platform_module_exists() {
-        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("platform dir");
         std::fs::write(
             dir.path().join("esp32c6.yaml"),
@@ -4847,7 +4932,9 @@ mod tests {
     /// reads as a crash rather than as "this board has no USB flash step".
     #[test]
     fn flash_routes_only_to_a_module_that_declares_it() {
-        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("platform dir");
         std::fs::write(
             dir.path().join("esp32c6.yaml"),
@@ -4936,7 +5023,9 @@ mod tests {
     /// board.
     #[tokio::test]
     async fn build_build_routes_by_platform_not_to_the_config_owners_module() {
-        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = tempfile::tempdir().unwrap();
         std::fs::write(
             reg.path().join("esp32c6.yaml"),
@@ -5030,7 +5119,9 @@ mod tests {
     fn hal_library_hints_come_from_yaml_and_fall_back() {
         use tempfile::tempdir;
 
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let reg = tempdir().unwrap();
         let dir = reg.path().join("platforms");
@@ -5381,7 +5472,9 @@ public:
 
         // Serialize against the OTHER test that mutates the process-global
         // SPIRE_PLATFORM_DIR env var (they must never interleave).
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Fixture platform registry mirroring the real seed layout.
         let reg = tempdir().unwrap();
@@ -5951,7 +6044,9 @@ public:
 
         // Serialize against the OTHER test that mutates the process-global
         // SPIRE_PLATFORM_DIR env var (they must never interleave).
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Fixture platform registry mirroring the real seed layout.
         let reg = tempdir().unwrap();
