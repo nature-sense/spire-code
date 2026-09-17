@@ -1852,6 +1852,60 @@ impl BuildManagerActor {
         rx.await.map_err(|e| format!("module response lost: {e}"))?
     }
 
+    /// Check a just-written contract with a compiler, and attach what happened.
+    ///
+    /// The second generator on the **verify spine** (the fill leg was the first), and the reason the
+    /// spine exists: the shape — gate, build, report — is the same, only the artifact differs. Two
+    /// differences from the fill leg are deliberate:
+    ///
+    /// - **The gate is real here.** The fill leg gates before writing and says so; a contract is
+    ///   written first and gated after, by re-reading the file that landed and parsing it — which is
+    ///   the only way to catch a write that did not survive the filesystem.
+    /// - **No repair rounds.** The source is the user's, typed in the sheet: there is no generator to
+    ///   hand errors back to, so `max_rounds = 0` (build once, report) is the honest configuration
+    ///   rather than a special case.
+    ///
+    /// A project Spire cannot build from (no manifest, no cargo module) is reported as `not_built`,
+    /// never as a failed contract — the same distinction the spine makes everywhere.
+    async fn verify_written_contract(&self, root: &Path, result: &mut serde_json::Value) {
+        let Some(written) = result
+            .get("written")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+        else {
+            return;
+        };
+        // `crates/<crate>/src/hal/<stem>.rs` → the crate to build. Read from the path that was
+        // written rather than re-deriving the project's naming rule a second time.
+        let crate_name = written
+            .strip_prefix(root.join("crates"))
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .map(|first| first.as_os_str().to_string_lossy().to_string());
+        let Some(crate_name) = crate_name else {
+            result["host_build"] = serde_json::json!({
+                "built": serde_json::Value::Null,
+                "not_built": "the written path is not inside crates/",
+            });
+            return;
+        };
+
+        let artifact = ContractArtifact {
+            manager: self,
+            root: root.to_path_buf(),
+            file: written.clone(),
+            crate_name,
+        };
+        let outcome = crate::build::verify_spine::verify_generated(&artifact, 0).await;
+        let mut json = outcome.to_json();
+        if let Some(errors) = json.get("errors").and_then(|e| e.as_str()) {
+            let kept = Self::tail_lines(errors, 40);
+            json["errors"] = serde_json::json!(kept);
+        }
+        result["host_build"] = json;
+    }
+
+    /// Check a just-written contract with a compiler, and attach what happened.
     async fn flash_project(
         &self,
         path: &Path,
@@ -3777,7 +3831,16 @@ executable('{project_name}-{platform}',
                         filename,
                         content,
                     ) {
-                        Ok(result) => result,
+                        Ok(mut result) => {
+                            // The write validated the *submitted* text; this checks the file that
+                            // landed, with a compiler. The verify spine runs with no repair rounds
+                            // here on purpose: the source is the user's own, typed in the sheet, so
+                            // there is no generator to hand errors back to — the caller gets the
+                            // compiler's words and decides.
+                            self.verify_written_contract(std::path::Path::new(root), &mut result)
+                                .await;
+                            result
+                        }
                         Err(e) => serde_json::json!({ "valid": false, "error": e }),
                     }
                 }
@@ -4653,6 +4716,100 @@ impl crate::build::verify_spine::GeneratedArtifact for FillArtifact<'_> {
         crate::build::embedded_hal_fill::repair(&self.root, &self.item, errors, &self.llm_tx)
             .await
             .map(|_| ())
+    }
+}
+
+/// A contract the user has just authored, seen by the verify spine.
+///
+/// The second implementation of the trait (the fill leg was the first), and the reason the spine is a
+/// trait rather than a pair of closures: the *shape* is identical while almost every detail differs —
+/// the artifact is a contract, the compiler is a host `cargo`, and there is nothing to repair.
+struct ContractArtifact<'a> {
+    manager: &'a BuildManagerActor,
+    root: PathBuf,
+    file: PathBuf,
+    /// The contract crate to build, e.g. `weather-hal`.
+    crate_name: String,
+}
+
+#[async_trait::async_trait]
+impl crate::build::verify_spine::GeneratedArtifact for ContractArtifact<'_> {
+    fn describe(&self) -> String {
+        self.file.display().to_string()
+    }
+
+    /// Re-read the file that landed and parse it.
+    ///
+    /// The write validated the *submitted* text; this is the one check that says the file on disk is
+    /// the file that was validated. Cheap, and it is what the drift measure's own parser would say.
+    fn gate(&self) -> Result<(), String> {
+        let content = std::fs::read_to_string(&self.file)
+            .map_err(|e| format!("cannot re-read the written file: {e}"))?;
+        let syntax = crate::build::hal_rust_contract::rust_syntax_check(&content);
+        if syntax.ok {
+            return Ok(());
+        }
+        let first = syntax
+            .errors
+            .first()
+            .map(|e| format!("line {}:{}: {}", e.line, e.col, e.context))
+            .unwrap_or_else(|| "unknown position".to_string());
+        Err(format!("the written file does not parse ({first})"))
+    }
+
+    /// Build the contract crate **on the host**.
+    ///
+    /// No platform: the contract crate is `no_std` but dependency-free and host-testable by design
+    /// (that is the point of the seam), so this needs no cross toolchain and no vendor SDK — which is
+    /// exactly why an authored contract can be verified everywhere, unlike a backend.
+    async fn build(&self) -> Result<(), crate::build::verify_spine::BuildFailure> {
+        use crate::build::verify_spine::BuildFailure;
+        let path_str = self.root.to_string_lossy().to_string();
+        let metadata = match self.manager.get_analysis(&path_str).await {
+            Some(metadata) => metadata,
+            None => match self.manager.analyze_project(&self.root, None).await {
+                Ok(metadata) => metadata,
+                Err(e) => return Err(BuildFailure::Setup(format!("could not analyse: {e}"))),
+            },
+        };
+        let Some(config) = metadata.config_files.first().cloned() else {
+            return Err(BuildFailure::Setup(
+                "the analysis names no config file".to_string(),
+            ));
+        };
+        let module_tx = self
+            .manager
+            .module_tx_for(&config, None)
+            .map_err(BuildFailure::Setup)?;
+        let opts = BuildOptions {
+            mode: "debug".to_string(),
+            package: Some(self.crate_name.clone()),
+            platform: None,
+            target: None,
+        };
+        let (tx, rx) = oneshot::channel();
+        module_tx
+            .send(BuildModuleMessage::Build {
+                path: self.root.clone(),
+                metadata,
+                opts,
+                build_spec: None,
+                reply_to: tx,
+            })
+            .await
+            .map_err(|e| BuildFailure::Setup(format!("module channel closed: {e}")))?;
+        match rx.await {
+            Ok(Ok(output)) if output.success => Ok(()),
+            Ok(Ok(output)) => Err(BuildFailure::Compiler(output.output)),
+            Ok(Err(e)) => Err(BuildFailure::Setup(e)),
+            Err(e) => Err(BuildFailure::Setup(format!("module response lost: {e}"))),
+        }
+    }
+
+    /// Never reached: the caller runs the spine with no repair rounds, because the source is the
+    /// user's own. Present because the trait asks, and honest about why.
+    async fn repair(&self, _errors: &str) -> Result<(), String> {
+        Err("an authored contract is not repaired by a model — fix the source".to_string())
     }
 }
 
@@ -6410,5 +6567,137 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
 
         // Verify content_hash is a SHA-256 hex string (64 chars).
         assert_eq!(parse_result.content_hash.len(), 64);
+    }
+
+    /// A contract the user authored, through the same spine the fill leg uses.
+    ///
+    /// Two levels, both cheap because the fixture is a project Spire cannot build from: the write
+    /// still lands (and is wired), and the host build is reported as **not built** with a reason
+    /// rather than as a broken contract. The build itself needs a real cargo project; what is pinned
+    /// here is that the verification runs, that its three-valued `built` is honest, and that a file
+    /// which does not parse is refused by the gate before any build is attempted.
+    #[tokio::test]
+    async fn a_written_contract_is_verified_and_says_what_it_could_not_check() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // A contract crate with a home for the write, but no workspace manifest: nothing to build
+        // from, which is exactly the "cannot check" case.
+        std::fs::create_dir_all(root.join("crates/demo-hal/src/hal")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal/src/hal/mod.rs"),
+            "pub mod led;\n\npub use led::Led;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal/src/hal/led.rs"),
+            "pub trait Led {\n    fn set(&mut self, on: bool);\n}\n",
+        )
+        .unwrap();
+
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
+        manager.set_llm(answering_llm("unused"));
+
+        let written = manager
+            .call_tool(
+                "embedded_hal_write_contract",
+                serde_json::json!({
+                    "root": root.to_string_lossy(),
+                    "filename": "sensor.rs",
+                    "content": "pub trait Sensor {\n    fn read(&mut self) -> i32;\n}\n",
+                }),
+            )
+            .await;
+        assert_eq!(written["valid"], serde_json::json!(true), "{written}");
+        assert_eq!(written["wired"], serde_json::json!(true), "{written}");
+        let host_build = &written["host_build"];
+        assert_eq!(
+            host_build["built"],
+            serde_json::Value::Null,
+            "no compiler ran, and the result says so rather than claiming a pass: {written}"
+        );
+        let not_built = host_build["not_built"].as_str().unwrap_or_default();
+        assert!(
+            not_built.contains("could not analyse"),
+            "and names the reason the check could not run: {written}"
+        );
+
+        // The layer that refuses bad *input* is the write's own validation, before anything lands —
+        // the gate on the spine re-reads what is already there, so this is where a parse error is
+        // caught first.
+        let broken = "pub trait Sensor {\n    fn read(&mut self) -> i32\n}\n";
+        let refused_write = manager
+            .call_tool(
+                "embedded_hal_write_contract",
+                serde_json::json!({
+                    "root": root.to_string_lossy(),
+                    "filename": "broken.rs",
+                    "content": broken,
+                }),
+            )
+            .await;
+        assert_eq!(
+            refused_write["valid"],
+            serde_json::json!(false),
+            "{refused_write}"
+        );
+        assert!(
+            refused_write["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("does not parse"),
+            "{refused_write}"
+        );
+        assert!(
+            !root.join("crates/demo-hal/src/hal/broken.rs").exists(),
+            "an invalid contract never touches disk"
+        );
+    }
+
+    /// The spine's **gate**, on the contract artifact: it re-reads the file that landed, so a file
+    /// that changed under us (or was never written) is refused *before* a build is attempted.
+    ///
+    /// Unreachable through the tool — `write_contract` validates the submitted text first, which is
+    /// why it is tested here directly rather than by trying to sneak a broken file past the write.
+    #[tokio::test]
+    async fn the_contract_gate_re_reads_what_is_on_disk() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let broken = root.join("hal.rs");
+        std::fs::write(
+            &broken,
+            "pub trait Sensor {\n    fn read(&mut self) -> i32\n}\n",
+        )
+        .unwrap();
+
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
+        let artifact = ContractArtifact {
+            manager: &manager,
+            root: root.to_path_buf(),
+            file: broken,
+            crate_name: "demo-hal".to_string(),
+        };
+        let outcome = crate::build::verify_spine::verify_generated(&artifact, 0).await;
+        assert_eq!(outcome.built, None, "no compiler ran: {outcome:?}");
+        let refused = outcome.refused.unwrap_or_default();
+        assert!(refused.contains("does not parse"), "{refused}");
+        assert!(
+            refused.contains("hal.rs"),
+            "the gate names the file: {refused}"
+        );
+
+        // A missing file is a refusal too, not a panic.
+        let artifact = ContractArtifact {
+            manager: &manager,
+            root: root.to_path_buf(),
+            file: root.join("gone.rs"),
+            crate_name: "demo-hal".to_string(),
+        };
+        let outcome = crate::build::verify_spine::verify_generated(&artifact, 0).await;
+        let refused = outcome.refused.clone().unwrap_or_default();
+        assert!(refused.contains("cannot re-read"), "{refused:?}");
     }
 }

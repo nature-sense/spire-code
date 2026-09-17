@@ -407,14 +407,27 @@ entry tracks the work end to end.
       Still open: no UI yet for trap control (the Device group has Connect / Run tests on board /
       Deploy binary), and a board is needed to exercise the pass-through end to end — what is pinned
       here is the board's behaviour and the host's validation.
-- [ ] 6. Backlog — first-class prompt→generate→verify everywhere. Wire the
+- [x] 6. Backlog — first-class prompt→generate→verify everywhere (partly done 2026-09-17: the spine
+      exists and now has two implementations). Wire the
       generate tools (`createProject/*`, `hal_*`) into the verify spine so new
       code is compile-verified as it is generated; covers brand-new HAL
-      contracts, new toolkits, and from-scratch projects (not yet exercised —
-      all work so far has been on the pre-existing ai-traps project). The spine
-      itself now exists (`build/verify_spine.rs`): gate → build → hand the
-      compiler's errors back to the generator → rebuild, bounded. What remains is
-      wiring the generators that still write without one.
+      contracts, new toolkits, and from-scratch projects. The spine itself landed
+      (`build/verify_spine.rs`): gate → build → hand the compiler's errors back to the generator →
+      rebuild, bounded. It has **two** implementations now, which is what justified extracting it:
+      the fill leg (`FillArtifact`, three repair rounds) and `embedded_hal_write_contract`
+      (`ContractArtifact`, zero rounds — the source is the user's own, so there is no generator to
+      hand errors to, and the result carries the compiler's words for the caller to act on). The
+      contract case is the one that needed no cross toolchain: the contract crate is `no_std` but
+      dependency-free and host-testable by design, so an authored contract is verified everywhere.
+      Two differences from the fill leg are deliberate and documented in place: the **gate is real**
+      (it re-reads the file that landed and parses it, because the write validated the *submitted*
+      text, not what survived the filesystem) and the repair is never reached. Writing the tests
+      established which layer refuses what: an invalid contract is refused by the write's own
+      validation before anything lands, so the gate is unreachable through the tool and is covered
+      by a direct test of the artifact instead of a contrived one.
+      Remaining: the C++ generators (`hal_generate_impl` already has a `meson compile` gate;
+      `hal_generate_placeholder`, the `createProject/*` scaffold's cross backends) and the
+      from-scratch project route still write without a spine behind them.
 
 ## 8. Embedded targets — ESP32 first, via a reusable HAL + actor framework
 
