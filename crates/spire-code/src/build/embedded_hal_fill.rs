@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
 
-//! The **Rust** HAL fill plan: what a scaffolded backend still owes, and the prompt that asks for
-//! it.
+//! The **Rust** HAL fill: what a scaffolded backend still owes, and the two halves that act on it —
+//! [`plan`] (read-only, the reviewed artefact) and [`apply`] (one model call per item, gated before
+//! anything is written).
 //!
-//! Read-only, as `hal_fill::plan` is and for the same reason: the work is reviewed before anything
-//! is written. It differs from the C++ plan in one structural way — a C++ implementation is a file
-//! per interface, while a Rust backend implements *every* contract trait (the traits are modules,
-//! not classes) and may hold them in several files. The unit of work is therefore the **file**: an
-//! item names one backend file, what it still owes, and the prompt that asks for it.
+//! The plan differs from the C++ one in one structural way — a C++ implementation is a file per
+//! interface, while a Rust backend implements *every* contract trait (the traits are modules, not
+//! classes) and may hold them in several files. The unit of work is therefore the **file**: an item
+//! names one backend file, what it still owes, and the prompt that asks for it.
 //!
-//! The prompt is the point of the plan. Everything an implementation needs and cannot discover
-//! from the file itself is injected here — the vendor crate, the runtime (std or not) and the
-//! platform's own `library_hints` — because the failure mode of a generated backend is not a
-//! missing method, it is a method written against the wrong API for that chip.
+//! The prompt is the point of the plan. Everything an implementation needs and cannot discover from
+//! the file itself is injected here — the vendor crate, the runtime (std or not) and the platform's
+//! own `library_hints` — because the failure mode of a generated backend is not a missing method, it
+//! is a method written against the wrong API for that chip.
 //!
 //! Pending work comes from [`crate::build::hal_rust_contract::rust_platform_coverage_map`], the
 //! same measure the UI's HAL indicators read. A scaffolded backend reports as pending even though
@@ -23,8 +23,10 @@
 use crate::build::embedded_hal_scaffold::{family_spec, FamilySpec};
 use crate::platform::Platform;
 use serde_json::json;
+use spire_core::subsystems::llm::llm::{LlmMessage, LlmModelRole};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use tokio::sync::{mpsc, oneshot};
 
 /// One contract trait this backend still owes, with the state that decides how it is presented.
 struct Pending {
@@ -82,6 +84,304 @@ fn relative(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
+}
+
+/// One pending trait of a plan item, as the item carries it back in.
+///
+/// The plan is JSON on its way out and back (the UI reviews it), so the apply side reads what it
+/// wrote rather than sharing a struct: an item that has been through a user's editor must be
+/// validated for the same reason a request is.
+struct PlannedTrait {
+    interface: String,
+    trait_name: String,
+    methods: Vec<String>,
+}
+
+fn planned_traits(item: &serde_json::Value) -> Vec<PlannedTrait> {
+    item.get("pending")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    Some(PlannedTrait {
+                        interface: entry.get("interface")?.as_str()?.to_string(),
+                        trait_name: entry.get("trait")?.as_str()?.to_string(),
+                        methods: entry
+                            .get("methods")
+                            .and_then(|m| m.as_array())
+                            .map(|m| {
+                                m.iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The gate between a model's answer and the file it would become.
+///
+/// Both halves are what the plan promised: every pending trait is implemented, and no placeholder
+/// is left behind. A generation failing either is reported rather than written — a file that parses
+/// but still says `unimplemented!()` looks finished to every later reader, and the whole point of
+/// the placeholder convention is that it does not.
+fn verify_generated(source: &str, pending: &[PlannedTrait]) -> Result<(), String> {
+    let impls = crate::build::hal_rust_contract::extract_impl_methods_rust(source);
+    let placeholders = crate::build::hal_rust_contract::placeholder_impls_rust(source);
+
+    for owed in pending {
+        let Some((_, provided)) = impls
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&owed.trait_name))
+        else {
+            return Err(format!(
+                "the generated file has no `impl {} for …` — the trait was in the prompt and must stay",
+                owed.trait_name
+            ));
+        };
+        let missing: Vec<&str> = owed
+            .methods
+            .iter()
+            .filter(|method| !provided.contains(method))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "`impl {}` still has no {}",
+                owed.trait_name,
+                missing.join(", ")
+            ));
+        }
+        if placeholders
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&owed.trait_name))
+        {
+            return Err(format!(
+                "`impl {}` still contains `unimplemented!()` — the placeholder is to be replaced, not kept",
+                owed.trait_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Generate-and-write the plan: one model call and one gated write per item.
+///
+/// `plan` is what [`plan`] returned — the wrapper object or its `plan` array, since it has been
+/// through a UI that may hand back either. Without an LLM this refuses by name and writes nothing:
+/// the plan is a prompt, and a prompt with no model behind it is not an implementation.
+pub(crate) async fn apply(
+    root: &Path,
+    plan: &serde_json::Value,
+    llm_tx: &Option<mpsc::Sender<LlmMessage>>,
+) -> serde_json::Value {
+    let Some(llm_tx) = llm_tx.as_ref() else {
+        return json!({
+            "error": "embedded_hal_fill_apply: LLM unavailable — the build manager is not connected \
+                      to the LLM service (wiring, not a missing API key)"
+        });
+    };
+    let items: Vec<serde_json::Value> = match plan {
+        serde_json::Value::Array(items) => items.clone(),
+        other => other
+            .get("plan")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    };
+    if items.is_empty() {
+        return json!({
+            "error": "embedded_hal_fill_apply: the plan has no items — run embedded_hal_fill_plan first"
+        });
+    }
+
+    let mut applied: Vec<serde_json::Value> = Vec::new();
+    let mut failures: Vec<serde_json::Value> = Vec::new();
+    for item in &items {
+        match apply_item(root, item, llm_tx).await {
+            Ok(entry) => applied.push(entry),
+            Err((file, reason)) => failures.push(json!({ "file": file, "reason": reason })),
+        }
+    }
+
+    json!({
+        "applied": applied,
+        "failures": failures,
+        "note": "Only backend files under `crates/` are written; the contract is never edited. \
+                 Each write is followed by a re-measure, so `interfaces_still_pending` is the \
+                 honest verdict rather than a claim.",
+    })
+}
+
+/// One item: check the path, ask the model, gate the answer, write, re-measure.
+///
+/// The error carries the file, so a failure names where it happened even when the reason is about
+/// the model's answer rather than about the file.
+async fn apply_item(
+    root: &Path,
+    item: &serde_json::Value,
+    llm_tx: &mpsc::Sender<LlmMessage>,
+) -> Result<serde_json::Value, (String, String)> {
+    let file = item
+        .get("file")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if file.is_empty() {
+        return Err((file, "the plan item has no `file`".to_string()));
+    }
+    let path = PathBuf::from(&file);
+    // The path comes from the plan and the plan came from disk — but this is the one value that
+    // decides where a model's output lands, so it is checked rather than trusted.
+    let inside = path
+        .strip_prefix(root)
+        .is_ok_and(|rel| rel.starts_with("crates") && path.is_file());
+    if !inside {
+        return Err((
+            file,
+            "refused: not an existing file under `crates/` in this project".to_string(),
+        ));
+    }
+
+    let pending = planned_traits(item);
+    if pending.is_empty() {
+        return Err((
+            file,
+            "the plan item owes no trait — nothing to generate".to_string(),
+        ));
+    }
+    let prompt = item
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if prompt.trim().is_empty() {
+        return Err((file, "the plan item carries no prompt".to_string()));
+    }
+
+    let source = generate(llm_tx, prompt)
+        .await
+        .map_err(|e| (file.clone(), e))?;
+    verify_generated(&source, &pending).map_err(|e| (file.clone(), e))?;
+    std::fs::write(&path, &source).map_err(|e| (file.clone(), format!("write failed: {e}")))?;
+
+    // Re-measure instead of declaring success: the same map the UI reads decides whether the item
+    // is done, so a write that did not satisfy the contract shows up as still pending.
+    let family = item
+        .get("family")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let coverage = crate::build::hal_rust_contract::rust_platform_coverage_map(root);
+    let done = |interface: &str| {
+        coverage
+            .get(family)
+            .and_then(|ifaces| ifaces.get(interface))
+            .map(|cov| cov.implemented)
+            .unwrap_or(false)
+    };
+    let (done_ifaces, still_pending): (Vec<&str>, Vec<&str>) = pending
+        .iter()
+        .map(|owed| owed.interface.as_str())
+        .partition(|interface| done(interface));
+
+    Ok(json!({
+        "family": family,
+        "file": file,
+        "interfaces_done": done_ifaces,
+        "interfaces_still_pending": still_pending,
+    }))
+}
+
+/// The file inside a model's answer: the first fenced block if there is one, else the answer.
+///
+/// Not `strip_code_fences`: that one handles a fence only at the very start of the answer and only
+/// a `cpp` tag. That is enough where its verdict is advisory, but not here — a preamble ("Sure,
+/// here it is:") or a ```rust tag would leave the fences in, and the syntax gate would then refuse
+/// every answer. The fence is a presentation detail; the file is what is between the fences.
+fn code_block(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(start) = trimmed.find("```") else {
+        return trimmed.to_string();
+    };
+    // Skip the opening fence's own line, whose tag may be `rust`, `rs` or nothing at all.
+    let after_open = &trimmed[start + 3..];
+    let body_start = after_open
+        .find('\n')
+        .map(|i| i + 1)
+        .unwrap_or(after_open.len());
+    let body = &after_open[body_start..];
+    match body.find("```") {
+        Some(end) => body[..end].trim().to_string(),
+        // An unterminated fence: the rest of the answer is the file. A truncated answer is the
+        // case that happens in, and the gate still judges whatever arrived.
+        None => body.trim().to_string(),
+    }
+}
+
+/// Ask the model for the file, retrying the way the C++ path does: once when the answer was
+/// truncated (with a "be concise" instruction), and up to twice when it does not parse (with the
+/// parse errors).
+///
+/// Unlike the C++ path it never returns source that does not parse. There the verdict is advisory
+/// — a human reads it — but this file lands in a crate the host build compiles, where a write that
+/// cannot build is worse than a failure that names the file.
+async fn generate(llm_tx: &mpsc::Sender<LlmMessage>, prompt: &str) -> Result<String, String> {
+    let mut prompt = prompt.to_string();
+    for attempt in 0..3u32 {
+        let (reply_to, reply) = oneshot::channel();
+        if llm_tx
+            .send(LlmMessage::Complete {
+                prompt: prompt.clone(),
+                role: LlmModelRole::Coding,
+                reply_to,
+            })
+            .await
+            .is_err()
+        {
+            return Err("LLM channel closed".to_string());
+        }
+        let text = match reply.await {
+            Ok(Ok(text)) => text,
+            Ok(Err(e)) => {
+                let message = e.to_string();
+                if message.contains("truncated") && attempt == 0 {
+                    prompt.push_str(
+                        "\n\nYour previous response was truncated. Return the file again, more \
+                         concisely: no commentary, minimal comments, compact code.",
+                    );
+                    continue;
+                }
+                return Err(format!("LLM failed: {message}"));
+            }
+            Err(_) => return Err("LLM reply lost".to_string()),
+        };
+
+        let source = code_block(&text);
+        let check = crate::build::hal_rust_contract::rust_syntax_check(&source);
+        if check.ok {
+            return Ok(source);
+        }
+        let hints: Vec<String> = check
+            .errors
+            .iter()
+            .map(|e| format!("line {} col {}: {} ({})", e.line, e.col, e.kind, e.context))
+            .collect();
+        if attempt < 2 {
+            prompt.push_str(&format!(
+                "\n\nThe file did not parse as Rust:\n{}\nFix them and return the complete file \
+                 again (no fences).",
+                hints.join("; ")
+            ));
+        } else {
+            return Err(format!(
+                "the generated file does not parse as Rust: {}",
+                hints.join("; ")
+            ));
+        }
+    }
+    Err("no answer from the model".to_string())
 }
 
 /// The registry record whose hints describe this family's hardware.
@@ -648,6 +948,143 @@ mod tests {
         assert!(
             !prompt.contains("TIMG0 is the delay"),
             "and no other board's hints leak in: {prompt}"
+        );
+    }
+
+    /// The gate: what a model's answer must be before it becomes the file.
+    ///
+    /// These are the three ways a generation looks plausible and is not — a kept placeholder, a
+    /// dropped impl, a method it forgot — and each is refused with a reason naming the trait.
+    #[test]
+    fn the_gate_refuses_a_generation_that_would_look_finished() {
+        let owed = vec![PlannedTrait {
+            interface: "led".to_string(),
+            trait_name: "Led".to_string(),
+            methods: vec!["set".to_string()],
+        }];
+        let real = "use demo_hal::hal::Led;\n\npub struct GpioLed;\n\n\
+                    impl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n";
+        assert_eq!(verify_generated(real, &owed), Ok(()), "a real body passes");
+
+        let kept = real.replace("let _ = on;", "unimplemented!(\"GpioLed::set\")");
+        let reason =
+            verify_generated(&kept, &owed).expect_err("a kept placeholder must be refused");
+        assert!(reason.contains("unimplemented!()"), "{reason}");
+        assert!(
+            reason.contains("Led"),
+            "the refusal names the trait: {reason}"
+        );
+
+        let dropped = "pub struct GpioLed;\n";
+        let reason = verify_generated(dropped, &owed).expect_err("a dropped impl must be refused");
+        assert!(reason.contains("no `impl Led for"), "{reason}");
+
+        let empty_impl = "impl Led for GpioLed {}\n";
+        let reason =
+            verify_generated(empty_impl, &owed).expect_err("a missing method must be refused");
+        assert!(reason.contains("still has no set"), "{reason}");
+    }
+
+    /// Every pending trait is gated, not just the first: a file that satisfies `Led` and leaves
+    /// `DelayMs` a placeholder is the partial case the flow must keep reporting.
+    #[test]
+    fn the_gate_covers_every_pending_trait() {
+        let owed = vec![
+            PlannedTrait {
+                interface: "led".to_string(),
+                trait_name: "Led".to_string(),
+                methods: vec!["set".to_string()],
+            },
+            PlannedTrait {
+                interface: "time".to_string(),
+                trait_name: "DelayMs".to_string(),
+                methods: vec!["delay_ms".to_string()],
+            },
+        ];
+        let src = "impl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n\n\
+                   impl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, _ms: u32) {\n        unimplemented!(\"delay\")\n    }\n}\n";
+        let reason = verify_generated(src, &owed).expect_err("the second trait is still pending");
+        assert!(reason.contains("DelayMs"), "{reason}");
+    }
+
+    /// The answer's fences come off whatever the model says around them: a preamble, a `rust` tag,
+    /// a bare fence, or no fence at all. Getting this wrong is not cosmetic — the syntax gate would
+    /// refuse every answer, which is how it was caught.
+    #[test]
+    fn the_file_is_taken_from_the_answer_whatever_wraps_it() {
+        let body = "impl Led for GpioLed {\n    fn set(&mut self, _on: bool) {}\n}";
+        for answer in [
+            format!("Sure, here it is:\n\n```rust\n{body}\n```\n"),
+            format!("```\n{body}\n```"),
+            format!("```rs\n{body}\n```\n\nThat should do it."),
+            body.to_string(),
+        ] {
+            assert_eq!(code_block(&answer), body, "answer: {answer:?}");
+        }
+        // Truncated mid-answer: what arrived is still the file, and the gate judges it.
+        assert_eq!(
+            code_block(&format!("```rust\n{body}")),
+            body,
+            "an unterminated fence is not a reason to fall back to the whole answer"
+        );
+    }
+
+    /// Without an LLM the apply refuses by name and writes nothing — the plan is a prompt, and a
+    /// prompt with no model behind it is not an implementation.
+    #[tokio::test]
+    async fn apply_without_an_llm_refuses_rather_than_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        project(root, "        unimplemented!(\"GpioLed::set\")");
+        let before =
+            std::fs::read_to_string(root.join("crates/demo-hal-esp32/src/lib.rs")).unwrap();
+
+        let out = plan(root, None);
+        let result = apply(root, &out, &None).await;
+
+        let err = result["error"].as_str().expect("an error, not a write");
+        assert!(err.contains("LLM unavailable"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("crates/demo-hal-esp32/src/lib.rs")).unwrap(),
+            before,
+            "the file is untouched"
+        );
+    }
+
+    /// The path in an item decides where a model's output lands, so it is checked rather than
+    /// trusted: only an existing file under `crates/` in this project is written.
+    #[tokio::test]
+    async fn apply_refuses_a_plan_item_pointing_outside_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        project(root, "        unimplemented!(\"GpioLed::set\")");
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("lib.rs");
+        std::fs::write(&victim, "// not a backend\n").unwrap();
+
+        // A live sender: the refusal has to happen before any model call.
+        let (llm_tx, _llm_rx) = mpsc::channel(1);
+        let item = json!({
+            "family": "esp32",
+            "file": victim.to_string_lossy(),
+            "pending": [{"interface": "led", "trait": "Led", "status": "stub", "methods": ["set"]}],
+            "prompt": "…",
+        });
+        let result = apply(root, &json!({ "plan": [item] }), &Some(llm_tx)).await;
+
+        let failures = result["failures"].as_array().expect("failures");
+        assert_eq!(failures.len(), 1, "{result}");
+        assert!(
+            failures[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("under `crates/`"),
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "// not a backend\n",
+            "nothing outside the project is written"
         );
     }
 

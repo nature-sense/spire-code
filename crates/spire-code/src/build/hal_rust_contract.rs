@@ -127,6 +127,67 @@ fn collect_impls(node: Node, content: &str, out: &mut Vec<(String, Vec<String>)>
     }
 }
 
+/// A structural Rust syntax problem, in the same shape `cpp_syntax_check` reports one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustSyntaxError {
+    pub line: u32,
+    pub col: u32,
+    pub kind: String,
+    pub context: String,
+}
+
+/// The verdict of [`rust_syntax_check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustSyntaxReport {
+    pub ok: bool,
+    pub errors: Vec<RustSyntaxError>,
+}
+
+/// Structural syntax check with the same `tree-sitter-rust` CST the drift measure parses.
+///
+/// Structural only — a type error still needs `cargo`. What it is for is the moment before a
+/// generated backend is written: a file that does not parse would otherwise land in a crate the
+/// host `cargo test` builds, turning a bad generation into a build failure the user has to read.
+pub fn rust_syntax_check(content: &str) -> RustSyntaxReport {
+    let mut parser = rust_parser();
+    let Some(tree) = parser.parse(content, None) else {
+        return RustSyntaxReport {
+            ok: false,
+            errors: Vec::new(),
+        };
+    };
+    let root = tree.root_node();
+    if !root.has_error() {
+        return RustSyntaxReport {
+            ok: true,
+            errors: Vec::new(),
+        };
+    }
+    let mut errors = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.is_error() || node.is_missing() {
+            let (row, col) = (node.start_position().row, node.start_position().column);
+            let context = content
+                .lines()
+                .nth(row)
+                .map(|line| line.trim().to_string())
+                .unwrap_or_default();
+            errors.push(RustSyntaxError {
+                line: row as u32 + 1,
+                col: col as u32 + 1,
+                kind: node.kind().to_string(),
+                context,
+            });
+            continue; // do not descend into erroneous nodes
+        }
+        for child in named_children(node) {
+            stack.push(child);
+        }
+    }
+    RustSyntaxReport { ok: false, errors }
+}
+
 /// Traits whose `impl` blocks are still **placeholders** — a body containing `unimplemented!()`.
 ///
 /// The drift measure above counts a declared method as provided whatever its body, which is what

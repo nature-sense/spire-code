@@ -584,8 +584,8 @@ build/flash leg.
 - [ ] 9c. **Rust contract authoring + fill, hint-injected.** The Rust analogues of the `hal_*`
       tools (`_validate/_write_contract`, `_add_platform`, `_fill_plan/_fill_apply`,
       `_missing_impls`) whose prompts read the platform's `library_hints` (+ a Rust hardware
-      profile) so a generated `impl` uses that board's real peripherals. Half done — the measure
-      and the plan, which are the two pieces the rest builds on:
+      profile) so a generated `impl` uses that board's real peripherals. Half done — the measure,
+      the plan and the apply leg, which are the pieces the rest builds on:
       - **The measure reads the new layout, and a stub is not coverage** (done 2026-09-17).
         `rust_platform_coverage_map` now knows the embedded-HAL tree as well as the C++ one:
         contracts from `crates/<prefix>-hal/src/hal/*.rs` (the same stem-keyed interface
@@ -617,9 +617,26 @@ build/flash leg.
         runtime/vendor crate), each pending contract's source, the file's current source, and the
         rules that keep the answer inside this file and this vendor's API. Read-only: the plan is
         the reviewed artefact, and the same measure the UI reads feeds it, so the two cannot
-        disagree. `_fill_apply` (send the prompt, write the file),
-        `_validate/_write_contract` and `_add_platform` for Rust are still open, and the UI cannot
-        reach the plan until 9e.
+        disagree. `_validate/_write_contract` and `_add_platform` for Rust remain open, and the UI
+        cannot reach either tool until 9e.
+      - **`embedded_hal_fill_apply`** (done 2026-09-17). One model call per item (role `Coding`)
+        with the same two retries the C++ path uses: once on truncation with a "be concise"
+        instruction, twice on a parse error with the errors appended. Between the answer and the
+        file sits the **gate** — every pending trait implemented by name, every pending method
+        present, and no `unimplemented!()` left in its `impl` — and a generation failing any of
+        those is reported with the reason while **nothing is written**. Unlike the C++ path it never
+        writes source that does not parse: there the verdict is advisory for a human, here the file
+        lands in a crate the host build compiles. The item's path is checked (an existing file under
+        `crates/`) rather than trusted, and each write is followed by a re-measure, so
+        `interfaces_still_pending` is the honest verdict rather than a claim.
+        The answer's fences come off through a Rust-aware `code_block`: the shared
+        `strip_code_fences` handles only a fence at the very start of the answer and only a `cpp`
+        tag, so a preamble or a ```rust tag would have failed the parse gate on *every* answer —
+        which is how it was caught, by the two end-to-end tests. Both ends of the loop are pinned
+        with a **fake LLM** (a channel that answers with a canned string): one drives plan →
+        generate → gate → write and asserts `hal_missing_impls` then reports `implemented` with
+        `is_stub: false`; the other answers with the placeholder kept and asserts the refusal plus a
+        byte-identical file.
 - [ ] 9d. **rp2040 platform + build/flash.** A registry entry (`os: rp2040`,
       `family: rp2040`, `target: thumbv6m-none-eabi`, flash via `elf2uf2`/`probe-rs`, its own
       `library_hints`) and an rp2040 build module — no `-Zbuild-std`, no ESP-IDF.

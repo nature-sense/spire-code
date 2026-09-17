@@ -3491,6 +3491,32 @@ executable('{project_name}-{platform}',
                 }
             }
 
+            "embedded_hal_fill_apply" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                match (root.is_empty(), args.get("plan")) {
+                    (false, Some(plan)) => {
+                        // No re-analysis afterwards, unlike the C++ apply: that one *creates* files
+                        // (a declaration/definition pair plus meson wiring) and has to re-analyze
+                        // for them to exist. This rewrites one existing backend file, and the
+                        // coverage the UI reads is recomputed from disk on every call — so there is
+                        // nothing stale to refresh, and a full parse pass would be a cost with no
+                        // effect.
+                        crate::build::embedded_hal_fill::apply(
+                            std::path::Path::new(root),
+                            plan,
+                            &self.llm_tx,
+                        )
+                        .await
+                    }
+                    _ => serde_json::json!({
+                        "error": "embedded_hal_fill_apply: \"root\" and \"plan\" required"
+                    }),
+                }
+            }
+
             "hal_diff_contracts" => {
                 let old_summary = args
                     .get("old_summary")
@@ -4021,6 +4047,12 @@ executable('{project_name}-{platform}',
                   "platform": { "type": "string", "description": "Platform registry id supplying the hardware profile + hints (e.g. esp32c6); defaults to the first record of the backend's family" }
               }),
               &["root"]),
+            t("embedded_hal_fill_apply", "Generate and write a Rust embedded-HAL fill plan (one model call per backend file; the result is gated and the project re-measured).",
+              serde_json::json!({
+                  "root": { "type": "string" },
+                  "plan": { "description": "The embedded_hal_fill_plan result, or its `plan` array" }
+              }),
+              &["root", "plan"]),
             t("hal_diff_contracts", "Diff two HAL contract summaries (added/removed/changed methods).",
               serde_json::json!({ "old_summary": { "type": "object" }, "new_summary": { "type": "object" } }),
               &["old_summary", "new_summary"]),
@@ -5182,6 +5214,166 @@ public:
         assert!(
             err.contains("LLM unavailable"),
             "must reject when LLM is unconfigured: {err}"
+        );
+    }
+
+    /// A model that always answers with `answer`, so the fill leg can be exercised without a
+    /// provider: what is under test is the plumbing around the answer, not the answer.
+    fn answering_llm(answer: &'static str) -> mpsc::Sender<LlmMessage> {
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let LlmMessage::Complete { reply_to, .. } = message {
+                    let _ = reply_to.send(Ok(answer.to_string()));
+                }
+            }
+        });
+        tx
+    }
+
+    /// A scaffolded project in miniature: the contract's `led` trait and a backend whose body is
+    /// still the placeholder.
+    fn rust_hal_project(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("crates/demo-hal/src/hal")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal/src/hal/led.rs"),
+            "/// A single binary output.\npub trait Led {\n    fn set(&mut self, on: bool);\n}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/demo-hal-esp32/src")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal-esp32/src/lib.rs"),
+            "use demo_hal::hal::Led;\n\npub struct GpioLed;\n\n\
+             impl Led for GpioLed {\n    fn set(&mut self, _on: bool) {\n        \
+             unimplemented!(\"GpioLed::set\")\n    }\n}\n",
+        )
+        .unwrap();
+    }
+
+    /// **The fill leg end to end, without a board and without a provider**: plan → generate → gate
+    /// → write → re-measure. The verdict comes from the same coverage map the UI reads, so this
+    /// asserts the loop a user actually runs rather than the file write alone.
+    #[tokio::test]
+    async fn embedded_hal_fill_apply_writes_what_the_gate_accepts() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        rust_hal_project(root);
+        let backend = root.join("crates/demo-hal-esp32/src/lib.rs");
+
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
+        manager.set_llm(answering_llm(
+            "Sure — here it is:\n\n```rust\nuse demo_hal::hal::Led;\n\npub struct GpioLed;\n\n\
+             impl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n```\n",
+        ));
+
+        let plan = manager
+            .call_tool(
+                "embedded_hal_fill_plan",
+                serde_json::json!({ "root": root.to_string_lossy() }),
+            )
+            .await;
+        let items = plan["plan"].as_array().expect("plan items");
+        assert_eq!(items.len(), 1, "{plan}");
+        assert_eq!(items[0]["pending"][0]["status"], "stub", "{plan}");
+        assert!(
+            items[0]["prompt"].as_str().unwrap().contains("esp-idf-hal"),
+            "the prompt names the vendor API: {plan}"
+        );
+
+        let applied = manager
+            .call_tool(
+                "embedded_hal_fill_apply",
+                serde_json::json!({
+                    "root": root.to_string_lossy(),
+                    "plan": plan,
+                }),
+            )
+            .await;
+        assert_eq!(applied["failures"], serde_json::json!([]), "{applied}");
+        assert_eq!(
+            applied["applied"][0]["interfaces_done"],
+            serde_json::json!(["led"]),
+            "{applied}"
+        );
+        assert_eq!(
+            applied["applied"][0]["interfaces_still_pending"],
+            serde_json::json!([]),
+            "{applied}"
+        );
+
+        // The fence came off, the body landed, the placeholder is gone, and the rest of the file
+        // — the import and the struct — is what it was.
+        let written = std::fs::read_to_string(&backend).unwrap();
+        assert!(written.contains("let _ = on;"), "{written}");
+        assert!(!written.contains("unimplemented!"), "{written}");
+        assert!(written.contains("use demo_hal::hal::Led;"), "{written}");
+        assert!(written.contains("pub struct GpioLed;"), "{written}");
+
+        // And the indicator agrees: the interface is no longer in the missing queue.
+        let coverage = manager
+            .call_tool(
+                "hal_missing_impls",
+                serde_json::json!({ "root": root.to_string_lossy() }),
+            )
+            .await;
+        assert_eq!(
+            coverage["platforms"]["esp32"]["led"]["implemented"],
+            serde_json::json!(true),
+            "{coverage}"
+        );
+        assert_eq!(
+            coverage["platforms"]["esp32"]["led"]["is_stub"],
+            serde_json::json!(false),
+            "{coverage}"
+        );
+    }
+
+    /// The gate is what stands between a plausible answer and the file: an answer that keeps the
+    /// placeholder is reported and **nothing is written**. A file that looks finished but is not is
+    /// the worst outcome the placeholder convention exists to prevent.
+    #[tokio::test]
+    async fn embedded_hal_fill_apply_refuses_an_answer_that_keeps_the_placeholder() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        rust_hal_project(root);
+        let backend = root.join("crates/demo-hal-esp32/src/lib.rs");
+        let before = std::fs::read_to_string(&backend).unwrap();
+
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
+        // Parses as Rust, declares the impl, provides the method — and still does nothing.
+        manager.set_llm(answering_llm(
+            "```rust\nimpl Led for GpioLed {\n    fn set(&mut self, _on: bool) {\n        \
+             unimplemented!(\"GpioLed::set\")\n    }\n}\n```",
+        ));
+
+        let plan = manager
+            .call_tool(
+                "embedded_hal_fill_plan",
+                serde_json::json!({ "root": root.to_string_lossy() }),
+            )
+            .await;
+        let applied = manager
+            .call_tool(
+                "embedded_hal_fill_apply",
+                serde_json::json!({ "root": root.to_string_lossy(), "plan": plan }),
+            )
+            .await;
+
+        assert_eq!(applied["applied"], serde_json::json!([]), "{applied}");
+        let reason = applied["failures"][0]["reason"].as_str().expect("a reason");
+        assert!(reason.contains("unimplemented!()"), "{reason}");
+        assert!(
+            reason.contains("Led"),
+            "the refusal names the trait: {reason}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backend).unwrap(),
+            before,
+            "the file is untouched"
         );
     }
 
