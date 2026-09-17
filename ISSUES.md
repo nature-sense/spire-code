@@ -384,11 +384,29 @@ entry tracks the work end to end.
   are undone differently (`git checkout --` versus deleting). A board is needed for the whole loop,
   so what is pinned here is the prompt, the git refusal, the two change lists, and the preconditions;
   the loop's rounds are exercised by the same shape as the fill's (the verify spine).
-- [ ] 5. M5 — trap control + all boards. Tools `run` / `start` / `stop` /
-      `status` / `logs`; generalize across rpi5 / rock3c / a7s. The **board side
-      is the blocker**: `spire-target-mcp` currently exposes only `run_test` and
-      `deploy`, so those tools have to exist there (a separate repo) before the
-      host can pass them through.
+- [x] 5. M5 — trap control + all boards (done 2026-09-17). Tools `run` / `start` / `stop` /
+      `status` / `logs`, generalized across boards. The board side lands first (`spire-target-mcp @
+      4dad5c7`), because it is the machine holding the processes: `procs.rs` is a name → pid table for
+      the life of the server, with `run` (start and wait — `run_test` under the name a non-test binary
+      deserves, one implementation behind both), `start` (background, stdout *and* stderr appended to
+      `<work>/logs/<name>.log`), `status`, `logs` (bounded tail) and `stop`. Three limits keep it from
+      becoming a board full of orphans: **named, one per name** (starting a running name is refused, so
+      `stop` always means what the caller started), **logged from the first byte**, and **TERM → 2s →
+      KILL**, killed by pid so it still works for a child that outlived a restarted server. A process
+      that exited on its own stays listed as `alive: false` — "it crashed" and "it never started" are
+      different answers. Tested against real processes: start → status → logs → stop, the duplicate
+      refusal, a self-exiting process, and the path-traversal refusal on the name.
+      The host side is a **thin pass-through** (`device/run|start|stop|logs|procs`), deliberately: the
+      board owns the state, and mirroring it in Spire would give two answers to "what is running" with
+      the stale one on screen. It resolves the platform's `device.mcp`, connects, calls the tool and
+      folds the board's `isError` into `error` — keeping the board's own words, which name the pid, the
+      signal and the log path. The host name for the board's `status` is **`device/procs`**: `device/
+      status` is Spire's own listing of the *boards* it knows, and a name that answered both questions
+      would be the confusing one — pinned by a test. Validation paths (no platform, unknown platform,
+      a platform with no board) match the existing `device/*` family.
+      Still open: no UI yet for trap control (the Device group has Connect / Run tests on board /
+      Deploy binary), and a board is needed to exercise the pass-through end to end — what is pinned
+      here is the board's behaviour and the host's validation.
 - [ ] 6. Backlog — first-class prompt→generate→verify everywhere. Wire the
       generate tools (`createProject/*`, `hal_*`) into the verify spine so new
       code is compile-verified as it is generated; covers brand-new HAL

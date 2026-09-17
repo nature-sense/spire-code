@@ -3483,6 +3483,47 @@ sysroot:
         "{fix_without_project}"
     );
 
+    // M5's trap-control pass-throughs validate the same way, and the name that matters is checked
+    // explicitly: `device/procs` (the board's processes) is *not* `device/status` (Spire's list of
+    // boards), and a pass-through must not answer the wrong one of those questions.
+    let procs_no_platform = route(&coord_tx, "device/procs", serde_json::json!({})).await;
+    assert!(
+        procs_no_platform["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'platform' is required"),
+        "{procs_no_platform}"
+    );
+    for tool in ["device/run", "device/start", "device/stop", "device/logs"] {
+        let unknown = route(
+            &coord_tx,
+            tool,
+            serde_json::json!({"platform": "nope", "name": "x", "path": "x"}),
+        )
+        .await;
+        assert!(
+            unknown["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not in the registry"),
+            "{tool}: {unknown}"
+        );
+    }
+    // A platform with no board answers with the reason, not with a connection attempt.
+    let host_control = route(
+        &coord_tx,
+        "device/procs",
+        serde_json::json!({"platform": "host"}),
+    )
+    .await;
+    assert!(
+        host_control["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("device.mcp"),
+        "{host_control}"
+    );
+
     // device/deploy shares that front half (resolve → connect → upload), so it
     // validates its inputs identically — no board needed for any of these.
     let deploy_no_platform =

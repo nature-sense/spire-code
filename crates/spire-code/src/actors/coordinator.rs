@@ -1702,6 +1702,26 @@ impl CoordinatorActor {
             "device/fix_test" | "device/fixTest" => {
                 return self.handle_device_fix_test(&params).await;
             }
+            // ── M5: trap control, passed through to the board ────────────────
+            //
+            // `device/procs` rather than `device/status`: `device/status` is Spire's own listing of
+            // the *boards* it knows, and the board's `status` is about the processes running on one
+            // of them. Two questions, and a name that answered both would be the confusing one.
+            "device/run" => {
+                return self.handle_device_tool("run", &params).await;
+            }
+            "device/start" => {
+                return self.handle_device_tool("start", &params).await;
+            }
+            "device/stop" => {
+                return self.handle_device_tool("stop", &params).await;
+            }
+            "device/procs" => {
+                return self.handle_device_tool("status", &params).await;
+            }
+            "device/logs" => {
+                return self.handle_device_tool("logs", &params).await;
+            }
             "mcp/disconnectAll" => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 if self
@@ -3884,6 +3904,94 @@ impl CoordinatorActor {
             }
         }
         (modified, created)
+    }
+
+    /// Trap control, passed through to the board: `run` / `start` / `stop` / `status` / `logs` (M5).
+    ///
+    /// The **board owns the process table** — it is the machine running the binaries — so this is
+    /// deliberately thin: resolve the platform's `device.mcp`, make sure the server is connected, call
+    /// the tool with everything except `platform` (which names the board here, not the process) and
+    /// return the board's answer. Mirroring the board's state in the host would give two answers to
+    /// "what is running", and the stale one would be the one shown.
+    ///
+    /// A tool-level failure comes back as `error` (from the board's `isError`) so the UI reads one
+    /// shape, and the board's own words survive — they name the pid, the signal and the log path.
+    async fn handle_device_tool(
+        &self,
+        tool: &str,
+        params: &serde_json::Value,
+    ) -> serde_json::Value {
+        let platform_id = params
+            .get("platform")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if platform_id.is_empty() {
+            return serde_json::json!({ "error": format!("device/{tool}: 'platform' is required") });
+        }
+        let Some(platform) = crate::platform::Platform::from_registry(&platform_id) else {
+            return serde_json::json!({
+                "error": format!("platform '{platform_id}' is not in the registry (~/.spire/platforms)")
+            });
+        };
+        if platform
+            .device
+            .as_ref()
+            .and_then(|device| device.mcp.as_ref())
+            .is_none()
+        {
+            return serde_json::json!({
+                "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see ~/.spire/platforms/{platform_id}.yaml")
+            });
+        }
+        let server_name = format!("device-{platform_id}");
+        if let Err(err) = self.ensure_device_connected(&server_name).await {
+            return serde_json::json!({ "error": err });
+        }
+
+        let mut arguments = params.as_object().cloned().unwrap_or_default();
+        arguments.remove("platform");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .mcp_client_tx
+            .send(McpClientMessage::CallTool {
+                server_name: server_name.clone(),
+                tool_name: tool.to_string(),
+                arguments: Some(arguments),
+                reply_to: tx,
+            })
+            .await
+            .is_err()
+        {
+            return serde_json::json!({ "error": "MCP client actor not available" });
+        }
+
+        match rx.await {
+            Ok(Ok(result)) => {
+                let output = result
+                    .content
+                    .iter()
+                    .filter_map(|content| content.as_text_content().ok())
+                    .map(|content| content.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if result.is_error == Some(true) {
+                    return serde_json::json!({ "error": output, "platform": platform_id });
+                }
+                serde_json::json!({
+                    "platform": platform_id,
+                    "server": server_name,
+                    "tool": tool,
+                    "result": result.structured_content,
+                    "output": output,
+                })
+            }
+            Ok(Err(err)) => serde_json::json!({
+                "error": format!("{tool} on '{server_name}' failed: {err}")
+            }),
+            Err(_) => serde_json::json!({ "error": "MCP client actor response error" }),
+        }
     }
 
     /// `device/fix_test` — M4: run the tests on the board, and on failure hand the output to the
