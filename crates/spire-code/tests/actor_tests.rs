@@ -3439,6 +3439,32 @@ sysroot:
             .contains("not found"),
         "{missing_binary}"
     );
+    // The message names the way to have it built, because that is now something this call can do.
+    assert!(
+        missing_binary["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"build\": true"),
+        "the missing-artifact error must point at the cross-build leg: {missing_binary}"
+    );
+
+    // `build: true` builds *before* it touches the network — so with no project open at all it
+    // stops there rather than uploading anything. (The build itself needs a real project and
+    // toolchain; what this pins is the ordering and the reason, which is what a caller reads when it
+    // goes wrong.)
+    let build_without_project = route(
+        &coord_tx,
+        "device/test",
+        serde_json::json!({"platform": "rpi5", "path": "build-rpi5/tests", "build": true}),
+    )
+    .await;
+    assert!(
+        build_without_project["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("needs an open project"),
+        "{build_without_project}"
+    );
 
     // device/deploy shares that front half (resolve → connect → upload), so it
     // validates its inputs identically — no board needed for any of these.

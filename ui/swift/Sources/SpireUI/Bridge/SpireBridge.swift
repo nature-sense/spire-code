@@ -1140,13 +1140,22 @@ final class SpireBridge {
 
     /// Deploy a cross-built test binary to the board and run it there.
     ///
-    /// `path` is relative to the project root (an absolute path works too).
-    /// Returns the board's reply, which carries `passed` and the full result.
-    func runDeviceTests(platform: String, path: String, timeoutSecs: Int = 120) async -> [String: Any]? {
-        await deviceCommand(
-            "device/test",
-            params: ["platform": platform, "path": path, "timeout_secs": timeoutSecs]
-        )
+    /// `path` is relative to the project root (an absolute path works too). With `build` the call
+    /// **cross-builds first** — through the build tools, so the artifact is the one this platform's
+    /// module writes for this triple — and then uploads and runs it: one action instead of "build it
+    /// somewhere, then hand me the path". Returns the board's reply, which carries `passed` and the
+    /// full result; a failed build returns an error naming the build, not the board.
+    func runDeviceTests(
+        platform: String,
+        path: String,
+        timeoutSecs: Int = 120,
+        build: Bool = false
+    ) async -> [String: Any]? {
+        var params: [String: Any] = [
+            "platform": platform, "path": path, "timeout_secs": timeoutSecs,
+        ]
+        if build { params["build"] = true }
+        return await deviceCommand("device/test", params: params)
     }
 
     /// Install a production binary on the board.

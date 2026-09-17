@@ -238,6 +238,22 @@ impl Wizard {
     }
 }
 
+/// Serializes the tests in this binary that set the process-global `SPIRE_PLATFORM_DIR`.
+///
+/// Integration tests are one binary with one environment, so two of them running in parallel can
+/// drop each other's registry directory — and the failure is not a missing file but a *confusing*
+/// one: a platform whose registry vanished mid-test stops routing to its module, which reads as
+/// "rp2040 does not route to a platform module" in a test that has nothing to do with routing. The
+/// lib tests learned this the same way (`crate::PLATFORM_DIR_TEST_LOCK`); this is that lock for the
+/// integration target, async so holding it across awaits is not a warning.
+static PLATFORM_DIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take the registry lock. Every test in this file sets `SPIRE_PLATFORM_DIR`, so every test starts
+/// here.
+async fn serialized() -> tokio::sync::MutexGuard<'static, ()> {
+    PLATFORM_DIR_LOCK.lock().await
+}
+
 /// A registry with one variant of each family, so `esp32c6` + `rp2040` collapse to two backends.
 fn registry() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("platform dir");
@@ -273,6 +289,7 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
     // No lock around `SPIRE_PLATFORM_DIR`: an integration-test binary is its own process, and this
     // is the only test in it, so nothing else can be reading the variable. (The unit-test lock
     // exists because those tests share a process.)
+    let _serialized = serialized().await;
     let platforms = registry();
     std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
 
@@ -463,6 +480,7 @@ async fn a_scaffolded_backend_builds_after_one_repair_round() {
         }
     }
 
+    let _serialized = serialized().await;
     let platforms = registry();
     std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
     let dir = tempfile::tempdir().expect("project dir");
@@ -567,6 +585,7 @@ async fn a_second_wrong_answer_still_gets_a_third_round() {
         }
     }
 
+    let _serialized = serialized().await;
     let platforms = registry();
     std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
     let dir = tempfile::tempdir().expect("project dir");
@@ -641,6 +660,7 @@ async fn a_second_wrong_answer_still_gets_a_third_round() {
 /// project would look *finished* rather than broken.
 #[tokio::test]
 async fn a_new_contract_and_a_new_board_both_become_fill_work() {
+    let _serialized = serialized().await;
     let platforms = registry();
     std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
     let dir = tempfile::tempdir().expect("project dir");
@@ -801,6 +821,7 @@ async fn a_real_model_fills_and_the_backend_builds() {
         }
     }
 
+    let _serialized = serialized().await;
     let platforms = registry();
     std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
     let keep = std::env::var("SPIRE_LIVE_FILL_DIR").ok();
@@ -893,6 +914,7 @@ async fn a_real_model_fills_the_backends_it_is_asked_for() {
         return;
     }
 
+    let _serialized = serialized().await;
     let platforms = registry();
     std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
     // A stable directory when asked for one, so the project the model wrote can be inspected and

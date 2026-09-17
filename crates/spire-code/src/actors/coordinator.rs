@@ -3599,6 +3599,64 @@ impl CoordinatorActor {
             .ffi_deps()
             .ok()
             .and_then(|(_, state)| state.project_root.lock().unwrap().clone());
+
+        // ── The optional cross-build (M3's missing leg) ──
+        //
+        // This used to be the caller's problem: `device/test` wanted a binary that already existed
+        // ("build it for <platform> first"). With `build: true` the same call produces it, through
+        // the *build tools*, so the artifact is the one this platform's module writes for this
+        // triple — with its SDK environment and its flags — rather than whatever a hand-run command
+        // happened to leave in the tree.
+        if params
+            .get("build")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            let Some(root) = root.as_ref() else {
+                return Err(serde_json::json!({
+                    "error": "build: true needs an open project (no project root is set)"
+                }));
+            };
+            let root_str = root.to_string_lossy().to_string();
+
+            // A build routes on a stored analysis, and asking for one is cheap — requiring the
+            // caller to have analysed first would be the same hidden ordering requirement the fill
+            // leg dropped, and it fails the same way (best-effort storage, so "I did analyse" is not
+            // something the caller can rely on either).
+            let analyzed = self
+                .call_tool_json("build_analyze", serde_json::json!({ "path": root_str }))
+                .await;
+            if let Some(err) = analyzed.get("error").and_then(|value| value.as_str()) {
+                return Err(serde_json::json!({
+                    "error": format!("could not analyse {} before building: {err}", root.display())
+                }));
+            }
+
+            let mut build_args = serde_json::json!({
+                "path": root_str,
+                "platform": platform_id,
+                "mode": params.get("mode").and_then(|value| value.as_str()).unwrap_or("debug"),
+            });
+            if let Some(package) = params.get("package").and_then(|value| value.as_str()) {
+                build_args["package"] = serde_json::json!(package);
+            }
+            let built = self.call_tool_json("build_build", build_args).await;
+            if built.get("success").and_then(|value| value.as_bool()) != Some(true) {
+                // The build's own output is the diagnosis: a cross-build fails for a reason the
+                // user can act on (a missing target, a missing SDK), and paraphrasing it would
+                // hide the one line that says which.
+                let output = built
+                    .get("output")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let tail: Vec<&str> = output.lines().rev().take(25).collect();
+                let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+                return Err(serde_json::json!({
+                    "error": format!("cross-build for '{platform_id}' failed:\n{tail}")
+                }));
+            }
+        }
+
         let candidate = match root.as_ref() {
             Some(root) => root.join(&path_param),
             None => PathBuf::from(&path_param),
@@ -3611,7 +3669,8 @@ impl CoordinatorActor {
         if !binary.is_file() {
             return Err(serde_json::json!({
                 "error": format!(
-                    "test binary not found: {} — build it for {platform_id} first",
+                    "test binary not found: {} — build it for {platform_id} first, or pass \
+                     \"build\": true to have this call do it",
                     binary.display()
                 )
             }));

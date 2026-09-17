@@ -948,11 +948,16 @@ struct ActionPanelView: View {
 
             Button {
                 runningDevice = "test"
-                deviceNote = "Deploying and running tests on \(platform)…"
+                deviceNote = "Building, deploying and running tests on \(platform)…"
                 Task {
+                    // `build: true` — the action is "run the tests on this board", so it produces
+                    // the binary the same way the platform module does rather than depending on one
+                    // having been built by hand first. A build failure comes back naming the build,
+                    // which is the useful error ("no target installed"), not "file not found".
                     let reply = await bridge.runDeviceTests(
                         platform: platform,
-                        path: testBinaryPath(platform, projectName: project.name)
+                        path: testBinaryPath(platform, projectName: project.name),
+                        build: true
                     )
                     runningDevice = nil
                     deviceNote = deviceSummary(reply, verb: "test")

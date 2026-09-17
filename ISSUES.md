@@ -173,12 +173,21 @@ entry tracks the work end to end.
       stream and treated any status for it as fatal, so *any* spec-compliant
       Streamable HTTP server (the GET endpoint is optional; 400/405 is allowed)
       was unusable with `HTTP error: 400 Bad Request`.
-- [ ] 3. M3 — Test action over the device. Cross-build the test binary → upload
+- [x] 3. M3 — Test action over the device (done 2026-09-17). Cross-build the test binary → upload
       it over HTTP → MCP `run_test` → report exit code + output. No `meson`/
-      `test()` machinery is needed on the device — it just runs the ELF. The host
-      side, the test executable and the cross toolchain: 3a/3b/3c are done, and what
-      remains is the **cross-build leg** — `device/test` still wants a prebuilt binary
-      ("build it for <platform> first") rather than building it itself.
+      `test()` machinery is needed on the device — it just runs the ELF. 3a/3b/3c were already done;
+      the **cross-build leg** is now closed too: `device/test` (and `device/deploy`, which shares the
+      same front half) takes `build: true` and produces the artifact itself, through the *build
+      tools*, so it is the one this platform's module writes for this triple — with its SDK
+      environment and flags — rather than whatever a hand-run command left in the tree. It analyses
+      on demand first (a build routes on a stored analysis, and requiring the caller to have done it
+      was the same hidden ordering requirement the fill leg dropped), and a failed build returns the
+      build's own output tail, because a cross-build fails for a reason the user can act on ("no
+      target installed") that paraphrasing would hide. `device/test` also names that option in its
+      missing-artifact error — "build it for <platform> first, or pass `\"build\": true`" — and the
+      UI's "Run tests on board" passes it, so the action builds, deploys and runs in one gesture.
+      Covered by the existing `device/test` validation test, which now pins the ordering (a build
+      request with no project open stops before any network) and the hint.
   - [x] 3a. Device side — done (2026-09-13, `spire-target-mcp @ af8980f`).
         `PUT /upload/<name>` stores a binary in the work directory (single name
         component, `.part`+rename, executable bit) and the `run_test` tool runs
