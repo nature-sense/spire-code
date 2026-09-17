@@ -2508,7 +2508,7 @@ impl CoordinatorActor {
                             .filter_map(crate::actors::platform_codec::platform_json_to_spire)
                             .collect();
                         if !platforms.is_empty() {
-                            serde_json::to_value(platforms).unwrap_or(serde_json::json!([]))
+                            platforms_listing(platforms)
                         } else {
                             // The startup phase chain may not have seeded the
                             // graph yet (or a fresh DB cleared it). The YAML
@@ -2518,7 +2518,7 @@ impl CoordinatorActor {
                             let dir = crate::platform::Platform::default_platform_dir();
                             let from_seed =
                                 crate::platform::Platform::load_directory(&dir).unwrap_or_default();
-                            serde_json::to_value(from_seed).unwrap_or(serde_json::json!([]))
+                            platforms_listing(from_seed)
                         }
                     }
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
@@ -5081,5 +5081,84 @@ impl CoordinatorActor {
                 .unwrap_or_else(|_| serde_json::json!({ "error": "serialize state" })),
             Err(e) => serde_json::json!({ "error": format!("lost: {e}") }),
         }
+    }
+}
+
+/// The `platforms/list` payload: every registered platform, plus the one fact a UI cannot derive
+/// without re-implementing a rule.
+///
+/// `embedded` is `Platform::is_embedded()` **sent** rather than recomputed by the client: the rule
+/// is `os`, which is what the build itself keys on, and a second copy of it in another language
+/// could only ever disagree with the first. The create-project wizard filters its platform list on
+/// this flag, so an embedded-HAL project can never be offered a Linux cross-target.
+#[derive(serde::Serialize)]
+struct PlatformListing<'a> {
+    #[serde(flatten)]
+    platform: &'a crate::platform::Platform,
+    embedded: bool,
+}
+
+fn platforms_listing(platforms: Vec<crate::platform::Platform>) -> serde_json::Value {
+    let listing: Vec<PlatformListing> = platforms
+        .iter()
+        .map(|platform| PlatformListing {
+            platform,
+            embedded: platform.is_embedded(),
+        })
+        .collect();
+    serde_json::to_value(listing).unwrap_or(serde_json::json!([]))
+}
+
+#[cfg(test)]
+mod platform_listing_tests {
+    use super::*;
+
+    /// A platform entry carrying only what the listing reads.
+    fn platform(id: &str, os: &str) -> crate::platform::Platform {
+        crate::platform::Platform {
+            id: id.to_string(),
+            name: id.to_string(),
+            os: os.to_string(),
+            architecture: crate::platform::PlatformArchitecture {
+                cpu_family: "x".into(),
+                cpu: "x".into(),
+                endian: "little".into(),
+                target_triple: "x".into(),
+                march: None,
+            },
+            toolchain: Default::default(),
+            sysroot: Default::default(),
+            device: None,
+            family: Some("x".into()),
+            rust: None,
+            library_hints: Some("the board's own notes".into()),
+        }
+    }
+
+    /// The flag the wizard filters on is in the payload, and the rest of the platform travels with
+    /// it — the UI reads the rule from here rather than keeping its own copy.
+    #[test]
+    fn the_listing_marks_which_platforms_a_firmware_project_can_target() {
+        let out = platforms_listing(vec![
+            platform("esp32c6", "esp-idf"),
+            platform("rpi5", "linux"),
+        ]);
+
+        let boards = out.as_array().expect("an array");
+        assert_eq!(boards.len(), 2, "{out}");
+        assert_eq!(boards[0]["embedded"], serde_json::json!(true), "{out}");
+        assert_eq!(
+            boards[0]["os"], "esp-idf",
+            "the whole platform travels: {out}"
+        );
+        assert_eq!(
+            boards[0]["library_hints"], "the board's own notes",
+            "including the hints the wizard shows while a board is chosen: {out}"
+        );
+        assert_eq!(
+            boards[1]["embedded"],
+            serde_json::json!(false),
+            "a Linux cross-target is not a board a firmware project can target: {out}"
+        );
     }
 }

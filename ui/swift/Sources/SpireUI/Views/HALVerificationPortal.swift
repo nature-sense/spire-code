@@ -69,6 +69,11 @@ struct HALVerificationView: View {
                     } else {
                         Text("Failed to run verification.").foregroundStyle(.red).padding()
                     }
+
+                    // The Rust surface: the same window, because "is this HAL done?" has one
+                    // answer per structure — C++ issues above, backend maturity + fill below.
+                    Divider().padding(.vertical, 4)
+                    EmbeddedHalBackendsSection(projectRoot: projectRoot)
                 }
             }
         }

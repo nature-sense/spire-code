@@ -1222,6 +1222,14 @@ and NEVER repeat any line or block."
                 .spire_app_template_plan(goal, root_dir, language, platforms)
                 .await;
         }
+        // Embedded-HAL: the same shape of answer as SpireApp, for the same reason — the structure
+        // is fixed before the goal is read, so the plan is the scaffold's own file writes plus a
+        // parse and a host build gate. An LLM plan here would write into the contract.
+        if structure == Some(spire_core::build_types::ProjectStructure::EmbeddedHal) {
+            return self
+                .embedded_hal_template_plan(goal, root_dir, language, platforms)
+                .await;
+        }
         if let Some(llm_tx) = &self.llm_tx {
             let project_name = root_dir
                 .file_name()
@@ -1502,55 +1510,66 @@ Project:
                 }
             });
 
-        let mut steps: Vec<CreationStep> = Vec::new();
-        for (i, f) in spec.files.iter().enumerate() {
-            let step_type = if f.structural {
-                CreationStepType::WriteBuildConfig
-            } else {
-                CreationStepType::WriteSourceFile
-            };
-            steps.push(CreationStep {
-                id: format!("scaffold-{}", i + 1),
-                step_type,
-                description: format!("Write {}", f.path),
-                status: StepStatus::Pending,
-                parameters: serde_json::json!({ "path": f.path, "content": f.content }),
-                result: None,
-            });
-        }
-        let rs_paths: Vec<String> = spec
-            .files
-            .iter()
-            .filter(|f| f.path.ends_with(".rs"))
-            .map(|f| f.path.clone())
-            .collect();
-        steps.push(CreationStep {
-            id: format!("scaffold-{}", steps.len() + 1),
-            step_type: CreationStepType::ParseAndValidate,
-            description: "Parse source files to validate syntax via AST modules".into(),
-            status: StepStatus::Pending,
-            parameters: serde_json::json!({ "paths": rs_paths }),
-            result: None,
-        });
-        steps.push(CreationStep {
-            id: format!("scaffold-{}", steps.len() + 1),
-            step_type: CreationStepType::Build,
-            description: "Build the workspace to verify the scaffold compiles".into(),
-            status: StepStatus::Pending,
-            parameters: serde_json::json!({}),
-            result: None,
-        });
+        scaffold_plan_from_spec(
+            goal,
+            root_dir,
+            language,
+            spec,
+            "SpireApp structure — deterministic monorepo scaffold",
+        )
+    }
 
-        PlanGenerationResult {
-            goal: goal.to_string(),
-            language: language.to_string(),
-            root_dir: root_dir.to_string_lossy().to_string(),
-            steps,
-            is_template: true,
-            fallback_reason: Some(
-                "SpireApp structure — deterministic monorepo scaffold".to_string(),
-            ),
-        }
+    /// Deterministic embedded-HAL plan: scaffold the workspace — the contract crate, the executor
+    /// and one backend crate per board family — then gate it with a parse and a **host** build.
+    /// Never calls the LLM.
+    ///
+    /// The build gate is the workspace's own `cargo test`, whose `default-members` excludes the
+    /// backends on purpose: the contract and the executor must compile and be testable here, while
+    /// a backend needs a cross toolchain and its vendor SDK. Filling a backend is the fill
+    /// cascade's job (`embedded_hal_fill_plan` / `embedded_hal_fill_apply`), not a step inside a
+    /// creation plan — a backend written from a generic goal would be written against whatever API
+    /// the model guessed, which is the one failure the whole contract exists to prevent.
+    async fn embedded_hal_template_plan(
+        &self,
+        goal: &str,
+        root_dir: &PathBuf,
+        language: &str,
+        platforms: &[String],
+    ) -> PlanGenerationResult {
+        let project_name = root_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "embedded-hal".to_string());
+        let spec = self
+            .scaffold_spec_in_memory(
+                &project_name,
+                root_dir,
+                language,
+                platforms,
+                Some(spire_core::build_types::ProjectStructure::EmbeddedHal),
+                true,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                warn!("[ProjectCreation] embedded-HAL scaffold spec failed: {e}");
+                crate::subsystems::build::build_manager::ScaffoldSpec {
+                    structural_files: vec!["Cargo.toml".to_string()],
+                    fill_roots: vec!["crates".to_string()],
+                    dependency_sections: vec!["Cargo.toml".to_string()],
+                    platform_targets: platforms.to_vec(),
+                    build_system: "Cargo".to_string(),
+                    files: vec![],
+                    structure: spire_core::build_types::ProjectStructure::EmbeddedHal,
+                    embedded: true,
+                }
+            });
+        scaffold_plan_from_spec(
+            goal,
+            root_dir,
+            language,
+            spec,
+            "embedded-HAL structure — deterministic workspace scaffold",
+        )
     }
 
     /// Generate a plan for a new project. In v1 this is a deterministic
@@ -2628,6 +2647,72 @@ impl Actor for ProjectCreationActor {
     }
 }
 
+/// Turn a scaffold spec's files into a creation plan: one write step per file (structural →
+/// build-config, fillable → source), then a parse and a **host** build.
+///
+/// Shared by the two structures whose shape is fixed before the goal is read — SpireApp and the
+/// embedded HAL — so they cannot drift in what "scaffold and gate this" means: whatever the spec
+/// contains is written, then checked. Neither asks the LLM for a plan, because for both of them the
+/// structure *is* the answer.
+///
+/// `reason` lands in `fallback_reason`, which the wizard surfaces as "this is a template, not a
+/// generated plan" — honest, since no model was involved.
+fn scaffold_plan_from_spec(
+    goal: &str,
+    root_dir: &std::path::Path,
+    language: &str,
+    spec: crate::subsystems::build::build_manager::ScaffoldSpec,
+    reason: &str,
+) -> PlanGenerationResult {
+    let mut steps: Vec<CreationStep> = Vec::new();
+    for (i, f) in spec.files.iter().enumerate() {
+        let step_type = if f.structural {
+            CreationStepType::WriteBuildConfig
+        } else {
+            CreationStepType::WriteSourceFile
+        };
+        steps.push(CreationStep {
+            id: format!("scaffold-{}", i + 1),
+            step_type,
+            description: format!("Write {}", f.path),
+            status: StepStatus::Pending,
+            parameters: serde_json::json!({ "path": f.path, "content": f.content }),
+            result: None,
+        });
+    }
+    let rs_paths: Vec<String> = spec
+        .files
+        .iter()
+        .filter(|f| f.path.ends_with(".rs"))
+        .map(|f| f.path.clone())
+        .collect();
+    steps.push(CreationStep {
+        id: format!("scaffold-{}", steps.len() + 1),
+        step_type: CreationStepType::ParseAndValidate,
+        description: "Parse source files to validate syntax via AST modules".into(),
+        status: StepStatus::Pending,
+        parameters: serde_json::json!({ "paths": rs_paths }),
+        result: None,
+    });
+    steps.push(CreationStep {
+        id: format!("scaffold-{}", steps.len() + 1),
+        step_type: CreationStepType::Build,
+        description: "Build the workspace to verify the scaffold compiles".into(),
+        status: StepStatus::Pending,
+        parameters: serde_json::json!({}),
+        result: None,
+    });
+
+    PlanGenerationResult {
+        goal: goal.to_string(),
+        language: language.to_string(),
+        root_dir: root_dir.to_string_lossy().to_string(),
+        steps,
+        is_template: true,
+        fallback_reason: Some(reason.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2642,6 +2727,77 @@ mod tests {
 
     fn dummy_mcp() -> mpsc::Sender<McpClientMessage> {
         mpsc::channel(4).0
+    }
+
+    /// The shared builder behind the two fixed-shape structures: every file the spec carries
+    /// becomes a write step (structural → build-config, the rest → source), and the plan ends with
+    /// a parse and a build gate. No LLM is involved, which is why `is_template` is true and the
+    /// reason is the caller's.
+    #[test]
+    fn a_scaffold_spec_becomes_its_write_steps_and_a_gate() {
+        use crate::build::ScaffoldFile;
+        use crate::subsystems::build::build_manager::ScaffoldSpec;
+
+        let spec = ScaffoldSpec {
+            structural_files: vec!["Cargo.toml".to_string()],
+            fill_roots: vec!["crates".to_string()],
+            dependency_sections: vec!["Cargo.toml".to_string()],
+            platform_targets: vec!["esp32c6".to_string()],
+            build_system: "Cargo".to_string(),
+            files: vec![
+                ScaffoldFile {
+                    path: "Cargo.toml".to_string(),
+                    content: "[workspace]".to_string(),
+                    structural: true,
+                    fill_role: None,
+                },
+                ScaffoldFile {
+                    path: "crates/demo-hal/src/lib.rs".to_string(),
+                    content: "#![no_std]".to_string(),
+                    structural: false,
+                    fill_role: None,
+                },
+            ],
+            structure: spire_core::build_types::ProjectStructure::EmbeddedHal,
+            embedded: true,
+        };
+
+        let plan = scaffold_plan_from_spec(
+            "blink a light",
+            &PathBuf::from("/tmp/demo"),
+            "Rust",
+            spec,
+            "embedded-HAL structure — deterministic workspace scaffold",
+        );
+
+        assert!(
+            plan.is_template,
+            "no model was asked for this plan: {plan:?}"
+        );
+        assert_eq!(
+            plan.fallback_reason.as_deref(),
+            Some("embedded-HAL structure — deterministic workspace scaffold")
+        );
+        assert_eq!(plan.root_dir, "/tmp/demo");
+        let kinds: Vec<&CreationStepType> = plan.steps.iter().map(|s| &s.step_type).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                &CreationStepType::WriteBuildConfig,
+                &CreationStepType::WriteSourceFile,
+                &CreationStepType::ParseAndValidate,
+                &CreationStepType::Build,
+            ],
+            "{:?}",
+            plan.steps
+        );
+        assert_eq!(plan.steps[0].parameters["path"], "Cargo.toml");
+        assert_eq!(
+            plan.steps[2].parameters["paths"],
+            serde_json::json!(["crates/demo-hal/src/lib.rs"]),
+            "the parse gate checks the Rust the scaffold wrote: {:?}",
+            plan.steps[2].parameters
+        );
     }
 
     /// The AppSpec requirements pass drives the real LlmMessage channel: a

@@ -667,9 +667,35 @@ build/flash leg.
       one about to run (name the sysroot, and say to put `rustup which cargo`'s directory first on
       `PATH` — the fix, verified on this machine). A toolchain that cannot be asked is not a refusal:
       cargo's own error is better than a guess.
-- [ ] 9e. **UI.** "Embedded HAL (Rust)" in `ProjectWizardView` with an embedded-platform
-      multi-select showing each platform's hints, and `HALVerificationPortal` showing Rust drift
-      per backend.
+- [x] 9e. **UI** (done 2026-09-17). "Embedded HAL (Rust)" is the third structure in the wizard's
+      Cargo row, and the platform picker narrows to **boards** when it is selected: a Linux
+      cross-target has no backend crate to fill, and the scaffold refuses one by name. Each board's
+      `library_hints` are shown under its checkbox — the same text the fill prompt injects, so what
+      the user reads while choosing is what the implementation will be constrained by — and Plan
+      stays disabled until a board is chosen, because the project *is* its backends. The rule for
+      "is this a board" is **not** re-implemented in Swift: `platforms/list` sends `embedded`
+      (`Platform::is_embedded()`) beside the platform, and both ends are pinned by tests (the
+      payload in Rust, the decode in Swift). The Swift `Platform` gained the fields the picker needs
+      (`family`, `rust`, `library_hints`, `embedded`), which it had been silently dropping.
+      Two things came with it, both needed for the wizard's flow to be *true* rather than merely to
+      compile:
+      - **The Plan route is deterministic for this structure**, as SpireApp's is: a shared
+        `scaffold_plan_from_spec` turns the emitter's files into write steps and adds a parse + host
+        build gate, so "OK — scaffold and run" never hands the contract to an LLM plan. (The
+        `embedded` flag on the creation messages was already carried and ignored; the dispatch is on
+        the structure, which is what actually differs.)
+      - The verification window grew a **Rust backends** section: one row per family with each
+        interface's maturity and its missing methods, read from the same `hal_missing_impls`
+        coverage the maturity chips and the build gate use — so a backend shown `stub` there is
+        exactly what keeps that platform's build disabled, and filling it flips both. "Plan fill"
+        runs `embedded_hal_fill_plan` (read-only, one item per backend file) and shows the pending
+        traits *before* anything happens; "Fill" runs `embedded_hal_fill_apply`, which gates the
+        model's answer (every pending trait implemented by name, no `unimplemented!()` left) and
+        re-measures, after which the UI re-reads coverage. The C++ pair-file flow is untouched
+        beside it.
+      Verified: `swift build` and `swift test` pass with the new decode test, and 306 lib tests pass.
+      The wizard's `createProject/Plan` → `Scaffold` → `ExecutePlan` route through the FFI is still
+      not driven end to end, which is the next thing to do by hand.
 
 Design notes worth keeping: the contract stays **`no_std`** and **synchronous** (`Spawner` is
 the backend's only obligation, so the rp2040 backend supplies its own synchronous scheduler and

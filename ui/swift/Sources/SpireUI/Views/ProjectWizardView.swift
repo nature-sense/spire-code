@@ -54,12 +54,36 @@ struct ProjectWizardView: View {
             return [
                 ("native", "Plain Cargo crate", "Single source set, cross-compiled per target"),
                 ("spire_app", "Spire app", "Rust core + SwiftUI, built on spire-actor & spire-core"),
+                ("embedded_hal", "Embedded HAL (Rust)",
+                 "Contract crate + one backend per board family, filled by the drift cascade"),
             ]
         }
         return [
             ("single_source", "Single source base", "Portable — no hardware-specific layer"),
             ("hal", "Hardware abstraction", "Common core + hal/api contract + per-target implementations"),
         ]
+    }
+
+    /// The wizard chose the embedded-HAL structure: a Cargo workspace of a contract crate, an
+    /// executor and one **backend crate per board family**.
+    private var isEmbeddedHal: Bool {
+        structure == "embedded_hal"
+    }
+
+    /// The platforms offered for the current structure.
+    ///
+    /// An embedded-HAL project *is* its board backends, so it is offered boards and nothing else: a
+    /// Linux cross-target has no backend to fill, and the scaffold refuses one by name. The
+    /// `embedded` flag comes from `platforms/list` rather than being derived here — the rule is the
+    /// build's own (`os`).
+    private var offeredPlatforms: [Platform] {
+        isEmbeddedHal ? availablePlatforms.filter(\.embedded) : availablePlatforms
+    }
+
+    /// Ready to plan: described, named, and — for an embedded-HAL project — carrying at least one
+    /// board, because a workspace with no backend is not the project the user asked for.
+    private var canPlan: Bool {
+        hasDescription && (!isEmbeddedHal || !selectedPlatforms.isEmpty)
     }
 
     private var hasDescription: Bool {
@@ -110,6 +134,13 @@ struct ProjectWizardView: View {
         }
         .onChange(of: buildSystem) { _, _ in
             structure = structureOptions.first?.key ?? "native"
+        }
+        .onChange(of: structure) { _, _ in
+            // Switching to a structure that offers fewer platforms (an embedded-HAL project is
+            // offered boards only) must not carry a selection it can no longer use — the scaffold
+            // would refuse the Linux id it kept.
+            let offered = Set(offeredPlatforms.map(\.id))
+            selectedPlatforms = selectedPlatforms.intersection(offered)
         }
     }
 
@@ -166,21 +197,44 @@ struct ProjectWizardView: View {
                     .truncationMode(.middle)
             }
 
-            Text("Platforms (optional — empty = host only)")
+            Text(isEmbeddedHal
+                 ? "Boards (at least one — each family gets a backend crate)"
+                 : "Platforms (optional — empty = host only)")
                 .font(.headline)
-            if availablePlatforms.isEmpty {
-                Text("No cross-compilation platforms registered")
+            if offeredPlatforms.isEmpty {
+                Text(isEmbeddedHal
+                     ? "No embedded platforms registered — an embedded project needs one (os: esp-idf or rp2040) in ~/.spire/platforms"
+                     : "No cross-compilation platforms registered")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isEmbeddedHal ? Color.orange : Color.secondary)
             } else {
-                ForEach(availablePlatforms.map(\.id), id: \.self) { id in
-                    Toggle(id, isOn: Binding(
-                        get: { selectedPlatforms.contains(id) },
-                        set: { isOn in
-                            if isOn { selectedPlatforms.insert(id) } else { selectedPlatforms.remove(id) }
+                ForEach(offeredPlatforms) { platform in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Toggle(isOn: Binding(
+                            get: { selectedPlatforms.contains(platform.id) },
+                            set: { isOn in
+                                if isOn { selectedPlatforms.insert(platform.id) }
+                                else { selectedPlatforms.remove(platform.id) }
+                            }
+                        )) {
+                            Text("\(platform.name) (\(platform.id))")
                         }
-                    ))
-                    .toggleStyle(.checkbox)
+                        .toggleStyle(.checkbox)
+
+                        // The platform's own notes, shown where the choice is made: which SDK, which
+                        // peripherals, what the variant does not have. The same text the Rust fill
+                        // prompt injects, so what the user reads here is what the implementation is
+                        // constrained by.
+                        if let hints = platform.libraryHints?
+                            .trimmingCharacters(in: .whitespacesAndNewlines),
+                           !hints.isEmpty {
+                            Text(hints)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.leading, 20)
+                        }
+                    }
                 }
             }
 
@@ -201,7 +255,7 @@ struct ProjectWizardView: View {
 
             // The Plan button appears only once the project has been described
             // AND a location resolved.
-            if hasDescription && !resolvedProjectDirectory.isEmpty {
+            if canPlan && !resolvedProjectDirectory.isEmpty {
                 Button {
                     Task { await plan() }
                 } label: {

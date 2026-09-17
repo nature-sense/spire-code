@@ -1523,6 +1523,38 @@ final class SpireBridge {
         return (written, failures, nil)
     }
 
+    /// Rust embedded-HAL fill — plan: one item per backend **file** that still owes something, each
+    /// carrying the pending traits and the constrained prompt (the platform's hints, a hardware
+    /// profile, the contract's own source). Read-only, and read from the same coverage measure the
+    /// maturity chips use — so this list and those chips cannot disagree.
+    func embeddedHalFillPlan(root: String, platform: String? = nil) async -> (items: [[String: Any]], error: String?) {
+        var args: [String: Any] = ["root": root]
+        if let platform, !platform.isEmpty { args["platform"] = platform }
+        guard let json = await callBuildTool("embedded_hal_fill_plan", args: args) else {
+            return ([], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([], err)
+        }
+        return ((json["plan"] as? [[String: Any]]) ?? [], nil)
+    }
+
+    /// Rust embedded-HAL fill — apply: one model call per item, **gated** before anything is
+    /// written (every pending trait implemented by name, no `unimplemented!()` left behind), then
+    /// the project is re-measured. `applied` therefore reports what the measure says afterwards,
+    /// not what the model claimed.
+    func embeddedHalFillApply(root: String, plan: [[String: Any]]) async -> (applied: [[String: Any]], failures: [[String: Any]], error: String?) {
+        guard let json = await callBuildTool("embedded_hal_fill_apply", args: ["root": root, "plan": plan]) else {
+            return ([], [], "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return ([], [], err)
+        }
+        let applied = (json["applied"] as? [[String: Any]]) ?? []
+        let failures = (json["failures"] as? [[String: Any]]) ?? []
+        return (applied, failures, nil)
+    }
+
     /// SEMANTIC Stage-1 (deterministic half): build the constrained module-pair
     /// implementation prompt for one interface × platform via
     /// `hal_build_impl_prompt` (contract + structured docs + hardware profile +

@@ -1,5 +1,73 @@
 import Testing
+import Foundation
 @testable import SpireUI
+
+/// The `platforms/list` payload, as the wizard consumes it.
+///
+/// This is the contract between the two halves of the wizard's board picker: the Rust side sends
+/// `embedded` (its `os` rule) rather than letting Swift re-derive it, and the hints are shown where
+/// the choice is made. A field that silently stopped decoding would show an empty list rather than
+/// an error, so it is pinned here against the exact JSON `platforms/list` produces.
+@Test("A platform listing decodes with the wizard's fields")
+func platformListingDecodes() throws {
+    let json = """
+    [{
+      "id": "esp32c6",
+      "name": "ESP32-C6",
+      "os": "esp-idf",
+      "architecture": {
+        "cpu_family": "riscv", "cpu": "esp32c6", "endian": "little",
+        "target_triple": "riscv32imac-esp-espidf"
+      },
+      "toolchain": {
+        "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
+        "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+        "needs_exe_wrapper": false
+      },
+      "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+      "family": "esp32",
+      "rust": {
+        "target": "riscv32imac-esp-espidf", "idf_target": "esp32c6", "flash": "espflash"
+      },
+      "library_hints": "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make.",
+      "embedded": true
+    }, {
+      "id": "rpi5",
+      "name": "Raspberry Pi 5",
+      "os": "linux",
+      "architecture": {
+        "cpu_family": "aarch64", "cpu": "armv8-a", "endian": "little",
+        "target_triple": "aarch64-linux-gnu"
+      },
+      "toolchain": {
+        "c": "aarch64-linux-gnu-gcc", "cpp": "aarch64-linux-gnu-g++",
+        "ar": "aarch64-linux-gnu-ar", "strip": "aarch64-linux-gnu-strip",
+        "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+        "needs_exe_wrapper": false
+      },
+      "sysroot": { "root": "/usr/aarch64-linux-gnu", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+      "embedded": false
+    }]
+    """
+
+    let platforms: [Platform] = try MessageSerializer.decode(Data(json.utf8))
+    #expect(platforms.count == 2)
+
+    let board = platforms[0]
+    #expect(board.embedded, "a firmware board is what the embedded picker offers")
+    #expect(board.family == "esp32")
+    #expect(board.rust?.target == "riscv32imac-esp-espidf")
+    #expect(board.rust?.idfTarget == "esp32c6")
+    #expect(board.rust?.flash == "espflash")
+    #expect(board.libraryHints?.contains("RV32IMAC") == true)
+
+    let host = platforms[1]
+    #expect(!host.embedded, "a Linux cross-target has no backend crate to fill")
+    #expect(host.family == nil, "family is absent, not empty, for a C platform")
+    #expect(host.rust == nil)
+    #expect(host.libraryHints == nil)
+}
+
 
 @Test("Bridge initialises without crashing")
 func bridgeInit() {
