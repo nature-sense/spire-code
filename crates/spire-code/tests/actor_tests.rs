@@ -3466,6 +3466,23 @@ sysroot:
         "{build_without_project}"
     );
 
+    // `device/fix_test` (M4) edits the project's source, so it refuses before anything else when
+    // there is no project to edit — and the message says why that matters rather than "missing
+    // parameter".
+    let fix_without_project = route(
+        &coord_tx,
+        "device/fix_test",
+        serde_json::json!({"platform": "rpi5", "path": "build-rpi5/tests"}),
+    )
+    .await;
+    assert!(
+        fix_without_project["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("needs an open project"),
+        "{fix_without_project}"
+    );
+
     // device/deploy shares that front half (resolve → connect → upload), so it
     // validates its inputs identically — no board needed for any of these.
     let deploy_no_platform =

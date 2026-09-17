@@ -360,12 +360,30 @@ entry tracks the work end to end.
       close, and the gated live-model run. It found three defects the fakes could not: a
       double-counted diagnostic stub, a wrong-reply bug, and `success: true` on a
       rolled-back change.
-- [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
-      loop (rebuild → redeploy → re-run), bounded and revert-safe — the
-      first-class prompt→generate→verify slice. Depends on M3's cross-build leg
-      (the loop has to rebuild) and reuses the **bounded compile→fix spine** that
-      the embedded-HAL fill leg now runs on (see 9f), so the two are one
-      mechanism rather than two.
+- [x] 4. M4 — run→fix loop (done 2026-09-17). Feed a failing `run_test` back into the LLM fix
+      loop (rebuild → redeploy → re-run), bounded and revert-safe. `device/fix_test` runs the board's
+      tests (through M3's cross-build leg), and on failure hands the board's own output to the
+      **existing** code-modification path (`modify/code`) rather than growing a second fix mechanism,
+      then runs again. Two disciplines make it safe to automate rather than a loop that quietly
+      rewrites a project:
+  - **Revertible** — the project must be a git repository (the wizard's scaffolds make every project
+    one, with a committed baseline, precisely so LLM changes are reviewable as a diff), so the loop
+    refuses with that reason rather than editing a tree nobody can undo. It reports what it touched
+    and how to undo it, and does **not** run the undo: discarding a user's changes automatically is a
+    bigger act than the one they asked for.
+  - **Bounded** — `max_rounds` counts *fixes* (default 2, capped at 4). A passing run ends the loop;
+    a refused fix ends it with the reason, because a model that cannot produce a change on one round
+    will not on the next. A run that could not happen (no board, a failed build) is reported as such
+    instead of being turned into a fix prompt — the same setup-versus-content split the verify spine
+    made for compile failures.
+  The prompt is a pure function with its own test: the board's words verbatim, a bounded tail (a
+  failing harness can print thousands of lines), and the rule that keeps a "fix" from being a deleted
+  test. Writing the revert report caught a real defect in the first attempt — `git diff --name-only`
+  does not mention **untracked** files, so a fix that *created* a file would have reported "nothing
+  changed"; it reads `git status --porcelain` and separates modified from created, because the two
+  are undone differently (`git checkout --` versus deleting). A board is needed for the whole loop,
+  so what is pinned here is the prompt, the git refusal, the two change lists, and the preconditions;
+  the loop's rounds are exercised by the same shape as the fill's (the verify spine).
 - [ ] 5. M5 — trap control + all boards. Tools `run` / `start` / `stop` /
       `status` / `logs`; generalize across rpi5 / rock3c / a7s. The **board side
       is the blocker**: `spire-target-mcp` currently exposes only `run_test` and

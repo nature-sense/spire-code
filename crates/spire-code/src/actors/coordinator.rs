@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -1697,6 +1697,10 @@ impl CoordinatorActor {
             }
             "device/deploy" => {
                 return self.handle_device_deploy(&params).await;
+            }
+            // ── M4: run → fix → rebuild → re-run, bounded and revert-safe ────
+            "device/fix_test" | "device/fixTest" => {
+                return self.handle_device_fix_test(&params).await;
             }
             "mcp/disconnectAll" => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3797,6 +3801,215 @@ impl CoordinatorActor {
         }
     }
 
+    /// The prompt the fix round sends: the board's own output, then the one instruction that keeps
+    /// the model inside the project.
+    ///
+    /// Pure and separate so it can be tested without a board: what matters is that the *test's*
+    /// words survive verbatim (a paraphrase loses the assertion, the file and the line — the three
+    /// things a fix needs) and that the tail is bounded, because a failing harness can print
+    /// thousands of lines and the model reads the end of a test run anyway.
+    fn fix_prompt(output: &str, extra: Option<&str>) -> String {
+        const KEPT_LINES: usize = 60;
+        let lines: Vec<&str> = output.lines().collect();
+        let start = lines.len().saturating_sub(KEPT_LINES);
+        let mut kept = lines[start..].join("\n");
+        if start > 0 {
+            kept = format!("… ({start} earlier lines omitted)\n{kept}");
+        }
+        let context = extra
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| format!("\n\nWhat this project is: {text}"))
+            .unwrap_or_default();
+        format!(
+            "The tests for this project failed on the target board. The board said:\n\n{kept}\n\n\
+             Fix the cause in this project's source — do not weaken or delete the test, and do not \
+             touch the board's own tooling. Keep the change as small as the failure allows.{context}"
+        )
+    }
+
+    /// Refuse to run an editing loop in a tree that cannot be rolled back, naming the way to get one.
+    async fn require_git_repo(root: &Path) -> Result<(), String> {
+        let out = tokio::process::Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .await;
+        match out {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(_) => Err(format!(
+                "{} is not a git repository, so a fix could not be rolled back — run `git init` \
+                 there first (the wizard's scaffolds do this for you)",
+                root.display()
+            )),
+            Err(e) => Err(format!("could not ask git about {}: {e}", root.display())),
+        }
+    }
+
+    /// The files an editing loop touched, as git sees them: `(modified, created)`.
+    ///
+    /// `git status --porcelain` rather than `git diff`, because a fix can *create* a file — and
+    /// `git diff` does not mention untracked files at all, so a loop that added one would report
+    /// "no file changed, so there is nothing to revert" about a project it had just written to. (A
+    /// test with an untracked file is what caught that.) The two lists are separate because they are
+    /// undone differently: `git checkout --` for a modified file, deletion for a new one.
+    ///
+    /// A git failure here is not an error for the caller: it means both lists are empty.
+    async fn git_changed_files(root: &Path) -> (Vec<String>, Vec<String>) {
+        let Ok(out) = tokio::process::Command::new("git")
+            .current_dir(root)
+            .args(["status", "--porcelain"])
+            .output()
+            .await
+        else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut modified = Vec::new();
+        let mut created = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.len() < 4 {
+                continue;
+            }
+            let (status, path) = line.split_at(2);
+            let path = path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            // A rename reads `R  old -> new`; the file that exists now is what a user would revert.
+            let path = path.rsplit(" -> ").next().unwrap_or(path).to_string();
+            if status.trim() == "??" {
+                created.push(path);
+            } else {
+                modified.push(path);
+            }
+        }
+        (modified, created)
+    }
+
+    /// `device/fix_test` — M4: run the tests on the board, and on failure hand the output to the
+    /// code-modification path, rebuild and run again — **bounded**, and only where the result is
+    /// revertible.
+    ///
+    /// Two disciplines make this safe to automate rather than a loop that quietly rewrites a project:
+    ///
+    /// - **Revertible**: the project must be a git repository. The wizard's scaffolds make every
+    ///   project one, with a committed baseline, precisely so LLM changes can be reviewed as a diff —
+    ///   so the loop refuses with that reason rather than editing a tree nobody can undo. It reports
+    ///   the files it changed and the command that reverts them, and does **not** revert them itself:
+    ///   discarding a user's changes automatically is a bigger act than the one they asked for.
+    /// - **Bounded**: `max_rounds` (default 2, capped at 4) counts *fixes*, not runs. A run that
+    ///   passes ends the loop; a fix that is refused ends it with the reason, because a model that
+    ///   cannot produce a change on one round cannot on the next either.
+    async fn handle_device_fix_test(&self, params: &serde_json::Value) -> serde_json::Value {
+        let max_rounds = params
+            .get("max_rounds")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(2)
+            .clamp(1, 4) as u32;
+
+        let root = match self
+            .ffi_deps()
+            .ok()
+            .and_then(|(_, state)| state.project_root.lock().unwrap().clone())
+        {
+            Some(root) => root,
+            None => {
+                return serde_json::json!({
+                    "error": "device/fix_test needs an open project (the loop edits its source)"
+                })
+            }
+        };
+        if let Err(reason) = Self::require_git_repo(&root).await {
+            return serde_json::json!({ "error": reason });
+        }
+
+        // The loop owns the build: it is defined as "build, run, and fix what fails", so the caller
+        // does not get to switch that off and have it report a missing binary instead.
+        let mut test_args = params.clone();
+        if let Some(obj) = test_args.as_object_mut() {
+            obj.insert("build".to_string(), serde_json::json!(true));
+            obj.remove("max_rounds");
+        }
+
+        let mut rounds: u32 = 0;
+        let mut last_run = serde_json::json!(null);
+        let mut fix_refused: Option<String> = None;
+
+        for attempt in 0..=max_rounds {
+            let run = self.call_tool_json("device/test", test_args.clone()).await;
+            if let Some(err) = run.get("error").and_then(|value| value.as_str()) {
+                // A run that could not happen — no board, a failed build — is not something a fix
+                // round can help with, so it is reported rather than turned into a fix prompt.
+                return serde_json::json!({
+                    "passed": false,
+                    "rounds": rounds,
+                    "error": err,
+                    "run": last_run,
+                });
+            }
+            if run.get("passed").and_then(|value| value.as_bool()) == Some(true) {
+                return serde_json::json!({ "passed": true, "rounds": rounds, "run": run });
+            }
+            last_run = run;
+            if attempt == max_rounds {
+                break;
+            }
+
+            let output = last_run
+                .get("output")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let mut fix_args = serde_json::json!({
+                "path": root.to_string_lossy(),
+                "prompt": Self::fix_prompt(output, params.get("prompt").and_then(|v| v.as_str())),
+            });
+            if let Some(platform) = params.get("platform").and_then(|value| value.as_str()) {
+                fix_args["platform"] = serde_json::json!(platform);
+            }
+            let fix = self.call_tool_json("modify/code", fix_args).await;
+            match fix.get("success").and_then(|value| value.as_bool()) {
+                Some(true) => rounds += 1,
+                _ => {
+                    fix_refused = Some(
+                        fix.get("error")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("the fix round did not change anything")
+                            .to_string(),
+                    );
+                    break;
+                }
+            }
+        }
+
+        let (modified, created) = Self::git_changed_files(&root).await;
+        // The note names both commands, because the two cases are undone differently — and it does
+        // not run them: discarding a user's changes automatically is a bigger act than the one they
+        // asked for.
+        let mut reverts: Vec<String> = Vec::new();
+        if !modified.is_empty() {
+            reverts.push(format!("git checkout -- {}", modified.join(" ")));
+        }
+        if !created.is_empty() {
+            reverts.push(format!("rm {}", created.join(" ")));
+        }
+        let mut result = serde_json::json!({
+            "passed": false,
+            "rounds": rounds,
+            "run": last_run,
+            "changed": modified,
+            "added": created,
+            "note": if reverts.is_empty() {
+                "no file changed, so there is nothing to revert".to_string()
+            } else {
+                format!("revert with: {}", reverts.join("; "))
+            },
+        });
+        if let Some(reason) = fix_refused {
+            result["fix_refused"] = serde_json::json!(reason);
+        }
+        result
+    }
+
     /// `device/deploy` — install a cross-built production binary on a board.
     ///
     /// The same front half as `device/test` (resolve → connect → upload), then
@@ -5218,6 +5431,133 @@ mod platform_listing_tests {
             boards[1]["embedded"],
             serde_json::json!(false),
             "a Linux cross-target is not a board a firmware project can target: {out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fix_loop_tests {
+    use super::*;
+
+    /// The fix prompt carries the test's own words. A paraphrase would lose the assertion, the file
+    /// and the line — the three things a fix needs — so the output is passed through verbatim aside
+    /// from the bounded tail.
+    #[test]
+    fn the_fix_prompt_quotes_the_board_and_bounds_the_tail() {
+        let short = "FAILED: trap_blink\n  expected 3 blinks, saw 2\n  at tests/led.rs:41";
+        let prompt = CoordinatorActor::fix_prompt(short, None);
+        assert!(prompt.contains(short), "{prompt}");
+        assert!(
+            prompt.contains("do not weaken or delete the test"),
+            "the rule that keeps a fix from being a deletion: {prompt}"
+        );
+        assert!(!prompt.contains("earlier lines omitted"), "{prompt}");
+
+        // A noisy run keeps its *end* — where a test run says what failed — and says what it cut.
+        let long: String = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = CoordinatorActor::fix_prompt(&long, None);
+        assert!(prompt.contains("earlier lines omitted"), "{prompt}");
+        assert!(
+            prompt.contains("line 199"),
+            "the tail is what matters: {prompt}"
+        );
+        assert!(!prompt.contains("line 10\n"), "not the whole run: {prompt}");
+
+        // The caller's context is optional and, when present, is labelled rather than spliced in.
+        let with_context =
+            CoordinatorActor::fix_prompt(short, Some("  a blink test for the rpi5  "));
+        assert!(
+            with_context.contains("What this project is: a blink test for the rpi5"),
+            "{with_context}"
+        );
+        assert!(
+            !CoordinatorActor::fix_prompt(short, Some("   ")).contains("What this project is"),
+            "blank context is not context"
+        );
+    }
+
+    /// The loop refuses a tree it could not roll back, and says how to get one.
+    #[tokio::test]
+    async fn the_loop_refuses_a_project_git_cannot_roll_back() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let err = CoordinatorActor::require_git_repo(tmp.path())
+            .await
+            .expect_err("a bare directory is not revertible");
+        assert!(err.contains("not a git repository"), "{err}");
+        assert!(err.contains("git init"), "the reason names the fix: {err}");
+
+        let status = tokio::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .await
+            .expect("git is available");
+        assert!(status.success());
+        assert!(
+            CoordinatorActor::require_git_repo(tmp.path()).await.is_ok(),
+            "an initialised repository is enough — the loop does not require a commit"
+        );
+    }
+
+    /// What the loop reports as changed, so a user can revert it by hand.
+    #[tokio::test]
+    async fn changed_files_come_from_git_and_an_unreadable_tree_is_simply_empty() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        assert!(
+            CoordinatorActor::git_changed_files(tmp.path()).await == (Vec::new(), Vec::new()),
+            "no repository, nothing to report — and that is not an error"
+        );
+
+        tokio::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .await
+            .expect("git init");
+        // A fix can modify a file *or* create one, and the two are undone differently — which is
+        // why both lists exist. `git diff` alone would call the second case "nothing changed".
+        tokio::fs::write(tmp.path().join("touched.rs"), "fn main() {}\n")
+            .await
+            .expect("write");
+        tokio::fs::write(tmp.path().join("tracked.rs"), "fn main() {}\n")
+            .await
+            .expect("write");
+        for args in [
+            vec!["add", "tracked.rs"],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        ] {
+            assert!(
+                tokio::process::Command::new("git")
+                    .current_dir(tmp.path())
+                    .args(&args)
+                    .status()
+                    .await
+                    .expect("git")
+                    .success(),
+                "{args:?}"
+            );
+        }
+        tokio::fs::write(tmp.path().join("tracked.rs"), "fn main() { /* fixed */ }\n")
+            .await
+            .expect("write");
+
+        let (modified, created) = CoordinatorActor::git_changed_files(tmp.path()).await;
+        assert_eq!(modified, vec!["tracked.rs".to_string()], "an edited file");
+        assert_eq!(
+            created,
+            vec!["touched.rs".to_string()],
+            "a file the fix created — invisible to `git diff`"
         );
     }
 }
