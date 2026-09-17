@@ -69,6 +69,67 @@ func platformListingDecodes() throws {
 }
 
 
+/// Which boards the "Add board" menu offers.
+///
+/// The rule the *view* applies, pinned here because the tool refuses what it would offer: a family
+/// that already has a backend crate, a platform that is not a board, and — since one backend serves
+/// every variant of a family — a second variant of a family already present.
+@Test("Add board offers one entry per absent family, and only boards")
+func addableBoardsOffersOneEntryPerAbsentFamily() throws {
+    // Shaped like the real `platforms/list` payload: the model's `architecture`/`toolchain`/`sysroot`
+    // are required keys, so a fixture that omitted them would be testing a payload the core never
+    // sends.
+    let platforms: [Platform] = try MessageSerializer.decode(Data("""
+    [{ "id": "esp32c6", "name": "ESP32-C6", "os": "esp-idf", "family": "esp32", "embedded": true,
+       "library_hints": "RISC-V RV32IMAC via esp-idf-hal.",
+       "architecture": { "cpu_family": "riscv", "cpu": "esp32c6", "endian": "little",
+                         "target_triple": "riscv32imac-esp-espidf" },
+       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+       "rust": { "target": "riscv32imac-esp-espidf", "idf_target": "esp32c6", "flash": "espflash" }
+    }, { "id": "esp32s3", "name": "ESP32-S3", "os": "esp-idf", "family": "esp32", "embedded": true,
+       "architecture": { "cpu_family": "xtensa", "cpu": "esp32s3", "endian": "little",
+                         "target_triple": "xtensa-esp32s3-espidf" },
+       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+       "rust": { "target": "xtensa-esp32s3-espidf", "idf_target": "esp32s3", "flash": "espflash" }
+    }, { "id": "rp2040", "name": "Raspberry Pi Pico", "os": "rp2040", "family": "rp2040", "embedded": true,
+       "architecture": { "cpu_family": "arm", "cpu": "rp2040", "endian": "little",
+                         "target_triple": "thumbv6m-none-eabi" },
+       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+       "rust": { "target": "thumbv6m-none-eabi", "idf_target": "RP2040", "flash": "picotool" }
+    }, { "id": "rpi5", "name": "Raspberry Pi 5", "os": "linux", "embedded": false,
+       "architecture": { "cpu_family": "aarch64", "cpu": "armv8-a", "endian": "little",
+                         "target_triple": "aarch64-linux-gnu" },
+       "toolchain": { "c": "aarch64-linux-gnu-gcc", "cpp": "aarch64-linux-gnu-g++",
+                      "ar": "aarch64-linux-gnu-ar", "strip": "aarch64-linux-gnu-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "/usr/aarch64-linux-gnu", "lib_dirs": [], "include_dirs": [],
+                    "pkg_config_libdir": [] }
+    }]
+    """.utf8))
+
+    // A project with an rp2040 backend: the two esp variants are one offer, and rp2040 is not offered
+    // again (the tool would refuse it — a second click must not fork the crate).
+    let addable = EmbeddedHalBackendsSection.addableBoards(
+        platforms: platforms,
+        presentFamilies: ["rp2040"]
+    )
+    #expect(addable.map(\.id) == ["esp32c6"], "one entry per family, boards only: \(addable.map(\.id))")
+
+    // A project with no backends yet: every board family, and still not the Linux host.
+    let fresh = EmbeddedHalBackendsSection.addableBoards(platforms: platforms, presentFamilies: [])
+    #expect(fresh.map(\.id) == ["esp32c6", "rp2040"], "\(fresh.map(\.id))")
+}
+
 @Test("Bridge initialises without crashing")
 func bridgeInit() {
     let bridge = SpireBridge()

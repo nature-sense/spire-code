@@ -21,9 +21,34 @@ struct EmbeddedHalBackendsSection: View {
     /// A family, not a platform id: the coverage map is keyed by the backend crate's suffix, and one
     /// backend serves every variant of its family.
     @State private var families: Set<String> = []
+    /// Every embedded platform the registry has, for the add-board menu. Kept whole (id *and* name)
+    /// because the id is what the tool takes and the name is what the user reads.
+    @State private var boards: [Platform] = []
     @State private var plan: [[String: Any]] = []
     @State private var status: String?
     @State private var busy = false
+
+    /// The boards this project could still add: embedded, with a family no backend crate covers yet,
+    /// one entry per family (two variants of a board are one backend, so offering both would offer
+    /// the same crate twice).
+    ///
+    /// Static and pure so it can be tested without a running core — the same reason the wizard's
+    /// platform filter is not re-implemented in the view.
+    static func addableBoards(platforms: [Platform], presentFamilies: Set<String>) -> [Platform] {
+        var seen: Set<String> = presentFamilies
+        var out: [Platform] = []
+        for platform in platforms where platform.embedded {
+            guard let family = platform.family else { continue }
+            if seen.contains(family) { continue }
+            seen.insert(family)
+            out.append(platform)
+        }
+        return out.sorted { $0.id < $1.id }
+    }
+
+    private var addable: [Platform] {
+        Self.addableBoards(platforms: boards, presentFamilies: Set(bridge.halFunctionGaps.keys))
+    }
 
     private var rows: [(family: String, interfaces: [(name: String, gaps: SpireBridge.HalInterfaceGaps)])] {
         bridge.halFunctionGaps
@@ -53,6 +78,27 @@ struct EmbeddedHalBackendsSection: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(busy || rows.isEmpty)
+
+                // Adding a board is the other half of authoring: it emits the backend crate and its
+                // workspace member, after which the rows above gain a family and the plan gains a
+                // file. Offered only for families this project does not have yet — the tool refuses
+                // a duplicate, and a menu that offers what it will refuse is a lie.
+                if !addable.isEmpty {
+                    Menu {
+                        ForEach(addable, id: \.id) { board in
+                            Button {
+                                Task { await addBoard(board) }
+                            } label: {
+                                Text(board.name.isEmpty ? board.id : "\(board.name) (\(board.id))")
+                            }
+                        }
+                    } label: {
+                        Label("Add board", systemImage: "plus.rectangle.on.folder")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .disabled(busy)
+                }
             }
 
             if rows.isEmpty {
@@ -94,6 +140,7 @@ struct EmbeddedHalBackendsSection: View {
         }
         .task {
             let platforms = await bridge.fetchPlatforms()
+            boards = platforms
             families = Set(platforms.filter(\.embedded).compactMap(\.family))
         }
     }
@@ -160,6 +207,39 @@ struct EmbeddedHalBackendsSection: View {
             .foregroundStyle(color)
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(color.opacity(0.12), in: Capsule())
+    }
+
+    /// Add a board: emit its backend crate and workspace member, then re-read the coverage so the
+    /// rows above gain the family — and the board disappears from this menu, because its family is now
+    /// present. Nothing is claimed on the tool's behalf: `written`/`workspace_member` are reported as
+    /// they came back, and a refusal (a duplicate, a non-board platform) is shown as the reason.
+    @MainActor
+    private func addBoard(_ board: Platform) async {
+        busy = true
+        status = nil
+        defer { busy = false }
+        let (result, error) = await bridge.embeddedHalAddPlatform(root: projectRoot, platform: board.id)
+        if let error {
+            status = "Could not add \(board.id): \(error)"
+            return
+        }
+        guard let result else {
+            status = "Could not add \(board.id): no answer from the core."
+            return
+        }
+        var lines: [String] = []
+        if let crate = result["crate"] as? String {
+            lines.append("added \(crate) for family \(result["family"] as? String ?? "?")")
+        }
+        if let member = result["workspace_member"] as? String {
+            lines.append("workspace member: \(member)")
+        }
+        if let note = result["note"] as? String {
+            lines.append(note)
+        }
+        status = lines.isEmpty ? "Added \(board.id)." : lines.joined(separator: "\n")
+        plan = []
+        await bridge.refreshHalData(root: projectRoot)
     }
 
     @MainActor

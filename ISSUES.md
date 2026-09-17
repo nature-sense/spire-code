@@ -675,9 +675,14 @@ build/flash leg.
         real failure turned into ten unrelated ones, which is exactly how it presented. And the
         fixture discipline (a registry *and* the lock *and* an env guard) is what makes these tests
         pass together, not just alone.
-        Still open: nothing calls these three tools from the UI — the wizard's "Rust backends"
-        section could carry "Add board", and contract authoring is a tool-call away rather than a
-        window. The C++ `hal_*` pair is untouched beside them.
+        In the UI: **"Add board"** (the "Rust backends" section) calls `embedded_hal_add_platform`
+        and re-reads the coverage, so the rows gain the family and the menu drops it in the same
+        gesture. The menu offers only families the project does not have — the tool refuses a
+        duplicate, and a menu that offered what it will refuse would be a lie — and that rule is a
+        static, tested function (`addableBoards`) rather than a second copy of the refusal. Still
+        open: `_validate`/`_write_contract` are tool-only, so authoring a contract is a tool call
+        rather than a window; the validate-then-wire behaviour they pair up is what such a window
+        would show. The C++ `hal_*` pair is untouched beside them.
 - [x] 9d. **rp2040 platform + build/flash** (done 2026-09-17). A registry entry
       (`~/.spire/platforms/rp2040.yaml`: `os: rp2040`, `family: rp2040`,
       `target: thumbv6m-none-eabi`, `rust.idf_target: RP2040` for `probe-rs --chip`,

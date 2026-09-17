@@ -1539,6 +1539,24 @@ final class SpireBridge {
         return ((json["plan"] as? [[String: Any]]) ?? [], nil)
     }
 
+    /// Rust embedded-HAL authoring — **add a board**: the backend crate for that platform's family
+    /// (emitted by the scaffold's own code path) plus the workspace member line that makes it part of
+    /// the project.
+    ///
+    /// The refusals are the tool's and arrive as `error`: a platform that is not a board, an unknown
+    /// registry id, and a family that already has a backend crate — that last one is the guard against
+    /// a second click forking the crate. `result["written"]` and `result["workspace_member"]` say
+    /// what landed; `result["note"]` is what the tool did *not* do.
+    func embeddedHalAddPlatform(root: String, platform: String) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool("embedded_hal_add_platform", args: ["root": root, "platform": platform]) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
     /// Rust embedded-HAL fill — apply: one model call per item, **gated** before anything is
     /// written (every pending trait implemented by name, no `unimplemented!()` left behind), then
     /// the project is re-measured. `applied` therefore reports what the measure says afterwards,
