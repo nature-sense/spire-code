@@ -783,6 +783,17 @@ test's project on disk so its backends can be built by hand; doing that found th
   from the registry), so the test asserts `repaired: true` and `built: true`, and that the file on
   disk is the repaired one. No API key, no flakiness, and it is the failing case: swap the second
   answer for a wrong one and it fails.
+- **And with the real model** (`a_real_model_fills_and_the_backend_builds`, now passing): the hints
+  did their job — the first live answer since them declared
+  `Pin<Gpio25, FunctionSio<SioOutput>, PullDown>` and `use embedded_hal::digital::OutputPin;`
+  correctly, and the IO traits resolved. The failure moved to the *crate list*: the model wrote
+  `cortex_m::asm::delay(...)` for `DelayMs` — idiomatic for a Cortex-M0, and unavailable, because
+  rp2040-hal *uses* `cortex-m` 0.7 without re-exporting anything from it, so a backend can only name
+  it by declaring it. The repair ran, quoted rustc's "use `cargo add cortex_m`", and the model kept
+  the crate it could not have — one round is not enough when the error asks for a dependency the
+  manifest will not grant. Fixing the *data* instead was the honest move: `cortex-m = "0.7"` (the
+  version 0.10.2 itself depends on, same rule as `embedded-hal`) is now one of rp2040's `deps`, and
+  the model's own answer builds unchanged.
 - **Two things driving it taught, now in the code**: the tool receives the plan as the *items array*
   (the UI hands back `plan`), which the verification read as `plan["plan"]` — it silently checked
   nothing; and requiring a prior `build_analyze` was a hidden ordering requirement (the analysis store

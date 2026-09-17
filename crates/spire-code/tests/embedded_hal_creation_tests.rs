@@ -628,6 +628,9 @@ async fn a_real_model_fills_and_the_backend_builds() {
     assert_eq!(applied["failures"], serde_json::json!([]), "{applied}");
 
     let verification = &applied["build_verification"][0];
+    // Printed so a real run is readable: which answer was written, whether it was repaired, and the
+    // compiler's words when it still does not build.
+    eprintln!("verification → {verification}");
     assert_ne!(
         verification["built"],
         serde_json::Value::Null,
@@ -639,7 +642,8 @@ async fn a_real_model_fills_and_the_backend_builds() {
         "the generated backend does not build, and the repair did not rescue it: {applied}"
     );
 }
-//
+
+// ─────────────────────────────────────────────────────────────────────────────────────
 // Everything above runs without a model, which is what makes it deterministic. This does the
 // opposite — one real call per backend file — because the fill leg's whole value is what a model
 // does with that prompt, and only a model can answer that. What is asserted is STRUCTURE (every

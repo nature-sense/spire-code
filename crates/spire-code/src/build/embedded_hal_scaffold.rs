@@ -74,20 +74,25 @@ pub(crate) fn family_spec(family: &str) -> Option<FamilySpec> {
         }),
         "rp2040" => Some(FamilySpec {
             vendor_crate: "rp2040-hal",
-            // Two, and the *versions* matter as much as the names: `rp2040-hal` does not re-export
-            // `embedded-hal` (checked against 0.10.2's source — it re-exports `fugit`, `paste` and
-            // `rp2040-pac`), and its GPIO methods are that crate's traits. 0.10.2 depends on
-            // `embedded-hal = "1.0.0"`, so a backend declaring `"0.2"` pulls in a *second* copy of
-            // the crate whose `OutputPin` is not the one implemented on `Pin` — and then
-            // `set_high` does not resolve no matter how right the import looks. The first two
-            // generated backends failed on exactly that, which is what the version pin here is for.
-            deps: &["rp2040-hal = \"0.10\"", "embedded-hal = \"1\""],
+            // `embedded-hal` and `cortex-m` are here at the versions `rp2040-hal` 0.10.2 itself
+            // depends on — `embedded-hal = "1.0.0"` and `cortex-m = "0.7.2"`, both straight out of
+            // its manifest. Names alone are not enough: a backend declaring `embedded-hal = "0.2"`
+            // pulls in a second copy of the crate whose `OutputPin` is not the one implemented on
+            // `Pin`, so `set_high` never resolves; and a backend reaching for `cortex_m::asm::nop`
+            // rp2040-hal *uses* `cortex-m` without re-exporting it (a real model wrote a `nop` spin
+            // for `DelayMs` and pinned the belief that the re-export existed). Both were measured
+            // from the compiler, and both are pinned here so they cannot regress silently.
+            deps: &[
+                "rp2040-hal = \"0.10\"",
+                "embedded-hal = \"1\"",
+                "cortex-m = \"0.7\"",
+            ],
             vendor_note:
                 "# The blocking HAL: this backend's actor executor is synchronous, so it\n\
                           # needs no async runtime. (An embassy-rp backend is the async\n\
                           # alternative, and would still drive the same synchronous `handle`.)\n\
-                          # `embedded-hal` 1.x is here because rp2040-hal's GPIO and delay methods\n\
-                          # *are* its traits and it does not re-export them.",
+                          # `embedded-hal` 1.x and `cortex-m` 0.7 are here because rp2040-hal's GPIO\n\
+                          # and delay methods *are* their traits and it re-exports neither.",
             uses_std_executor: false,
         }),
         _ => None,
@@ -809,12 +814,16 @@ mod tests {
             rp.contains("#![no_std]"),
             "a no_std family's backend must declare it: {rp}"
         );
-        // And the crates its HAL's methods actually need in scope — at the version `rp2040-hal`
-        // 0.10.2 itself depends on (`embedded-hal` 1.0.0), because the *other* major's `OutputPin`
-        // is a different trait: a generated backend importing the right path from the wrong version
-        // still could not call `set_high`.
+        // And the crates its HAL's methods actually need in scope — at the versions `rp2040-hal`
+        // 0.10.2 itself depends on (`embedded-hal` 1.0.0, `cortex-m` 0.7.2), because the *other*
+        // major's `OutputPin` is a different trait (so the right import from the wrong version still
+        // cannot call `set_high`) and a crate that is only a transitive dependency cannot be named.
         let rp_manifest = &file("crates/weather-hal-rp2040/Cargo.toml").content;
-        for dep in ["rp2040-hal = \"0.10\"", "embedded-hal = \"1\""] {
+        for dep in [
+            "rp2040-hal = \"0.10\"",
+            "embedded-hal = \"1\"",
+            "cortex-m = \"0.7\"",
+        ] {
             assert!(rp_manifest.contains(dep), "missing {dep}: {rp_manifest}");
         }
         assert!(
