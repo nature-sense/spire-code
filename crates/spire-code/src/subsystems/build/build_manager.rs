@@ -1766,10 +1766,12 @@ impl BuildManagerActor {
         }
     }
 
-    /// One backend: build it, and on failure repair once with the compiler's errors and rebuild.
+    /// One backend, on the **verify spine**: build it, and on failure hand the compiler's errors to
+    /// the model and rebuild — bounded (see `MAX_REPAIR_ROUNDS`).
     ///
     /// Returns the outcome as JSON, because "written", "repaired then built" and "still does not
-    /// build" are three different things and the caller's result has to say which one happened.
+    /// build" are different things and the caller's result has to say which happened. `rounds` says
+    /// how many repairs it took, and `built: null` still means *nothing compiled it*.
     #[allow(clippy::too_many_arguments)]
     async fn build_one_backend(
         &self,
@@ -1782,44 +1784,28 @@ impl BuildManagerActor {
         metadata: &BuildMetadata,
         llm_tx: &mpsc::Sender<LlmMessage>,
     ) -> serde_json::Value {
-        match self
-            .build_backend_crate(root, config, metadata, platform, package)
-            .await
-        {
-            Ok(output) if output.success => serde_json::json!({ "file": file, "built": true }),
-            Ok(output) => {
-                let errors = output.output;
-                match crate::build::embedded_hal_fill::repair(root, item, &errors, llm_tx).await {
-                    Ok(_) => {
-                        let (built, rest) = match self
-                            .build_backend_crate(root, config, metadata, platform, package)
-                            .await
-                        {
-                            Ok(second) => (second.success, second.output),
-                            Err(e) => (false, e),
-                        };
-                        serde_json::json!({
-                            "file": file,
-                            "built": built,
-                            "repaired": true,
-                            "errors": Self::tail_lines(&rest, 40),
-                        })
-                    }
-                    Err(reason) => serde_json::json!({
-                        "file": file,
-                        "built": false,
-                        "repaired": false,
-                        "repair_refused": reason,
-                        "errors": Self::tail_lines(&errors, 40),
-                    }),
-                }
-            }
-            Err(e) => serde_json::json!({
-                "file": file,
-                "built": serde_json::Value::Null,
-                "note": format!("could not build: {e}"),
-            }),
+        let artifact = FillArtifact {
+            manager: self,
+            root: root.to_path_buf(),
+            file: file.to_string(),
+            item: item.clone(),
+            platform: platform.to_string(),
+            package: package.to_string(),
+            config: config.to_string(),
+            metadata: metadata.clone(),
+            llm_tx: llm_tx.clone(),
+        };
+        let outcome =
+            crate::build::verify_spine::verify_generated(&artifact, MAX_REPAIR_ROUNDS).await;
+        let mut json = outcome.to_json();
+        // The tail, not the whole build log: `cargo` says the interesting part last, and a failed
+        // build for a crate with a big dependency tree is mostly "Compiling …".
+        if let Some(errors) = json.get("errors").and_then(|e| e.as_str()) {
+            let kept = Self::tail_lines(errors, 40);
+            json["errors"] = serde_json::json!(kept);
         }
+        json["file"] = serde_json::json!(file);
+        json
     }
 
     /// One build attempt for a backend crate, through the platform module that owns its `os`.
@@ -4599,6 +4585,74 @@ impl Actor for BuildEventLogActor {
                 let _ = reply_to.send(std::mem::take(&mut self.pending));
             }
         }
+    }
+}
+
+/// How many repair rounds a filled backend gets before its compiler errors are simply reported.
+///
+/// A cost ceiling, not an aspiration: each round is one model call. One round was measurably not
+/// enough — a live run fixed the GPIO type and then needed one more import — and three covers the
+/// observed second-order cases while bounding a model that keeps answering the same way. A leftover
+/// failure is reported with the compiler's words attached, which is what a fourth round would have
+/// given it anyway.
+const MAX_REPAIR_ROUNDS: u32 = 3;
+
+/// A filled backend, seen by the verify spine.
+///
+/// The two facts the spine needs that the fill leg alone knows: which platform module can build this
+/// crate, and that a build which *cannot run* (no module for that `os`, a closed channel, a missing
+/// toolchain) is a setup problem rather than a compiler verdict. It is reported as such and never
+/// handed to the model — no answer fixes an environment.
+struct FillArtifact<'a> {
+    manager: &'a BuildManagerActor,
+    root: PathBuf,
+    file: String,
+    item: serde_json::Value,
+    platform: String,
+    package: String,
+    config: String,
+    metadata: BuildMetadata,
+    llm_tx: mpsc::Sender<LlmMessage>,
+}
+
+#[async_trait::async_trait]
+impl crate::build::verify_spine::GeneratedArtifact for FillArtifact<'_> {
+    fn describe(&self) -> String {
+        self.file.clone()
+    }
+
+    /// Nothing to gate: the fill leg already gated this answer (every pending trait implemented by
+    /// name, no `unimplemented!()` left) *before* writing it, and re-checking the same rules on the
+    /// same file would be a second implementation of that gate rather than a second opinion.
+    fn gate(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn build(&self) -> Result<(), crate::build::verify_spine::BuildFailure> {
+        use crate::build::verify_spine::BuildFailure;
+        match self
+            .manager
+            .build_backend_crate(
+                &self.root,
+                &self.config,
+                &self.metadata,
+                &self.platform,
+                &self.package,
+            )
+            .await
+        {
+            Ok(output) if output.success => Ok(()),
+            // The crate was built and rejected: the compiler's words are the repair's input.
+            Ok(output) => Err(BuildFailure::Compiler(output.output)),
+            // Not built at all — nothing for a model to act on.
+            Err(setup) => Err(BuildFailure::Setup(setup)),
+        }
+    }
+
+    async fn repair(&self, errors: &str) -> Result<(), String> {
+        crate::build::embedded_hal_fill::repair(&self.root, &self.item, errors, &self.llm_tx)
+            .await
+            .map(|_| ())
     }
 }
 

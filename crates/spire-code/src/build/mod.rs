@@ -64,6 +64,7 @@ pub mod embedded_hal_scaffold;
 pub mod hal_migration;
 pub mod hal_rust_contract;
 pub mod spire_app_scaffold;
+pub mod verify_spine;
 
 /// Shared message protocol implemented by every build module.
 #[derive(Debug)]

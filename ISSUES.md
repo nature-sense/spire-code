@@ -176,7 +176,9 @@ entry tracks the work end to end.
 - [ ] 3. M3 — Test action over the device. Cross-build the test binary → upload
       it over HTTP → MCP `run_test` → report exit code + output. No `meson`/
       `test()` machinery is needed on the device — it just runs the ELF. The host
-      side, the test executable and the cross toolchain (below) are what remain.
+      side, the test executable and the cross toolchain: 3a/3b/3c are done, and what
+      remains is the **cross-build leg** — `device/test` still wants a prebuilt binary
+      ("build it for <platform> first") rather than building it itself.
   - [x] 3a. Device side — done (2026-09-13, `spire-target-mcp @ af8980f`).
         `PUT /upload/<name>` stores a binary in the work directory (single name
         component, `.part`+rename, executable bit) and the `run_test` tool runs
@@ -351,14 +353,23 @@ entry tracks the work end to end.
       rolled-back change.
 - [ ] 4. M4 — run→fix loop. Feed a failing `run_test` back into the LLM fix
       loop (rebuild → redeploy → re-run), bounded and revert-safe — the
-      first-class prompt→generate→verify slice.
+      first-class prompt→generate→verify slice. Depends on M3's cross-build leg
+      (the loop has to rebuild) and reuses the **bounded compile→fix spine** that
+      the embedded-HAL fill leg now runs on (see 9f), so the two are one
+      mechanism rather than two.
 - [ ] 5. M5 — trap control + all boards. Tools `run` / `start` / `stop` /
-      `status` / `logs`; generalize across rpi5 / rock3c / a7s.
+      `status` / `logs`; generalize across rpi5 / rock3c / a7s. The **board side
+      is the blocker**: `spire-target-mcp` currently exposes only `run_test` and
+      `deploy`, so those tools have to exist there (a separate repo) before the
+      host can pass them through.
 - [ ] 6. Backlog — first-class prompt→generate→verify everywhere. Wire the
       generate tools (`createProject/*`, `hal_*`) into the verify spine so new
       code is compile-verified as it is generated; covers brand-new HAL
       contracts, new toolkits, and from-scratch projects (not yet exercised —
-      all work so far has been on the pre-existing ai-traps project).
+      all work so far has been on the pre-existing ai-traps project). The spine
+      itself now exists (`build/verify_spine.rs`): gate → build → hand the
+      compiler's errors back to the generator → rebuild, bounded. What remains is
+      wiring the generators that still write without one.
 
 ## 8. Embedded targets — ESP32 first, via a reusable HAL + actor framework
 
@@ -617,8 +628,8 @@ build/flash leg.
         runtime/vendor crate), each pending contract's source, the file's current source, and the
         rules that keep the answer inside this file and this vendor's API. Read-only: the plan is
         the reviewed artefact, and the same measure the UI reads feeds it, so the two cannot
-        disagree. `_validate/_write_contract` and `_add_platform` for Rust remain open, and the UI
-        cannot reach either tool until 9e.
+        disagree. The authoring tools that pair with it are below; the UI reaches Add board and is
+        yet to reach contract authoring.
       - **`embedded_hal_fill_apply`** (done 2026-09-17). One model call per item (role `Coding`)
         with the same two retries the C++ path uses: once on truncation with a "be concise"
         instruction, twice on a parse error with the errors appended. Between the answer and the
@@ -845,9 +856,25 @@ test's project on disk so its backends can be built by hand; doing that found th
   nothing; and requiring a prior `build_analyze` was a hidden ordering requirement (the analysis store
   is best-effort: an analyze can succeed and the lookup still miss), so the verification now analyzes
   on demand and every skip names its reason — "written" and "verified to build" stay different claims.
-- **Still open (smaller)**: the repair is one round, so a second-order error (the corrected answer
-  needing one more import) ends as `built: false` with the compiler's words attached rather than
-  another call. The esp32 leg's build needs the ESP-IDF SDK, so its verification runs only where that
-  is installed; the deterministic test covers rp2040 only.
+- **Still open (smaller)**: the esp32 leg's build needs the ESP-IDF SDK, so its verification runs only
+  where that is installed; the deterministic tests cover rp2040 only. (The one-round limit this entry
+  used to carry is closed — see below.)
+- **The loop is now bounded at three rounds, not one** (done 2026-09-17, and the first piece of the
+  verify spine). `Repair` stopped being a special case of the fill: the shape gate → build → hand the
+  compiler's errors back → rebuild now lives in `build/verify_spine.rs`, and the fill leg implements
+  it (`FillArtifact`) instead of repeating it. Two things came out of writing it once:
+  - **A setup failure is not a compiler failure.** No module for the platform's `os`, a closed
+    channel, a toolchain that is missing — a model cannot fix any of that, so the spine stops and
+    reports `built: null` + `not_built: <reason>` rather than spending a call to be told nothing. The
+    fill's three-valued `built` (`null`/`true`/`false`) finally has a name for what it meant.
+  - **`rounds` is reported, not just `repaired`.** "Built after one repair" and "built after three"
+    are different facts about the same success.
+  `MAX_REPAIR_ROUNDS = 3` is a cost ceiling chosen from evidence: a live run's first answer fixed the
+  GPIO type and its second still needed the trait in scope, so one round was measurably short.
+  Verified without a key: `a_second_wrong_answer_still_gets_a_third_round` scripts exactly that
+  sequence through the real route (scaffold → plan → apply) with a real compiler and asserts
+  `rounds: 2` and `built: true`; the spine itself has six unit tests (a fake that fails twice, a
+  refused repair, a gate refusal, a setup failure, `max_rounds: 0`) that need no model, no toolchain
+  and no files.
 
 

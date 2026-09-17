@@ -522,6 +522,11 @@ async fn a_scaffolded_backend_builds_after_one_repair_round() {
         "the first answer is wrong on purpose, so a repair must have happened: {applied}"
     );
     assert_eq!(
+        verification["rounds"],
+        serde_json::json!(1),
+        "one repair was enough here, and the report says how many: {applied}"
+    );
+    assert_eq!(
         verification["built"],
         serde_json::json!(true),
         "the repaired backend must build: {applied}"
@@ -532,6 +537,98 @@ async fn a_scaffolded_backend_builds_after_one_repair_round() {
     assert!(
         written.contains("FunctionSio<SioOutput>"),
         "the file on disk is the repaired one: {written}"
+    );
+}
+/// The spine's budget, driven through the real route: a scripted model answers wrongly **twice**, and
+/// the third answer is only reachable because round 2 saw round 1's *new* errors rather than the
+/// first round's again.
+///
+/// This is the case the one-round loop could not reach, and the live run that motivated three rounds
+/// hit it for real: the first answer fixed the GPIO type, and the second still needed the trait in
+/// scope. The build in between is real — rustup toolchain, `thumbv6m-none-eabi`, `rp2040-hal` from the
+/// registry — so `rounds: 2` is a measurement, not a claim.
+#[tokio::test]
+async fn a_second_wrong_answer_still_gets_a_third_round() {
+    // Same machine trap as the other build tests: rustup's toolchain must be the one that runs.
+    if let Ok(out) = std::process::Command::new("rustup")
+        .args(["which", "cargo"])
+        .output()
+    {
+        if out.status.success() {
+            let cargo = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(bin) = std::path::Path::new(&cargo).parent() {
+                let path = format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                );
+                std::env::set_var("PATH", path);
+            }
+        }
+    }
+
+    let platforms = registry();
+    std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path().join("blink-stubborn");
+    let wizard = Wizard::build_with_rp2040(None).await;
+    wizard
+        .set_llm(scripted_llm(vec![
+            // 1. The type that does not exist — the measured first failure of a real model.
+            "```rust\n#![no_std]\n\nuse blink_stubborn_hal::hal::{DelayMs, Led};\nuse rp2040_hal::gpio::{Output, Pin, PinId, PullDown};\n\npub struct GpioLed {\n    pin: Pin<PinId, Output<PullDown>>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+            // 2. The right *types*, but the trait is not in scope, so `set_high` still will not
+            //    resolve — the second-order error, and a different compiler message from round 1.
+            "```rust\n#![no_std]\n\nuse blink_stubborn_hal::hal::{DelayMs, Led};\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct GpioLed {\n    pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+            // 3. Both fixed.
+            "```rust\n#![no_std]\n\nuse blink_stubborn_hal::hal::{DelayMs, Led};\nuse embedded_hal::digital::OutputPin;\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct GpioLed {\n    pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+        ]))
+        .await;
+
+    let scaffold = wizard
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "blink-stubborn",
+                "rootDir": root.to_string_lossy(),
+                "language": "Rust",
+                "platforms": ["rp2040"],
+                "structure": "embedded_hal",
+            }),
+        )
+        .await;
+    assert!(scaffold.get("error").is_none(), "{scaffold}");
+
+    let plan = wizard
+        .tool(
+            "embedded_hal_fill_plan",
+            serde_json::json!({ "root": root.to_string_lossy() }),
+        )
+        .await;
+    let items = plan["plan"].as_array().expect("fill items").clone();
+
+    let applied = wizard
+        .tool(
+            "embedded_hal_fill_apply",
+            serde_json::json!({ "root": root.to_string_lossy(), "plan": items }),
+        )
+        .await;
+    let verification = &applied["build_verification"][0];
+    eprintln!("verification → {verification}");
+    assert_eq!(
+        verification["rounds"],
+        serde_json::json!(2),
+        "two repairs were needed, and the budget allowed both: {applied}"
+    );
+    assert_eq!(
+        verification["built"],
+        serde_json::json!(true),
+        "the third answer builds: {applied}"
+    );
+    let written =
+        std::fs::read_to_string(root.join("crates/blink-stubborn-hal-rp2040/src/lib.rs")).unwrap();
+    assert!(
+        written.contains("use embedded_hal::digital::OutputPin;"),
+        "the file on disk is the third answer: {written}"
     );
 }
 
