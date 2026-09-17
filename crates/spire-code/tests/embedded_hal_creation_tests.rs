@@ -71,14 +71,33 @@ struct Wizard {
 }
 
 impl Wizard {
+    /// The harness with **no model wired at all** — the shape that proves the creation route needs
+    /// none.
     async fn build() -> Self {
+        Self::build_with_llm(None).await
+    }
+
+    /// The same harness with a model attached to the build manager, which is what the fill leg
+    /// needs (one call per backend file). `None` leaves it detached on purpose.
+    async fn build_with_llm(llm_config: Option<LlmConfig>) -> Self {
         let system = ActorSystem::new();
 
         let (memory_graph_tx, _) = system.spawn(MemoryGraphActor::new());
         let (bm_tx, _) = system.spawn(BuildManagerActor::new(memory_graph_tx.clone()));
-        let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
+        let (llm_tx, _) = system.spawn(LlmActor::new(llm_config.clone().unwrap_or_default()));
         let (mcp_tx, _) = system.spawn(McpClientActor::new());
         let (system_tx, _) = system.spawn(SystemActor::new());
+
+        // Only a harness told to have a model hands one to the build manager — exactly as `ffi.rs`
+        // does (it wires the LLM only when a key is configured). Everything else here is unchanged
+        // by the presence or absence of a model.
+        if llm_config.is_some() {
+            let _ = bm_tx
+                .send(BuildManagerMessage::SetLlm {
+                    llm_tx: llm_tx.clone(),
+                })
+                .await;
+        }
 
         // The real tool registry: `tools/call` resolves against it, so a tool that is not reachable
         // from here is a tool the UI cannot call.
@@ -346,4 +365,113 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
         esp_prompt.contains("crates/blink-workshop-hal/src/hal/led.rs"),
         "and so does the contract it must implement: {esp_prompt}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// The live model: the one thing a fake cannot answer
+//
+// Everything above runs without a model, which is what makes it deterministic. This does the
+// opposite — one real call per backend file — because the fill leg's whole value is what a model
+// does with that prompt, and only a model can answer that. What is asserted is STRUCTURE (every
+// pending trait implemented, no placeholder left, the measure flipping to implemented), never exact
+// text: a model may legitimately write the pin handling differently every run.
+//
+// Gated twice, like the other live test in this crate: `#[ignore]` so a plain `cargo test` never
+// spends money or network, and a runtime check so that even `--ignored` skips cleanly with no key
+// configured. The key is read through `load_global_llm_config()` — the same call the app makes at
+// startup — so it never lives in this file. Run it with:
+//
+//     cargo test -p spire-code --test embedded_hal_creation_tests -- --ignored
+// ─────────────────────────────────────────────────────────────────────────────────────
+#[ignore = "live model: spends real calls — run explicitly with `--ignored`"]
+#[tokio::test]
+async fn a_real_model_fills_the_backends_it_is_asked_for() {
+    // ── The gate ──
+    let llm_config = spire_core::config::load_global_llm_config();
+    if llm_config.api_key.trim().is_empty() {
+        eprintln!("skipping: no API key in ~/.spire/llm-config.json");
+        return;
+    }
+
+    let platforms = registry();
+    std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path().join("blink-live");
+    let wizard = Wizard::build_with_llm(Some(llm_config)).await;
+
+    // Scaffold first: the fill needs files to fill.
+    let scaffold = wizard
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "blink-live",
+                "rootDir": root.to_string_lossy(),
+                "language": "Rust",
+                "platforms": ["esp32c6", "rp2040"],
+                "structure": "embedded_hal",
+            }),
+        )
+        .await;
+    assert!(scaffold.get("error").is_none(), "{scaffold}");
+
+    let plan = wizard
+        .tool(
+            "embedded_hal_fill_plan",
+            serde_json::json!({ "root": root.to_string_lossy() }),
+        )
+        .await;
+    let items = plan["plan"].as_array().expect("fill items").clone();
+    assert_eq!(items.len(), 2, "{plan}");
+
+    let applied = wizard
+        .tool(
+            "embedded_hal_fill_apply",
+            serde_json::json!({ "root": root.to_string_lossy(), "plan": items }),
+        )
+        .await;
+    assert_eq!(
+        applied["failures"],
+        serde_json::json!([]),
+        "the gate refused a real model's answer — the reason is in failures: {applied}"
+    );
+    assert_eq!(
+        applied["applied"].as_array().map(|a| a.len()),
+        Some(2),
+        "{applied}"
+    );
+
+    // The measure is the verdict, not the model's word: both backends implemented, no placeholders.
+    let coverage = wizard
+        .tool(
+            "hal_missing_impls",
+            serde_json::json!({ "root": root.to_string_lossy() }),
+        )
+        .await;
+    for family in ["esp32", "rp2040"] {
+        assert_eq!(
+            coverage["platforms"][family]["led"]["implemented"],
+            serde_json::json!(true),
+            "{family}: {coverage}"
+        );
+        assert_eq!(
+            coverage["platforms"][family]["time"]["implemented"],
+            serde_json::json!(true),
+            "{family}: {coverage}"
+        );
+    }
+    for backend in [
+        "crates/blink-live-hal-esp32/src/lib.rs",
+        "crates/blink-live-hal-rp2040/src/lib.rs",
+    ] {
+        let source = std::fs::read_to_string(root.join(backend)).unwrap();
+        // Only that the file is still a file. Text checks are the wrong tool here, twice over: the
+        // scaffold's own header *mentions* `unimplemented!()`, and a correct trait impl may be
+        // written `impl<'d> Led for GpioLed<'d>` (which is a word away from `impl Led`). The
+        // `implemented` assertions above are the real check — they come from the editor's own
+        // measure, which reads impl blocks rather than text.
+        assert!(
+            source.lines().count() > 20,
+            "{backend} came back as a fragment: {source}"
+        );
+    }
 }

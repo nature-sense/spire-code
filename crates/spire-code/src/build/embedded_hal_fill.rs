@@ -122,6 +122,25 @@ fn planned_traits(item: &serde_json::Value) -> Vec<PlannedTrait> {
         .unwrap_or_default()
 }
 
+/// The `impl` lines of an answer, for a refusal that has to be actionable.
+///
+/// A gate refusal is the only thing a reader gets — the answer itself is dropped — so a reason like
+/// "no `impl Led for …`" is a dead end: was the impl renamed, turned into an inherent one, written
+/// under another path? Three lines answer that without dumping a file into a UI (or a log) that had
+/// no way to show one.
+fn impl_lines(source: &str) -> String {
+    let impls: Vec<&str> = source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("impl"))
+        .take(3)
+        .collect();
+    if impls.is_empty() {
+        return String::new();
+    }
+    format!(" (the answer's impls: {})", impls.join(" | "))
+}
+
 /// The gate between a model's answer and the file it would become.
 ///
 /// Both halves are what the plan promised: every pending trait is implemented, and no placeholder
@@ -138,8 +157,10 @@ fn verify_generated(source: &str, pending: &[PlannedTrait]) -> Result<(), String
             .find(|(name, _)| name.eq_ignore_ascii_case(&owed.trait_name))
         else {
             return Err(format!(
-                "the generated file has no `impl {} for …` — the trait was in the prompt and must stay",
-                owed.trait_name
+                "the generated file has no `impl {} for …` — the trait was in the prompt and must \
+                 stay{}",
+                owed.trait_name,
+                impl_lines(source)
             ));
         };
         let missing: Vec<&str> = owed
@@ -261,10 +282,9 @@ async fn apply_item(
         return Err((file, "the plan item carries no prompt".to_string()));
     }
 
-    let source = generate(llm_tx, prompt)
+    let source = generate(llm_tx, prompt, &pending)
         .await
         .map_err(|e| (file.clone(), e))?;
-    verify_generated(&source, &pending).map_err(|e| (file.clone(), e))?;
     std::fs::write(&path, &source).map_err(|e| (file.clone(), format!("write failed: {e}")))?;
 
     // Re-measure instead of declaring success: the same map the UI reads decides whether the item
@@ -320,14 +340,19 @@ fn code_block(text: &str) -> String {
     }
 }
 
-/// Ask the model for the file, retrying the way the C++ path does: once when the answer was
-/// truncated (with a "be concise" instruction), and up to twice when it does not parse (with the
-/// parse errors).
+/// Ask the model for the file, retrying what the C++ path retries — once on truncation, twice on a
+/// parse error — **and once on a gate refusal**.
 ///
-/// Unlike the C++ path it never returns source that does not parse. There the verdict is advisory
-/// — a human reads it — but this file lands in a crate the host build compiles, where a write that
-/// cannot build is worse than a failure that names the file.
-async fn generate(llm_tx: &mpsc::Sender<LlmMessage>, prompt: &str) -> Result<String, String> {
+/// The gate retry is the one a live run asked for: a model that returns only the methods it changed
+/// (a plausible reading of "write the pending methods") or that keeps one `unimplemented!()` gets
+/// told *which* trait and method failed, in the words of the gate, instead of the run ending with a
+/// refusal the user cannot act on. Two such answers in a row still end as a refusal — the gate is
+/// the authority, and a retry loop that kept trying would be a rate limit, not a fix.
+async fn generate(
+    llm_tx: &mpsc::Sender<LlmMessage>,
+    prompt: &str,
+    pending: &[PlannedTrait],
+) -> Result<String, String> {
     let mut prompt = prompt.to_string();
     for attempt in 0..3u32 {
         let (reply_to, reply) = oneshot::channel();
@@ -361,7 +386,22 @@ async fn generate(llm_tx: &mpsc::Sender<LlmMessage>, prompt: &str) -> Result<Str
         let source = code_block(&text);
         let check = crate::build::hal_rust_contract::rust_syntax_check(&source);
         if check.ok {
-            return Ok(source);
+            // Parses — now the gate, which is the other half of "is this usable": an answer can be
+            // valid Rust and still not be what was asked for.
+            match verify_generated(&source, pending) {
+                Ok(()) => return Ok(source),
+                Err(reason) => {
+                    if attempt < 2 {
+                        prompt.push_str(&format!(
+                            "\n\nYour previous answer was refused: {reason}\nReturn the COMPLETE \
+                             file again, every pending method implemented and no `unimplemented!()` \
+                             left (no fences)."
+                        ));
+                        continue;
+                    }
+                    return Err(reason);
+                }
+            }
         }
         let hints: Vec<String> = check
             .errors
@@ -527,10 +567,12 @@ fn render_prompt(f: &FillFacts<'_>) -> String {
 
     p.push_str("RULES\n");
     p.push_str(
-        "1. Write the pending methods and nothing else. Every other item — the structs, their\n\
-         \x20  field types, the executor block — stays exactly as it is.\n\
-         2. Replace the `unimplemented!()` bodies. Do not leave one behind and do not add a new\n\
-         \x20  one: the workspace measures placeholders, so an `unimplemented!()` left in place\n\
+        "1. Return the COMPLETE file — every line it should have on disk — with only the pending\n\
+         \x20  method bodies written. Everything else (the structs, their field types, the executor\n\
+         \x20  block, the doc comments) stays exactly as it is. An answer containing only the\n\
+         \x20  methods you changed is not a file and will be refused.\n\
+         2. The `unimplemented!()` bodies must be gone. Do not leave one behind and do not add a\n\
+         \x20  new one: the workspace measures placeholders, so an `unimplemented!()` left in place\n\
          \x20  reports this backend as unfinished.\n",
     );
     p.push_str(&format!(
@@ -857,7 +899,12 @@ mod tests {
             "what is pending: {prompt}"
         );
         assert!(
-            prompt.contains("Replace the `unimplemented!()` bodies"),
+            prompt.contains("Return the COMPLETE file"),
+            "the output contract — a whole file, not a patch of methods (the reading a live run \
+             showed a model taking): {prompt}"
+        );
+        assert!(
+            prompt.contains("The `unimplemented!()` bodies must be gone"),
             "the placeholder convention: {prompt}"
         );
         // A std family gets no `no_std` rule: telling a model not to use `std` where `std::thread`

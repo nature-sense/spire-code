@@ -714,6 +714,24 @@ build/flash leg.
       - `hal_missing_impls` reported `kind: "partial"` for a backend that is a fresh stub, because
         it tested `implemented` before `is_stub`. `kind` now says `stub` when a placeholder is
         present — the same word the maturity chips use, so the payload and the UI agree.
+      **And the fill leg now runs against a real model** (`#[ignore]`d live test in the same file,
+      gated on `load_global_llm_config()` like the crate's other live test). Both backends filled,
+      the gate accepted both answers, and the measure reported `led` *and* `time` implemented for
+      `esp32` and `rp2040` — the end of the chain, on a real model, unattended. Getting there was
+      worth the three earlier live runs, which failed for reasons worth keeping:
+      - The prompt said "write the pending methods and nothing else", which a model reads as *return
+        only those methods*; the gate then refuses the fragment ("no `impl Led for …`"). Rule 1 now
+        says **return the COMPLETE file**, with the reason spelled out — the output contract was
+        implicit and had to be explicit.
+      - A gate refusal was terminal, so those two runs ended with a refusal a user could not act on.
+        `generate` now retries **once on a gate refusal**, feeding the reason back ("the answer's
+        impls: …" — a new excerpt, since the answer itself is dropped) — the same courtesy the parse
+        error already got. Two refusals in a row still end as a refusal: the gate is the authority.
+      - Both of my own first assertions in the live test were wrong in the same way, and neither was
+        a product bug: `source.contains("unimplemented!")` matched the scaffold's **doc header**,
+        which mentions the macro; `source.contains("impl Led")` missed `impl<'d> Led for
+        GpioLed<'d>`, which is how a lifetime-carrying GPIO type must be written. Text is the wrong
+        tool for both questions; the measure reads impl blocks, and it is what the test asserts on.
 
 Design notes worth keeping: the contract stays **`no_std`** and **synchronous** (`Spawner` is
 the backend's only obligation, so the rp2040 backend supplies its own synchronous scheduler and
