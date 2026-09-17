@@ -395,8 +395,16 @@ async fn a_real_model_fills_the_backends_it_is_asked_for() {
 
     let platforms = registry();
     std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
-    let dir = tempfile::tempdir().expect("project dir");
-    let root = dir.path().join("blink-live");
+    // A stable directory when asked for one, so the project the model wrote can be inspected and
+    // built by hand afterwards — which is the only way to answer "does generated code compile?"
+    // without wrapping two cross-builds (and their SDKs) into one test.
+    let keep = std::env::var("SPIRE_LIVE_FILL_DIR").ok();
+    let _temp = tempfile::tempdir().expect("project dir");
+    let dir = std::path::PathBuf::from(
+        keep.clone()
+            .unwrap_or_else(|| _temp.path().to_string_lossy().to_string()),
+    );
+    let root = dir.join("blink-live");
     let wizard = Wizard::build_with_llm(Some(llm_config)).await;
 
     // Scaffold first: the fill needs files to fill.

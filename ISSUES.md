@@ -739,4 +739,34 @@ does not depend on `spire-hal-std`); backends are per **family**, not per chip (
 `MCU` env var, the triple is the variant); and the contract grows a trait only when a *second*
 family needs it.
 
+**9f — building what the model wrote** (open). `SPIRE_LIVE_FILL_DIR=<dir>` keeps the live fill
+test's project on disk so its backends can be built by hand; doing that found two scaffold gaps
+(fixed) and one real limit (open):
+- **Gap 1, fixed**: the emitted `no_std` backend had no `#![no_std]`, so `cargo build --target
+  thumbv6m-none-eabi` failed with "can't find crate for `std`". Nothing had ever built a backend —
+  the host `cargo test` deliberately excludes them. Emitted per family now (`uses_std_executor`
+  decides; an esp-idf backend must *not* have it, since `std::thread` is its executor) and pinned by
+  the scaffold test.
+- **Gap 2, fixed**: `rp2040-hal` does **not** re-export `embedded-hal` or `nb` (checked against
+  0.10.2's source: it re-exports `fugit`, `paste`, `rpac`), yet its GPIO and timer methods *are*
+  those traits — `Pin::set_high` is `embedded_hal::digital::v2::OutputPin::set_high` and
+  `count_down()` returns an `nb`-based `CountDown`. "One dependency, not two" was a fact about
+  esp-idf-hal generalised into a rule; each family now carries its own `deps` (rp2040's is three),
+  and the prompt quotes the manifest's `[dependencies]` verbatim — the list the compiler enforces —
+  instead of asserting a count.
+- **Limit, open**: with the dependencies right, both generated backends still fail on the vendor
+  API's *shape*. rp2040: `rp2040_hal::gpio::Output` does not exist (it is `FunctionSio<SioOutput>`)
+  and `Pin` takes three parameters, not two. esp32: `esp_idf_hal::gpio::AnyOutput` does not exist
+  and `PinDriver<'d, MODE>` takes **one** generic since 0.47 — `PinDriver::output(pin)` erases the
+  pin — where the model wrote two; rustc pointed at the crate source to say so. `spire-hal`'s
+  hand-written esp32 backend documents that exact trap in a comment, so the knowledge exists in the
+  repo and simply does not reach the prompt. Fix candidates, cheapest first: **(a)** the platform's
+  `library_hints` name the shapes — the field exists for this and the prompt already injects it (the
+  `rp2040` entry now carries them; the four esp entries in `~/.spire/platforms` need the
+  `PinDriver<'d, MODE>` sentence); **(b)** the prompt quotes the installed crate's signatures;
+  **(c)** feed *compile errors* back, which is what makes the loop converge rather than requiring the
+  prompt to be omniscient — the fix leg's job, and the natural next step. The fill's gate stays
+  structural by design: it decides whether an answer is the file it claims to be, and `cargo`
+  decides whether that file builds.
+
 

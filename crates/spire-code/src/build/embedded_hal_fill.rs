@@ -68,6 +68,12 @@ struct FillFacts<'a> {
     /// The platform's `library_hints`, already resolved. Empty is a real possibility and the prompt
     /// says so rather than pretending the board needs no guidance.
     hints: &'a str,
+    /// The backend manifest's `[dependencies]` block, verbatim.
+    ///
+    /// Verbatim because it is what the compiler will enforce: the model may use these crates and no
+    /// others, and telling it the *list* beats telling it a count (the count differs per family —
+    /// esp-idf-hal re-exports the sys crate, rp2040-hal does not re-export `embedded-hal`/`nb`).
+    dependencies: &'a str,
     pending: &'a [Pending],
 }
 
@@ -424,6 +430,36 @@ async fn generate(
     Err("no answer from the model".to_string())
 }
 
+/// A backend manifest's `[dependencies]` block, verbatim, or an empty string when it cannot be read.
+///
+/// Verbatim on purpose: it is the list the compiler enforces, and paraphrasing it — or counting it —
+/// is how a prompt tells a model to use a crate that is not there. Empty is not an error: a manifest
+/// always has the block, and if it does not, the prompt simply says nothing about dependencies
+/// rather than inventing a list.
+fn backend_dependencies(crate_dir: &Path) -> String {
+    let Ok(manifest) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut inside = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            inside = trimmed == "[dependencies]";
+            if inside {
+                out.push_str("[dependencies]\n");
+            }
+            continue;
+        }
+        if inside && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            out.push_str("  ");
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// The registry record whose hints describe this family's hardware.
 ///
 /// The scaffold collapses the wizard's selection to families, so after scaffolding the family is
@@ -576,9 +612,10 @@ fn render_prompt(f: &FillFacts<'_>) -> String {
          \x20  reports this backend as unfinished.\n",
     );
     p.push_str(&format!(
-        "3. Build every hardware access on `{}`. Add no dependency and reach for no other API:\n\
-         \x20  this crate's manifest lists exactly one, and the build will fail on anything else.\n",
-        f.spec.vendor_crate
+        "3. Build every hardware access on the crates this backend already depends on:\n\n{}\n\
+         \x20  Add no dependency and reach for no other API: the build will fail on anything else.\n\
+         \x20  If a HAL method needs a trait in scope, that trait's crate is in the list above.\n",
+        f.dependencies.trim_end()
     ));
     p.push_str(
         "4. The `hal` module is the contract, shared by every backend. Implement it as declared —\n\
@@ -696,6 +733,12 @@ pub(crate) fn plan(root: &Path, platform: Option<&str>) -> serde_json::Value {
             .map(|p| crate::build::generic_helpers::hal_platform_library_hints(&p.id))
             .unwrap_or_default();
         let profile = profile_lines(family, record.as_ref(), &spec);
+        // The dependencies the compiler will enforce, read from the manifest the scaffold wrote —
+        // so the prompt cannot drift from it, and a family that needs three crates says three.
+        let dependencies = match src_dir.parent() {
+            Some(crate_dir) => backend_dependencies(crate_dir),
+            None => String::new(),
+        };
 
         for (file, pending) in &by_file {
             let file_source = std::fs::read_to_string(file).unwrap_or_default();
@@ -709,6 +752,7 @@ pub(crate) fn plan(root: &Path, platform: Option<&str>) -> serde_json::Value {
                 spec: &spec,
                 profile: &profile,
                 hints: &hints,
+                dependencies: &dependencies,
                 pending,
             };
 
@@ -778,6 +822,13 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(root.join("crates/demo-hal-esp32/src")).unwrap();
+        // The manifest matters: it is what the prompt shows the model as the crates it may use.
+        std::fs::write(
+            root.join("crates/demo-hal-esp32/Cargo.toml"),
+            "[package]\nname = \"demo-hal-esp32\"\n\n[dependencies]\n\
+             demo-hal = { path = \"../demo-hal\" }\nesp-idf-hal = \"0.47\"\n",
+        )
+        .unwrap();
         std::fs::write(
             root.join("crates/demo-hal-esp32/src/lib.rs"),
             format!(
@@ -877,7 +928,14 @@ mod tests {
         );
 
         let prompt = item["prompt"].as_str().unwrap();
-        assert!(prompt.contains("`esp-idf-hal`"), "the vendor API: {prompt}");
+        assert!(
+            prompt.contains("esp-idf-hal = \"0.47\""),
+            "the dependencies the compiler will enforce, verbatim: {prompt}"
+        );
+        assert!(
+            prompt.contains("demo-hal = { path = \"../demo-hal\" }"),
+            "including the contract crate itself: {prompt}"
+        );
         assert!(
             prompt.contains("crate    demo-hal-esp32"),
             "the crate being edited: {prompt}"

@@ -40,8 +40,14 @@ use spire_core::build_types::ProjectStructure;
 pub(crate) struct FamilySpec {
     /// The vendor HAL crate: prose only (the backend's description and doc header).
     pub(crate) vendor_crate: &'static str,
-    /// The vendor HAL dependency line, as written into the backend manifest.
-    vendor_dep: &'static str,
+    /// The crates this backend builds on: the vendor HAL first, then whatever its API needs in
+    /// scope to be callable at all.
+    ///
+    /// A list rather than one line because the count is a **measured** fact, not a rule: esp-idf-hal
+    /// re-exports the sys crate under it (one is right), while rp2040-hal's GPIO and timer methods
+    /// are `embedded-hal`/`nb` traits it does not re-export (one is not enough). The first backend a
+    /// model filled failed to compile on exactly that difference.
+    deps: &'static [&'static str],
     /// The note emitted next to it, for the one thing that is easy to get wrong.
     vendor_note: &'static str,
     /// True when this family's executor is the shared std one.
@@ -60,7 +66,7 @@ pub(crate) fn family_spec(family: &str) -> Option<FamilySpec> {
     match family {
         "esp32" => Some(FamilySpec {
             vendor_crate: "esp-idf-hal",
-            vendor_dep: "esp-idf-hal = \"0.47\"",
+            deps: &["esp-idf-hal = \"0.47\""],
             vendor_note: "# One dependency, not two: esp-idf-hal re-exports esp-idf-sys as\n\
                           # `esp_idf_hal::sys`. There are no per-chip features — the chip is the\n\
                           # `MCU` environment variable esp-idf-sys reads, plus `--target`.",
@@ -68,11 +74,24 @@ pub(crate) fn family_spec(family: &str) -> Option<FamilySpec> {
         }),
         "rp2040" => Some(FamilySpec {
             vendor_crate: "rp2040-hal",
-            vendor_dep: "rp2040-hal = \"0.10\"",
+            // Three, not one, and measured rather than assumed: `rp2040-hal` does **not** re-export
+            // `embedded-hal` or `nb` (checked against 0.10.2's source — it re-exports `fugit`,
+            // `paste` and `rp2040-pac`), and its GPIO and timer APIs are those traits:
+            // `Pin::set_high` is `embedded_hal::digital::v2::OutputPin::set_high`, and
+            // `Timer::count_down` returns an `nb`-based `CountDown`. Without these two the backend
+            // cannot call the HAL's own methods — the first generated backend failed to compile on
+            // exactly this.
+            deps: &[
+                "rp2040-hal = \"0.10\"",
+                "embedded-hal = \"0.2\"",
+                "nb = \"1\"",
+            ],
             vendor_note:
                 "# The blocking HAL: this backend's actor executor is synchronous, so it\n\
                           # needs no async runtime. (An embassy-rp backend is the async\n\
-                          # alternative, and would still drive the same synchronous `handle`.)",
+                          # alternative, and would still drive the same synchronous `handle`.)\n\
+                          # `embedded-hal` and `nb` are here because rp2040-hal's GPIO and timer\n\
+                          # methods come from them and it does not re-export them.",
             uses_std_executor: false,
         }),
         _ => None,
@@ -586,7 +605,10 @@ fn backend_files(
     if spec.uses_std_executor {
         manifest.push_str(&format!("{hal}-std = {{ path = \"../{hal}-std\" }}\n"));
     }
-    manifest.push_str(spec.vendor_dep);
+    for dep in spec.deps {
+        manifest.push_str(dep);
+        manifest.push('\n');
+    }
     manifest.push_str("\n\n");
     manifest.push_str(spec.vendor_note);
     manifest.push('\n');
@@ -622,10 +644,24 @@ fn backend_lib(hal_id: &str, family: &str, spec: &FamilySpec) -> String {
         .replace("__FAMILY__", family)
         .replace("__VENDOR__", spec.vendor_crate)
         .replace("__HAL_ID__", hal_id)
+        .replace(
+            "__NO_STD__",
+            if spec.uses_std_executor {
+                ""
+            } else {
+                "#![no_std]\n"
+            },
+        )
         .replace("__EXECUTOR__", &executor)
 }
 
 /// The backend template. Stubs are `unimplemented!()` on purpose — see the header.
+///
+/// `__NO_STD__` is the crate-level attribute a `no_std` family needs and a `std` one must not have:
+/// a `thumbv6m` target has no `std` to link, and an esp-idf backend that declared `no_std` could not
+/// call `std::thread` — which *is* its executor. It sits after the `//!` block because inner
+/// attributes may follow inner doc comments, and before `use` because that is where an inner
+/// attribute must be.
 const BACKEND_LIB_RS: &str = r#"//! The __FAMILY__ backend: the contract, implemented with `__VENDOR__`.
 //!
 //! Types from `__VENDOR__` live here and nowhere else: a firmware actor holds the *traits*, so
@@ -634,7 +670,7 @@ const BACKEND_LIB_RS: &str = r#"//! The __FAMILY__ backend: the contract, implem
 //! The stubs below are `unimplemented!()` on purpose. This is the file the contract's drift
 //! measure reports as not implemented and the fill phase writes; a stub that quietly did nothing
 //! would look implemented, which is worse than one that fails loudly.
-
+__NO_STD__
 use __HAL_ID__::hal::{DelayMs, Led};
 
 __EXECUTOR__
@@ -762,11 +798,32 @@ mod tests {
         // The std family reuses the shared executor; the no_std family owns its own.
         let esp = &file("crates/weather-hal-esp32/src/lib.rs").content;
         assert!(esp.contains("weather_hal_std::StdSpawner"), "{esp}");
+        assert!(
+            !esp.contains("#![no_std]"),
+            "an esp-idf backend must not declare no_std — `std::thread` *is* its executor: {esp}"
+        );
         assert!(file("crates/weather-hal-esp32/Cargo.toml")
             .content
             .contains("esp-idf-hal = \"0.47\""));
         let rp = &file("crates/weather-hal-rp2040/src/lib.rs").content;
         assert!(rp.contains("StaticSpawner"), "{rp}");
+        // The attribute the compiler demanded: without it the crate wants `std`, which a thumbv6m
+        // target does not have ("can't find crate for `std`" — found by building one).
+        assert!(
+            rp.contains("#![no_std]"),
+            "a no_std family's backend must declare it: {rp}"
+        );
+        // And the crates its HAL's methods actually need in scope: rp2040-hal's GPIO and timer APIs
+        // are `embedded-hal`/`nb` traits it does not re-export, which a generated backend found out
+        // the hard way ("no method named `set_high`").
+        let rp_manifest = &file("crates/weather-hal-rp2040/Cargo.toml").content;
+        for dep in [
+            "rp2040-hal = \"0.10\"",
+            "embedded-hal = \"0.2\"",
+            "nb = \"1\"",
+        ] {
+            assert!(rp_manifest.contains(dep), "missing {dep}: {rp_manifest}");
+        }
         assert!(
             !file("crates/weather-hal-rp2040/Cargo.toml")
                 .content
