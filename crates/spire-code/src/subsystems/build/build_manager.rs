@@ -1637,6 +1637,235 @@ impl BuildManagerActor {
     /// tool must talk to, and unlike a build there is no default that is safe — the host is
     /// not a board. Both the refusal and the route follow from it, so they are checked before
     /// the message is sent (`route_for_flash`) rather than after it fails to answer.
+    /// Build each filled backend through its platform's module, and repair once when it fails.
+    ///
+    /// The fill's gate is structural: it decides whether an answer is the file it claims to be.
+    /// Whether that file *builds* is a question only `cargo` answers, and the answer is worth a
+    /// second call — a wrong-but-plausible vendor API is the failure mode the gate cannot see
+    /// (`PinDriver<'d, MODE>` written with two generics, `gpio::Output` where the type is
+    /// `FunctionSio<SioOutput>`), and the compiler's own words are what fix it.
+    ///
+    /// Verification is **skipped, never failed**, when Spire cannot build here: no stored analysis
+    /// (nothing routes), no platform id on the item, or no module for that platform's `os`. The
+    /// note says which, because "written" and "verified to build" are different claims and the
+    /// result must not blur them.
+    async fn verify_embedded_hal_fills(
+        &self,
+        root: &Path,
+        plan: &serde_json::Value,
+        result: &mut serde_json::Value,
+    ) {
+        let Some(llm_tx) = self.llm_tx.clone() else {
+            self.note_build_verification(result, "skipped: no LLM to repair with");
+            return;
+        };
+        let path_str = root.to_string_lossy().to_string();
+        // Analyze on demand when the graph has nothing: the verification needs the config file and
+        // the metadata, and requiring a *prior* `build_analyze` in the same process was a hidden
+        // ordering requirement — the store is best-effort, so a caller that did analyze could still
+        // arrive here with nothing to read (found by driving it: `build_analyze` succeeded and the
+        // lookup still missed). Analyzing here is cheap and makes the tool self-contained.
+        let metadata = match self.get_analysis(&path_str).await {
+            Some(metadata) => metadata,
+            None => match self.analyze_project(root, None).await {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    self.note_build_verification(
+                        result,
+                        &format!("skipped: could not analyze the project to build it: {e}"),
+                    );
+                    return;
+                }
+            },
+        };
+        let Some(config) = metadata.config_files.first().cloned() else {
+            self.note_build_verification(result, "skipped: the analysis names no config file");
+            return;
+        };
+
+        // The tool accepts the plan either as the whole object or as just its `plan` array (that is
+        // what the UI hands back), so read it the same way the apply does.
+        let items = match plan {
+            serde_json::Value::Array(items) => items.clone(),
+            other => other
+                .get("plan")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        let applied: Vec<String> = result
+            .get("applied")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|entry| {
+                        entry.get("file").and_then(|f| f.as_str()).map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut outcomes: Vec<serde_json::Value> = Vec::new();
+        for item in &items {
+            let file = item
+                .get("file")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if !applied.contains(&file) {
+                continue;
+            }
+            let Some(platform) = item.get("platform").and_then(|v| v.as_str()) else {
+                outcomes.push(serde_json::json!({
+                    "file": file,
+                    "built": serde_json::Value::Null,
+                    "note": "no platform id on the item — cannot choose a build",
+                }));
+                continue;
+            };
+            let package = item
+                .get("crate")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            outcomes.push(
+                self.build_one_backend(
+                    root, &file, item, platform, &package, &config, &metadata, &llm_tx,
+                )
+                .await,
+            );
+        }
+
+        if !outcomes.is_empty() {
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert(
+                    "build_verification".into(),
+                    serde_json::Value::Array(outcomes),
+                );
+            }
+        }
+    }
+
+    /// The last `n` lines of build output.
+    ///
+    /// `cargo` prints the interesting part **last** (the errors, then the summary), and a failed
+    /// build for a crate with a big dependency tree can carry thousands of "Compiling …" lines
+    /// before them — so the tail is the part worth reporting, and the part worth handing to a model.
+    fn tail_lines(output: &str, n: usize) -> String {
+        let lines: Vec<&str> = output.lines().collect();
+        let start = lines.len().saturating_sub(n);
+        lines[start..].join("\n")
+    }
+
+    fn note_build_verification(&self, result: &mut serde_json::Value, note: &str) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "build_verification".into(),
+                serde_json::Value::String(note.to_string()),
+            );
+        }
+    }
+
+    /// One backend: build it, and on failure repair once with the compiler's errors and rebuild.
+    ///
+    /// Returns the outcome as JSON, because "written", "repaired then built" and "still does not
+    /// build" are three different things and the caller's result has to say which one happened.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_one_backend(
+        &self,
+        root: &Path,
+        file: &str,
+        item: &serde_json::Value,
+        platform: &str,
+        package: &str,
+        config: &str,
+        metadata: &BuildMetadata,
+        llm_tx: &mpsc::Sender<LlmMessage>,
+    ) -> serde_json::Value {
+        match self
+            .build_backend_crate(root, config, metadata, platform, package)
+            .await
+        {
+            Ok(output) if output.success => serde_json::json!({ "file": file, "built": true }),
+            Ok(output) => {
+                let errors = output.output;
+                match crate::build::embedded_hal_fill::repair(root, item, &errors, llm_tx).await {
+                    Ok(_) => {
+                        let (built, rest) = match self
+                            .build_backend_crate(root, config, metadata, platform, package)
+                            .await
+                        {
+                            Ok(second) => (second.success, second.output),
+                            Err(e) => (false, e),
+                        };
+                        serde_json::json!({
+                            "file": file,
+                            "built": built,
+                            "repaired": true,
+                            "errors": Self::tail_lines(&rest, 40),
+                        })
+                    }
+                    Err(reason) => serde_json::json!({
+                        "file": file,
+                        "built": false,
+                        "repaired": false,
+                        "repair_refused": reason,
+                        "errors": Self::tail_lines(&errors, 40),
+                    }),
+                }
+            }
+            Err(e) => serde_json::json!({
+                "file": file,
+                "built": serde_json::Value::Null,
+                "note": format!("could not build: {e}"),
+            }),
+        }
+    }
+
+    /// One build attempt for a backend crate, through the platform module that owns its `os`.
+    ///
+    /// The same message the UI's build action sends, with `package` naming the backend and
+    /// `platform` choosing the toolchain — so a fill is verified by the *product's* build path
+    /// rather than by a second implementation of it in a test.
+    async fn build_backend_crate(
+        &self,
+        root: &Path,
+        config: &str,
+        metadata: &BuildMetadata,
+        platform: &str,
+        package: &str,
+    ) -> Result<BuildOutput, String> {
+        match self.route_for(config, Some(platform)) {
+            BuildRoute::Platform(_) => {}
+            // No platform module owns this platform's `os`, so nothing here knows how to build for
+            // it — say so rather than sending the message to a module that would refuse it.
+            BuildRoute::Config(_) => {
+                return Err(format!(
+                    "platform '{platform}' does not route to a platform module"
+                ))
+            }
+        }
+        let module_tx = self.module_tx_for(config, Some(platform))?;
+        let opts = BuildOptions {
+            mode: "debug".to_string(),
+            package: Some(package.to_string()),
+            platform: Some(platform.to_string()),
+            target: None,
+        };
+        let (tx, rx) = oneshot::channel();
+        module_tx
+            .send(BuildModuleMessage::Build {
+                path: root.to_path_buf(),
+                metadata: metadata.clone(),
+                opts,
+                build_spec: None,
+                reply_to: tx,
+            })
+            .await
+            .map_err(|e| format!("module channel closed: {e}"))?;
+        rx.await.map_err(|e| format!("module response lost: {e}"))?
+    }
+
     async fn flash_project(
         &self,
         path: &Path,
@@ -3510,12 +3739,16 @@ executable('{project_name}-{platform}',
                         // coverage the UI reads is recomputed from disk on every call — so there is
                         // nothing stale to refresh, and a full parse pass would be a cost with no
                         // effect.
-                        crate::build::embedded_hal_fill::apply(
-                            std::path::Path::new(root),
-                            plan,
-                            &self.llm_tx,
-                        )
-                        .await
+                        let path = std::path::Path::new(root);
+                        let mut result =
+                            crate::build::embedded_hal_fill::apply(path, plan, &self.llm_tx).await;
+                        // Then the only check that can say whether the file *builds*: the fill's own
+                        // gate is structural, so the compiler gets the last word — and one repair
+                        // round with the compiler's errors, because a wrong-but-plausible API guess
+                        // is the failure mode that gate cannot see.
+                        self.verify_embedded_hal_fills(path, plan, &mut result)
+                            .await;
+                        result
                     }
                     _ => serde_json::json!({
                         "error": "embedded_hal_fill_apply: \"root\" and \"plan\" required"
@@ -5363,6 +5596,15 @@ public:
             applied["applied"][0]["interfaces_still_pending"],
             serde_json::json!([]),
             "{applied}"
+        );
+        // The build verification is *skipped* here, and says why: this fixture has no manifest at the
+        // root, so nothing can be analyzed — let alone built — from it. "Written" and "verified to
+        // build" are different claims, and a skip always names its reason rather than implying a
+        // check happened.
+        let note = applied["build_verification"].as_str().unwrap_or_default();
+        assert!(
+            note.starts_with("skipped:") && note.contains("could not analyze"),
+            "an unbuildable project is reported as such, with the reason: {applied}"
         );
 
         // The fence came off, the body landed, the placeholder is gone, and the rest of the file

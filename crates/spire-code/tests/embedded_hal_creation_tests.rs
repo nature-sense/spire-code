@@ -23,7 +23,7 @@ use spire_code::actors::{
     ProjectAnalyzerMessage, ProjectCreationActor, ProjectQueryMessage, SystemActor,
     ToolRouterActor, ToolsActor,
 };
-use spire_code::build::{BuildModuleMessage, CargoBuildModule};
+use spire_code::build::{BuildModuleMessage, CargoBuildModule, Rp2040BuildModule};
 use spire_code::subsystems::project::project_creation::ProjectCreationMessage;
 use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use tokio::sync::mpsc;
@@ -68,6 +68,8 @@ async fn register_build_module(
 /// build module for the layout, so mocking either would test nothing that matters.
 struct Wizard {
     coord: mpsc::Sender<CoordinatorMessage>,
+    /// Kept so a test can attach a model after construction (the fill leg needs one).
+    build_manager: mpsc::Sender<BuildManagerMessage>,
 }
 
 impl Wizard {
@@ -77,9 +79,21 @@ impl Wizard {
         Self::build_with_llm(None).await
     }
 
+    /// The same harness with the **platform module for the rp2040** registered, which is what a
+    /// build (and therefore a repair) needs in order to route.
+    async fn build_with_rp2040(llm_config: Option<LlmConfig>) -> Self {
+        Self::build_modules(llm_config, true).await
+    }
+
     /// The same harness with a model attached to the build manager, which is what the fill leg
     /// needs (one call per backend file). `None` leaves it detached on purpose.
     async fn build_with_llm(llm_config: Option<LlmConfig>) -> Self {
+        Self::build_modules(llm_config, false).await
+    }
+
+    /// The whole graph. `with_platforms` registers the rp2040 platform module, which is what a
+    /// *build* needs: without it nothing routes a `Build` for that board.
+    async fn build_modules(llm_config: Option<LlmConfig>, with_platforms: bool) -> Self {
         let system = ActorSystem::new();
 
         let (memory_graph_tx, _) = system.spawn(MemoryGraphActor::new());
@@ -130,6 +144,23 @@ impl Wizard {
         let cargo_tx = spawn_module(CargoBuildModule::new());
         register_build_module("cargo", cargo_tx, &bm_tx).await;
 
+        if with_platforms {
+            let rp2040_tx = spawn_module(Rp2040BuildModule::new());
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let _ = rp2040_tx
+                .send(BuildModuleMessage::DescribeCapabilities { reply_to: reply_tx })
+                .await;
+            if let Ok(capability) = reply_rx.await {
+                let _ = bm_tx
+                    .send(BuildManagerMessage::AddPlatformModule {
+                        os: "rp2040".to_string(),
+                        capability,
+                        module_tx: rp2040_tx,
+                    })
+                    .await;
+            }
+        }
+
         let mut creation = ProjectCreationActor::new(fs_tx, bm_tx.clone(), mcp_tx.clone());
         // Deliberately **not** wired to a model: the plan for this structure must not need one. The
         // memory graph is, because the scaffold records what it wrote.
@@ -153,7 +184,7 @@ impl Wizard {
         let registry = std::sync::Arc::new(ServiceRegistry::new());
         let (analyzer_tx, _) = system.spawn(ProjectAnalyzerActor::new());
         let _ = registry.register::<ProjectAnalyzerMessage>("project.analyzer", analyzer_tx);
-        let _ = registry.register::<BuildManagerMessage>("build.manager", bm_tx);
+        let _ = registry.register::<BuildManagerMessage>("build.manager", bm_tx.clone());
         let _ = registry.register::<MemoryGraphMessage>("memory_graph", memory_graph_tx.clone());
         let _ = registry.register::<MemoryGraphMessage>("knowledge_graph", memory_graph_tx);
         let _ = registry.register::<ProjectQueryMessage>("project.query", project_query_tx);
@@ -169,7 +200,10 @@ impl Wizard {
             })
             .await;
 
-        Self { coord: coord_tx }
+        Self {
+            coord: coord_tx,
+            build_manager: bm_tx,
+        }
     }
 
     /// Send one request and wait for the coordinator's answer — the same envelope the UI sends.
@@ -192,6 +226,15 @@ impl Wizard {
             serde_json::json!({ "tool": tool, "args": args }),
         )
         .await
+    }
+
+    /// Attach a model to the build manager — what the fill leg needs, and what `ffi.rs` does only
+    /// when a key is configured.
+    async fn set_llm(&self, llm_tx: mpsc::Sender<spire_core::subsystems::llm::llm::LlmMessage>) {
+        let _ = self
+            .build_manager
+            .send(BuildManagerMessage::SetLlm { llm_tx })
+            .await;
     }
 }
 
@@ -367,8 +410,235 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
     );
 }
 
+/// A model with a script: it answers the list in order, then repeats the last answer forever.
+///
+/// Deterministic on purpose. The *build* is real — a compiler, a cross target, the vendor crate —
+/// so a script that answers a wrong API and then the corrected one exercises the whole repair loop
+/// with no API key, and the assertions can be exact, which a live model's answers cannot be.
+fn scripted_llm(
+    answers: Vec<&'static str>,
+) -> mpsc::Sender<spire_core::subsystems::llm::llm::LlmMessage> {
+    use spire_core::subsystems::llm::llm::LlmMessage;
+    let (tx, mut rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        let mut next = 0;
+        while let Some(message) = rx.recv().await {
+            if let LlmMessage::Complete { reply_to, .. } = message {
+                let answer = answers
+                    .get(next)
+                    .or_else(|| answers.last())
+                    .copied()
+                    .unwrap_or("");
+                if next + 1 < answers.len() {
+                    next += 1;
+                }
+                let _ = reply_to.send(Ok(answer.to_string()));
+            }
+        }
+    });
+    tx
+}
+
+/// The whole loop on a project this wizard just created: scaffold → fill (a **scripted** model
+/// answers a wrong vendor API) → Spire builds the backend, it fails, the compiler's errors go back
+/// to the model → the corrected file builds. No API key; the compiler is real.
+#[tokio::test]
+async fn a_scaffolded_backend_builds_after_one_repair_round() {
+    // The machine trap the rp2040 module refuses over: rustup's toolchain must be the one that runs,
+    // or a `--target thumbv6m-none-eabi` build cannot find `core`.
+    if let Ok(out) = std::process::Command::new("rustup")
+        .args(["which", "cargo"])
+        .output()
+    {
+        if out.status.success() {
+            let cargo = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(bin) = std::path::Path::new(&cargo).parent() {
+                let path = format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                );
+                std::env::set_var("PATH", path);
+            }
+        }
+    }
+
+    let platforms = registry();
+    std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path().join("blink-wired");
+    let wizard = Wizard::build_with_rp2040(None).await;
+    wizard
+        .set_llm(scripted_llm(vec![
+            // What a real model gave, measured: the GPIO *mode* type invented, and the pin written
+            // with a parameter list the crate does not have. Both are errors a compiler names.
+            "```rust\n#![no_std]\n\nuse blink_wired_hal::hal::{DelayMs, Led};\nuse rp2040_hal::gpio::{Output, Pin, PinId, PullDown};\n\npub struct GpioLed {\n    pin: Pin<PinId, Output<PullDown>>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+            // The shape rp2040-hal 0.10 actually has — including the `OutputPin` import the fixed
+            // types make load-bearing (`set_high`/`set_low` come from the trait, not the type).
+            "```rust\n#![no_std]\n\nuse blink_wired_hal::hal::{DelayMs, Led};\nuse embedded_hal::digital::OutputPin;\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct GpioLed {\n    pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+        ]))
+        .await;
+
+    let scaffold = wizard
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "blink-wired",
+                "rootDir": root.to_string_lossy(),
+                "language": "Rust",
+                "platforms": ["rp2040"],
+                "structure": "embedded_hal",
+            }),
+        )
+        .await;
+    assert!(scaffold.get("error").is_none(), "{scaffold}");
+
+    let plan = wizard
+        .tool(
+            "embedded_hal_fill_plan",
+            serde_json::json!({ "root": root.to_string_lossy() }),
+        )
+        .await;
+    let items = plan["plan"].as_array().expect("fill items").clone();
+    assert_eq!(items.len(), 1, "one backend: {plan}");
+
+    let applied = wizard
+        .tool(
+            "embedded_hal_fill_apply",
+            serde_json::json!({ "root": root.to_string_lossy(), "plan": items }),
+        )
+        .await;
+    assert_eq!(applied["failures"], serde_json::json!([]), "{applied}");
+
+    let verification = &applied["build_verification"][0];
+    assert_ne!(
+        verification["built"],
+        serde_json::Value::Null,
+        "the verification could not build, so nothing was actually checked: {applied}"
+    );
+    assert_eq!(
+        verification["repaired"],
+        serde_json::json!(true),
+        "the first answer is wrong on purpose, so a repair must have happened: {applied}"
+    );
+    assert_eq!(
+        verification["built"],
+        serde_json::json!(true),
+        "the repaired backend must build: {applied}"
+    );
+
+    let written =
+        std::fs::read_to_string(root.join("crates/blink-wired-hal-rp2040/src/lib.rs")).unwrap();
+    assert!(
+        written.contains("FunctionSio<SioOutput>"),
+        "the file on disk is the repaired one: {written}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────
-// The live model: the one thing a fake cannot answer
+// The whole loop, live: fill → build → repair with the compiler's words → build again
+// ─────────────────────────────────────────────────────────────────────────────────────
+//
+// The fill's gate is structural; this is the part that can only be answered by a compiler. One
+// board family (rp2040) is enough: its build needs no SDK, and its failure mode is exactly the one
+// the repair exists for — a vendor API guessed wrong (`gpio::Output` where the type is
+// `FunctionSio<SioOutput>`). `#[ignore]`d and key-gated like the other two live tests.
+//
+//     cargo test -p spire-code --test embedded_hal_creation_tests -- --ignored
+#[ignore = "live model + real cross-build: run explicitly with `--ignored`"]
+#[tokio::test]
+async fn a_real_model_fills_and_the_backend_builds() {
+    let llm_config = spire_core::config::load_global_llm_config();
+    if llm_config.api_key.trim().is_empty() {
+        eprintln!("skipping: no API key in ~/.spire/llm-config.json");
+        return;
+    }
+
+    // This machine's trap, and the one the rp2040 module's refusal describes: `cargo`/`rustc` on
+    // PATH are not rustup's, so a `--target thumbv6m-none-eabi` build cannot find `core`. Put the
+    // rustup toolchain first for the whole process — which is what a user is told to do, so the
+    // test does it rather than working around it.
+    if let Ok(out) = std::process::Command::new("rustup")
+        .args(["which", "cargo"])
+        .output()
+    {
+        if out.status.success() {
+            let cargo = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(bin) = std::path::Path::new(&cargo).parent() {
+                let path = format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                );
+                std::env::set_var("PATH", path);
+            }
+        }
+    }
+
+    let platforms = registry();
+    std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
+    let keep = std::env::var("SPIRE_LIVE_FILL_DIR").ok();
+    let _temp = tempfile::tempdir().expect("project dir");
+    let dir = std::path::PathBuf::from(
+        keep.clone()
+            .unwrap_or_else(|| _temp.path().to_string_lossy().to_string()),
+    );
+    let root = dir.join("blink-build");
+    let wizard = Wizard::build_with_rp2040(Some(llm_config)).await;
+
+    let scaffold = wizard
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "blink-build",
+                "rootDir": root.to_string_lossy(),
+                "language": "Rust",
+                "platforms": ["rp2040"],
+                "structure": "embedded_hal",
+            }),
+        )
+        .await;
+    assert!(scaffold.get("error").is_none(), "{scaffold}");
+
+    // Analyze first: a build routes on the stored analysis, and the verification says so when it is
+    // missing rather than pretending to have checked.
+    let analyzed = wizard
+        .tool(
+            "build_analyze",
+            serde_json::json!({ "path": root.to_string_lossy() }),
+        )
+        .await;
+    assert!(analyzed.get("error").is_none(), "{analyzed}");
+
+    let plan = wizard
+        .tool(
+            "embedded_hal_fill_plan",
+            serde_json::json!({ "root": root.to_string_lossy() }),
+        )
+        .await;
+    let items = plan["plan"].as_array().expect("fill items").clone();
+    assert_eq!(items.len(), 1, "one backend: {plan}");
+
+    let applied = wizard
+        .tool(
+            "embedded_hal_fill_apply",
+            serde_json::json!({ "root": root.to_string_lossy(), "plan": items }),
+        )
+        .await;
+    assert_eq!(applied["failures"], serde_json::json!([]), "{applied}");
+
+    let verification = &applied["build_verification"][0];
+    assert_ne!(
+        verification["built"],
+        serde_json::Value::Null,
+        "the verification could not build — nothing was actually checked: {applied}"
+    );
+    assert_eq!(
+        verification["built"],
+        serde_json::json!(true),
+        "the generated backend does not build, and the repair did not rescue it: {applied}"
+    );
+}
 //
 // Everything above runs without a model, which is what makes it deterministic. This does the
 // opposite — one real call per backend file — because the fill leg's whole value is what a model

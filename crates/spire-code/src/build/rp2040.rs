@@ -784,6 +784,38 @@ mod tests {
         assert!(!target_installed_in("", RP2040_TARGET));
     }
 
+    /// Read the **whole registry** (`~/.spire/platforms/*.yaml`) through the real loader, so a
+    /// hand-edited entry is known to parse before anything depends on it — and so the hints the
+    /// wizard shows and the fill prompt injects can be read back as one list.
+    ///
+    /// Ignored by default because it reads outside the target directory:
+    ///
+    /// ```sh
+    /// cargo test -p spire-code --lib dump_registry -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "reads the platform registry from ~/.spire/platforms"]
+    fn dump_registry() {
+        let dir = Platform::default_platform_dir();
+        let platforms = Platform::load_directory(&dir).expect("the registry directory loads");
+        println!("{} entries in {}", platforms.len(), dir.display());
+        for platform in platforms {
+            println!(
+                "  {:<10} os={:<8} embedded={:<5} family={:<8} flash={:<9} hints={} chars",
+                platform.id,
+                platform.os,
+                platform.is_embedded(),
+                platform.family.as_deref().unwrap_or("-"),
+                platform
+                    .rust
+                    .as_ref()
+                    .and_then(|r| r.flash.as_deref())
+                    .unwrap_or("-"),
+                platform.library_hints.as_deref().unwrap_or("").trim().len()
+            );
+        }
+    }
+
     /// Read the **real** registry entry (`~/.spire/platforms/rp2040.yaml`) through the real code,
     /// so the platform definition and the module cannot disagree about what an rp2040 build is —
     /// the triple, the chip spelling a tool needs, the flasher, and that it counts as embedded.

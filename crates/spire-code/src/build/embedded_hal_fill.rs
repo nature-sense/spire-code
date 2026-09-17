@@ -26,6 +26,8 @@ use serde_json::json;
 use spire_core::subsystems::llm::llm::{LlmMessage, LlmModelRole};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 /// One contract trait this backend still owes, with the state that decides how it is presented.
@@ -243,15 +245,12 @@ pub(crate) async fn apply(
     })
 }
 
-/// One item: check the path, ask the model, gate the answer, write, re-measure.
-///
-/// The error carries the file, so a failure names where it happened even when the reason is about
-/// the model's answer rather than about the file.
-async fn apply_item(
+/// Where an item will be written, what it owes, and the prompt it was planned from — the three
+/// things both applying and repairing need, checked once.
+fn item_target(
     root: &Path,
     item: &serde_json::Value,
-    llm_tx: &mpsc::Sender<LlmMessage>,
-) -> Result<serde_json::Value, (String, String)> {
+) -> Result<(PathBuf, Vec<PlannedTrait>, String), (String, String)> {
     let file = item
         .get("file")
         .and_then(|v| v.as_str())
@@ -272,7 +271,6 @@ async fn apply_item(
             "refused: not an existing file under `crates/` in this project".to_string(),
         ));
     }
-
     let pending = planned_traits(item);
     if pending.is_empty() {
         return Err((
@@ -287,8 +285,22 @@ async fn apply_item(
     if prompt.trim().is_empty() {
         return Err((file, "the plan item carries no prompt".to_string()));
     }
+    Ok((path, pending, prompt.to_string()))
+}
 
-    let source = generate(llm_tx, prompt, &pending)
+/// One item: check the path, ask the model, gate the answer, write, re-measure.
+///
+/// The error carries the file, so a failure names where it happened even when the reason is about
+/// the model's answer rather than about the file.
+async fn apply_item(
+    root: &Path,
+    item: &serde_json::Value,
+    llm_tx: &mpsc::Sender<LlmMessage>,
+) -> Result<serde_json::Value, (String, String)> {
+    let (path, pending, prompt) = item_target(root, item)?;
+    let file = path.to_string_lossy().to_string();
+
+    let source = generate(llm_tx, &prompt, &pending)
         .await
         .map_err(|e| (file.clone(), e))?;
     std::fs::write(&path, &source).map_err(|e| (file.clone(), format!("write failed: {e}")))?;
@@ -458,6 +470,44 @@ fn backend_dependencies(crate_dir: &Path) -> String {
         }
     }
     out
+}
+
+/// Repair a written backend that does not compile: one more model call, with the compiler's own
+/// errors in the prompt, then the same gate as any other answer.
+///
+/// This is the loop a live run pointed at. The gate above is **structural** — it decides whether an
+/// answer is the file it claims to be — and only `cargo` can say whether that file builds, so the
+/// compiler's words are the one piece of feedback that makes a wrong-but-plausible answer
+/// recoverable. The errors are passed through verbatim (truncated): paraphrase would lose the line
+/// numbers and the type names, which are exactly what the model needs.
+///
+/// One round only. A second failed answer is reported, not retried again — the caller decides
+/// whether to spend another — and the file is left as the compiler saw it, so a repair that fails
+/// never leaves the backend in a state nobody has built.
+pub(crate) async fn repair(
+    root: &Path,
+    item: &serde_json::Value,
+    errors: &str,
+    llm_tx: &mpsc::Sender<LlmMessage>,
+) -> Result<String, String> {
+    let (path, pending, prompt) = item_target(root, item)
+        .map_err(|(file, reason)| format!("cannot repair {file}: {reason}"))?;
+
+    // Enough of the compiler's output to act on, and no more: a `cargo` failure on one crate is
+    // usually a handful of errors, but a broken dependency graph can produce thousands of lines.
+    let mut kept: String = errors.lines().take(80).collect::<Vec<_>>().join("\n");
+    if errors.lines().count() > 80 {
+        kept.push_str("\n… (more errors omitted)");
+    }
+
+    let repair_prompt = format!(
+        "{prompt}\n\nThe file you wrote does not compile. The compiler said:\n\n{kept}\n\n\
+         Return the COMPLETE corrected file — every pending method implemented, using only the \
+         crates in the manifest above and the API as the errors describe it (no fences)."
+    );
+    let source = generate(llm_tx, &repair_prompt, &pending).await?;
+    std::fs::write(&path, &source).map_err(|e| format!("write failed: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// The registry record whose hints describe this family's hardware.
@@ -1131,6 +1181,115 @@ mod tests {
             code_block(&format!("```rust\n{body}")),
             body,
             "an unterminated fence is not a reason to fall back to the whole answer"
+        );
+    }
+
+    /// A fake model that answers `answer` and **records** the prompts it was given — which is how a
+    /// test can assert what a repair actually sent.
+    fn recording_llm(
+        answer: &'static str,
+        said: Arc<Mutex<Vec<String>>>,
+    ) -> mpsc::Sender<LlmMessage> {
+        let (tx, mut rx) = mpsc::channel(4);
+        let said = said.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let LlmMessage::Complete {
+                    prompt, reply_to, ..
+                } = message
+                {
+                    said.lock().unwrap().push(prompt);
+                    let _ = reply_to.send(Ok(answer.to_string()));
+                }
+            }
+        });
+        tx
+    }
+
+    /// A repair is one more model call carrying the compiler's **own words**, and the same gate as
+    /// any other answer — so a "fixed" file that still is not the file it claims to be is refused
+    /// rather than written.
+    #[tokio::test]
+    async fn a_repair_carries_the_compilers_errors_and_passes_the_same_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        project(root, "        unimplemented!(\"GpioLed::set\")");
+        let out = plan(root, None);
+        let item = &out["plan"][0];
+
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let llm_tx = recording_llm(
+            "```rust\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n```",
+            said.clone(),
+        );
+
+        let errors = "error[E0107]: struct takes 3 generic arguments\n  --> src/lib.rs:12:10";
+        let file = repair(root, item, errors, &llm_tx)
+            .await
+            .expect("the repaired answer passes the gate");
+
+        assert!(file.ends_with("src/lib.rs"), "{file}");
+        let prompts = said.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "one repair call, not a loop");
+        assert!(
+            prompts[0].contains("does not compile"),
+            "the repair says what happened: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[0].contains("takes 3 generic arguments"),
+            "and quotes the compiler rather than paraphrasing it: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[0].contains("Return the COMPLETE corrected file"),
+            "the output contract survives a repair: {}",
+            prompts[0]
+        );
+        drop(prompts);
+
+        let written =
+            std::fs::read_to_string(root.join("crates/demo-hal-esp32/src/lib.rs")).unwrap();
+        assert!(written.contains("let _ = on;"), "{written}");
+    }
+
+    /// The same gate, on a repair that answers with a placeholder: refused, and the file keeps what
+    /// it had — a repair cannot leave a backend worse than it found it.
+    #[tokio::test]
+    async fn a_repair_that_answers_with_a_placeholder_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        project(root, "        let _ = _on;");
+        let out = plan(root, None);
+        // The item is planned from the stub; `plan` only reports what still owes work, so drive the
+        // repair from the item the plan would have produced before the file was written.
+        let _ = out;
+        let item = json!({
+            "family": "esp32",
+            "file": root.join("crates/demo-hal-esp32/src/lib.rs").to_string_lossy(),
+            "platform": "esp32c6",
+            "pending": [{
+                "interface": "led", "trait": "Led", "status": "stub", "methods": ["set"]
+            }],
+            "prompt": "…",
+        });
+        let before =
+            std::fs::read_to_string(root.join("crates/demo-hal-esp32/src/lib.rs")).unwrap();
+
+        let said = Arc::new(Mutex::new(Vec::new()));
+        let llm_tx = recording_llm(
+            "```rust\nimpl Led for GpioLed {\n    fn set(&mut self, _on: bool) {\n        unimplemented!(\"set\")\n    }\n}\n```",
+            said,
+        );
+
+        let reason = repair(root, &item, "error[E0432]: unresolved import", &llm_tx)
+            .await
+            .expect_err("a placeholder is not a repair");
+        assert!(reason.contains("unimplemented!()"), "{reason}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("crates/demo-hal-esp32/src/lib.rs")).unwrap(),
+            before,
+            "the file is untouched"
         );
     }
 

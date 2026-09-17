@@ -739,34 +739,58 @@ does not depend on `spire-hal-std`); backends are per **family**, not per chip (
 `MCU` env var, the triple is the variant); and the contract grows a trait only when a *second*
 family needs it.
 
-**9f — building what the model wrote** (open). `SPIRE_LIVE_FILL_DIR=<dir>` keeps the live fill
-test's project on disk so its backends can be built by hand; doing that found two scaffold gaps
-(fixed) and one real limit (open):
+**9f — building what the model wrote** (closed). `SPIRE_LIVE_FILL_DIR=<dir>` keeps the live fill
+test's project on disk so its backends can be built by hand; doing that found three scaffold gaps
+(all fixed) and the limit that mattered, which is now closed by a repair round:
+
 - **Gap 1, fixed**: the emitted `no_std` backend had no `#![no_std]`, so `cargo build --target
   thumbv6m-none-eabi` failed with "can't find crate for `std`". Nothing had ever built a backend —
   the host `cargo test` deliberately excludes them. Emitted per family now (`uses_std_executor`
   decides; an esp-idf backend must *not* have it, since `std::thread` is its executor) and pinned by
   the scaffold test.
-- **Gap 2, fixed**: `rp2040-hal` does **not** re-export `embedded-hal` or `nb` (checked against
-  0.10.2's source: it re-exports `fugit`, `paste`, `rpac`), yet its GPIO and timer methods *are*
-  those traits — `Pin::set_high` is `embedded_hal::digital::v2::OutputPin::set_high` and
-  `count_down()` returns an `nb`-based `CountDown`. "One dependency, not two" was a fact about
-  esp-idf-hal generalised into a rule; each family now carries its own `deps` (rp2040's is three),
-  and the prompt quotes the manifest's `[dependencies]` verbatim — the list the compiler enforces —
-  instead of asserting a count.
-- **Limit, open**: with the dependencies right, both generated backends still fail on the vendor
-  API's *shape*. rp2040: `rp2040_hal::gpio::Output` does not exist (it is `FunctionSio<SioOutput>`)
-  and `Pin` takes three parameters, not two. esp32: `esp_idf_hal::gpio::AnyOutput` does not exist
-  and `PinDriver<'d, MODE>` takes **one** generic since 0.47 — `PinDriver::output(pin)` erases the
-  pin — where the model wrote two; rustc pointed at the crate source to say so. `spire-hal`'s
-  hand-written esp32 backend documents that exact trap in a comment, so the knowledge exists in the
-  repo and simply does not reach the prompt. Fix candidates, cheapest first: **(a)** the platform's
-  `library_hints` name the shapes — the field exists for this and the prompt already injects it (the
-  `rp2040` entry now carries them; the four esp entries in `~/.spire/platforms` need the
-  `PinDriver<'d, MODE>` sentence); **(b)** the prompt quotes the installed crate's signatures;
-  **(c)** feed *compile errors* back, which is what makes the loop converge rather than requiring the
-  prompt to be omniscient — the fix leg's job, and the natural next step. The fill's gate stays
-  structural by design: it decides whether an answer is the file it claims to be, and `cargo`
-  decides whether that file builds.
+- **Gap 2, fixed**: `rp2040-hal` does not re-export `embedded-hal`/`nb`, yet its GPIO and delay
+  methods *are* those traits — so the family carries its own `deps` and the prompt quotes the
+  manifest's `[dependencies]` verbatim (the list the compiler enforces) rather than asserting a
+  count. "One dependency, not two" was a fact about esp-idf-hal generalised into a rule.
+- **Gap 3, fixed — and the one that hid the real failure**: the version, not just the name. The
+  scaffold pinned `embedded-hal = "0.2"` while `rp2040-hal` 0.10.2 depends on `embedded-hal =
+  "1.0.0"` (checked in its manifest: `[dependencies.embedded-hal] version = "1.0.0"`, plus
+  `embedded_hal_0_2` as a *renamed* compatibility dep). A backend importing
+  `embedded_hal::digital::OutputPin` then has the *other* crate's trait in scope, and
+  `set_high` does not resolve however right the import looks — the compiler's own words were
+  "the following traits which provide `set_high` are implemented but not in scope", naming a trait
+  that does not provide it for that `Pin`. The scaffold test now pins the version, so this cannot
+  regress silently.
+- **The limit, closed**: the vendor API's *shape* cannot be guaranteed by a prompt. rp2040:
+  `gpio::Output` does not exist (the type is `FunctionSio<SioOutput>`, and `Pin` takes three
+  parameters). esp32: `PinDriver<'d, MODE>` takes **one** generic since 0.47 (`PinDriver::output`
+  erases the pin) where the model wrote two, and `AnyOutput` does not exist. `spire-hal`'s
+  hand-written esp32 backend documents that trap in a comment — the knowledge was in the repo and
+  never reached the prompt.
+  Two legs, both landed:
+  - **(a) the data**: `library_hints` name the shapes for all five embedded entries (`rp2040` and the
+    four esp ones; the prompt already injects the field). The rp2040 entry's claim was *wrong* —
+    it said `embedded_hal::digital::v2::OutputPin` — so the compiler's output, not memory, is what
+    the text now repeats.
+  - **(c) the loop**: `embedded_hal_fill_apply` builds each backend it wrote through the *platform
+    module* (the same `Build` message the UI sends, `package` naming the crate), and on failure
+    makes **one repair call** whose prompt appends the compiler's errors verbatim, then rebuilds.
+    One round only, and the file keeps what the compiler saw if the repair is refused — a failed
+    repair cannot leave a backend in a state nobody has built.
+- **Proven, not asserted**: `a_scaffolded_backend_builds_after_one_repair_round` drives the real
+  route (scaffold → plan → apply) with a **scripted** model that answers rp2040's wrong API first and
+  the corrected one second. The build is real (rustup toolchain, `thumbv6m-none-eabi`, `rp2040-hal`
+  from the registry), so the test asserts `repaired: true` and `built: true`, and that the file on
+  disk is the repaired one. No API key, no flakiness, and it is the failing case: swap the second
+  answer for a wrong one and it fails.
+- **Two things driving it taught, now in the code**: the tool receives the plan as the *items array*
+  (the UI hands back `plan`), which the verification read as `plan["plan"]` — it silently checked
+  nothing; and requiring a prior `build_analyze` was a hidden ordering requirement (the analysis store
+  is best-effort: an analyze can succeed and the lookup still miss), so the verification now analyzes
+  on demand and every skip names its reason — "written" and "verified to build" stay different claims.
+- **Still open (smaller)**: the repair is one round, so a second-order error (the corrected answer
+  needing one more import) ends as `built: false` with the compiler's words attached rather than
+  another call. The esp32 leg's build needs the ESP-IDF SDK, so its verification runs only where that
+  is installed; the deterministic test covers rp2040 only.
 
 
