@@ -2052,6 +2052,7 @@ impl Actor for MesonBuildModule {
                     supports_lint: true,
                     supports_format: true,
                     supports_fix: true,
+                    supports_flash: false,
                     mcp_servers: vec![],
                 });
             }
@@ -2270,6 +2271,13 @@ impl Actor for MesonBuildModule {
             } => {
                 let result = self.scaffold_layout(&project_name, &goal, &platforms, structure);
                 let _ = reply_to.send(result);
+            }
+
+            // The manager refuses a flash for a module that declared `supports_flash: false`
+            // before routing, so reaching here would mean the capability gate was bypassed —
+            // answer rather than fall silent, so the caller gets an error and not a lost channel.
+            BuildModuleMessage::Flash { reply_to, .. } => {
+                let _ = reply_to.send(Err("flash not supported for this module".to_string()));
             }
 
             BuildModuleMessage::CallTool { reply_to, .. } => {

@@ -390,12 +390,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (esp_tx, esp_rx) =
             tokio::sync::mpsc::channel::<spire_code::build::BuildModuleMessage>(8);
         spire_code::build::EspBuildModule::new().spawn(esp_rx);
-        let _ = bm_tx
-            .send(BuildManagerMessage::AddPlatformModule {
-                os: "esp-idf".to_string(),
-                module_tx: esp_tx,
-            })
+        // The capability is queried first because the registration carries it: the manager
+        // gates `build_flash` on `supports_flash`, and a platform module whose capability was
+        // never asked for would have to be given one the manager cannot trust.
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = esp_tx
+            .send(spire_code::build::BuildModuleMessage::DescribeCapabilities { reply_to: t })
             .await;
+        if let Ok(cap) = r.await {
+            let _ = bm_tx
+                .send(BuildManagerMessage::AddPlatformModule {
+                    os: "esp-idf".to_string(),
+                    capability: cap,
+                    module_tx: esp_tx,
+                })
+                .await;
+        }
     }
 
     // ── Spawn the project build actor (orchestrates multi-system builds) ──

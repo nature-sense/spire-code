@@ -309,6 +309,9 @@ pub enum BuildManagerMessage {
     /// A module registered this way claims **no** config files.
     AddPlatformModule {
         os: String,
+        /// What the module declared it can do — carried here because it decides whether a
+        /// `flash` request is routed to it or refused (see `PlatformModule`).
+        capability: ModuleCapability,
         module_tx: mpsc::Sender<BuildModuleMessage>,
     },
     /// Analyze a project → produce + store BuildMetadata.
@@ -407,7 +410,11 @@ pub struct BuildManagerActor {
     /// Consulted *before* [`Self::router`]: a platform-specific module wins over the module
     /// that owns the config file, because the platform is what the invocation actually
     /// depends on (an ESP32 build is still a `Cargo.toml` project).
-    platform_router: HashMap<String, mpsc::Sender<BuildModuleMessage>>,
+    ///
+    /// The module's capability is stored with its sender: it is what gates the one operation
+    /// only a platform module can perform (`flash`), and a missing capability would have to be
+    /// re-asked for on every request.
+    platform_router: HashMap<String, PlatformModule>,
     /// Capabilities of all registered modules.
     capabilities: Vec<ModuleCapability>,
     /// Sender to the MemoryGraph actor for analysis state.
@@ -433,6 +440,15 @@ enum BuildRoute {
     Platform(String),
     /// The module that owns the config file — the pre-existing behaviour.
     Config(String),
+}
+
+/// A module registered by the platform `os` it serves, with the capability that gates it.
+///
+/// One value rather than two maps: a platform module is only usable together with what it
+/// declared it can do, so they are registered and looked up as a unit.
+struct PlatformModule {
+    capability: ModuleCapability,
+    module_tx: mpsc::Sender<BuildModuleMessage>,
 }
 
 /// The `os` of a registered platform, or `None` when the id is unknown.
@@ -500,9 +516,24 @@ impl BuildManagerActor {
     }
 
     /// Register a platform-specific module (see `AddPlatformModule`).
-    fn add_platform_module(&mut self, os: String, module_tx: mpsc::Sender<BuildModuleMessage>) {
-        tracing::info!("BuildManager: module registered for platform os '{os}'");
-        self.platform_router.insert(os, module_tx);
+    fn add_platform_module(
+        &mut self,
+        os: String,
+        capability: ModuleCapability,
+        module_tx: mpsc::Sender<BuildModuleMessage>,
+    ) {
+        tracing::info!(
+            "BuildManager: module '{}' registered for platform os '{}'",
+            capability.name,
+            os
+        );
+        self.platform_router.insert(
+            os,
+            PlatformModule {
+                capability,
+                module_tx,
+            },
+        );
     }
 
     /// Which registered module should handle a build of `config` under `platform`.
@@ -520,7 +551,7 @@ impl BuildManagerActor {
 
     fn sender_for(&self, route: &BuildRoute) -> Option<&mpsc::Sender<BuildModuleMessage>> {
         match route {
-            BuildRoute::Platform(os) => self.platform_router.get(os),
+            BuildRoute::Platform(os) => self.platform_router.get(os).map(|m| &m.module_tx),
             BuildRoute::Config(config) => self.router.get(config),
         }
     }
@@ -544,6 +575,42 @@ impl BuildManagerActor {
             BuildRoute::Platform(os) => format!("No module registered for platform '{}'", os),
             BuildRoute::Config(config) => format!("No module registered for {}", config),
         })
+    }
+
+    /// The route a `flash` request takes, refused unless the module that would handle it
+    /// declares `supports_flash`.
+    ///
+    /// Flash is the one operation only a *platform* module can perform — the chip and the USB
+    /// tool are platform facts, and no config file implies them. So a project whose platform
+    /// routes to its config file's owner is refused here by name (a Raspberry Pi is still
+    /// Cargo), rather than handed to a module whose answer would arrive as a lost channel.
+    fn route_for_flash(&self, config: &str, platform: &str) -> Result<BuildRoute, String> {
+        let route = self.route_for(config, Some(platform));
+        match &route {
+            BuildRoute::Platform(os) => {
+                let module = self
+                    .platform_router
+                    .get(os)
+                    .ok_or_else(|| format!("No module registered for platform '{}'", os))?;
+                if !module.capability.supports_flash {
+                    return Err(format!(
+                        "flash is not supported for build system {}",
+                        module.capability.build_system
+                    ));
+                }
+                Ok(route)
+            }
+            // No platform module claimed this platform's `os`, so nothing here flashes. Naming
+            // the `os` is what tells the user whether the id was wrong or the board simply has
+            // no flash step.
+            BuildRoute::Config(_) => Err(match platform_os_of(platform) {
+                Some(os) => format!(
+                    "flash is not supported for platform '{}' (no module flashes os '{}')",
+                    platform, os
+                ),
+                None => format!("unknown platform '{}'", platform),
+            }),
+        }
     }
 
     /// Find which registered config file applies to a path.
@@ -1275,7 +1342,11 @@ impl BuildManagerActor {
             .first()
             .cloned()
             .ok_or_else(|| "Stored analysis has no config file".to_string())?;
-        let module_tx = self.module_tx_for(&config, None)?;
+        // The platform decides the module here too — `build_build` is the path a UI Build click
+        // and a `build_build` tool call share, so leaving `platform` out of the lookup sent an
+        // ESP32 build to the cargo module while the batch `build_project` above sent it to the
+        // platform module. Two paths, two answers, for the same request.
+        let module_tx = self.module_tx_for(&config, opts.platform.as_deref())?;
 
         let (tx, rx) = oneshot::channel();
         let (build_event_tx, mut build_event_rx) =
@@ -1551,6 +1622,59 @@ impl BuildManagerActor {
                 path: path.to_path_buf(),
                 metadata,
                 platform,
+                reply_to: tx,
+            })
+            .await
+            .map_err(|e| format!("Module channel closed: {}", e))?;
+        rx.await
+            .map_err(|e| format!("Module response lost: {}", e))?
+    }
+
+    /// Flash the built artifact for `opts.platform` onto the board — the last leg of
+    /// contract → drift → fill → cross-build → **flash** → run.
+    ///
+    /// A platform is mandatory here, in a way it is not for a build: it names the chip the
+    /// tool must talk to, and unlike a build there is no default that is safe — the host is
+    /// not a board. Both the refusal and the route follow from it, so they are checked before
+    /// the message is sent (`route_for_flash`) rather than after it fails to answer.
+    async fn flash_project(
+        &self,
+        path: &Path,
+        opts: &BuildOptions,
+        artifact: Option<PathBuf>,
+        port: Option<PathBuf>,
+    ) -> Result<BuildOutput, String> {
+        let platform_id = opts
+            .platform
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| "flashing needs a platform, e.g. \"esp32c6\"".to_string())?;
+
+        let path_str = path.to_string_lossy().to_string();
+        let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
+            format!(
+                "No stored analysis for {}; run AnalyzeProject first",
+                path_str
+            )
+        })?;
+        let config = metadata
+            .config_files
+            .first()
+            .cloned()
+            .ok_or_else(|| "Stored analysis has no config file".to_string())?;
+
+        self.route_for_flash(&config, platform_id)?;
+        let module_tx = self.module_tx_for(&config, Some(platform_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        module_tx
+            .send(BuildModuleMessage::Flash {
+                path: path.to_path_buf(),
+                metadata,
+                opts: opts.clone(),
+                artifact,
+                port,
                 reply_to: tx,
             })
             .await
@@ -2057,6 +2181,65 @@ impl BuildManagerActor {
                                 status_target.as_deref(),
                                 o.success,
                                 o.duration_secs,
+                            )
+                            .await;
+                        serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}))
+                    }
+                    Err(e) => serde_json::json!({ "error": e }),
+                }
+            }
+            "build_flash" => {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let opts = BuildOptions {
+                    mode: args
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    package: args
+                        .get("package")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    platform: args
+                        .get("platform")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    target: None,
+                };
+                let artifact = args
+                    .get("artifact")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(PathBuf::from);
+                let port = args
+                    .get("port")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from);
+                let status_target = self
+                    .resolve_status_target(path, None, opts.platform.as_deref())
+                    .await;
+                match self
+                    .flash_project(Path::new(path), &opts, artifact, port)
+                    .await
+                {
+                    Ok(o) => {
+                        // Recorded per target like build/test, so the platform list can show
+                        // "last flashed" alongside "last built" — the two facts that decide
+                        // whether the chip is running what is on disk.
+                        let _ = self
+                            .store_action_status_with_output(
+                                "flash",
+                                path,
+                                status_target.as_deref(),
+                                o.success,
+                                o.duration_secs,
+                                &o.output,
                             )
                             .await;
                         serde_json::to_value(o).unwrap_or(serde_json::json!({"error": "serialize"}))
@@ -3292,6 +3475,22 @@ executable('{project_name}-{platform}',
                 }
             }
 
+            // Rust embedded-HAL gap fill: the work items for each backend crate, with the
+            // constrained prompt. Reads the same Rust coverage measure `hal_missing_impls`
+            // merges, so the plan and the UI's indicators can never disagree.
+            "embedded_hal_fill_plan" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let platform = args.get("platform").and_then(|v| v.as_str());
+                if root.is_empty() {
+                    serde_json::json!({ "error": "embedded_hal_fill_plan: \"root\" required" })
+                } else {
+                    crate::build::embedded_hal_fill::plan(std::path::Path::new(root), platform)
+                }
+            }
+
             "hal_diff_contracts" => {
                 let old_summary = args
                     .get("old_summary")
@@ -3603,6 +3802,22 @@ executable('{project_name}-{platform}',
                 }),
             },
             spire_core::actors::ToolInfo {
+                name: "build_flash".to_string(),
+                description: "Flash a built artifact onto an embedded board over USB (esp-idf: espflash) and report the result. Requires prior build_analyze and a successful build for that platform.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Project root directory" },
+                        "platform": { "type": "string", "description": "Platform registry id of the board to flash (e.g. esp32c6) — required, because it names the chip the tool talks to" },
+                        "mode": { "type": "string", "description": "Build profile whose artifact is flashed: debug (default) or release" },
+                        "package": { "type": "string", "description": "Optional package/workspace member whose binary is flashed" },
+                        "artifact": { "type": "string", "description": "Optional path to the binary to flash; defaults to the one the build wrote for that platform" },
+                        "port": { "type": "string", "description": "Optional serial port of the board (e.g. /dev/cu.usbserial-1234); defaults to the single USB serial device" }
+                    },
+                    "required": ["path", "platform"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
                 name: "build_clean".to_string(),
                 description: "Clean a project directory using its detected build system (removes build artifacts, keeps the configured build dir). Requires prior build_analyze.".to_string(),
                 input_schema: serde_json::json!({
@@ -3800,6 +4015,12 @@ executable('{project_name}-{platform}',
             t("hal_fill_plan", "Plan (read-only) the HAL gap-fill work items for a platform.", root_plat.clone(), &["root"]),
             t("hal_fill_apply", "Apply a HAL gap-fill plan (write the concrete implementation files).",
               serde_json::json!({ "root": { "type": "string" }, "plan": { "type": "array" } }), &["root", "plan"]),
+            t("embedded_hal_fill_plan", "Plan (read-only) the Rust embedded-HAL fill work: one item per backend file, with the constrained prompt.",
+              serde_json::json!({
+                  "root": { "type": "string" },
+                  "platform": { "type": "string", "description": "Platform registry id supplying the hardware profile + hints (e.g. esp32c6); defaults to the first record of the backend's family" }
+              }),
+              &["root"]),
             t("hal_diff_contracts", "Diff two HAL contract summaries (added/removed/changed methods).",
               serde_json::json!({ "old_summary": { "type": "object" }, "new_summary": { "type": "object" } }),
               &["old_summary", "new_summary"]),
@@ -3823,8 +4044,12 @@ impl Actor for BuildManagerActor {
                 self.add_module(capability, module_tx);
             }
 
-            BuildManagerMessage::AddPlatformModule { os, module_tx } => {
-                self.add_platform_module(os, module_tx);
+            BuildManagerMessage::AddPlatformModule {
+                os,
+                capability,
+                module_tx,
+            } => {
+                self.add_platform_module(os, capability, module_tx);
             }
 
             BuildManagerMessage::AnalyzeProject {
@@ -4195,6 +4420,41 @@ mod tests {
         }
     }
 
+    /// The capability the ESP32 module advertises: it claims **no** config file (routing is by
+    /// platform) and it is the one module that flashes.
+    fn esp_module_capability() -> ModuleCapability {
+        ModuleCapability {
+            name: "esp-idf".to_string(),
+            config_files: Vec::new(),
+            build_system: "Cargo (esp-idf)".to_string(),
+            language: "Rust".to_string(),
+            source_extensions: vec!["rs".to_string()],
+            mcp_servers: Vec::new(),
+            supports_flash: true,
+            supports_clean: false,
+            supports_lint: false,
+            supports_format: false,
+            supports_fix: false,
+        }
+    }
+
+    /// The capability of a config-file module: owns `Cargo.toml`, flashes nothing.
+    fn cargo_capability() -> ModuleCapability {
+        ModuleCapability {
+            name: "cargo".to_string(),
+            config_files: vec!["Cargo.toml".to_string()],
+            build_system: "Cargo".to_string(),
+            language: "Rust".to_string(),
+            source_extensions: vec!["rs".to_string()],
+            mcp_servers: Vec::new(),
+            supports_clean: true,
+            supports_lint: true,
+            supports_format: true,
+            supports_fix: true,
+            supports_flash: false,
+        }
+    }
+
     /// The point of platform routing: an ESP32 build must reach the platform module, and
     /// **every other project must keep reaching its config module**.
     ///
@@ -4224,7 +4484,11 @@ mod tests {
         let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
         // The platform module (as the ESP32 one registers itself) — and note it claims no
         // config file, which is what makes the next registration possible.
-        manager.add_platform_module("esp-idf".to_string(), mpsc::channel(1).0);
+        manager.add_platform_module(
+            "esp-idf".to_string(),
+            esp_module_capability(),
+            mpsc::channel(1).0,
+        );
         manager.add_module(
             ModuleCapability {
                 name: "cargo".to_string(),
@@ -4237,6 +4501,7 @@ mod tests {
                 supports_lint: true,
                 supports_format: true,
                 supports_fix: true,
+                supports_flash: false,
             },
             mpsc::channel(1).0,
         );
@@ -4261,6 +4526,173 @@ mod tests {
         assert_eq!(
             manager.route_for("Cargo.toml", Some("no-such-board")),
             BuildRoute::Config("Cargo.toml".to_string())
+        );
+    }
+
+    /// `flash` is gated by capability *and* by platform, and each refusal names a different
+    /// gap — wrong id, no flash step for that os, or a module that does not flash.
+    ///
+    /// It matters that these are refusals and not errors from the module: a module that cannot
+    /// flash has no reply to send, so routing to it would surface as a lost channel, which
+    /// reads as a crash rather than as "this board has no USB flash step".
+    #[test]
+    fn flash_routes_only_to_a_module_that_declares_it() {
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("platform dir");
+        std::fs::write(
+            dir.path().join("esp32c6.yaml"),
+            "id: esp32c6\nname: ESP32-C6\nos: esp-idf\narchitecture:\n  \
+             cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
+             target_triple: riscv32imac-esp-espidf\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("rpi5.yaml"),
+            "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  \
+             cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
+             target_triple: aarch64-linux-gnu\n",
+        )
+        .unwrap();
+        let _env = SpirePlatformDirGuard::set(dir.path());
+
+        let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
+        manager.add_platform_module(
+            "esp-idf".to_string(),
+            esp_module_capability(),
+            mpsc::channel(1).0,
+        );
+        manager.add_module(cargo_capability(), mpsc::channel(1).0);
+
+        // A flash-capable platform module is routed exactly as a build would be.
+        assert_eq!(
+            manager.route_for_flash("Cargo.toml", "esp32c6"),
+            Ok(BuildRoute::Platform("esp-idf".to_string()))
+        );
+
+        // A board with no flash step: the message names both the platform and its os, so a
+        // reader can tell a typo'd id from "this board is not flashed over USB".
+        let err = manager
+            .route_for_flash("Cargo.toml", "rpi5")
+            .expect_err("a linux platform has no flash step");
+        assert!(err.contains("rpi5") && err.contains("linux"), "{err}");
+
+        // An id that is not in the registry: the same wording `run_esp_flash` uses, so the
+        // message does not depend on how far the request got.
+        let err = manager
+            .route_for_flash("Cargo.toml", "no-such-board")
+            .expect_err("an unknown platform cannot be flashed");
+        assert!(err.contains("unknown platform"), "{err}");
+
+        // Same platform, but the module says it does not flash: refused before routing.
+        let mut no_flash = BuildManagerActor::new(mpsc::channel(1).0);
+        let mut cap = esp_module_capability();
+        cap.supports_flash = false;
+        no_flash.add_platform_module("esp-idf".to_string(), cap, mpsc::channel(1).0);
+        no_flash.add_module(cargo_capability(), mpsc::channel(1).0);
+        let err = no_flash
+            .route_for_flash("Cargo.toml", "esp32c6")
+            .expect_err("a module without flash must be refused up front");
+        assert!(err.contains("not supported for build system"), "{err}");
+    }
+
+    /// `build_build` — the **streaming** path a UI Build click and a `build_build` tool call
+    /// share — must honour the platform when routing, exactly as the batch path does.
+    ///
+    /// Regression test for a bug found on hardware: the streaming path looked the module up
+    /// with `platform: None`, so an ESP32 build went to the **cargo** module while the batch
+    /// `build_project` sent the same request to the esp module. Two paths, two answers — and
+    /// the wrong one is a host `cargo build` that "succeeds" without producing firmware.
+    ///
+    /// Both modules are fakes that stamp a distinct `command`, so the assertion is about *which
+    /// module ran*, not about a build. The stored analysis is faked at the channel boundary
+    /// (`GetConfig`), which is what keeps this a unit test: no MemoryGraph, no toolchain, no
+    /// board.
+    #[tokio::test]
+    async fn build_build_routes_by_platform_not_to_the_config_owners_module() {
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let reg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            reg.path().join("esp32c6.yaml"),
+            "id: esp32c6\nname: ESP32-C6\nos: esp-idf\narchitecture:\n  \
+             cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
+             target_triple: riscv32imac-esp-espidf\nrust:\n  \
+             target: riscv32imac-esp-espidf\n  idf_target: esp32c6\n  flash: espflash\n",
+        )
+        .unwrap();
+        let _env = SpirePlatformDirGuard::set(reg.path());
+
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().to_string_lossy().to_string();
+
+        // `get_analysis` asks the graph for the manager's own key; answer it with the analysis
+        // an `AnalyzeProject` would have stored, and swallow anything else.
+        let analysis_key = format!("build.analysis.{root}");
+        let stored = serde_json::to_value(BuildMetadata {
+            config_files: vec!["Cargo.toml".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let (mg_tx, mut mg_rx) = mpsc::channel::<MemoryGraphMessage>(8);
+        tokio::spawn(async move {
+            while let Some(msg) = mg_rx.recv().await {
+                match msg {
+                    MemoryGraphMessage::GetConfig { key, reply_to } => {
+                        let value = (key == analysis_key).then(|| stored.clone());
+                        let _ = reply_to.send(Ok(value));
+                    }
+                    MemoryGraphMessage::SetConfig { reply_to, .. } => {
+                        let _ = reply_to.send(Ok(()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let mut manager = BuildManagerActor::new(mg_tx);
+
+        // The platform module — and the command it stamps is what proves it was chosen.
+        let (esp_tx, mut esp_rx) = mpsc::channel::<BuildModuleMessage>(8);
+        tokio::spawn(async move {
+            while let Some(msg) = esp_rx.recv().await {
+                if let BuildModuleMessage::BuildStreaming { reply_to, .. } = msg {
+                    let _ = reply_to.send(Ok(BuildOutput {
+                        success: true,
+                        command: "esp-build".to_string(),
+                        ..Default::default()
+                    }));
+                }
+            }
+        });
+        manager.add_platform_module("esp-idf".to_string(), esp_module_capability(), esp_tx);
+
+        // The module that owns `Cargo.toml`: registered, and must NOT be the one asked.
+        let (cargo_tx, mut cargo_rx) = mpsc::channel::<BuildModuleMessage>(8);
+        tokio::spawn(async move {
+            while let Some(msg) = cargo_rx.recv().await {
+                if let BuildModuleMessage::BuildStreaming { reply_to, .. } = msg {
+                    let _ = reply_to.send(Ok(BuildOutput {
+                        success: true,
+                        command: "cargo-build".to_string(),
+                        ..Default::default()
+                    }));
+                }
+            }
+        });
+        manager.add_module(cargo_capability(), cargo_tx);
+
+        let opts = BuildOptions {
+            platform: Some("esp32c6".to_string()),
+            mode: "release".to_string(),
+            ..Default::default()
+        };
+        let (output, _events) = manager
+            .build_project_with_events(std::path::Path::new(&root), &opts)
+            .await
+            .expect("the routed module answers");
+
+        assert_eq!(
+            output.command, "esp-build",
+            "the esp-idf module must build for the esp platform, not the Cargo.toml owner"
         );
     }
 
@@ -4327,6 +4759,7 @@ mod tests {
             "build_build",
             "build_verify",
             "build_test",
+            "build_flash",
             "build_clean",
             "build_lint",
             "build_format",
@@ -4354,6 +4787,7 @@ mod tests {
                 supports_lint: true,
                 supports_format: true,
                 supports_fix: true,
+                supports_flash: false,
                 mcp_servers: vec![],
             },
             mpsc::channel(1).0,
@@ -4383,6 +4817,7 @@ mod tests {
                     supports_lint: false,
                     supports_format: false,
                     supports_fix: false,
+                    supports_flash: false,
                     mcp_servers: vec![],
                 },
                 mpsc::channel(1).0,
@@ -4459,6 +4894,7 @@ mod tests {
                 supports_lint: true,
                 supports_format: true,
                 supports_fix: true,
+                supports_flash: false,
                 mcp_servers: vec![],
             },
             mpsc::channel(1).0,

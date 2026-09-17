@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
 
-//! The esp-idf build plan — what an ESP32 project's build actually *is*.
+//! The esp-idf build *and flash* plan — what an ESP32 project's build actually *is*.
 //!
 //! Kept separate from the actor that runs it ([`crate::build::esp`]'s module) because this
 //! is the part worth testing: turning a [`Platform`] into a command is the knowledge, and it
@@ -17,6 +17,10 @@
 //!    why the esp toolchain must supply `rustc` as well (see [`esp_toolchain_bin`]).
 //! 3. **`LIBCLANG_PATH` must be set** or bindgen fails inside `esp-idf-sys`, with an error
 //!    that does not mention bindgen.
+//!
+//! The flash step is the same knowledge pointed at a board: the chip the build puts in `MCU`
+//! is the chip `espflash` is told with `--chip`, and the artifact is where that build wrote it
+//! — so both come from [`esp_chip`] and [`esp_artifact_path`] rather than from a second guess.
 
 use std::path::{Path, PathBuf};
 
@@ -42,26 +46,33 @@ pub struct EspPlan {
     pub env: Vec<(String, String)>,
 }
 
+/// The chip a platform targets — `IDF_TARGET`, and the `MCU` environment variable — or `None`
+/// when this is not an esp-idf platform or does not name one.
+///
+/// One function because three things key off the chip and they must agree: the build (as
+/// `MCU`), the flash tool (as `--chip`), and the triple's directory under `target/`.
+pub fn esp_chip(platform: &Platform) -> Option<String> {
+    if platform.os != "esp-idf" {
+        return None;
+    }
+    let rust = platform.rust.as_ref()?;
+    // `cpu` and `idf_target` say the same thing; prefer the explicit one, and fall back so a
+    // hand-written YAML with only `cpu` still works.
+    let chip = rust
+        .idf_target
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(platform.architecture.cpu.as_str());
+    (!chip.is_empty()).then(|| chip.to_string())
+}
+
 /// The esp-idf plan for `platform`, or `None` when this is not an esp-idf platform.
 ///
 /// Returning `None` is what stops the ESP32 module from claiming a plain Rust project: a
 /// `linux` platform with a `Cargo.toml` must go to `CargoBuildModule`, exactly as before.
 pub fn esp_plan(platform: &Platform, opts: &BuildOptions) -> Option<EspPlan> {
     let rust = platform.rust.as_ref()?;
-    if platform.os != "esp-idf" {
-        return None;
-    }
-    // `cpu` and `idf_target` say the same thing; prefer the explicit one, and fall back so a
-    // hand-written YAML with only `cpu` still works.
-    let chip = match rust
-        .idf_target
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(platform.architecture.cpu.as_str())
-    {
-        "" => return None,
-        chip => chip.to_string(),
-    };
+    let chip = esp_chip(platform)?;
 
     let mut args = vec![
         "build".to_string(),
@@ -87,27 +98,164 @@ pub fn esp_plan(platform: &Platform, opts: &BuildOptions) -> Option<EspPlan> {
     })
 }
 
+/// The host-side flash tool a platform declares (`rust.flash`), or `None`.
+///
+/// Its own function because two callers ask the same question for different reasons: the
+/// command builder needs the tool to run, and `run_esp_flash` needs it to *refuse* a platform
+/// that has no flash step before it looks for an artifact.
+pub fn esp_flash_tool(platform: &Platform) -> Option<&str> {
+    platform
+        .rust
+        .as_ref()?
+        .flash
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+}
+
 /// The host-side flash command for `artifact` (`espflash`, from `rust.flash`), or `None`.
 ///
 /// Deliberately a **host** command, not a device-MCP one: a board that has never been
 /// flashed has nothing running to talk to, so the network leg cannot bootstrap itself.
-pub fn esp_flash_command(platform: &Platform, artifact: &Path) -> Option<Vec<String>> {
-    let rust = platform.rust.as_ref()?;
-    let tool = rust.flash.as_deref().filter(|t| !t.trim().is_empty())?;
-    let plan = esp_plan(
-        platform,
-        &BuildOptions {
-            mode: "release".to_string(),
-            ..Default::default()
-        },
-    )?;
-    Some(vec![
+///
+/// `--non-interactive` is not decoration. espflash's fallback for a device it cannot
+/// auto-detect is a **prompt**, and a `tools/call` has no terminal: measured on the attached
+/// ESP32, the un-flagged command dies with `espflash::dialoguer_error / IO error: not a
+/// terminal` — a failure that names neither the board nor the port.
+pub fn esp_flash_command(
+    platform: &Platform,
+    artifact: &Path,
+    port: Option<&Path>,
+) -> Option<Vec<String>> {
+    let tool = esp_flash_tool(platform)?;
+    let chip = esp_chip(platform)?;
+    let mut command = vec![
         tool.to_string(),
         "flash".to_string(),
         "--chip".to_string(),
-        plan.chip,
-        artifact.to_string_lossy().to_string(),
-    ])
+        chip,
+        "--non-interactive".to_string(),
+    ];
+    if let Some(port) = port {
+        command.push("--port".to_string());
+        command.push(port.to_string_lossy().to_string());
+    }
+    command.push(artifact.to_string_lossy().to_string());
+    Some(command)
+}
+
+/// Filename fragments that identify a **USB-serial adapter** on macOS and Linux.
+///
+/// espflash matches specific Espressif VID/PIDs and does not know a plain adapter (CP210x,
+/// CH34x, FTDI). Measured on the attached ESP32: `espflash list-ports` prints *No known serial
+/// ports found* while `--port /dev/cu.usbserial-…` connects and reads the chip. So the port is
+/// found here, where it can be explained, instead of left to a prompt.
+const USB_SERIAL_MARKERS: &[&str] = &["usbserial", "usbmodem", "wchusbserial", "SLAB_USBtoUART"];
+
+/// The **single** USB-serial device in `dir`, or `None` when there is none or more than one.
+///
+/// A directory parameter so this is provable on a temp dir — the same reason `libclang_path_in`
+/// takes one. Ambiguity returns `None` rather than the first match: two adapters means two
+/// boards, and picking one would flash the wrong silicon.
+pub fn serial_port_in(dir: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => return false,
+            };
+            let is_device =
+                name.starts_with("cu.") || name.starts_with("ttyUSB") || name.starts_with("ttyACM");
+            is_device
+                && USB_SERIAL_MARKERS
+                    .iter()
+                    .any(|marker| name.contains(marker))
+        })
+        .collect();
+    found.sort();
+    match found.len() {
+        1 => found.pop(),
+        _ => None,
+    }
+}
+
+/// The attached board's USB-serial port, or `None` when that is not unambiguous.
+pub fn esp_serial_port() -> Option<PathBuf> {
+    serial_port_in(Path::new("/dev"))
+}
+
+/// The binary a `cargo build` for `platform` writes, or `None` when its name cannot be known.
+///
+/// `target/<triple>/<profile>/<name>`: the triple is a **subdirectory** because `--target` was
+/// passed (a host build puts it straight in `target/<profile>/`), and the profile is `release`
+/// only for a release build — flashing a debug artifact from the release path, or the reverse,
+/// is a wrong-binary flash that no tool would catch.
+///
+/// `explicit` wins when given (a `[[bin]]` name, or an artifact some other step produced);
+/// otherwise the name is `package`, falling back to the `[package] name` in `Cargo.toml`.
+pub fn esp_artifact_path(
+    root: &Path,
+    platform: &Platform,
+    mode: &str,
+    package: Option<&str>,
+    explicit: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = explicit {
+        // Relative paths are relative to the project, like every other path in a build request.
+        return Some(if explicit.is_absolute() {
+            explicit.to_path_buf()
+        } else {
+            root.join(explicit)
+        });
+    }
+    let rust = platform.rust.as_ref()?;
+    let name = package
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .or_else(|| cargo_package_name(root))?;
+    let profile = if mode.eq_ignore_ascii_case("release") {
+        "release"
+    } else {
+        "debug"
+    };
+    Some(
+        root.join("target")
+            .join(&rust.target)
+            .join(profile)
+            .join(name),
+    )
+}
+
+/// `[package] name` from the project's `Cargo.toml`, or `None`.
+///
+/// A crate's binary is named after its package unless a `[[bin]]` section overrides it — and
+/// when it does, the derived path simply does not exist and the refusal names the path it
+/// looked for, which is more useful than silently flashing nothing.
+fn cargo_package_name(root: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("name") {
+            if let Some(value) = value.trim_start().strip_prefix('=') {
+                let name = value.trim().trim_matches('"').trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// `~/.rustup/toolchains/esp/bin` — where `espup` puts the toolchain whose `cargo` *and*
@@ -150,6 +298,41 @@ pub fn libclang_path_in(toolchain_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The value esp-idf-sys's `esp_idf_tools_install_dir` must be given, so every project on the
+/// machine shares one ESP-IDF install instead of installing its own.
+///
+/// **One installation per machine, not one per project.** With the setting unset, esp-idf-sys
+/// defaults to `workspace` — `<workspace>/.embuild/espressif`, a complete copy of ESP-IDF, its
+/// build tools, a Python env and a download cache *per workspace*: measured on this machine,
+/// ~5.3 GB for the `spire-hal` workspace and ~6.6 GB again for the detached `blink-esp32`
+/// example. `global` is esp-idf-sys's own keyword for the standard `~/.espressif`, and that
+/// directory is keyed by tool and version, so an Xtensa `esp32` build and a RISC-V `esp32c6`
+/// build share it happily.
+///
+/// The environment wins and is forwarded **verbatim**, because this value is not a path: it is
+/// one of `global` / `workspace` / `out` / `fromenv` / `custom:<dir>`, and esp-idf-sys parses it
+/// by splitting on `:` and matching the first part. Handing it a bare path — the obvious first
+/// attempt, and what an earlier version of this function did — fails with
+/// `Matching variant not found`, an error that names neither the variable nor the reason. So a
+/// machine points it at a shared cache, a CI layer or an air-gapped mirror with `custom:<dir>`,
+/// or takes back the per-project behaviour with `workspace`, and no code changes.
+pub fn esp_idf_tools_install_dir() -> String {
+    esp_idf_tools_install_dir_in(std::env::var("ESP_IDF_TOOLS_INSTALL_DIR").ok().as_deref())
+}
+
+/// The setting used when the environment names nothing: esp-idf-sys's keyword for the shared
+/// `~/.espressif`. Its own default is `workspace`, which is one install per project — see above.
+pub const DEFAULT_ESP_IDF_TOOLS_INSTALL_DIR: &str = "global";
+
+/// [`esp_idf_tools_install_dir`] with the environment passed in (see [`esp_toolchain_bin_in`]).
+pub fn esp_idf_tools_install_dir_in(explicit: Option<&str>) -> String {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ESP_IDF_TOOLS_INSTALL_DIR)
+        .to_string()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────
 // The module
 // ─────────────────────────────────────────────────────────────────────────────────────
@@ -186,6 +369,9 @@ impl Actor for EspBuildModule {
                     language: "Rust".to_string(),
                     source_extensions: vec!["rs".to_string()],
                     mcp_servers: Vec::new(),
+                    // The one operation this module *is* for: the artifact exists, the chip is
+                    // a platform fact, and the tool (`espflash`) is a host binary.
+                    supports_flash: true,
                     // Declared false so the manager refuses these *before* routing to us: a
                     // clean or lint here would run against the wrong target, which is worse
                     // than refusing.
@@ -194,6 +380,18 @@ impl Actor for EspBuildModule {
                     supports_format: false,
                     supports_fix: false,
                 });
+            }
+
+            BuildModuleMessage::Flash {
+                path,
+                opts,
+                artifact,
+                port,
+                reply_to,
+                ..
+            } => {
+                let _ = reply_to
+                    .send(run_esp_flash(&path, &opts, artifact.as_deref(), port.as_deref()).await);
             }
 
             BuildModuleMessage::Build {
@@ -246,47 +444,132 @@ impl Actor for EspBuildModule {
     }
 }
 
+/// The platform and plan a build *or* a flash both need, or the refusal naming what is missing.
+///
+/// One function so the two paths cannot drift in what they accept — while the message names the
+/// operation, because "an esp-idf build needs a platform" is a confusing thing to read when you
+/// asked for a flash. `esp_plan` is what decides "is this esp-idf": an `os: esp-idf` platform
+/// with no `rust:` block can neither be built nor flashed, so it is refused here rather than
+/// producing a command with an empty triple.
+fn esp_platform_plan(op: &str, opts: &BuildOptions) -> Result<(Platform, EspPlan), String> {
+    let platform_id = opts
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("an esp-idf {op} needs a platform, e.g. \"esp32c6\""))?;
+    let platform = Platform::from_registry(platform_id)
+        .ok_or_else(|| format!("unknown platform '{platform_id}'"))?;
+    let plan = esp_plan(&platform, opts)
+        .ok_or_else(|| format!("platform '{platform_id}' is not an esp-idf platform"))?;
+    Ok((platform, plan))
+}
+
 /// Run an esp-idf build for `opts.platform`, through the **shared** process runner.
 ///
 /// Reusing `run_build_spec` rather than spawning a `Command` here means environment
 /// handling, duration measurement and exit-code reporting behave exactly as they do for
 /// every other build module.
 pub async fn run_esp_build(path: &Path, opts: &BuildOptions) -> Result<BuildOutput, String> {
-    let platform_id = opts
-        .platform
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| "an esp-idf build needs a platform, e.g. \"esp32c6\"".to_string())?;
-    let platform = Platform::from_registry(platform_id)
-        .ok_or_else(|| format!("unknown platform '{platform_id}'"))?;
-    let plan = esp_plan(&platform, opts)
-        .ok_or_else(|| format!("platform '{platform_id}' is not an esp-idf platform"))?;
-
+    let (_, plan) = esp_platform_plan("build", opts)?;
     crate::build::generic_helpers::run_build_spec(path, &spec_from_plan(plan)).await
 }
 
-/// The [`BuildSpec`] an [`EspPlan`] becomes, with the two environment requirements added.
+/// Flash the artifact for `opts.platform` onto the board, over USB.
 ///
-/// Both are easy to miss and neither failure names its real cause, which is why they live
-/// here rather than in a shell script someone has to remember to source.
+/// Every failure mode is a *refusal*, never an attempt: no platform, an unknown one, one that
+/// is not esp-idf, one that declares no flash tool, an artifact that cannot be identified, an
+/// artifact that is not there, and a board with no identifiable serial port. Each would
+/// otherwise flash the wrong binary — or the right binary onto the wrong chip. All of them
+/// happen before the tool runs; the invocation itself is [`esp_flash_command`]'s.
+///
+/// The port resolves explicit → `$ESPFLASH_PORT` → the single USB-serial device → refusal. It is
+/// named rather than left to espflash because espflash cannot see this adapter at all (see
+/// [`USB_SERIAL_MARKERS`]), and its fallback would be a prompt with no terminal to answer it.
+pub async fn run_esp_flash(
+    path: &Path,
+    opts: &BuildOptions,
+    artifact: Option<&Path>,
+    port: Option<&Path>,
+) -> Result<BuildOutput, String> {
+    let (platform, _) = esp_platform_plan("flash", opts)?;
+
+    if esp_flash_tool(&platform).is_none() {
+        return Err(format!(
+            "platform '{}' declares no flash tool (rust.flash), so nothing can flash it",
+            platform.id
+        ));
+    }
+
+    let artifact = esp_artifact_path(
+        path,
+        &platform,
+        &opts.mode,
+        opts.package.as_deref(),
+        artifact,
+    )
+    .ok_or_else(|| {
+        "cannot tell which binary to flash: Cargo.toml has no [package] name and no package \
+             was given — pass artifact=<path> or package=<name>"
+            .to_string()
+    })?;
+    if !artifact.is_file() {
+        return Err(format!(
+            "no artifact at {}; build for '{}' first, or pass artifact=<path> / mode=<profile>",
+            artifact.display(),
+            platform.id
+        ));
+    }
+
+    // Explicit, then a convention, then discovery — and otherwise refuse. A refusal is right
+    // here because espflash's own fallback is a prompt, which a `tools/call` cannot answer.
+    let port = port
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var("ESPFLASH_PORT")
+                .ok()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(esp_serial_port)
+        .ok_or_else(|| {
+            "no serial port to flash over: pass port=<dev>, or set $ESPFLASH_PORT — a single \
+             USB serial device was not found (espflash does not recognise plain adapters, so it \
+             cannot pick one itself)"
+                .to_string()
+        })?;
+
+    let command = esp_flash_command(&platform, &artifact, Some(&port))
+        .ok_or_else(|| format!("platform '{}' has no flash command", platform.id))?;
+    crate::build::generic_helpers::run_build_spec(path, &spec_from_command(command)).await
+}
+
+/// The [`BuildSpec`] an [`EspPlan`] becomes, with the environment requirements added.
+///
+/// Each is easy to miss and no failure names its real cause, which is why they live here rather
+/// than in a shell script someone has to remember to source. The last one is not a correctness
+/// requirement but a disk one: without it every project installs its own copy of ESP-IDF.
 pub(crate) fn spec_from_plan(plan: EspPlan) -> BuildSpec {
     spec_from_parts(
         plan,
         esp_toolchain_bin().as_deref(),
         libclang_path().as_deref(),
+        &esp_idf_tools_install_dir(),
         std::env::var("PATH").ok().as_deref(),
     )
 }
 
-/// The conversion itself, with the three environment lookups passed in.
+/// The conversion itself, with the environment lookups passed in.
 ///
-/// Split out so it can be tested deterministically: `esp_toolchain_bin` and `libclang_path`
-/// read `$HOME`, so a test calling them would pass or fail on whether *this* machine happens
-/// to have espup — failing for a reason unrelated to the logic under test.
+/// Split out so it can be tested deterministically: `esp_toolchain_bin`, `libclang_path` and
+/// `esp_idf_tools_install_dir` read `$HOME`, so a test calling them would pass or fail on whether
+/// *this* machine happens to have espup — failing for a reason unrelated to the logic under test.
 pub(crate) fn spec_from_parts(
     plan: EspPlan,
     toolchain_bin: Option<&Path>,
     libclang: Option<&Path>,
+    idf_tools_dir: &str,
     inherited_path: Option<&str>,
 ) -> BuildSpec {
     let mut env = plan.env;
@@ -312,11 +595,44 @@ pub(crate) fn spec_from_parts(
         ));
     }
 
+    // Where esp-idf-sys installs ESP-IDF and its tools. Left to itself it uses `workspace` —
+    // `<workspace>/.embuild/espressif` — so every project on the machine pays for its own copy
+    // (measured: ~5.3 GB and ~6.6 GB for two projects here). This is always set, never optional:
+    // the value is a keyword, not a discovered path, so there is nothing to fail to resolve.
+    env.push((
+        "ESP_IDF_TOOLS_INSTALL_DIR".to_string(),
+        idf_tools_dir.to_string(),
+    ));
+
     BuildSpec {
         command: "cargo".to_string(),
         arguments: plan.args,
         working_dir: String::new(),
         env,
+    }
+}
+
+/// A host `[program, args…]` as a [`BuildSpec`] — the flash step's counterpart to
+/// [`spec_from_plan`].
+///
+/// **No environment**, deliberately: `espflash` is a host binary (cargo-installed), so unlike
+/// the build it needs neither the esp toolchain on `PATH` nor `LIBCLANG_PATH`. Setting them
+/// here would be cargo-cult, and a `PATH` that hides the user's own tools is a real failure
+/// mode, not a theoretical one.
+pub(crate) fn spec_from_command(mut command: Vec<String>) -> BuildSpec {
+    // `esp_flash_command` always names a program, so the first element is the program; the
+    // empty case is handled rather than asserted so a future caller that passes nothing gets
+    // an empty command that fails visibly, not a panic in the flash path.
+    let arguments = if command.is_empty() {
+        Vec::new()
+    } else {
+        command.split_off(1)
+    };
+    BuildSpec {
+        command: command.into_iter().next().unwrap_or_default(),
+        arguments,
+        working_dir: String::new(),
+        env: Vec::new(),
     }
 }
 
@@ -352,6 +668,7 @@ mod tests {
                 idf_target: Some(idf.into()),
                 flash: Some("espflash".into()),
             }),
+            library_hints: None,
         }
     }
 
@@ -447,23 +764,292 @@ mod tests {
 
     /// Flashing is a **host** command: a board that has never been flashed has nothing
     /// running to talk to, so the network MCP leg cannot be how the first flash happens.
+    ///
+    /// The port and `--non-interactive` are pinned because both were learned from the board:
+    /// espflash does not recognise this adapter (`list-ports` finds none) and without a port it
+    /// **prompts** — which a `tools/call` cannot answer, so it fails as `IO error: not a
+    /// terminal`. Naming the port is what makes the flash unattended.
     #[test]
-    fn flash_is_a_host_command_naming_the_chip() {
-        let cmd = esp_flash_command(&c6(), Path::new("target/riscv32imac-esp-espidf/release/fw"))
-            .expect("an esp platform with `flash` set flashes");
+    fn flash_is_a_host_command_naming_the_chip_and_the_port() {
+        let cmd = esp_flash_command(
+            &c6(),
+            Path::new("target/riscv32imac-esp-espidf/release/fw"),
+            Some(Path::new("/dev/cu.usbserial-569C0028661")),
+        )
+        .expect("an esp platform with `flash` set flashes");
         assert_eq!(cmd[0], "espflash");
         assert_eq!(cmd[1], "flash");
         // espflash cannot always infer the chip, so it is named explicitly.
         assert_eq!(cmd[2], "--chip");
         assert_eq!(cmd[3], "esp32c6");
-        assert!(cmd[4].ends_with("release/fw"), "{cmd:?}");
+        assert!(
+            cmd.contains(&"--non-interactive".to_string()),
+            "without this a prompt with no terminal is the failure mode: {cmd:?}"
+        );
+        let at = cmd
+            .iter()
+            .position(|a| a == "--port")
+            .expect("the port is named");
+        assert_eq!(
+            cmd.get(at + 1).map(String::as_str),
+            Some("/dev/cu.usbserial-569C0028661")
+        );
+        assert!(
+            cmd.last().expect("artifact").ends_with("release/fw"),
+            "{cmd:?}"
+        );
     }
 
     #[test]
     fn a_platform_without_a_flash_tool_has_no_flash_command() {
         let mut c6 = c6();
         c6.rust.as_mut().expect("rust").flash = None;
-        assert!(esp_flash_command(&c6, Path::new("fw")).is_none());
+        assert!(esp_flash_command(&c6, Path::new("fw"), None).is_none());
+    }
+
+    /// The port is the **single** USB-serial device, and ambiguity is `None` rather than a
+    /// pick: two adapters means two boards, and choosing one would flash the wrong silicon.
+    ///
+    /// The non-adapter devices are here on purpose — they are what the attached machine
+    /// actually lists (`cu.Bluetooth-Incoming-Port`, `cu.debug-console`, a headset), and a
+    /// filter that did not exclude them would find four devices and refuse forever.
+    #[test]
+    fn the_serial_port_is_the_single_usb_adapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for noise in [
+            "cu.Bluetooth-Incoming-Port",
+            "cu.debug-console",
+            "cu.StevesBeatsStudioBuds",
+        ] {
+            std::fs::write(dir.join(noise), "").unwrap();
+        }
+        assert!(
+            serial_port_in(dir).is_none(),
+            "non-adapter devices are not candidates"
+        );
+
+        std::fs::write(dir.join("cu.usbserial-569C0028661"), "").unwrap();
+        assert_eq!(
+            serial_port_in(dir),
+            Some(dir.join("cu.usbserial-569C0028661")),
+            "one adapter is the board"
+        );
+
+        // A second adapter makes it a guess, and a guess can flash the wrong board.
+        std::fs::write(dir.join("cu.wchusbserial1420"), "").unwrap();
+        assert!(serial_port_in(dir).is_none(), "two adapters is ambiguous");
+
+        // A directory with no serial devices at all: also None, not an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(serial_port_in(empty.path()).is_none());
+    }
+
+    /// The artifact is where *that* build wrote it: the triple is a **subdirectory** (because
+    /// `--target` was passed) and the profile directory follows the requested mode. Getting the
+    /// profile wrong would flash a binary from an earlier build, which no tool would notice.
+    #[test]
+    fn the_flash_artifact_is_where_that_build_wrote_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fw\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let debug =
+            esp_artifact_path(root, &c6(), "", None, None).expect("the name comes from Cargo.toml");
+        assert_eq!(
+            debug,
+            root.join("target/riscv32imac-esp-espidf/debug/fw"),
+            "the triple is a directory under target/, and debug is the default profile"
+        );
+
+        let release = esp_artifact_path(root, &c6(), "release", None, None).expect("path");
+        assert_eq!(
+            release,
+            root.join("target/riscv32imac-esp-espidf/release/fw")
+        );
+    }
+
+    /// The two escape hatches a `[[bin]]` name or a workspace member needs: an explicit
+    /// artifact (relative to the project, unless absolute) and an explicit package.
+    #[test]
+    fn an_explicit_artifact_or_package_overrides_the_derived_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        assert_eq!(
+            esp_artifact_path(root, &c6(), "", None, Some(Path::new("out/fw.elf"))),
+            Some(root.join("out/fw.elf")),
+            "a relative artifact is relative to the project, like every build path"
+        );
+        assert_eq!(
+            esp_artifact_path(root, &c6(), "", None, Some(Path::new("/abs/fw.elf"))),
+            Some(PathBuf::from("/abs/fw.elf")),
+            "an absolute artifact is not joined to the project"
+        );
+        assert_eq!(
+            esp_artifact_path(root, &c6(), "release", Some("member"), None),
+            Some(root.join("target/riscv32imac-esp-espidf/release/member")),
+            "a named package wins even when there is no Cargo.toml to read"
+        );
+    }
+
+    /// With nothing to derive a name from the path is *unknown*, not guessed: an invented
+    /// binary name would be flashed (or fail) with no explanation of where it came from.
+    #[test]
+    fn a_project_without_a_package_name_cannot_say_which_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A workspace root: `[workspace]` with members, no `[package]`.
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"fw\"]\n",
+        )
+        .unwrap();
+        assert!(esp_artifact_path(tmp.path(), &c6(), "", None, None).is_none());
+
+        // No Cargo.toml at all is the same answer.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(esp_artifact_path(empty.path(), &c6(), "", None, None).is_none());
+    }
+
+    /// The flash spec carries **no environment**: `espflash` is a host binary, so neither the
+    /// esp toolchain's `PATH` entry nor `LIBCLANG_PATH` belongs on it. Pinned because copying
+    /// the build's env here would look harmless while silently shadowing the user's own tools.
+    #[test]
+    fn the_flash_spec_runs_the_host_tool_with_no_build_environment() {
+        let cmd = esp_flash_command(
+            &c6(),
+            Path::new("target/riscv32imac-esp-espidf/release/fw"),
+            Some(Path::new("/dev/cu.usbserial-569C0028661")),
+        )
+        .expect("command");
+        let spec = spec_from_command(cmd);
+
+        assert_eq!(spec.command, "espflash");
+        assert_eq!(
+            &spec.arguments[..3],
+            ["flash", "--chip", "esp32c6"],
+            "{:?}",
+            spec.arguments
+        );
+        assert!(
+            spec.arguments
+                .contains(&"/dev/cu.usbserial-569C0028661".to_string()),
+            "the port travels in the command, not in the environment: {:?}",
+            spec.arguments
+        );
+        assert!(
+            spec.env.is_empty(),
+            "espflash needs none of the build's environment: {:?}",
+            spec.env
+        );
+        assert!(
+            spec.working_dir.is_empty(),
+            "the project root is the working dir"
+        );
+    }
+
+    /// `run_esp_flash`'s refusals — everything about a flash except running the tool.
+    ///
+    /// Ordered by what a reader has to fix first: which platform, whether it can be flashed at
+    /// all, which binary, and whether that binary exists. Proven without `espflash` and without a
+    /// board, which is the point: every one of these declines *before* a device is touched.
+    #[tokio::test]
+    async fn run_esp_flash_refuses_before_it_could_flash_the_wrong_thing() {
+        let _guard = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("platform dir");
+        std::fs::write(
+            dir.path().join("esp32c6.yaml"),
+            "id: esp32c6\nname: ESP32-C6\nos: esp-idf\narchitecture:\n  \
+             cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
+             target_triple: riscv32imac-esp-espidf\nrust:\n  \
+             target: riscv32imac-esp-espidf\n  idf_target: esp32c6\n  flash: espflash\n",
+        )
+        .unwrap();
+        // Same chip, but no USB flash step declared.
+        std::fs::write(
+            dir.path().join("esp32c6-nousb.yaml"),
+            "id: esp32c6-nousb\nname: ESP32-C6 (no USB)\nos: esp-idf\narchitecture:\n  \
+             cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
+             target_triple: riscv32imac-esp-espidf\nrust:\n  \
+             target: riscv32imac-esp-espidf\n  idf_target: esp32c6\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("rpi5.yaml"),
+            "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  \
+             cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
+             target_triple: aarch64-linux-gnu\n",
+        )
+        .unwrap();
+        let _env = PlatformDir::set(dir.path());
+
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"fw\"\n").unwrap();
+
+        // 1. No platform: there is no default chip, and the host is not a board.
+        let err = run_esp_flash(root, &BuildOptions::default(), None, None)
+            .await
+            .expect_err("a flash without a platform must refuse");
+        assert!(err.contains("platform"), "{err}");
+
+        // 2. A real platform that is not esp-idf.
+        let linux = BuildOptions {
+            platform: Some("rpi5".to_string()),
+            ..Default::default()
+        };
+        let err = run_esp_flash(root, &linux, None, None)
+            .await
+            .expect_err("a linux platform has no flash step");
+        assert!(err.contains("not an esp-idf platform"), "{err}");
+
+        // 3. An esp platform with no flash tool: refused *before* the artifact is looked for,
+        //    because no artifact would make it flashable.
+        let no_usb = BuildOptions {
+            platform: Some("esp32c6-nousb".to_string()),
+            ..Default::default()
+        };
+        let err = run_esp_flash(root, &no_usb, None, None)
+            .await
+            .expect_err("no tool, no flash");
+        assert!(err.contains("no flash tool"), "{err}");
+
+        // 4. A flashable platform whose artifact was never built — the message names the path it
+        //    expected, which is what makes "build first" actionable.
+        let c6_opts = BuildOptions {
+            platform: Some("esp32c6".to_string()),
+            ..Default::default()
+        };
+        let err = run_esp_flash(root, &c6_opts, None, None)
+            .await
+            .expect_err("nothing has been built yet");
+        assert!(
+            err.contains("no artifact at") && err.contains("debug/fw"),
+            "{err}"
+        );
+
+        // 5. A project that cannot name its binary (a workspace root, no `[package]`): the
+        //    refusal points at the flag that answers it.
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let err = run_esp_flash(workspace.path(), &c6_opts, None, None)
+            .await
+            .expect_err("an unnamed binary cannot be flashed");
+        assert!(err.contains("artifact=<path>"), "{err}");
+
+        // 6. An id that is not in the registry at all.
+        let unknown = BuildOptions {
+            platform: Some("no-such-board".to_string()),
+            ..Default::default()
+        };
+        let err = run_esp_flash(root, &unknown, None, None)
+            .await
+            .expect_err("an unknown platform must refuse");
+        assert!(err.contains("unknown platform"), "{err}");
     }
 
     /// The toolchain probes are filesystem checks, so the *logic* is tested against a
@@ -498,15 +1084,16 @@ mod tests {
         assert_eq!(libclang_path_in(&toolchain), Some(lib));
     }
 
-    /// The invocation is only correct if these two are present, and *both* failures are
-    /// silent about their cause — so they are pinned here rather than discovered on a board.
+    /// The invocation is only correct if these are present, and *each* failure is silent about
+    /// its cause — so they are pinned here rather than discovered on a board.
     #[test]
-    fn the_spec_carries_mcu_the_toolchain_and_libclang() {
+    fn the_spec_carries_mcu_the_toolchain_libclang_and_the_shared_idf_dir() {
         let plan = esp_plan(&c6(), &BuildOptions::default()).expect("plan");
         let spec = spec_from_parts(
             plan,
             Some(Path::new("/home/x/.rustup/toolchains/esp/bin")),
             Some(Path::new("/home/x/clang/lib")),
+            "global",
             Some("/usr/bin:/bin"),
         );
 
@@ -533,6 +1120,11 @@ mod tests {
             "the toolchain bin must be prepended to the inherited PATH"
         );
         assert_eq!(env("LIBCLANG_PATH").as_deref(), Some("/home/x/clang/lib"));
+        assert_eq!(
+            env("ESP_IDF_TOOLS_INSTALL_DIR").as_deref(),
+            Some("global"),
+            "one ESP-IDF install per machine, not one per project"
+        );
     }
 
     /// And when they cannot be resolved, nothing is emitted for them: an empty `PATH` entry
@@ -541,7 +1133,7 @@ mod tests {
     #[test]
     fn the_spec_omits_environment_it_could_not_resolve() {
         let plan = esp_plan(&c6(), &BuildOptions::default()).expect("plan");
-        let spec = spec_from_parts(plan, None, None, None);
+        let spec = spec_from_parts(plan, None, None, "global", None);
 
         let env = |key: &str| {
             spec.env
@@ -560,6 +1152,47 @@ mod tests {
             "an empty PATH entry would look deliberate"
         );
         assert_eq!(env("LIBCLANG_PATH"), None);
+        assert_eq!(
+            env("ESP_IDF_TOOLS_INSTALL_DIR").as_deref(),
+            Some("global"),
+            "not discovered, so it cannot fail to resolve: the shared install survives even \
+             when nothing else can be found"
+        );
+    }
+
+    /// The shared ESP-IDF install setting: the environment wins, and the default is
+    /// esp-idf-sys's own `global` keyword — the disk argument being that its default
+    /// (`workspace`) is one install per *project* (~5.3 GB here, then ~6.6 GB again for the
+    /// second one).
+    ///
+    /// The **keyword** form is pinned deliberately, because this is not a path: esp-idf-sys
+    /// splits the value on `:` and matches the first part against
+    /// `global`/`workspace`/`out`/`fromenv`/`custom:<dir>`. Passing an absolute path — the
+    /// obvious first attempt, and what this function did in its first version — dies with
+    /// `Matching variant not found`, an error that names neither the variable nor the reason.
+    #[test]
+    fn the_idf_install_dir_defaults_to_global_and_passes_an_override_through() {
+        assert_eq!(
+            esp_idf_tools_install_dir_in(None),
+            "global",
+            "unset: the shared `~/.espressif`, not esp-idf-sys's per-project `workspace`"
+        );
+        assert_eq!(
+            esp_idf_tools_install_dir_in(Some("   ")),
+            "global",
+            "whitespace is not an override"
+        );
+        assert_eq!(
+            esp_idf_tools_install_dir_in(Some("workspace")),
+            "workspace",
+            "a project can take back the per-project behaviour"
+        );
+        assert_eq!(
+            esp_idf_tools_install_dir_in(Some("custom:/cache/espressif")),
+            "custom:/cache/espressif",
+            "a shared cache, CI layer or air-gapped mirror: forwarded verbatim, and the only \
+             form that names a directory to esp-idf-sys"
+        );
     }
 
     /// Sets `SPIRE_PLATFORM_DIR` for the duration and restores it on drop.
@@ -592,7 +1225,8 @@ mod tests {
     /// pinned here is the capability itself, because two of its fields are safety properties:
     /// **no config files** is what stops it shadowing cargo, and the `supports_*` flags are
     /// what make the manager refuse lint/clean/fix *before* routing — each of which would
-    /// otherwise run against the wrong chip.
+    /// otherwise run against the wrong chip. `supports_flash` is the mirror image: the one
+    /// operation this module *is* for, and the flag that lets the manager route it here.
     #[tokio::test]
     async fn the_esp_module_claims_no_config_file_and_refuses_the_operations_it_lacks() {
         let mut module = EspBuildModule::new();
@@ -619,6 +1253,36 @@ mod tests {
                 "'{operation}' must be refused up front, not performed for the wrong chip"
             );
         }
+        assert!(
+            cap.supports_flash,
+            "flash is what this module is for; without the flag the manager refuses every \
+             build_flash before it can route it here"
+        );
+    }
+
+    /// The `Flash` arm answers on its channel with the reason, rather than falling silent.
+    ///
+    /// A silent arm would reach the manager as a *lost channel* — indistinguishable from a
+    /// crash — so the reason has to come back as an error. Proven with no platform, which is the
+    /// first refusal and needs neither a toolchain nor a board.
+    #[tokio::test]
+    async fn the_esp_module_answers_a_flash_it_cannot_perform() {
+        let mut module = EspBuildModule::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        module
+            .handle(BuildModuleMessage::Flash {
+                path: PathBuf::from("/tmp/does-not-matter"),
+                metadata: spire_core::build_types::BuildMetadata::default(),
+                opts: BuildOptions::default(),
+                artifact: None,
+                port: None,
+                reply_to: tx,
+            })
+            .await;
+
+        let result = rx.await.expect("the module replies to Flash");
+        let err = result.expect_err("a flash without a platform must refuse");
+        assert!(err.contains("platform"), "{err}");
     }
 
     /// `run_esp_build`'s three refusals — the whole function minus the invocation.

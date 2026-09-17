@@ -56,6 +56,8 @@ pub mod targeted_edit;
 pub use meson::MesonBuildModule;
 pub mod esp;
 pub use esp::EspBuildModule;
+pub mod embedded_hal_fill;
+pub mod embedded_hal_scaffold;
 pub mod hal_migration;
 pub mod hal_rust_contract;
 pub mod spire_app_scaffold;
@@ -156,6 +158,24 @@ pub enum BuildModuleMessage {
     Fix {
         path: PathBuf,
         metadata: BuildMetadata,
+        reply_to: oneshot::Sender<Result<BuildOutput, String>>,
+    },
+    /// Flash a built artifact onto a device, over USB (e.g. `espflash`).
+    ///
+    /// A separate message rather than a flag on `Build` because it is not a compilation: the
+    /// artifact already exists, the chip comes from `opts.platform`, and the tool is a *host*
+    /// binary. The last leg of contract → drift → fill → cross-build → flash → run.
+    Flash {
+        path: PathBuf,
+        metadata: BuildMetadata,
+        /// `platform` is required and names the chip; `mode` / `package` locate the artifact.
+        opts: BuildOptions,
+        /// An explicit binary to flash. `None` means "the one the build wrote" — which the
+        /// module derives (`target/<triple>/<profile>/<name>`), and refuses when it cannot.
+        artifact: Option<PathBuf>,
+        /// An explicit serial port for the board. `None` means "find the single USB-serial
+        /// device", which is a refusal rather than a prompt when there is not exactly one.
+        port: Option<PathBuf>,
         reply_to: oneshot::Sender<Result<BuildOutput, String>>,
     },
     /// Invoke an LLM-facing tool generically (JSON args/result).
@@ -346,6 +366,13 @@ pub struct ModuleCapability {
     pub supports_format: bool,
     #[serde(default)]
     pub supports_fix: bool,
+    /// Whether this module can `Flash` a built artifact onto a device.
+    ///
+    /// Only a platform module can — the chip and the USB tool are platform facts — so this is
+    /// also what the manager uses to refuse a flash for a project whose platform routes to
+    /// its config file's owner (a Raspberry Pi is still Cargo, and has no flash step).
+    #[serde(default)]
+    pub supports_flash: bool,
 }
 
 // ============================================================================

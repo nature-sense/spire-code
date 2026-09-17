@@ -321,6 +321,7 @@ impl PlanOrchestrator {
             "build_build",
             "build_verify",
             "build_test",
+            "build_flash",
             "build_clean",
             "build_lint",
             "build_format",

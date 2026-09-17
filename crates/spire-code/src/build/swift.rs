@@ -808,6 +808,7 @@ impl Actor for SwiftBuildModule {
                     supports_lint: true,
                     supports_format: true,
                     supports_fix: true,
+                    supports_flash: false,
                     mcp_servers: vec![McpServerDependency {
                         name: "swiftpm-mcp".to_string(),
                         package: "swiftpm-mcp-server".to_string(),
@@ -953,6 +954,13 @@ let package = Package(
                     source_content: sc,
                     ..Default::default()
                 }));
+            }
+
+            // The manager refuses a flash for a module that declared `supports_flash: false`
+            // before routing, so reaching here would mean the capability gate was bypassed —
+            // answer rather than fall silent, so the caller gets an error and not a lost channel.
+            BuildModuleMessage::Flash { reply_to, .. } => {
+                let _ = reply_to.send(Err("flash not supported for this module".to_string()));
             }
 
             BuildModuleMessage::CallTool { reply_to, .. } => {

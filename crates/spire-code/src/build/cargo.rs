@@ -427,6 +427,10 @@ impl CargoBuildModule {
             && content.contains("spire-core")
         {
             spire_core::build_types::ProjectStructure::SpireApp
+        } else if is_workspace && declares_embedded_hal(&content) {
+            // Declared by the workspace itself — see `ProjectStructure::EmbeddedHal` for why
+            // this is a marker rather than a guess at the layout.
+            spire_core::build_types::ProjectStructure::EmbeddedHal
         } else {
             spire_core::build_types::ProjectStructure::default()
         };
@@ -746,6 +750,41 @@ impl CargoBuildModule {
 }
 
 /// Walk up from a Cargo crate directory to find the workspace root and parse
+/// True when a workspace manifest declares the embedded-HAL shape.
+///
+/// ```toml
+/// [workspace.metadata.spire]
+/// structure = "embedded_hal"
+/// ```
+///
+/// Read by hand, like the rest of this module's manifest parsing: a TOML dependency for one key
+/// would be the tail wagging the dog, and the value is written by our own scaffold, so the
+/// tolerance a real parser would buy is not worth a new dependency. The table must match
+/// exactly, so a `structure` key inside some *other* table cannot be mistaken for this one.
+fn declares_embedded_hal(manifest: &str) -> bool {
+    let mut in_spire_metadata = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_spire_metadata = trimmed == "[workspace.metadata.spire]";
+            continue;
+        }
+        if !in_spire_metadata {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("structure") {
+            if let Some(value) = rest.trim_start().strip_prefix('=') {
+                // The enum's own key, so the marker and `ProjectStructure::as_str` cannot
+                // drift apart.
+                return value.trim().trim_matches('"').eq_ignore_ascii_case(
+                    spire_core::build_types::ProjectStructure::EmbeddedHal.as_str(),
+                );
+            }
+        }
+    }
+    false
+}
+
 /// `[workspace.dependencies]` into a name → version lookup map.
 ///
 /// This resolves versions for `{ workspace = true }` inherited dependencies.
@@ -1007,6 +1046,7 @@ impl Actor for CargoBuildModule {
                     supports_lint: true,
                     supports_format: true,
                     supports_fix: true,
+                    supports_flash: false,
                     mcp_servers: vec![McpServerDependency {
                         // In-process tool namespace: the LLM emits
                         // tool_call { server_name: "build/cargo", ... } and
@@ -1233,6 +1273,13 @@ impl Actor for CargoBuildModule {
                 let _ = reply_to.send(result);
             }
 
+            // The manager refuses a flash for a module that declared `supports_flash: false`
+            // before routing, so reaching here would mean the capability gate was bypassed —
+            // answer rather than fall silent, so the caller gets an error and not a lost channel.
+            BuildModuleMessage::Flash { reply_to, .. } => {
+                let _ = reply_to.send(Err("flash not supported for this module".to_string()));
+            }
+
             BuildModuleMessage::CallTool {
                 tool_name,
                 args,
@@ -1281,6 +1328,12 @@ impl CargoBuildModule {
         // SpireApp: Rust/SwiftUI monorepo built on the Spire framework.
         if structure == spire_core::build_types::ProjectStructure::SpireApp {
             return Ok(super::spire_app_scaffold::spire_app_scaffold(project_name));
+        }
+        // Embedded HAL: the contract crate + one backend crate per selected board family. The
+        // platforms are registry ids, so the emitter resolves families (and refuses what it
+        // cannot serve) rather than guessing from the name.
+        if structure == spire_core::build_types::ProjectStructure::EmbeddedHal {
+            return super::embedded_hal_scaffold::embedded_hal_scaffold(project_name, platforms);
         }
         let cross: Vec<&String> = platforms.iter().filter(|p| *p != "host").collect();
         if cross.is_empty() {
@@ -1968,5 +2021,44 @@ mod tests {
             assert_eq!(meta.targets[0].name, "demo");
             assert_eq!(meta.targets[0].kind, vec!["lib"]);
         }
+    }
+
+    /// The scaffold and the recognizer must not drift apart: the workspace the embedded-HAL
+    /// scaffold emits is the workspace this analyzer reads as `EmbeddedHal`.
+    ///
+    /// This is the pairing that matters — the marker is written in one module and read in
+    /// another, and a rename in either would otherwise show up only as a project the wizard
+    /// makes and the app then fails to recognize.
+    #[test]
+    fn embedded_hal_scaffold_is_recognized_by_the_analyzer() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK.lock().unwrap();
+        let reg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            reg.path().join("esp32c6.yaml"),
+            "id: esp32c6\nname: ESP32-C6\nos: esp-idf\nfamily: esp32\narchitecture:\n  \
+             cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
+             target_triple: riscv32imac-esp-espidf\n",
+        )
+        .unwrap();
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        let out = crate::build::embedded_hal_scaffold::embedded_hal_scaffold(
+            "weather",
+            &["esp32c6".to_string()],
+        )
+        .expect("the scaffold emits");
+        let tmp = tempfile::tempdir().unwrap();
+        for f in &out.files {
+            let p = tmp.path().join(&f.path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, &f.content).unwrap();
+        }
+
+        let meta = CargoBuildModule::new().analyze(tmp.path()).unwrap();
+        assert_eq!(
+            meta.structure,
+            spire_core::build_types::ProjectStructure::EmbeddedHal,
+            "the emitted marker must be what the analyzer reads"
+        );
     }
 }

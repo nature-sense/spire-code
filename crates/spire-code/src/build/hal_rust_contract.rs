@@ -12,8 +12,11 @@
 //! `trait_item` and `impl_item` were already mapped in `ast_parser::rust_language_config`, and
 //! `tree-sitter-rust` was already a dependency, so this is wiring rather than new machinery.
 //!
-//! It is deliberately not yet wired into `hal_missing_impls`: that path is proven against C++
-//! and should be extended with the Rust branch beside it rather than rewritten around it.
+//! It is wired into `hal_missing_impls` **beside** the C++ map, not into it: the proven C++
+//! path is what the whole HAL workflow runs on today, and a sibling that produces the same type
+//! cannot put it at risk. The embedded-HAL layout (`crates/<prefix>-hal`, one backend crate per
+//! family) and the C++-style one (`hal/api`, `hal/implementations/<plat>`) are both discovered,
+//! so a project mid-migration measures everything it has.
 
 use tree_sitter::Node;
 
@@ -124,6 +127,49 @@ fn collect_impls(node: Node, content: &str, out: &mut Vec<(String, Vec<String>)>
     }
 }
 
+/// Traits whose `impl` blocks are still **placeholders** — a body containing `unimplemented!()`.
+///
+/// The drift measure above counts a declared method as provided whatever its body, which is what
+/// makes a scaffolded backend "look implemented": every required method is there and none of them
+/// does anything. This is the Rust counterpart of the C++ `SPIRE-HAL-STUB` sentinel, and it is
+/// deliberately the macro rather than a comment of our own: `unimplemented!()` *is* the statement
+/// "not implemented", it panics loudly if reached, and it cannot be deleted by tidying up
+/// comments.
+pub fn placeholder_impls_rust(content: &str) -> Vec<String> {
+    let mut parser = rust_parser();
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_placeholder_impls(tree.root_node(), content, &mut out);
+    out
+}
+
+fn collect_placeholder_impls(node: Node, content: &str, out: &mut Vec<String>) {
+    if node.kind() == "impl_item" {
+        if let (Some(body), Some(trait_node)) = (
+            node.child_by_field_name("body"),
+            node.child_by_field_name("trait"),
+        ) {
+            let body_text = body.utf8_text(content.as_bytes()).unwrap_or("");
+            if body_text.contains("unimplemented!") {
+                let name = trait_node
+                    .utf8_text(content.as_bytes())
+                    .unwrap_or("")
+                    .trim()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                out.push(name);
+            }
+        }
+    }
+    for child in named_children(node) {
+        collect_placeholder_impls(child, content, out);
+    }
+}
+
 /// **The drift measure for Rust**: contract methods with no implementation.
 ///
 /// A trait with no `impl` at all reports all of its required methods, which is the case the
@@ -161,6 +207,89 @@ use crate::build::generic_helpers::HalInterfaceCoverage;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// A contract stem and the traits declared in its file: `time.rs` → `[("DelayMs", ["delay_ms"])]`.
+///
+/// The trait names are carried alongside the stem because the stem is only the *file's* name. The
+/// reference workspace's `time.rs` declares `DelayMs`, and matching an impl against the stem alone
+/// reports an implementation that exists as missing — the one failure that makes a fill rewrite
+/// what is already there.
+pub type RustContract = Vec<(String, Vec<String>)>;
+
+/// The **embedded-HAL** layout: a contract crate (`crates/<prefix>-hal`) and one backend crate
+/// per board family (`crates/<prefix>-hal-<family>`) — the shape the `embedded-hal` project type
+/// scaffolds.
+///
+/// Naming is the discovery here, exactly as it is for the C++ path (`hal/implementations/<plat>`)
+/// and for the same reason: the crate *is* the backend, so its name is the only place the family
+/// is written down. `-std` is excluded **by convention**: it is the shared executor crate (the
+/// `Spawner`/`Mailbox`/`Actor` infrastructure, present for any std family), not a board family,
+/// so measuring it as a coverage platform would report infrastructure traits as board gaps.
+///
+/// Returns `(contract stems → their traits, family → its `src` directory)`.
+pub fn embedded_hal_layout(
+    root: &Path,
+) -> (BTreeMap<String, RustContract>, BTreeMap<String, PathBuf>) {
+    let mut contracts: BTreeMap<String, RustContract> = BTreeMap::new();
+    let mut backends: BTreeMap<String, PathBuf> = BTreeMap::new();
+
+    let Ok(entries) = std::fs::read_dir(root.join("crates")) else {
+        return (contracts, backends);
+    };
+    // Read the crate names once: the contract crate is `<prefix>-hal`, and its backends are
+    // found by that prefix rather than by a second naming rule.
+    let names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+
+    for name in &names {
+        if !name.ends_with("-hal") {
+            continue;
+        }
+        // The contract's traits: `crates/<prefix>-hal/src/hal/*.rs`, stem-keyed like the C++ set.
+        let trait_dir = root.join("crates").join(name).join("src").join("hal");
+        if let Ok(entries) = std::fs::read_dir(&trait_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let traits: RustContract = required_trait_methods_rust(&content)
+                    .into_iter()
+                    .filter(|(_, methods)| !methods.is_empty())
+                    .collect();
+                // `hal/mod.rs` re-exports rather than declares, so it contributes nothing.
+                if traits.is_empty() {
+                    continue;
+                }
+                contracts.insert(stem.to_string(), traits);
+            }
+        }
+        // Its backends: `crates/<prefix>-hal-<family>/src`.
+        for candidate in &names {
+            let Some(family) = candidate.strip_prefix(&format!("{name}-")) else {
+                continue;
+            };
+            if family == "std" {
+                continue;
+            }
+            let src = root.join("crates").join(candidate).join("src");
+            if src.is_dir() {
+                backends.insert(family.to_string(), src);
+            }
+        }
+    }
+
+    (contracts, backends)
+}
+
 /// The Rust HAL's coverage map, in the same shape as `hal_platform_coverage_map`.
 ///
 /// A **sibling** to that C++ function rather than a branch inside it. The C++ path is proven
@@ -172,8 +301,9 @@ pub fn rust_platform_coverage_map(
 ) -> BTreeMap<String, BTreeMap<String, HalInterfaceCoverage>> {
     // 1. Contracts: `hal/api/*.rs` (and the toolkit mirror). The file STEM is the interface
     //    key, matching the C++ convention — so `led.rs` is the `led` interface whatever its
-    //    trait happens to be called.
-    let mut contracts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    //    trait happens to be called. The traits are kept with it, because the key is a file name
+    //    and the match has to be against the trait.
+    let mut contracts: BTreeMap<String, RustContract> = BTreeMap::new();
     for dir in [
         root.join("hal").join("api"),
         root.join("toolkit").join("src").join("hal").join("api"),
@@ -192,17 +322,22 @@ pub fn rust_platform_coverage_map(
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let required: Vec<String> = required_trait_methods_rust(&content)
-                .into_iter()
-                .flat_map(|(_, methods)| methods)
-                .collect();
             // A file with no trait, or a trait with no required methods, is not a contract.
-            if required.is_empty() {
+            let traits: RustContract = required_trait_methods_rust(&content)
+                .into_iter()
+                .filter(|(_, methods)| !methods.is_empty())
+                .collect();
+            if traits.is_empty() {
                 continue;
             }
-            contracts.insert(stem.to_string(), required);
+            contracts.insert(stem.to_string(), traits);
         }
     }
+    // The embedded-HAL layout contributes contracts of its own: same stem-keyed shape, different
+    // tree (`crates/<prefix>-hal/src/hal/*.rs`). Merged rather than branched so a project mid-way
+    // between the two layouts still measures everything it has.
+    let (rust_contracts, rust_backends) = embedded_hal_layout(root);
+    contracts.extend(rust_contracts);
     if contracts.is_empty() {
         return BTreeMap::new();
     }
@@ -253,12 +388,21 @@ pub fn rust_platform_coverage_map(
         }
     }
 
+    // 2b. embedded-HAL backends: one crate per board family, keyed by the family the crate name
+    //     names. Insert-if-absent like the C++ discovery above, so a project that has both a
+    //     `hal/implementations/esp32` and a `crates/…-hal-esp32` measures the canonical one.
+    for (family, dir) in rust_backends {
+        platform_dirs.entry(family).or_insert(dir);
+    }
+
     // 3. Coverage per platform × interface.
     let mut coverage: BTreeMap<String, BTreeMap<String, HalInterfaceCoverage>> = BTreeMap::new();
     for (plat, dir) in platform_dirs {
         // Every trait this platform implements and what it provides — read once per platform
         // rather than once per contract.
         let mut impls: Vec<(String, Vec<String>)> = Vec::new();
+        // Traits whose impl bodies are still `unimplemented!()` — the scaffold's placeholders.
+        let mut placeholders: Vec<String> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -267,43 +411,61 @@ pub fn rust_platform_coverage_map(
                 }
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     impls.extend(extract_impl_methods_rust(&content));
+                    placeholders.extend(placeholder_impls_rust(&content));
                 }
             }
         }
-        // The trait may be capitalised while the stem is not (`led.rs` → `trait Led`), so the
-        // match is case-insensitive. The C++ path gets the same freedom from file stems.
-        let provided_for = |stem: &str| -> Vec<String> {
+        // The match is **trait-name first, stem second**. The stem is a file name: this
+        // workspace's `time.rs` declares `DelayMs` and its `camera_hal.rs` would declare
+        // `CameraHal`, so matching the stem alone reports impls that exist as missing — and the
+        // fill flow then rewrites what is already there. The stem stays as the fallback for the
+        // case where an impl is written for the interface rather than for the trait.
+        let matches = |impl_trait: &str, stem: &str, traits: &RustContract| -> bool {
+            impl_trait.eq_ignore_ascii_case(stem)
+                || traits
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(impl_trait))
+        };
+        let provided_for = |stem: &str, traits: &RustContract| -> Vec<String> {
             impls
                 .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case(stem))
+                .filter(|(name, _)| matches(name, stem, traits))
                 .flat_map(|(_, methods)| methods.clone())
                 .collect()
         };
 
         let mut iface_map: BTreeMap<String, HalInterfaceCoverage> = BTreeMap::new();
-        for (stem, required) in &contracts {
-            let provided = provided_for(stem);
+        for (stem, traits) in &contracts {
+            let required: Vec<String> = traits
+                .iter()
+                .flat_map(|(_, methods)| methods.clone())
+                .collect();
+            let provided = provided_for(stem, traits);
             let missing: Vec<String> = required
                 .iter()
                 .filter(|method| !provided.contains(method))
                 .cloned()
                 .collect();
+            // A placeholder is not coverage. The scaffold's stub declares every required method
+            // and implements none of them, so "an impl exists" is true while "implemented" must
+            // still be false — this is the Rust reading of the C++ `SPIRE-HAL-STUB` sentinel, and
+            // without it a freshly scaffolded backend would report as complete and the fill queue
+            // would be empty exactly when it should be full.
+            let is_stub = placeholders.iter().any(|name| matches(name, stem, traits));
             iface_map.insert(
                 stem.clone(),
                 HalInterfaceCoverage {
-                    implemented: missing.is_empty(),
+                    implemented: missing.is_empty() && !is_stub,
                     // `has_impl` asks whether the trait is implemented AT ALL, not whether any
                     // method was found: `impl Led for X {}` is a real (partial) impl, and
                     // conflating it with "no impl" would send the fill flow off to scaffold a
                     // type that already exists. Its own test caught exactly that.
-                    has_impl: impls
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case(stem)),
-                    is_stub: false,
+                    has_impl: impls.iter().any(|(name, _)| matches(name, stem, traits)),
+                    is_stub,
                     missing,
-                    // No Rust fill path exists yet, so signatures are not collected. Leaving
-                    // them empty is honest; inventing blank ones would look like a contract
-                    // that had been read and found complete.
+                    // Signatures are not collected here: the Rust fill prompt carries the whole
+                    // contract file instead, so a signature list would be a second, thinner copy
+                    // of what the model is given. Left empty rather than guessed at.
                     missing_sigs: Vec::new(),
                     drifted: Vec::new(),
                 },
@@ -440,6 +602,155 @@ pub trait Led {
         // The interface key is the file STEM, matching the C++ convention — which is exactly
         // what lets both languages land in one map.
         assert!(map["esp32c6"].contains_key("led"));
+    }
+
+    /// Only the trait whose *own* impl block is a placeholder is reported as one. The C++ sentinel
+    /// can be per file because a file is one interface; a Rust backend file holds every trait it
+    /// implements, so "pending" has to be per `impl`.
+    #[test]
+    fn only_the_placeholder_trait_is_reported_as_one() {
+        let src = "impl Led for GpioLed {\n    fn set(&mut self, _on: bool) {\n        unimplemented!(\"set\")\n    }\n}\n\n\
+                   impl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, _ms: u32) {}\n}\n";
+        assert_eq!(placeholder_impls_rust(src), vec!["Led".to_string()]);
+    }
+
+    /// …and a backend file that has been filled in reports no placeholder at all.
+    #[test]
+    fn a_filled_impl_is_not_a_placeholder() {
+        let src = "impl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n";
+        assert!(placeholder_impls_rust(src).is_empty());
+    }
+
+    /// The **embedded-HAL** layout: a contract crate (`crates/<prefix>-hal/src/hal/*.rs`) and one
+    /// backend crate per family (`crates/<prefix>-hal-<family>`). This is what the `embedded-hal`
+    /// project type scaffolds — the C++ layout the measure was written for does not exist there, so
+    /// without this discovery a scaffolded project would report zero coverage rows, i.e. nothing to
+    /// fill, exactly when every file is a stub.
+    #[test]
+    fn the_embedded_hal_layout_is_measured_by_crate_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/demo-hal/src/hal")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal/src/hal/led.rs"),
+            "pub trait Led {\n    fn set(&mut self, on: bool);\n}\n",
+        )
+        .unwrap();
+        // `hal/mod.rs` re-exports; it declares no contract and must not become an interface.
+        std::fs::write(
+            root.join("crates/demo-hal/src/hal/mod.rs"),
+            "pub mod led;\npub use led::Led;\n",
+        )
+        .unwrap();
+        // The scaffold's stub verbatim: the trait IS implemented and the method IS declared, so
+        // syntax alone would call this complete.
+        std::fs::create_dir_all(root.join("crates/demo-hal-esp32/src")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal-esp32/src/lib.rs"),
+            "impl Led for GpioLed {\n    fn set(&mut self, _on: bool) {\n        unimplemented!(\"GpioLed::set\")\n    }\n}\n",
+        )
+        .unwrap();
+        // The shared executor is a crate of the same prefix and must not become a platform.
+        std::fs::create_dir_all(root.join("crates/demo-hal-std/src")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal-std/src/lib.rs"),
+            "// the executor\n",
+        )
+        .unwrap();
+
+        let map = rust_platform_coverage_map(root);
+        assert_eq!(
+            map.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["esp32"],
+            "one family, and `std` is not one: {map:?}"
+        );
+
+        let led = &map["esp32"]["led"];
+        assert!(led.has_impl, "the backend declares the impl");
+        assert!(led.is_stub, "…and its body is a placeholder");
+        assert!(
+            !led.implemented,
+            "a placeholder is not coverage — the fill queue must not be empty here"
+        );
+        assert!(
+            led.missing.is_empty(),
+            "the method is declared, just not written: {:?}",
+            led.missing
+        );
+    }
+
+    /// Once the body is real the same file is coverage — the placeholder is the *body*, so filling
+    /// it is what clears the flag (nothing has to remember to remove a marker).
+    #[test]
+    fn writing_the_body_clears_the_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/demo-hal/src/hal")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal/src/hal/led.rs"),
+            "pub trait Led {\n    fn set(&mut self, on: bool);\n}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/demo-hal-rp2040/src")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal-rp2040/src/lib.rs"),
+            "impl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let cov = &rust_platform_coverage_map(root)["rp2040"]["led"];
+        assert!(!cov.is_stub, "a real body is not a placeholder");
+        assert!(cov.implemented, "and it counts as coverage");
+        assert!(cov.has_impl);
+    }
+
+    /// **The stem is a file name, not the trait's name.** The reference workspace's `time.rs`
+    /// declares `DelayMs`, and this was caught by running the fill plan against that workspace:
+    /// matching the stem alone reported a real implementation as `none` — the one failure that
+    /// makes a fill rewrite code that is already there. Both directions are pinned here because
+    /// the scaffold emits this exact pair (`hal/time.rs` declaring `DelayMs`).
+    #[test]
+    fn a_trait_whose_name_differs_from_its_stem_still_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/demo-hal/src/hal")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal/src/hal/time.rs"),
+            "pub trait DelayMs {\n    fn delay_ms(&mut self, ms: u32);\n}\n",
+        )
+        .unwrap();
+
+        // One family has it written, the other still has the scaffold's placeholder.
+        std::fs::create_dir_all(root.join("crates/demo-hal-esp32/src")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal-esp32/src/time.rs"),
+            "impl DelayMs for FreeRtosDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/demo-hal-rp2040/src")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal-rp2040/src/lib.rs"),
+            "impl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, _ms: u32) {\n        unimplemented!(\"FamilyDelay::delay_ms\")\n    }\n}\n",
+        )
+        .unwrap();
+
+        let map = rust_platform_coverage_map(root);
+
+        let esp32 = &map["esp32"]["time"];
+        assert!(
+            esp32.has_impl,
+            "the impl exists, whatever the file is called: {esp32:?}"
+        );
+        assert!(esp32.implemented, "and it is written: {esp32:?}");
+        assert!(!esp32.is_stub);
+
+        let rp2040 = &map["rp2040"]["time"];
+        assert!(rp2040.has_impl, "the placeholder is still an impl");
+        assert!(
+            rp2040.is_stub,
+            "named by its trait, not its stem: {rp2040:?}"
+        );
+        assert!(!rp2040.implemented);
     }
 
     /// A project with no Rust contracts contributes an empty map, so merging it into the C++

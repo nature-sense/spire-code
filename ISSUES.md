@@ -396,7 +396,7 @@ projects**: a project depends on `spire-hal` and never on a vendor SDK.
       rustc silently uses stable, and `-Z` then fails with an error about a *flag*), plus
       `source ~/export-esp.sh` for LIBCLANG_PATH. Rationale and the three failed attempts are
       in that repo's README, since each failure names something other than its real cause.
-- [ ] 8c. Platform + build. **The variant is a compile-time property, so: one YAML per
+- [x] 8c. Platform + build. **The variant is a compile-time property, so: one YAML per
       chip, not one per family.** esp32c6 ≠ esp32 — different target triple, different
       `IDF_TARGET`, different cargo feature, and Xtensa vs RISC-V are different toolchains
       entirely, so a variant is a distinct cross-compilation target in exactly the way rpi5
@@ -415,12 +415,25 @@ projects**: a project depends on `spire-hal` and never on a vendor SDK.
       `esp-idf-sys` reads. The same source confirms every triple used here: esp32 →
       `xtensa-esp32-espidf`, esp32s3 → `xtensa-esp32s3-espidf`, esp32c6 →
       `riscv32imac-esp-espidf`, and esp32p4 → `riscv32imafc-esp-espidf` (note the `f`).
-      **The platform half of this is done** (`platform.rs` + codec + seeds for esp32, esp32s3,
-      esp32c6, esp32p4 — all validated, and the p4 entry compiles through to the backend).
-      What remains is the **build half**: an `EspBuildModule` that emits the invocation above
-      (`-Zbuild-std=std,panic_abort`, espup's `esp` toolchain, `source ~/export-esp.sh` for
-      LIBCLANG_PATH) and a host-side USB `espflash` step. Note for it: **ESP-IDF is built per
-      MCU**, so the first build for a new chip costs minutes while later ones are seconds.
+      **Done (2026-09-16): both halves.** Platform: `platform.rs` + codec + seeds for esp32,
+      esp32s3, esp32c6, esp32p4 — all validated, and the p4 entry compiles through to the
+      backend. Build: `build/esp.rs` (11 tests) emits the invocation above — espup's `esp`
+      toolchain prepended to `PATH` (cargo finding its own `rustc` silently picks stable, and
+      `-Zbuild-std` then fails complaining about a *flag*), `LIBCLANG_PATH` globbed out of the
+      versioned esp-clang dir, `MCU` from the platform — and registers **by platform**
+      (`AddPlatformModule { os: "esp-idf" }`) so it cannot shadow cargo for ordinary Rust
+      projects. The flash leg is reachable end to end: `build_flash { path, platform, … }` →
+      `BuildManager::flash_project` → `Flash` → `run_esp_flash` → host
+      `espflash flash --chip <chip> <artifact>`. The artifact is **derived, not guessed**
+      (`target/<triple>/<profile>/<package>`, the package from `opts.package` else
+      `[package] name`), and a refusal for every gap — missing or unknown platform, not
+      esp-idf, no flash tool, unnamed binary, artifact not built — fires *before* any device is
+      touched. `supports_flash` on
+      `ModuleCapability` applies the same up-front-refusal rule as clean/lint/format/fix, so a
+      `build_flash` for a board with no flash step is refused by name instead of being routed to
+      a module whose silence would surface as a lost channel.
+      Note: **ESP-IDF is built per MCU**, so the first build for a new chip costs minutes while
+      later ones are seconds.
 - [x] 8d. The Rust drift measure — `build/hal_rust_contract.rs`. tree-sitter-rust was already
       a dependency and `trait_item`/`impl_item` already mapped in `rust_language_config`, so
       this was wiring rather than new machinery: `missing_trait_methods_rust(contract, impl)`
@@ -431,9 +444,193 @@ projects**: a project depends on `spire-hal` and never on a vendor SDK.
       inherent `impl Foo` is not a contract and does not satisfy one; and
       `impl hal::Led for X` must match `trait Led` by its last path segment. A trait with no
       impl at all reports every required method — the cascade's starting state. 7 tests.
-      **Not yet wired into `hal_missing_impls`**: that path is proven against C++ and gets the
-      Rust branch *beside* it rather than a rewrite around it.
+      **Wired into `hal_missing_impls` as a sibling, not a rewrite**: the C++
+      `hal_platform_coverage_map` is untouched and `build_manager.rs` merges
+      `rust_platform_coverage_map` into the same map, because a project mid-migration
+      legitimately has both. Same conventions deliberately — contracts in `hal/api` plus the
+      toolkit mirror, the file **stem** as the interface key (which is what lets `led.rs` and
+      `camera.hpp` land in one map), canonical and legacy platform dirs, and the
+      `has_impl`/`implemented` split the fill flow branches on. `missing_sigs` is empty on
+      purpose: no Rust fill path exists yet, and blank signatures would look like a contract
+      that had been read and found complete.
       This is what makes the embedded work HAL-*based* rather than merely Rust: with it, the
       same cascade (contract → drift → fill → cross-build → flash → run) closes on firmware.
+
+### 8, on hardware (2026-09-16): the cascade ran against a real ESP32
+
+Board: **ESP32 rev v3.0** (M5Stack Core2), 16 MB flash, on `/dev/cu.usbserial-569C0028661`;
+firmware: `spire-hal/examples/blink-esp32`; platform: the `esp32` registry entry
+(`xtensa-esp32-espidf`). `build_flash` was driven through the app's own tool path
+(`spire_rpc.py`-style → FFI → `tools/call`) and flashed the board: `espflash flash --chip
+esp32 --non-interactive --port /dev/cu.usbserial-569C0028661 <elf>` → exit 0, then the serial
+console showed the actor loop (`blink: on` / `blink: off`). Two real bugs fell out of doing
+it, both fixed:
+
+- **`build_build` ignored the platform when routing.** `build_project_with_events` — the path
+  a UI Build click and a `build_build` tool call share — called `module_tx_for(config, None)`,
+  so an ESP32 build went to the **cargo** module while the batch `build_project` sent the same
+  request to the esp module. Two paths, two answers. Pinned by
+  `build_build_routes_by_platform_not_to_the_config_owners_module`: two fake modules stamp a
+  distinct `command`, and the stored analysis is faked at the `GetConfig` boundary — so it
+  needs no memory graph, toolchain or board, and it was verified to *fail* (`cargo-build`) with
+  the bug reintroduced.
+- **espflash cannot see a plain USB-serial adapter.** `espflash list-ports` reports *no known
+  serial ports* for this board while `--port /dev/cu.usbserial-…` connects fine, and its
+  fallback is an interactive prompt — which a `tools/call` cannot answer, so the un-flagged
+  command dies with `IO error: not a terminal`. The flash command now always passes
+  `--non-interactive` and names the port, discovered as the single USB-serial device
+  (`serial_port_in`, refusing when there are none or several), with `port=` / `$ESPFLASH_PORT`
+  as escape hatches.
+
+**Resolved (2026-09-16): the example was missing its `build.rs`.** The link died in `ldproxy`
+with *Cannot locate argument '--ldproxy-linker <linker>'* because **no crate re-emitted the
+link args for the binary**. `esp-idf-sys` does the real ESP-IDF build and *propagates* what it
+learned (`--ldproxy-linker`, the IDF linker script, the lib dirs, kconfig as `#[cfg]`) as
+`DEP_ESP_IDF_*` **metadata**; `esp-idf-hal`'s build script relays that onward as
+`DEP_ESP_IDF_HAL_*` — but a `rustc-link-arg` from a build script applies to the *emitting*
+package's own targets, which is why esp-idf-hal's `output()` is documented as "only necessary
+for building the examples". The documented one-liner for a binary crate that depends on
+esp-idf-sys/-hal/-svc is a `build.rs` containing `embuild::espidf::sysenv::output()`, and the
+blink example did not have one. Added, with `[build-dependencies] embuild = "0.33"` (the
+version esp-idf-sys already pulls in).
+
+Measured after the fix, cold and through the app: `build_build` → `cargo build --target
+xtensa-esp32-espidf -Zbuild-std=std,panic_abort --release`, exit 0, then `build_flash` → exit 0
+→ the serial console showing the actor loop. No workaround, no injected RUSTFLAGS.
+
+Two notes for the next person: an earlier version of this entry blamed a cargo propagation
+quirk — that was wrong, the mechanism above is the whole story, and the "minimal repro" it
+cited did not measure what it claimed. And the args being absent is *invisible* until the
+link, so a project like this fails with an error that names neither the crate nor the missing
+file; anyone scaffolding an esp project should emit this `build.rs` (spire-code has no esp
+project scaffold today — the example is hand-written).
+
+**Disk: one ESP-IDF install per machine, not per project** (2026-09-16). `esp-idf-sys` defaults
+to `<workspace>/.embuild/espressif`, which had installed the framework, its build tools, a
+Python env and an archive cache **twice** on this machine: ~5.3 GB for the `spire-hal` workspace
+and ~6.6 GB again for the detached `blink-esp32` example — because the example is its own
+workspace. `EspBuildModule` now sets `ESP_IDF_TOOLS_INSTALL_DIR` on every esp build — to
+esp-idf-sys's keyword `global` (its standard `~/.espressif`) unless the environment already names
+something, in which case that value is forwarded verbatim. It is a **keyword, not a path**:
+esp-idf-sys splits the value on `:` and matches `global` / `workspace` / `out` / `fromenv` /
+`custom:<dir>`, so passing an absolute path fails with `Matching variant not found` — an error
+naming neither the variable nor the reason, and exactly what the first version of this code did.
+`custom:<dir>` is how a machine points it at a shared cache or CI layer; `workspace` takes back
+the per-project behaviour. Switching is a one-time cost, and it
+can be made offline: seeding `<dir>/dist` with the tool archives (`*.tar.xz` from a previous
+`.embuild/espressif/dist`) turns the install into an extract rather than a download, and
+`idf_path`/`$IDF_PATH` covers the ESP-IDF clone itself. The espup toolchain (~1.6 GB: rustc for
+`-Zbuild-std` plus its own Xtensa C compiler and clang) is already per-user and unaffected.
+
+Measured after the switch: both project-local trees deleted (**11.9 GB reclaimed**), the shared
+`~/.espressif` 7.0 GB, and a **cold** rebuild driven through the app — `cargo clean` first, so std,
+every dependency and the esp32 ESP-IDF build all ran from scratch — succeeded in **84 s**, leaving
+`<workspace>/.embuild` empty: nothing re-downloaded, nothing re-installed per project. That same
+build was then flashed onto the board through `build_flash` and the console showed the actor loop
+(`blink: on` / `blink: off`), so the shared install costs nothing at runtime either.
+
+Two gotchas worth knowing. (1) The IDF cmake cache under
+`target/<triple>/<profile>/build/esp-idf-sys-*/out` records the IDF **source path**, so the first
+build after changing the directory fails with *"The source … does not match the source … used to
+generate cache"* until that build-script output is removed (`rm -rf
+target/<triple>/<profile>/build/esp-idf-sys-*`). (2) The setting is a keyword, not a path — see
+above; an absolute path is the obvious wrong answer and its error names neither variable nor value.
+
+## 9. The `embedded-hal` project type — one contract, N board families
+
+What this is: a **new create-project type** in the wizard that interactively builds a
+firmware HAL the way the existing *cross-platform with HAL* type builds a C++ one — contract
+first, then a scaffold and a fill per platform — but for Rust, with the contract a set of
+`trait`s and each platform a **backend crate**. The target repo shape is the `spire-hal`
+sibling (`spire-hal` contract + `spire-hal-std` executor + `spire-hal-esp32` / `spire-hal-rp2040`
+backends), and the multi-platform claim is true from day one: **esp32 family + rp2040**.
+
+The analogy, so the shape is obvious: contract ⇄ `hal/api/*.hpp`; impl ⇄ a backend crate;
+`meson.build` wiring ⇄ `Cargo.toml` + `.cargo/config.toml` + `build.rs`; and the drift measure
+already exists on both sides (`extract_contract_methods_cpp`, `missing_trait_methods_rust`,
+merged in `hal_missing_impls`). Reused as-is: the `createProject/*` wizard pipeline, the
+`ScaffoldSpec`/`ScaffoldFile` structural-vs-fillable contract, and `EspBuildModule` for the esp
+build/flash leg.
+
+- [x] 9a. **Platform model carries the HAL hints** (done 2026-09-17). `Platform` gained
+      `library_hints` — the free-text "use this SDK / these peripherals / no radio on this
+      variant" block the YAML already had and the C++ impl prompt already consumed — so the
+      wizard can *show* it while a platform is chosen and the Rust fill prompt can inject it.
+      It is persisted as its own typed property (`platform_codec`) and re-seeded on every
+      startup, so existing graphs pick it up without a migration. `Platform::is_embedded()`
+      (`os` ∈ esp-idf, rp2040) is the filter the picker needs; `os` rather than a new field
+      because `os` is what the *build* already keys on. `hal_platform_library_hints` reads the
+      typed field first and the raw YAML second, so a hand-written partial YAML still yields its
+      hint. Verified through the app: `platforms/list` returns all seven seeds with their hints,
+      and the four esp variants report `embedded=true` while the Linux cross-targets do not.
+- [x] 9b. **Type + recognition + scaffold** (done 2026-09-17). `ProjectStructure::EmbeddedHal`
+      (`"embedded_hal"`) is recognized by a **declared** marker rather than a layout guess:
+      `[workspace.metadata.spire] structure = "embedded_hal"` in the workspace manifest, read by
+      `cargo.rs::declares_embedded_hal` — hand-parsed like the rest of that module, since a TOML
+      dependency for one key is the tail wagging the dog. The emitter
+      (`build/embedded_hal_scaffold.rs`) writes the workspace, the contract crate
+      (`actor::{Actor, Mailbox, SendError, Spawner}`, `HalError`, `Led`, `DelayMs`), the std
+      executor (a real `QueueMailbox`/`StdSpawner` over `std::sync::mpsc`), and **one backend
+      crate per family** with its manifest plus a fillable `unimplemented!()` stub. It refuses by
+      name on an unknown platform, a platform that is not embedded, and a family no backend is
+      known for (today: esp32, rp2040) — a backend crate that cannot build is worse than none.
+      Two invariants are encoded *and tested*: **variants collapse to families** (esp32c6 +
+      esp32s3 → one `-esp32` crate, because the chip is `MCU` + `--target`, not a feature), and a
+      `std` family reuses the shared executor while a `no_std` one is told to supply its own
+      `Spawner`. Verified: the emitted scaffold's contract + executor build with **zero warnings**
+      and no cross toolchain (`default-members` excludes the backends), and a test runs the
+      emitter and then `analyze` to prove the marker written in one module is the marker read by
+      another. Backend *builds* wait on 9c/9d (the fill, and the rp2040 platform).
+- [ ] 9c. **Rust contract authoring + fill, hint-injected.** The Rust analogues of the `hal_*`
+      tools (`_validate/_write_contract`, `_add_platform`, `_fill_plan/_fill_apply`,
+      `_missing_impls`) whose prompts read the platform's `library_hints` (+ a Rust hardware
+      profile) so a generated `impl` uses that board's real peripherals. Half done — the measure
+      and the plan, which are the two pieces the rest builds on:
+      - **The measure reads the new layout, and a stub is not coverage** (done 2026-09-17).
+        `rust_platform_coverage_map` now knows the embedded-HAL tree as well as the C++ one:
+        contracts from `crates/<prefix>-hal/src/hal/*.rs` (the same stem-keyed interface
+        convention, so both layouts merge into one map) and backends from
+        `crates/<prefix>-hal-<family>/src`, keyed by **family**. `-std` is excluded by convention
+        — it is the shared executor crate, not a board family. Without this the measure found
+        *nothing* in a scaffolded project, which is the one project it most needed to see.
+        Placeholders are recognized **per `impl`** by `unimplemented!()` in the body
+        (`placeholder_impls_rust`): the scaffold declares every required method, so syntax alone
+        reported a fresh backend as `implemented` — the fill queue was empty exactly when it
+        should be full. `implemented` is now `missing.is_empty() && !is_stub`, so
+        `hal_missing_impls` reports `stub` and the Swift maturity label (which reads `is_stub`)
+        shows it without a UI change. Four tests pin the scaffold's own stub, the same file once
+        filled, `-std` not becoming a platform, and `hal/mod.rs` not becoming an interface.
+        Running the plan against the **real `spire-hal` workspace** then caught what tests shaped
+        like the scaffold could not: that workspace's `time.rs` declares `DelayMs`, so matching the
+        stem alone reported a written implementation as `none` — the one failure that makes a fill
+        rewrite code that is already there. The match is now **trait-name first, stem second** (a
+        contract keeps its traits beside its stem key, in both layouts), and the plan names the file
+        that **holds** each impl rather than assuming `lib.rs`, because the reference workspace
+        splits its backends into `led.rs`/`time.rs`. Re-run against that workspace: one injected
+        `unimplemented!()` yields exactly one item, on that file, with the platform's real hints.
+      - **`embedded_hal_fill_plan`** (done 2026-09-17). One item per backend **file** that still
+        owes something: family, crate, file, the pending traits with status
+        (`none`/`stub`/`partial`)
+        and the constrained prompt — plus a `refused[]` entry for a family with no vendor facts,
+        the same refusal the scaffold makes rather than a prompt that would invent an API. The
+        prompt injects the platform's `library_hints`, a hardware profile (board/chip/target/os/
+        runtime/vendor crate), each pending contract's source, the file's current source, and the
+        rules that keep the answer inside this file and this vendor's API. Read-only: the plan is
+        the reviewed artefact, and the same measure the UI reads feeds it, so the two cannot
+        disagree. `_fill_apply` (send the prompt, write the file),
+        `_validate/_write_contract` and `_add_platform` for Rust are still open, and the UI cannot
+        reach the plan until 9e.
+- [ ] 9d. **rp2040 platform + build/flash.** A registry entry (`os: rp2040`,
+      `family: rp2040`, `target: thumbv6m-none-eabi`, flash via `elf2uf2`/`probe-rs`, its own
+      `library_hints`) and an rp2040 build module — no `-Zbuild-std`, no ESP-IDF.
+- [ ] 9e. **UI.** "Embedded HAL (Rust)" in `ProjectWizardView` with an embedded-platform
+      multi-select showing each platform's hints, and `HALVerificationPortal` showing Rust drift
+      per backend.
+
+Design notes worth keeping: the contract stays **`no_std`** and **synchronous** (`Spawner` is
+the backend's only obligation, so the rp2040 backend supplies its own synchronous scheduler and
+does not depend on `spire-hal-std`); backends are per **family**, not per chip (the chip is the
+`MCU` env var, the triple is the variant); and the contract grows a trait only when a *second*
+family needs it.
 
 

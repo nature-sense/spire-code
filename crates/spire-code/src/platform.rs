@@ -79,6 +79,17 @@ pub struct Platform {
     /// trip over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rust: Option<PlatformRust>,
+    /// Free-text notes about this platform's SDKs, drivers and constraints, used to **focus**
+    /// a generated implementation.
+    ///
+    /// Already present in the registry YAML (`library_hints:`) and already fed to the C++ HAL
+    /// implementation prompt. Typed here because the other two consumers need it *from the
+    /// platform* rather than from a second parse of the YAML: the create-project wizard shows
+    /// it while a platform is chosen, and the Rust HAL fill prompt injects it to constrain
+    /// what an `impl` is allowed to use. Free-form on purpose — it is guidance for a model,
+    /// not a schema, and pinning prose to a shape would only make it worse to write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_hints: Option<String>,
 }
 
 /// How Spire reaches a board to run things on it (`device:` in the platform
@@ -217,6 +228,16 @@ pub struct PlatformSysroot {
 const SYSROOT_TOKEN: &str = "${SYSROOT}";
 
 impl Platform {
+    /// True for a board a firmware project targets; false for a host or a Linux cross-target.
+    ///
+    /// Keyed on `os` rather than a new field, because `os` is what the *build* already keys on
+    /// (an esp-idf build is not a C cross-compile; an rp2040 one has no OS at all), and a
+    /// second taxonomy could only disagree with the first. It is what the create-project
+    /// wizard filters on to offer embedded platforms for the embedded-HAL project type.
+    pub fn is_embedded(&self) -> bool {
+        matches!(self.os.as_str(), "esp-idf" | "rp2040")
+    }
+
     /// Load a platform definition from a YAML file.
     pub fn load(path: impl AsRef<Path>) -> Result<Platform> {
         let path = path.as_ref();
@@ -561,6 +582,36 @@ impl CrossSpec {
         })
     }
 }
+/// Set `SPIRE_PLATFORM_DIR` for a test and restore it on drop.
+///
+/// The variable is process-global, so a test using this must hold
+/// [`crate::PLATFORM_DIR_TEST_LOCK`] for its whole body; the guard only owns the value, which is
+/// the part that is easy to forget to restore. A hermetic platform registry is how a test can
+/// name a family the machine does not have (an rp2040 today) without depending on the user's
+/// `~/.spire/platforms`.
+#[cfg(test)]
+pub(crate) struct PlatformDirGuard {
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl PlatformDirGuard {
+    pub(crate) fn set(dir: impl AsRef<Path>) -> Self {
+        let previous = std::env::var("SPIRE_PLATFORM_DIR").ok();
+        std::env::set_var("SPIRE_PLATFORM_DIR", dir.as_ref());
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PlatformDirGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(prev) => std::env::set_var("SPIRE_PLATFORM_DIR", prev),
+            None => std::env::remove_var("SPIRE_PLATFORM_DIR"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -798,6 +849,40 @@ sysroot:
         );
     }
 
+    /// "Is this an embedded platform" is what the create-project wizard filters on to offer
+    /// platforms for the **embedded-HAL** project type, so it must answer for both families we
+    /// ship and must not claim a Linux cross-target.
+    #[test]
+    fn is_embedded_keys_on_os() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "esp32c6.yaml",
+            "id: esp32c6\nname: ESP32-C6\nos: esp-idf\narchitecture:\n  cpu_family: riscv\n  \
+             cpu: esp32c6\n  endian: little\n  target_triple: riscv32imac-esp-espidf\n",
+        );
+        write_yaml(
+            tmp.path(),
+            "rp2040.yaml",
+            "id: rp2040\nname: RP2040\nos: rp2040\narchitecture:\n  cpu_family: arm\n  \
+             cpu: cortex-m0plus\n  endian: little\n  target_triple: thumbv6m-none-eabi\n",
+        );
+        write_yaml(
+            tmp.path(),
+            "rpi5.yaml",
+            "id: rpi5\nname: Raspberry Pi 5\nos: linux\narchitecture:\n  cpu_family: aarch64\n  \
+             cpu: armv8-a\n  endian: little\n  target_triple: aarch64-linux-gnu\n",
+        );
+
+        let embedded = |name: &str| Platform::load(tmp.path().join(name)).unwrap().is_embedded();
+        assert!(embedded("esp32c6.yaml"));
+        assert!(embedded("rp2040.yaml"), "the second family is embedded too");
+        assert!(
+            !embedded("rpi5.yaml"),
+            "a Linux cross-target is a board we ssh into, not one we flash"
+        );
+    }
+
     #[test]
     fn non_linux_returns_none() {
         let platform = Platform {
@@ -816,13 +901,15 @@ sysroot:
             family: None,
             rust: None,
             device: None,
+            library_hints: None,
         };
         assert!(platform.meson_cross_file().is_none());
     }
 
     /// An embedded **variant** parses, and carries the facts that make it a distinct
     /// compilation target: its family (what a single backend crate keys off), the rustup
-    /// triple, the IDF target (which is also the cargo feature) and the USB flash command.
+    /// triple, the IDF target (which is also the cargo feature), the USB flash command, and
+    /// the free-text hints that *focus* a generated implementation.
     ///
     /// Two variants of one family are loaded together on purpose: same `family: esp32`, but
     /// `xtensa-esp32s3-espidf` vs `riscv32imac-esp-espidf` — Xtensa and RISC-V are different
@@ -848,6 +935,9 @@ rust:
   target: riscv32imac-esp-espidf
   idf_target: esp32c6
   flash: espflash
+# Free-text guidance for a generated implementation. Inline, so the scalar is exactly the
+# string (a block scalar would keep its trailing newline).
+library_hints: RISC-V RV32IMAC; no std-vs-no_std choice on this family.
 "#,
         );
         write_yaml(
@@ -880,6 +970,11 @@ rust:
         assert_eq!(rust.target, "riscv32imac-esp-espidf");
         assert_eq!(rust.idf_target.as_deref(), Some("esp32c6"));
         assert_eq!(rust.flash.as_deref(), Some("espflash"));
+        assert_eq!(
+            c6.library_hints.as_deref(),
+            Some("RISC-V RV32IMAC; no std-vs-no_std choice on this family."),
+            "the hints the wizard shows and the fill prompt injects come from the YAML"
+        );
         // Not a C cross-compile: the C toolchain block is absent from the YAML and the
         // cross-file path must not invent one.
         assert!(c6.meson_cross_file().is_none());
@@ -939,6 +1034,7 @@ rust:
             family: None,
             rust: None,
             device: None,
+            library_hints: None,
         };
         let (ok, reason) = missing.sysroot_ok();
         assert!(!ok, "missing root must be blocked");
@@ -968,6 +1064,7 @@ rust:
             family: None,
             rust: None,
             device: None,
+            library_hints: None,
         };
         let (ok, reason) = placeholder.sysroot_ok();
         assert!(!ok, "empty root must be blocked");
@@ -997,6 +1094,7 @@ rust:
             family: None,
             rust: None,
             device: None,
+            library_hints: None,
         };
         assert!(populated.sysroot_ok().0, "populated root must pass");
 
@@ -1018,6 +1116,7 @@ rust:
             family: None,
             rust: None,
             device: None,
+            library_hints: None,
         };
         assert!(host.sysroot_ok().0, "host must pass");
     }
@@ -1169,6 +1268,7 @@ sysroot:
             family: None,
             rust: None,
             device: None,
+            library_hints: None,
         };
 
         platform.device = Some(PlatformDevice {

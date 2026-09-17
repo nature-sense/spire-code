@@ -126,25 +126,23 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Query a build module's capabilities via DescribeCapabilities, register it
-/// with the BuildManager, and return the capability (so MCP server deps can
-/// be collected). Plain async fn (no closure lifetime issues).
-async fn register_build_module(
+/// Query a build module's capability via DescribeCapabilities.
+///
+/// A module that does not answer gets a **negative** capability naming it: every operation the
+/// manager gates on a `supports_*` flag is then refused with a real message, instead of the
+/// registration failing and the module quietly becoming unroutable.
+async fn describe_module(
     cap_name: &str,
-    module_tx: tokio::sync::mpsc::Sender<BuildModuleMessage>,
-    bm_tx: &tokio::sync::mpsc::Sender<BuildManagerMessage>,
+    module_tx: &tokio::sync::mpsc::Sender<BuildModuleMessage>,
 ) -> ModuleCapability {
     let (t, r) = tokio::sync::oneshot::channel();
     let _ = module_tx
         .send(BuildModuleMessage::DescribeCapabilities { reply_to: t })
         .await;
-    let cap = match r.await {
+    match r.await {
         Ok(cap) => cap,
         Err(_) => {
-            tracing::warn!(
-                "register_build_module: no capability response from '{}'",
-                cap_name
-            );
+            tracing::warn!("describe_module: no capability response from '{cap_name}'");
             ModuleCapability {
                 name: cap_name.to_string(),
                 config_files: vec![],
@@ -155,10 +153,21 @@ async fn register_build_module(
                 supports_lint: false,
                 supports_format: false,
                 supports_fix: false,
+                supports_flash: false,
                 mcp_servers: vec![],
             }
         }
-    };
+    }
+}
+
+/// Register a build module with the BuildManager and return its capability (so MCP
+/// server deps can be collected). Plain async fn (no closure lifetime issues).
+async fn register_build_module(
+    cap_name: &str,
+    module_tx: tokio::sync::mpsc::Sender<BuildModuleMessage>,
+    bm_tx: &tokio::sync::mpsc::Sender<BuildManagerMessage>,
+) -> ModuleCapability {
+    let cap = describe_module(cap_name, &module_tx).await;
     let _ = bm_tx
         .send(BuildManagerMessage::AddModule {
             capability: cap.clone(),
@@ -350,9 +359,13 @@ fn init_actor_system() {
         // `os: "esp-idf"` routes on what actually differs — the invocation.
         let esp_module_tx = spawn_module(EspBuildModule::new());
         let _ = registry.register::<BuildModuleMessage>("build_module_esp", esp_module_tx.clone());
+        // Its capability travels with the registration: it is what tells the manager whether a
+        // `build_flash` request may be routed here at all.
+        let esp_cap = describe_module("esp-idf", &esp_module_tx).await;
         let _ = bm_tx
             .send(BuildManagerMessage::AddPlatformModule {
                 os: "esp-idf".to_string(),
+                capability: esp_cap,
                 module_tx: esp_module_tx,
             })
             .await;

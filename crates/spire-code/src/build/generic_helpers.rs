@@ -945,6 +945,18 @@ pub fn resolve_semantic_hal_impl_names(
 /// precedence over this default. Falls back to a generic pointer when the
 /// platform YAML is missing or carries no `library_hints` key.
 pub fn hal_platform_library_hints(platform: &str) -> String {
+    // Typed first: the hint is a platform property now, and this is the same value the
+    // create-project wizard shows for the platform.
+    if let Some(hint) = crate::platform::Platform::from_registry(platform)
+        .and_then(|p| p.library_hints)
+        .map(|hint| hint.trim().to_string())
+        .filter(|hint| !hint.is_empty())
+    {
+        return hint;
+    }
+    // Then the raw document. A hand-written YAML that does not describe a *complete* platform
+    // (no `architecture`, say) still carries its hint, and refusing it would trade a useful
+    // prompt for a schema argument.
     let dir = crate::platform::Platform::default_platform_dir();
     let path = dir.join(format!("{platform}.yaml"));
     if let Ok(text) = std::fs::read_to_string(&path) {

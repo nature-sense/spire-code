@@ -99,6 +99,12 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
         }
     }
 
+    // The wizard and the Rust HAL fill prompt both read this from the platform, so it is
+    // persisted like any other field rather than left to a second parse of the YAML.
+    if let Some(hints) = &p.library_hints {
+        props.insert("library_hints".into(), serde_json::json!(hints));
+    }
+
     serde_json::json!({
         "id": p.id,
         "name": p.name,
@@ -193,6 +199,7 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
                 flash: get_opt("rust_flash"),
             })
         },
+        library_hints: get_opt("library_hints"),
     })
 }
 
@@ -225,6 +232,9 @@ mod tests {
                 idf_target: Some("esp32c6".into()),
                 flash: Some("espflash".into()),
             }),
+            library_hints: Some(
+                "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make.".into(),
+            ),
         }
     }
 
@@ -245,12 +255,14 @@ mod tests {
             device: None,
             family: None,
             rust: None,
+            library_hints: None,
         }
     }
 
     /// The codec is the graph boundary: anything it drops, the rest of the app cannot see.
-    /// A variant's family and Rust toolchain must survive the trip BOTH ways, stored as
-    /// individual typed properties — never a nested JSON fragment, per this module's rule.
+    /// A variant's family, Rust toolchain and library hints must survive the trip BOTH ways,
+    /// stored as individual typed properties — never a nested JSON fragment, per this module's
+    /// rule.
     #[test]
     fn an_esp32_variant_round_trips_through_the_registry_shape() {
         let json = platform_to_registry_json(&esp32c6());
@@ -267,6 +279,10 @@ mod tests {
             props.get("rust").is_none(),
             "individual typed properties, not a blob: {props}"
         );
+        assert_eq!(
+            props.get("library_hints").expect("library hints"),
+            "RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make."
+        );
 
         let back = platform_json_to_spire(&json).expect("round trip");
         assert_eq!(back.family.as_deref(), Some("esp32"));
@@ -274,6 +290,11 @@ mod tests {
         assert_eq!(rust.target, "riscv32imac-esp-espidf");
         assert_eq!(rust.idf_target.as_deref(), Some("esp32c6"));
         assert_eq!(rust.flash.as_deref(), Some("espflash"));
+        assert_eq!(
+            back.library_hints.as_deref(),
+            Some("RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make."),
+            "the wizard reads the hint off the platform, so it must survive the graph"
+        );
     }
 
     /// A C platform carries neither field, so the shape the existing registry already holds
@@ -284,9 +305,14 @@ mod tests {
         let props = json.get("properties").expect("properties");
         assert!(props.get("family").is_none(), "{props}");
         assert!(props.get("rust_target").is_none(), "{props}");
+        assert!(props.get("library_hints").is_none(), "{props}");
 
         let back = platform_json_to_spire(&json).expect("round trip");
         assert!(back.family.is_none(), "no family is not a blank family");
+        assert!(
+            back.library_hints.is_none(),
+            "no hints is not an empty hint"
+        );
         assert!(
             back.rust.is_none(),
             "an empty target is no toolchain at all"
