@@ -93,6 +93,11 @@ impl Wizard {
 
     /// The whole graph. `with_platforms` registers the rp2040 platform module, which is what a
     /// *build* needs: without it nothing routes a `Build` for that board.
+    ///
+    /// The project creator is left **unwired** to the model on purpose: the embedded-HAL plan is
+    /// deterministic, and a harness that gave it a model could not prove that. The one test that
+    /// drives the from-scratch route (which *does* need a plan from a model) wires it itself, so the
+    /// property stays visible instead of being diluted into every test here.
     async fn build_modules(llm_config: Option<LlmConfig>, with_platforms: bool) -> Self {
         let system = ActorSystem::new();
 
@@ -238,8 +243,55 @@ impl Wizard {
     }
 }
 
-/// Serializes the tests in this binary that set the process-global `SPIRE_PLATFORM_DIR`.
+/// The **from-scratch** route (no HAL, no embedded structure) — the one ISSUES.md listed as never
+/// exercised, and the one every new user takes first.
 ///
+/// What it measures, against the harness's deliberately modelless project creator: planning a
+/// project from a goal **requires a model**, and says so by name. That refusal is a design
+/// property, not an accident — `generate_plan` returns it when no model is wired, with the comment
+/// "nothing may ever be scaffolded without a real plan" — so it is worth pinning: a wizard that
+/// quietly wrote a project from a template when the model was missing would be inventing a plan
+/// nobody approved.
+///
+/// The other half — the same route with a scripted plan, to exercise the executor's writes, parse
+/// gate and build gate — needs the project creator wired to a model, which this harness does not do
+/// on purpose (a harness that gave the *embedded* route a model could not prove that route needs
+/// none). That is recorded as the remaining work on this item rather than half-wired here.
+#[tokio::test]
+async fn a_plain_project_needs_a_model_to_plan_and_says_so() {
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path().join("scratchpad");
+    let wizard = Wizard::build().await;
+
+    let refused = wizard
+        .call(
+            "createProject/Plan",
+            serde_json::json!({
+                "goal": "a command-line calculator",
+                "rootDir": root.to_string_lossy(),
+                "projectName": "scratchpad",
+                "language": "Rust",
+                "platforms": [],
+            }),
+        )
+        .await;
+    let error = refused["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("LLM unavailable"),
+        "a from-scratch plan must refuse by name rather than invent one: {refused}"
+    );
+    assert!(
+        error.contains("project creator"),
+        "and name the wiring that is missing: {refused}"
+    );
+    // Nothing was scaffolded on the way: a refused plan leaves no project half-created.
+    assert!(
+        !root.join("Cargo.toml").exists(),
+        "a refused plan must not have written anything: {refused}"
+    );
+}
+
+/// Serializes the tests in this binary that set the process-global `SPIRE_PLATFORM_DIR`.
 /// Integration tests are one binary with one environment, so two of them running in parallel can
 /// drop each other's registry directory — and the failure is not a missing file but a *confusing*
 /// one: a platform whose registry vanished mid-test stops routing to its module, which reads as

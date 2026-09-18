@@ -438,6 +438,19 @@ entry tracks the work end to end.
     store is best-effort — so an analyse could report success and the build then demand one. Build,
     test, format and lint now go through `analysis_for(path)`, which uses the metadata
     `analyze_project` *returns* when the store is empty instead of discarding it and looking for it.
+  - **The from-scratch route** (measured 2026-09-17; one half still open). Exercising it settled what
+    was previously an assumption: planning a project from a goal **requires a model** — with none
+    wired, `createProject/Plan` refuses by name ("LLM unavailable — the project creator is not
+    connected to the LLM service"), which is a deliberate property (`generate_plan`: *"nothing may
+    ever be scaffolded without a real plan"*) and now pinned by a test, together with the fact that a
+    refused plan writes nothing. So the route is not "unverified"; it is *model-planned*, and the
+    verify spine is inside the plan itself (the prompt asks for `parse_and_validate` and a final
+    `build` step, and `ExecutePlan` runs them).
+    **Still open**: the scripted-model half — drive that route with a fake endpoint and assert the
+    executor's writes, parse gate and build gate against a real filesystem and cargo. It needs the
+    test harness to wire the *project creator* to a model, which that harness deliberately does not
+    do (a harness that gave the embedded route a model could not prove that route needs none), so it
+    is a small, explicit harness change rather than a half-wired one.
   - **The C++ writers** (done 2026-09-17). `hal_add_target` used to write a `<stem>_stub.cpp` per
     interface, wire `hal/meson.build` and report — nothing between the write and the claim. It now
     reports `compile: {built, refused, not_built, errors}` from the spine, where the gate parses
