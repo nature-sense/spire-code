@@ -519,6 +519,10 @@ pub enum ProjectCreationMessage {
         /// Optional structural shape ("spire_app" etc.) chosen in the wizard.
         /// Defaults to Native.
         structure: Option<spire_core::build_types::ProjectStructure>,
+        /// Where the embedded-HAL project an `EmbeddedApp` depends on lives — see
+        /// `ScaffoldProject`. The plan **is** the application's scaffold, so it is required here
+        /// too, not only when writing.
+        hal_root: Option<PathBuf>,
         /// True for embedded projects (cross-compiled targets only — no host).
         embedded: bool,
         reply_to: oneshot::Sender<Result<PlanGenerationResult>>,
@@ -535,6 +539,12 @@ pub enum ProjectCreationMessage {
         platforms: Vec<String>,
         /// Optional structural shape ("spire_app" etc.) chosen in the wizard.
         structure: Option<spire_core::build_types::ProjectStructure>,
+        /// Where the embedded-HAL project an `EmbeddedApp` depends on lives.
+        ///
+        /// Set only for that structure, and **required** by it: an application's whole dependency
+        /// graph is read out of that directory, so a request without it is refused by name rather
+        /// than scaffolded against nothing.
+        hal_root: Option<PathBuf>,
         /// True for embedded projects (cross-compiled targets only — no host).
         embedded: bool,
         reply_to: oneshot::Sender<Result<crate::subsystems::build::build_manager::ScaffoldSpec>>,
@@ -582,6 +592,10 @@ pub enum ProjectCreationMessage {
         platforms: Vec<String>,
         /// Optional structural shape ("spire_app" etc.) chosen in the wizard.
         structure: Option<spire_core::build_types::ProjectStructure>,
+        /// Where the embedded-HAL project an `EmbeddedApp` depends on lives — see
+        /// `ScaffoldProject`. The *plan* needs it for the same reason the scaffold does: the spec
+        /// it describes is read from that directory.
+        hal_root: Option<PathBuf>,
         /// True for embedded projects (cross-compiled targets only — no host).
         embedded: bool,
         reply_to: oneshot::Sender<Result<PlanScaffoldResult>>,
@@ -1222,6 +1236,9 @@ and NEVER repeat any line or block."
         language: &str,
         platforms: &[String],
         structure: Option<spire_core::build_types::ProjectStructure>,
+        // The HAL directory an application depends on. See `embedded_app_template_plan`: the plan is
+        // the scaffold, so a plan that cannot read the HAL cannot be run either.
+        hal_root: Option<&std::path::Path>,
     ) -> PlanGenerationResult {
         // SpireApp: deterministic monorepo scaffold — the structure itself is
         // fixed (Cargo workspace + SwiftUI), so the plan is the scaffold's own
@@ -1237,6 +1254,14 @@ and NEVER repeat any line or block."
         if structure == Some(spire_core::build_types::ProjectStructure::EmbeddedHal) {
             return self
                 .embedded_hal_template_plan(goal, root_dir, language, platforms)
+                .await;
+        }
+        // Embedded application: the same deterministic shape as the HAL, for the same reason — the
+        // structure is fixed before the goal is read — and here the plan *is* the scaffold: its steps
+        // are what write the project (see `PlanView`).
+        if structure == Some(spire_core::build_types::ProjectStructure::EmbeddedApp) {
+            return self
+                .embedded_app_template_plan(goal, root_dir, language, platforms, hal_root)
                 .await;
         }
         if let Some(llm_tx) = &self.llm_tx {
@@ -1583,6 +1608,81 @@ Project:
             spec,
             "embedded-HAL structure — deterministic workspace scaffold",
         )
+    }
+
+    /// Deterministic embedded-**application** plan: scaffold the binary — the manifest that path-deps
+    /// the HAL, the board's build wiring, and the actor — then gate it with a parse and a cross-build.
+    /// Never calls the LLM.
+    ///
+    /// The plan *is* the scaffold here: `PlanView` materializes a project by executing the plan's
+    /// steps, so a structure without a template plan falls through to the LLM path and writes nothing
+    /// of this shape. The app's one model-written file is `src/main.rs` (the board's LED constructor),
+    /// which the scaffold already emits as a compiling `todo!()` — the same split the HAL uses: the
+    /// structure is fixed before the goal is read, and the goal only shapes the code inside it.
+    ///
+    /// `hal_root` is required: an application's entire dependency graph is read from that HAL project,
+    /// so a plan for one without it fails here, by name, rather than emitting a crate that cannot
+    /// resolve a single dependency.
+    async fn embedded_app_template_plan(
+        &self,
+        goal: &str,
+        root_dir: &PathBuf,
+        language: &str,
+        platforms: &[String],
+        hal_root: Option<&std::path::Path>,
+    ) -> PlanGenerationResult {
+        let project_name = root_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "embedded-app".to_string());
+        let spec = match hal_root {
+            Some(hal_root) => self
+                .scaffold_spec_in_memory(
+                    &project_name,
+                    root_dir,
+                    language,
+                    platforms,
+                    Some(spire_core::build_types::ProjectStructure::EmbeddedApp),
+                    Some(hal_root),
+                    true,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("[ProjectCreation] embedded-app scaffold spec failed: {e}");
+                    Self::embedded_app_fallback_spec(platforms)
+                }),
+            None => {
+                warn!(
+                    "[ProjectCreation] embedded app for '{project_name}' has no HAL directory: the \
+                     wizard's picker supplies `halRoot`"
+                );
+                Self::embedded_app_fallback_spec(platforms)
+            }
+        };
+        scaffold_plan_from_spec(
+            goal,
+            root_dir,
+            language,
+            spec,
+            "embedded-app structure — deterministic firmware scaffold",
+        )
+    }
+
+    /// The spec a failed (or HAL-less) application scaffold falls back to: enough for the plan to say
+    /// what is missing, and no invented dependency paths.
+    fn embedded_app_fallback_spec(
+        platforms: &[String],
+    ) -> crate::subsystems::build::build_manager::ScaffoldSpec {
+        crate::subsystems::build::build_manager::ScaffoldSpec {
+            structural_files: vec!["Cargo.toml".to_string()],
+            fill_roots: vec!["src".to_string()],
+            dependency_sections: vec!["Cargo.toml".to_string()],
+            platform_targets: platforms.to_vec(),
+            build_system: "Cargo".to_string(),
+            files: vec![],
+            structure: spire_core::build_types::ProjectStructure::EmbeddedApp,
+            embedded: true,
+        }
     }
 
     /// Generate a plan for a new project. In v1 this is a deterministic
@@ -2408,6 +2508,7 @@ impl Actor for ProjectCreationActor {
                 language,
                 platforms,
                 structure,
+                hal_root,
                 embedded: _embedded,
                 reply_to,
             } => {
@@ -2418,7 +2519,14 @@ impl Actor for ProjectCreationActor {
                     platforms
                 };
                 let plan = self
-                    .generate_plan_async(&goal, &root_dir, &language, &platforms, structure)
+                    .generate_plan_async(
+                        &goal,
+                        &root_dir,
+                        &language,
+                        &platforms,
+                        structure,
+                        hal_root.as_deref(),
+                    )
                     .await;
                 info!(
                     "[ProjectCreation] PLAN GENERATED: language={}, root_dir={}, steps={}",
@@ -2441,6 +2549,7 @@ impl Actor for ProjectCreationActor {
                 language,
                 platforms,
                 structure,
+                hal_root,
                 embedded,
                 reply_to,
             } => {
@@ -2451,31 +2560,49 @@ impl Actor for ProjectCreationActor {
                 };
                 let result: Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> =
                     async {
-                        let build_file = match language.to_lowercase().as_str() {
-                            "swift" => "Package.swift",
-                            "python" => "pyproject.toml",
-                            "javascript" | "typescript" | "node" => "package.json",
-                            "go" => "go.mod",
-                            "c++" | "cpp" | "c" | "meson" => "meson.build",
-                            _ => "Cargo.toml",
+                        // An embedded application is emitted outside the build module: its input is
+                        // another project's *directory*, which the module layer never sees. The write
+                        // loop below is shared, so both producers land on disk the same way.
+                        let out = if structure
+                            == Some(spire_core::build_types::ProjectStructure::EmbeddedApp)
+                        {
+                            let hal_root = hal_root.ok_or_else(|| {
+                                "an embedded application needs the embedded-HAL project it depends \
+                                 on: pass `halRoot` — the directory of the HAL it builds against"
+                                    .to_string()
+                            })?;
+                            crate::build::embedded_app_scaffold::embedded_app_scaffold(
+                                &project_name,
+                                &platforms,
+                                &hal_root.to_string_lossy(),
+                                &hal_root,
+                            )?
+                        } else {
+                            let build_file = match language.to_lowercase().as_str() {
+                                "swift" => "Package.swift",
+                                "python" => "pyproject.toml",
+                                "javascript" | "typescript" | "node" => "package.json",
+                                "go" => "go.mod",
+                                "c++" | "cpp" | "c" | "meson" => "meson.build",
+                                _ => "Cargo.toml",
+                            };
+                            let (t, r) = oneshot::channel();
+                            self.build_manager_tx
+                                .send(BuildManagerMessage::ScaffoldBuildConfig {
+                                    project_name: project_name.clone(),
+                                    goal: String::new(),
+                                    build_file: build_file.to_string(),
+                                    platforms: platforms.clone(),
+                                    structure,
+                                    embedded,
+                                    reply_to: t,
+                                })
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            r.await
+                                .map_err(|e| e.to_string())?
+                                .map_err(|e| e.to_string())?
                         };
-                        let (t, r) = oneshot::channel();
-                        self.build_manager_tx
-                            .send(BuildManagerMessage::ScaffoldBuildConfig {
-                                project_name: project_name.clone(),
-                                goal: String::new(),
-                                build_file: build_file.to_string(),
-                                platforms: platforms.clone(),
-                                structure,
-                                embedded,
-                                reply_to: t,
-                            })
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        let out = r
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .map_err(|e| e.to_string())?;
 
                         let root = root_dir.clone();
                         let build_system =
@@ -2552,6 +2679,7 @@ impl Actor for ProjectCreationActor {
                 language,
                 platforms,
                 structure,
+                hal_root,
                 embedded,
                 reply_to,
             } => {
@@ -2569,10 +2697,9 @@ impl Actor for ProjectCreationActor {
                             &language,
                             &platforms,
                             structure,
-                            // The HAL directory travels with the *scaffold* request (the wizard's
-                            // picker). A plan that needs one asks for it there rather than
-                            // guessing: an `embedded_app` plan without it is refused by name.
-                            None,
+                            // The HAL directory the wizard's picker supplied: an application's spec
+                            // is read from it, so a plan for one without it is refused by name.
+                            hal_root.as_deref(),
                             embedded,
                         )
                         .await?;

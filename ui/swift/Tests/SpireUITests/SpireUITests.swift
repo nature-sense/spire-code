@@ -428,6 +428,14 @@ func wizardTreeDecidesItsOwnSteps() {
     let controller = NewProjectView.path(environment: .embedded, deviceClass: .controller)
     #expect(controller == [.environment, .deviceClass, .controllerRole, .targets, .details])
     #expect(controller.firstIndex(of: .controllerRole)! < controller.firstIndex(of: .targets)!)
+
+    // An application is asked one more question than a HAL: which HAL it builds against. Nothing
+    // else in the wizard implies it, and the core refuses an app without it.
+    let application = NewProjectView.path(
+        environment: .embedded, deviceClass: .controller, controllerRole: .application
+    )
+    #expect(application == [.environment, .deviceClass, .controllerRole, .targets, .halProject, .details])
+    #expect(application.last == .details, "the HAL is chosen before the name, not after")
 }
 
 

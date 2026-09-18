@@ -37,11 +37,12 @@ use std::path::Path;
 
 /// The app-side facts for one board family — the half the *HAL* scaffold has no use for: how a
 /// `main` for this family is compiled and put on a board.
+///
+/// The rustup **target** and the **chip** are deliberately not here: one family spans chips whose
+/// triples differ (`xtensa-esp32-espidf` for the classic, `riscv32imac-esp-espidf` for the C6), so
+/// both are read from the chosen *platform*'s own `rust:` block. A family may share the linker, the
+/// runner and the vendor crate; it does not share a triple.
 struct AppSpec {
-    /// The rustup target `.cargo/config.toml` pins.
-    target: &'static str,
-    /// `MCU`: the chip esp-idf-sys reads. Absent for a family whose chip is the target triple.
-    mcu: Option<&'static str>,
     /// The linker. `ldproxy` for esp-idf, because IDF's flags travel in a response file.
     linker: Option<&'static str>,
     /// How `cargo run` reaches the board.
@@ -107,8 +108,6 @@ fn main() {
 fn app_spec(family: &str) -> Option<AppSpec> {
     match family {
         "esp32" => Some(AppSpec {
-            target: "xtensa-esp32-espidf",
-            mcu: Some("esp32"),
             linker: Some("ldproxy"),
             runner: "espflash flash --monitor",
             vendor_dep: "esp-idf-hal = \"0.47\"",
@@ -365,6 +364,22 @@ pub(crate) fn embedded_app_scaffold(
         &backend_name,
         &spec,
     );
+    // The **platform's** own facts, not the family's: one family spans chips whose triples differ
+    // (the classic esp32 and the C6), and the chip is what esp-idf-sys reads as `MCU`.
+    let rust = platform.rust.as_ref().ok_or_else(|| {
+        format!(
+            "platform '{platform_id}' declares no `rust:` block (a target triple), so an \
+             application cannot be compiled for it"
+        )
+    })?;
+    let target = rust.target.clone();
+    // `MCU` is esp-idf's own variable, so it is written for an esp-idf platform — not for a
+    // platform whose `idf_target` happens to exist for a different tool (`probe-rs --chip`).
+    let mcu = if platform.os.eq_ignore_ascii_case("esp-idf") {
+        rust.idf_target.clone()
+    } else {
+        None
+    };
 
     let mut files = vec![
         super::ScaffoldFile {
@@ -375,7 +390,7 @@ pub(crate) fn embedded_app_scaffold(
         },
         super::ScaffoldFile {
             path: ".cargo/config.toml".to_string(),
-            content: cargo_config(&spec),
+            content: cargo_config(&spec, &target, mcu.as_deref()),
             structural: true,
             ..Default::default()
         },
@@ -404,7 +419,7 @@ pub(crate) fn embedded_app_scaffold(
             ..Default::default()
         });
     }
-    if spec.mcu.is_some() {
+    if mcu.is_some() {
         files.push(super::ScaffoldFile {
             path: "sdkconfig.defaults".to_string(),
             content: ESP_SDKCONFIG_DEFAULTS.to_string(),
@@ -451,10 +466,9 @@ fn app_manifest(
         .replace("__MARKER__", &marker(hal_path))
 }
 
-/// The `.cargo/config.toml`: the family's target, its chip, its linker, and how it reaches a board.
-fn cargo_config(spec: &AppSpec) -> String {
-    let mcu = spec
-        .mcu
+/// The `.cargo/config.toml`: the platform's target and chip, the family's linker and runner.
+fn cargo_config(spec: &AppSpec, target: &str, mcu: Option<&str>) -> String {
+    let mcu = mcu
         .map(|mcu| format!("\n[env]\nMCU = \"{mcu}\"\n"))
         .unwrap_or_default();
     let linker = spec
@@ -469,7 +483,7 @@ fn cargo_config(spec: &AppSpec) -> String {
         })
         .unwrap_or_default();
     APP_CARGO_CONFIG
-        .replace("__TARGET__", spec.target)
+        .replace("__TARGET__", target)
         .replace("__MCU_BLOCK__", &mcu)
         .replace("__LINKER_BLOCK__", &linker)
         .replace("__RUNNER__", spec.runner)
@@ -664,15 +678,26 @@ mod tests {
 
     /// A hermetic registry, so the tests can name families the machine may not have and prove the
     /// refusals without touching `~/.spire/platforms`.
-    fn registry(entries: &[(&str, &str, Option<&str>)]) -> tempfile::TempDir {
+    ///
+    /// `(id, os, family, rust target)` — the target is what `.cargo/config.toml` pins, and the chip
+    /// (`idf_target`) is the platform's own id for the esp families, which is what it is in the real
+    /// registry. **Per platform, not per family**: two chips of one family differ here, which is
+    /// exactly what the emitter has to get right.
+    fn registry(entries: &[(&str, &str, Option<&str>, Option<&str>)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        for (id, os, family) in entries {
+        for (id, os, family, target) in entries {
             let family_line = family.map(|f| format!("family: {f}\n")).unwrap_or_default();
+            let rust_block = match target {
+                Some(target) => {
+                    format!("rust:\n  target: {target}\n  idf_target: {id}\n  flash: espflash\n")
+                }
+                None => String::new(),
+            };
             std::fs::write(
                 dir.path().join(format!("{id}.yaml")),
                 format!(
                     "id: {id}\nname: {id}\nos: {os}\n{family_line}architecture:\n  cpu_family: x\n  \
-                     cpu: x\n  endian: little\n  target_triple: x\n"
+                     cpu: x\n  endian: little\n  target_triple: x\n{rust_block}"
                 ),
             )
             .unwrap();
@@ -702,16 +727,28 @@ mod tests {
         let _lock = crate::PLATFORM_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let reg = registry(&[("esp32", "esp-idf", Some("esp32"))]);
+        // The board is a **C6**: same family as the classic esp32, different triple and chip. The
+        // config must carry this platform's facts, not the family's — which is the whole reason
+        // target and `MCU` are read per platform.
+        let reg = registry(&[(
+            "esp32c6",
+            "esp-idf",
+            Some("esp32"),
+            Some("riscv32imac-esp-espidf"),
+        )]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
         let hal_dir = tempfile::tempdir().unwrap();
-        hal_on_disk(hal_dir.path(), "weather", &["esp32"]);
+        hal_on_disk(hal_dir.path(), "weather", &["esp32c6"]);
         let hal_path = hal_dir.path().to_string_lossy().to_string();
 
-        let out =
-            embedded_app_scaffold("Weather Node", &["esp32".into()], &hal_path, hal_dir.path())
-                .expect("an esp32 app against an esp32 HAL");
+        let out = embedded_app_scaffold(
+            "Weather Node",
+            &["esp32c6".into()],
+            &hal_path,
+            hal_dir.path(),
+        )
+        .expect("an esp32c6 app against an esp32-family HAL");
 
         let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
         for expected in [
@@ -756,19 +793,22 @@ mod tests {
             "{manifest}"
         );
 
-        // The wiring that was measured on a board, not guessed.
+        // The wiring that was measured on a board, not guessed — and the **platform's** target and
+        // chip, which is why a C6 gets the RISC-V triple while the family still names esp32.
         let config = out
             .files
             .iter()
             .find(|f| f.path == ".cargo/config.toml")
             .unwrap();
         assert!(
-            config.content.contains("target = \"xtensa-esp32-espidf\""),
+            config
+                .content
+                .contains("target = \"riscv32imac-esp-espidf\""),
             "{}",
             config.content
         );
         assert!(
-            config.content.contains("MCU = \"esp32\""),
+            config.content.contains("MCU = \"esp32c6\""),
             "{}",
             config.content
         );
@@ -839,8 +879,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry(&[
-            ("esp32", "esp-idf", Some("esp32")),
-            ("esp32c6", "esp-idf", Some("esp32")),
+            (
+                "esp32",
+                "esp-idf",
+                Some("esp32"),
+                Some("xtensa-esp32-espidf"),
+            ),
+            (
+                "esp32c6",
+                "esp-idf",
+                Some("esp32"),
+                Some("riscv32imac-esp-espidf"),
+            ),
         ]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
         let hal_dir = tempfile::tempdir().unwrap();
@@ -872,8 +922,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reg = registry(&[
-            ("esp32", "esp-idf", Some("esp32")),
-            ("rp2040", "rp2040", Some("rp2040")),
+            (
+                "esp32",
+                "esp-idf",
+                Some("esp32"),
+                Some("xtensa-esp32-espidf"),
+            ),
+            (
+                "rp2040",
+                "rp2040",
+                Some("rp2040"),
+                Some("thumbv6m-none-eabi"),
+            ),
         ]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
@@ -919,7 +979,12 @@ mod tests {
         let _lock = crate::PLATFORM_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let reg = registry(&[("rp2040", "rp2040", Some("rp2040"))]);
+        let reg = registry(&[(
+            "rp2040",
+            "rp2040",
+            Some("rp2040"),
+            Some("thumbv6m-none-eabi"),
+        )]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
         let hal_dir = tempfile::tempdir().unwrap();
         hal_on_disk(hal_dir.path(), "weather", &["rp2040"]);
@@ -941,7 +1006,7 @@ mod tests {
         let _lock = crate::PLATFORM_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let reg = registry(&[("rpi5", "linux", None)]);
+        let reg = registry(&[("rpi5", "linux", None, None)]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
         let hal_dir = tempfile::tempdir().unwrap();
 

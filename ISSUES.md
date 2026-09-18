@@ -1182,4 +1182,33 @@ which is arguably right — the app's one job is writing `main.rs`), and no `no_
 is not writable until a backend supplies the executor an app spawns on.
 
 
+**Landed: the last hop, so the wizard can actually do it.** The HAL directory now travels from the
+FFI (`halRoot` on `createProject/GeneratePlan`, `/Plan` and `/Scaffold`, parsed into a
+`hal_root: Option<PathBuf>` on the three `ProjectCreationMessage` variants), and the wizard's
+Application leaf is a real choice: the card is enabled, the board step becomes single-select, and a
+new **HAL Project** step asks which HAL the app builds against — a directory picker, with the
+backend crate it implies (`crates/<hal>-<family>`) shown as a hint. The structure key decides whether
+`halRoot` is sent, so no other leaf's request changes.
+
+**The plan had to be built too, and that is what makes the flow work at all.** `PlanView`
+materializes a project by *executing the plan's steps*, so a structure with no template plan falls
+through to the LLM path and writes nothing of its shape. `embedded_app_template_plan` is therefore
+the app's scaffold in step form — the same split `SpireApp`/`EmbeddedHal` use, where the structure is
+fixed before the goal is read and the goal only shapes the code inside it.
+
+**A bug the tests caught by being asked the right question:** the target triple and `MCU` were
+family-level, but one *family* spans chips with different triples (`xtensa-esp32-espidf` for the
+classic, `riscv32imac-esp-espidf` for the C6). They now come from the platform's own `rust:` block —
+`cargo_config` takes them as arguments, and `MCU` is written only for an esp-idf platform, since
+`idf_target` on an rp2040 is `probe-rs`'s spelling, not IDF's. The unit test now scaffolds for
+**esp32c6** and asserts the RISC-V triple and `MCU = "esp32c6"` while the *backend crate* is still
+`-esp32` — one family, one backend, per-chip compilation facts. The live cross-build (still on the
+classic esp32, the board on this desk) passes after the change: 130 s.
+
+Worth knowing for the next person: the wizard's own plan path (`createProject/GeneratePlan`) is what
+`NewProjectView` calls, and `PlanView` executes it step by step — there is no separate `Scaffold` call
+on that route (`ProjectWizardView`, the only caller of `scaffoldProject`, is not presented by
+anything). So "the plan is the scaffold" is not a shortcut; it is how this flow has always worked.
+
+
 

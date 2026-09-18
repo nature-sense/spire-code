@@ -59,7 +59,7 @@ struct NewProjectView: View {
     }
 
     enum Step: String, CaseIterable {
-        case environment, nativeKind, deviceClass, controllerRole, targets, structure, details
+        case environment, nativeKind, deviceClass, controllerRole, targets, structure, halProject, details
     }
 
     @State private var stepIndex = 0
@@ -75,6 +75,11 @@ struct NewProjectView: View {
     /// a kept selection would be a build for hardware the branch does not have.
     @State private var selectedTargets: Set<String> = []
     @State private var useHal: Bool = true            // Linux SBC structure: HAL vs single-source
+    /// The embedded-HAL project a Controller **application** builds against.
+    ///
+    /// A directory the user picks, because the two are separate projects: the app's manifest
+    /// path-deps that HAL's contract and backend crates, and the core reads its members to name them.
+    @State private var halProject: String = ""
 
     @State private var goal: String = ""
     @State private var projectName: String = ""
@@ -112,13 +117,17 @@ struct NewProjectView: View {
     /// five steps for a Linux SBC (the Meson shape, unchanged), five for a Controller. The indicator
     /// and the footer both read this, so a step a branch does not have is not a step at all.
     private var path: [Step] {
-        Self.path(environment: environment, deviceClass: deviceClass)
+        Self.path(environment: environment, deviceClass: deviceClass, controllerRole: controllerRole)
     }
 
     /// The steps a branch has — **pure and static** so the shape is testable without a view, the same
-    /// reason the add-board menu is. `controllerRole` is deliberately not a parameter: the role
-    /// changes *what* the Controller branch scaffolds, not how many questions it asks.
-    static func path(environment: ProjectEnvironment, deviceClass: DeviceClass) -> [Step] {
+    /// reason the add-board menu is.
+    ///
+    /// `controllerRole` decides the *last* question on the Controller branch: an application is built
+    /// against a HAL project that nothing else implies, so it is asked for one more answer than the
+    /// HAL — which is the project itself.
+    static func path(environment: ProjectEnvironment, deviceClass: DeviceClass,
+                     controllerRole: ControllerRole = .halFrameworks) -> [Step] {
         var steps: [Step] = [.environment]
         switch environment {
         case .native:
@@ -132,6 +141,9 @@ struct NewProjectView: View {
             case .controller:
                 steps.append(.controllerRole)
                 steps.append(.targets)
+                if controllerRole == .application {
+                    steps.append(.halProject)
+                }
             }
         }
         steps.append(.details)
@@ -230,6 +242,10 @@ struct NewProjectView: View {
             // A branch with no targets in the registry cannot be advanced past on an empty
             // selection, and saying so beats scaffolding a project with nothing to build for.
             return !offeredTargets.isEmpty && !selectedTargets.isEmpty
+        case .halProject:
+            // The application's dependency: without it the core refuses, so the wizard does not
+            // pretend the answer is optional.
+            return !halProject.trimmingCharacters(in: .whitespaces).isEmpty
         case .details:
             return !goal.trimmingCharacters(in: .whitespaces).isEmpty
                 && !projectName.trimmingCharacters(in: .whitespaces).isEmpty
@@ -243,8 +259,14 @@ struct NewProjectView: View {
         case .nativeKind: return "Project Type"
         case .deviceClass: return "Device Class"
         case .controllerRole: return "Controller Project"
-        case .targets: return deviceClass == .controller ? "Target Board" : "Target Hardware"
+        case .targets:
+            // An application is one board, so the question is singular.
+            if controllerRole == .application {
+                return "Target Board"
+            }
+            return deviceClass == .controller ? "Target Board" : "Target Hardware"
         case .structure: return "Project Structure"
+        case .halProject: return "HAL Project"
         case .details: return "Name & Description"
         }
     }
@@ -316,6 +338,7 @@ struct NewProjectView: View {
         case .controllerRole: controllerRoleStep
         case .targets: targetsStep
         case .structure: structureStep
+        case .halProject: halProjectStep
         case .details: detailsStep
         }
     }
@@ -454,23 +477,19 @@ struct NewProjectView: View {
                     selected: controllerRole == .halFrameworks,
                     select: { controllerRole = .halFrameworks }
                 )
-                // Shown, not offered: the app structure does not exist in the core yet, and a
-                // selectable card would scaffold a plain host crate instead — silently. It becomes
-                // a choice by turning `enabled` on, in the change that lands `embedded_app`.
                 choiceCard(
                     title: "Application",
                     subtitle: "Firmware that depends on a HAL project",
                     systemImage: "app.badge",
                     selected: controllerRole == .application,
-                    enabled: false,
                     select: { controllerRole = .application }
                 )
             }
             Label(
                 controllerRole == .application
-                    ? "Arrives with the embedded-app scaffold: a separate project whose Cargo.toml path-deps a HAL's contract and board backend crates."
+                    ? "One board, one binary — a *separate* project whose Cargo.toml path-deps a HAL's contract and backend crates. The next step asks which HAL."
                     : "The traits a firmware programs against plus the per-family implementations — a library, filled by the drift cascade.",
-                systemImage: controllerRole == .application ? "clock" : "square.stack.3d.up"
+                systemImage: controllerRole == .application ? "app.badge" : "square.stack.3d.up"
             )
             .font(.callout)
             .foregroundStyle(.secondary)
@@ -503,7 +522,12 @@ struct NewProjectView: View {
                         ForEach(offeredTargets, id: \.id) { platform in
                             let isSelected = selectedTargets.contains(platform.id)
                             Button {
-                                if isSelected {
+                                // An application is one binary for one board, so a pick *replaces*:
+                                // it would be refused by the core otherwise, and silently keeping two
+                                // would look like it were allowed.
+                                if controllerRole == .application {
+                                    selectedTargets = [platform.id]
+                                } else if isSelected {
                                     selectedTargets.remove(platform.id)
                                 } else {
                                     selectedTargets.insert(platform.id)
@@ -569,6 +593,73 @@ struct NewProjectView: View {
         }
         .frame(maxWidth: 520, alignment: .leading)
     }
+
+    // MARK: HAL project (Controller → Application)
+
+    /// Which HAL the application depends on.
+    ///
+    /// Asked of the user because the two are **separate projects** and nothing else in the wizard
+    /// implies the answer: the app's `Cargo.toml` path-deps that HAL's contract crate and the chosen
+    /// board's backend crate, and the core reads that project's members to name them. The family in
+    /// the hint is the suggestion, not the rule — a HAL whose backend for this board is missing is
+    /// refused by the core, with the members it did find.
+    private var halProjectStep: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Which HAL does this application build against?")
+                .font(.headline)
+            Text("The application is a project of its own. This is the embedded-HAL project it path-deps — the same relationship `blink-esp32` has with `spire-hal`.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                TextField("/path/to/my-hal", text: $halProject)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                Button("Choose…") { chooseHalProject() }
+            }
+            .frame(maxWidth: 520)
+
+            if let expectation = backendCrateHint {
+                Label("Expects a backend crate: \(expectation)", systemImage: "shippingbox")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Label(
+                "The HAL is not copied and not modified — it is depended on, so several applications can build against one.",
+                systemImage: "arrow.triangle.branch"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+    }
+
+    /// The backend crate the chosen board implies, when a board is chosen: `<hal>-<family>`.
+    ///
+    /// Derived from the *family*, not the platform id, because one backend serves every chip of a
+    /// family — the same rule the core's own refusal names when it cannot find one.
+    private var backendCrateHint: String? {
+        guard let family = offeredTargets.first(where: { selectedTargets.contains($0.id) })?.family
+        else { return nil }
+        return "crates/<hal>-\(family)"
+    }
+
+    private func chooseHalProject() {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose HAL Project"
+        panel.message = "Select the embedded-HAL project this application depends on"
+        if !halProject.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: halProject)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            halProject = url.path
+        }
+    }
+
 
     // MARK: Step 5 — Details
 
@@ -650,6 +741,13 @@ struct NewProjectView: View {
                 Text("Toolchain: \(toolchainLabel)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if structureKey == "embedded_app" {
+                    Text("HAL: \(halProject.isEmpty ? "not chosen" : halProject)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -789,7 +887,10 @@ struct NewProjectView: View {
                 // the two branches cannot share a platform list.
                 platforms: isNative ? [] : selectedTargets.sorted(),
                 structure: structureKey,
-                embedded: !isNative
+                embedded: !isNative,
+                // Keyed on the *structure*, not the role: an application is the only leaf whose
+                // dependencies come from another project, so that is exactly when it travels.
+                halRoot: structureKey == "embedded_app" ? halProject : nil
             )
             await MainActor.run {
                 if let plan {

@@ -453,25 +453,33 @@ final class SpireBridge {
     /// `"native" | "single_source" | "hal"`; `embedded` is true for
     /// cross-compile projects (no host target). Calls FFI:
     /// createProject/GeneratePlan { goal, rootDir, language, platforms }.
+    /// - Parameter halRoot: the embedded-HAL project an `EmbeddedApp` depends on. The core requires
+    ///   it for that structure (the app's whole dependency graph is read from it) and omits it from
+    ///   every other request, so nothing else changes.
     func generateProjectPlan(
         goal: String,
         rootDir: String,
         language: String = "Rust",
         platforms: [String] = [],
         structure: String = "native",
-        embedded: Bool = false
+        embedded: Bool = false,
+        halRoot: String? = nil
     ) async -> PlanGenerationResult? {
         do {
+            var params: [String: Any] = [
+                "goal": goal,
+                "rootDir": rootDir,
+                "language": language,
+                "platforms": platforms,
+                "structure": structure,
+                "embedded": embedded
+            ]
+            if let halRoot, !halRoot.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["halRoot"] = halRoot
+            }
             let body: [String: Any] = [
                 "method": "createProject/GeneratePlan",
-                "params": [
-                    "goal": goal,
-                    "rootDir": rootDir,
-                    "language": language,
-                    "platforms": platforms,
-                    "structure": structure,
-                    "embedded": embedded
-                ]
+                "params": params
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
             let reply = try await backend.send(data)
@@ -1784,20 +1792,28 @@ final class SpireBridge {
     /// structural + source-stub files to `root`, runs AnalyzeProject, and
     /// returns the ScaffoldSpec (locked files, fill roots, platforms, layout).
     /// Returns nil on success, error string on failure.
+    ///
+    /// `halRoot` is the embedded-HAL project an `EmbeddedApp` depends on. It travels only for that
+    /// structure — the core refuses an application without it — and is omitted entirely otherwise, so
+    /// every other request is byte-for-byte what it was.
     func scaffoldProject(buildSystem: String, projectName: String, root: String,
                          platforms: [String] = [], structure: String = "native",
-                         embedded: Bool = false) async -> String? {
+                         embedded: Bool = false, halRoot: String? = nil) async -> String? {
         do {
+            var params: [String: Any] = [
+                "projectName": projectName,
+                "rootDir": root,
+                "language": buildSystem,
+                "platforms": platforms,
+                "structure": structure,
+                "embedded": embedded
+            ]
+            if let halRoot, !halRoot.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["halRoot"] = halRoot
+            }
             let body: [String: Any] = [
                 "method": "createProject/Scaffold",
-                "params": [
-                    "projectName": projectName,
-                    "rootDir": root,
-                    "language": buildSystem,
-                    "platforms": platforms,
-                    "structure": structure,
-                    "embedded": embedded
-                ]
+                "params": params
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
             let reply = try await backend.send(data)
