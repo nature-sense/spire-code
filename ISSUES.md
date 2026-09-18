@@ -641,6 +641,20 @@ generate cache"* until that build-script output is removed (`rm -rf
 target/<triple>/<profile>/build/esp-idf-sys-*`). (2) The setting is a keyword, not a path — see
 above; an absolute path is the obvious wrong answer and its error names neither variable nor value.
 
+**Where the toolchain and SDK come from is not Spire's business** (2026-09-18). The rule, stated
+where the wizard shows it: `espup` installs the Rust toolchain (and the clang bindgen needs),
+`esp-idf-sys` downloads ESP-IDF on the first build, and Spire **installs nothing** — it references an
+existing install through environment variables. Four of them are now *read* rather than assumed:
+`ESP_TOOLCHAIN_BIN` (a toolchain installed anywhere), `RUSTUP_HOME` (a relocated rustup), `$HOME/.rustup`
+(the default), and `LIBCLANG_PATH` (an exported clang). Two were previously the wrong way round: the
+toolchain was only ever looked for at `~/.rustup/toolchains/esp` with no way to say otherwise, and a
+*discovered* clang was written **over** an exported `LIBCLANG_PATH` — Spire overriding the one setting
+the user had been explicit about. The order is now explicit → standard variable → default, pinned by
+`build/esp.rs`'s tests, and a set-but-wrong `ESP_TOOLCHAIN_BIN` falls through rather than failing a
+build that would otherwise have worked (a typo must not lose a discovery). The story is also in every
+esp platform's `library_hints` and in the scaffold's per-family README block, because "run `espup
+install` first" previously existed only in code comments — the one place a user never reads.
+
 ## 9. The `embedded-hal` project type — one contract, N board families
 
 What this is: a **new create-project type** in the wizard that interactively builds a

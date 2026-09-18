@@ -80,10 +80,15 @@ pub(crate) fn family_spec(family: &str) -> Option<FamilySpec> {
                           # `esp_idf_hal::sys`. There are no per-chip features — the chip is the\n\
                           # `MCU` environment variable esp-idf-sys reads, plus `--target`.",
             uses_std_executor: true,
-            readme_build: "# esp32 family (std, esp-idf). Needs the espup `esp` toolchain and\n\
-                           # ESP-IDF, and LIBCLANG_PATH (Spire sets it; by hand, `source\n\
-                           # ~/export-esp.sh` first). The FIRST build compiles ESP-IDF itself and\n\
-                           # takes minutes; later builds are seconds.\n\
+            readme_build: "# esp32 family (std, esp-idf). The toolchain and the SDK are installed\n\
+                           # **outside this project** and only referenced by environment:\n\
+                           # `espup install` provides the `esp` rustup toolchain (and the clang\n\
+                           # bindgen needs), and esp-idf-sys downloads ESP-IDF itself on the first\n\
+                           # build — shared machine-wide by ESP_IDF_TOOLS_INSTALL_DIR=global, so a\n\
+                           # second project does not copy 5 GB. Spire reads ESP_TOOLCHAIN_BIN (else\n\
+                           # RUSTUP_HOME, else ~/.rustup) and honours an exported LIBCLANG_PATH; by\n\
+                           # hand `source ~/export-esp.sh` covers both. The FIRST build compiles\n\
+                           # ESP-IDF and takes minutes; later builds are seconds.\n\
                            MCU=esp32 cargo build --target xtensa-esp32-espidf \\\n\
                            \x20   -Zbuild-std=std,panic_abort -p __CRATE__",
         }),

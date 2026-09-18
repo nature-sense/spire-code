@@ -208,23 +208,63 @@ pub fn esp_artifact_path(
     crate::build::generic_helpers::cargo_artifact_path(root, &rust.target, mode, package, explicit)
 }
 
-/// `~/.rustup/toolchains/esp/bin` — where `espup` puts the toolchain whose `cargo` *and*
-/// `rustc` must both be used.
+/// The esp toolchain's `bin` — the directory that must come first on the child build's `PATH`.
 ///
-/// Both matter: leaving cargo to find its own `rustc` silently picks the stable one, and
-/// `-Zbuild-std` then fails with "the option `Z` is only accepted on the nightly compiler" —
-/// an error about a flag, never about the toolchain that should have accepted it.
+/// Resolved in the order a user would expect, each step a *reference* to an install this machine
+/// already has rather than anything Spire creates:
+///
+/// 1. **`ESP_TOOLCHAIN_BIN`** — an explicit answer, for a toolchain installed somewhere else (a
+///    second rustup home, a CI image, a vendored toolchain). The same courtesy
+///    `ESP_IDF_TOOLS_INSTALL_DIR` already extends to the SDK.
+/// 2. **`$RUSTUP_HOME/toolchains/esp/bin`** — the standard variable for a relocated rustup install.
+/// 3. **`$HOME/.rustup/toolchains/esp/bin`** — the default rustup home, which is where `espup` puts
+///    it on a normal machine.
+///
+/// A path that is set but does not exist is **not** fatal: the next step is tried, and if nothing is
+/// found the build fails with the toolchain's own error. Deliberate — an explicit typo losing a
+/// discovery that would have worked is a worse failure than a missing directory.
+///
+/// Both `cargo` *and* `rustc` must come from here: leaving cargo to find its own `rustc` silently
+/// picks the stable one, and `-Zbuild-std` then fails with "the option `Z` is only accepted on the
+/// nightly compiler" — an error about a flag, never about the toolchain that should have accepted it.
 pub fn esp_toolchain_bin() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    esp_toolchain_bin_in(&PathBuf::from(home).join(".rustup").join("toolchains"))
+    esp_toolchain_bin_in(
+        non_empty_env("ESP_TOOLCHAIN_BIN").as_deref(),
+        non_empty_env("RUSTUP_HOME").as_deref(),
+        non_empty_env("HOME").as_deref(),
+    )
 }
 
-/// [`esp_toolchain_bin`] against an explicit toolchains root, so it can be tested without
-/// depending on the machine having espup installed (the same reason `device_platforms_in`
-/// takes a directory).
-pub fn esp_toolchain_bin_in(toolchains_root: &Path) -> Option<PathBuf> {
-    let bin = toolchains_root.join(ESP_TOOLCHAIN).join("bin");
+/// [`esp_toolchain_bin`] with the environment passed in, so the order is testable without espup
+/// installed (the same reason `libclang_path_in` takes a directory).
+pub fn esp_toolchain_bin_in(
+    explicit: Option<&str>,
+    rustup_home: Option<&str>,
+    home: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = explicit {
+        let bin = PathBuf::from(explicit);
+        if bin.is_dir() {
+            return Some(bin);
+        }
+    }
+    let toolchains = match rustup_home {
+        Some(root) => PathBuf::from(root).join("toolchains"),
+        None => PathBuf::from(home?).join(".rustup").join("toolchains"),
+    };
+    let bin = toolchains.join(ESP_TOOLCHAIN).join("bin");
     bin.is_dir().then_some(bin)
+}
+
+/// An environment value that is set and not blank, else `None`.
+///
+/// Blank counts as unset: `ESP_TOOLCHAIN_BIN=""` in a shell profile would otherwise resolve to the
+/// current directory — the kind of deliberate-looking nonsense this module refuses elsewhere.
+pub(crate) fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// The `LIBCLANG_PATH` bindgen needs, discovered under the esp toolchain.
@@ -506,6 +546,7 @@ pub(crate) fn spec_from_plan(plan: EspPlan) -> BuildSpec {
         esp_toolchain_bin().as_deref(),
         libclang_path().as_deref(),
         &esp_idf_tools_install_dir(),
+        non_empty_env("LIBCLANG_PATH").as_deref(),
         std::env::var("PATH").ok().as_deref(),
     )
 }
@@ -520,6 +561,7 @@ pub(crate) fn spec_from_parts(
     toolchain_bin: Option<&Path>,
     libclang: Option<&Path>,
     idf_tools_dir: &str,
+    inherited_libclang: Option<&str>,
     inherited_path: Option<&str>,
 ) -> BuildSpec {
     let mut env = plan.env;
@@ -537,12 +579,18 @@ pub(crate) fn spec_from_parts(
         env.push(("PATH".to_string(), path));
     }
 
-    // Without this, bindgen inside esp-idf-sys fails with an error that never mentions bindgen.
-    if let Some(lib) = libclang {
-        env.push((
+    // Without `LIBCLANG_PATH`, bindgen inside esp-idf-sys fails with an error that never mentions
+    // bindgen. **An inherited value wins**: it is the canonical name for this setting, so a user who
+    // exported it did so about their own clang, and overwriting their choice with the one we found
+    // under the esp toolchain would be exactly the "Spire knows better" this module avoids
+    // everywhere else. Discovery is the fallback, not the authority.
+    match (inherited_libclang, libclang) {
+        (Some(explicit), _) => env.push(("LIBCLANG_PATH".to_string(), explicit.to_string())),
+        (None, Some(found)) => env.push((
             "LIBCLANG_PATH".to_string(),
-            lib.to_string_lossy().to_string(),
-        ));
+            found.to_string_lossy().to_string(),
+        )),
+        (None, None) => {}
     }
 
     // Where esp-idf-sys installs ESP-IDF and its tools. Left to itself it uses `workspace` —
@@ -993,36 +1041,72 @@ mod tests {
         assert!(err.contains("unknown platform"), "{err}");
     }
 
-    /// The toolchain probes are filesystem checks, so the *logic* is tested against a
-    /// directory rather than the machine's `$HOME` — which may not have espup at all, and a
-    /// test that needed it would fail for the wrong reason.
+    /// The toolchain probes are filesystem checks, so the *logic* is tested against directories
+    /// rather than the machine's `$HOME` — which may not have espup at all, and a test that needed
+    /// it would fail for the wrong reason.
+    ///
+    /// The order is the point: an explicit answer, then a relocated rustup home, then the default
+    /// one. Each is a *reference* to an install this machine already has (see `esp_toolchain_bin`).
     #[test]
-    fn the_toolchain_and_libclang_are_discovered_from_a_directory() {
+    fn the_esp_toolchain_is_resolved_explicit_then_rustup_home_then_home() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
-        // Not installed yet: no bin dir, no clang.
-        assert!(esp_toolchain_bin_in(root).is_none());
+        // Nothing installed anywhere: no toolchain, and no clang under one either.
+        assert!(esp_toolchain_bin_in(None, None, None).is_none());
         assert!(libclang_path_in(root).is_none());
 
-        // The toolchain's bin dir is what makes it usable...
-        std::fs::create_dir_all(root.join(ESP_TOOLCHAIN).join("bin")).unwrap();
+        // The default rustup home — where espup puts it on a normal machine.
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".rustup/toolchains/esp/bin")).unwrap();
+        let from_home = home.join(".rustup/toolchains/esp/bin");
         assert_eq!(
-            esp_toolchain_bin_in(root),
-            Some(root.join(ESP_TOOLCHAIN).join("bin"))
+            esp_toolchain_bin_in(None, None, home.to_str()),
+            Some(from_home.clone())
         );
 
-        // ...while libclang stays unknown until the versioned clang dir exists: that version
-        // is exactly what must not be hardcoded.
-        let toolchain = root.join(ESP_TOOLCHAIN);
-        assert!(libclang_path_in(&toolchain).is_none());
+        // `RUSTUP_HOME` relocates it, and wins over `$HOME`: that is what the variable is for.
+        let moved = root.join("elsewhere/rustup");
+        std::fs::create_dir_all(moved.join("toolchains/esp/bin")).unwrap();
+        let from_moved = moved.join("toolchains/esp/bin");
+        assert_eq!(
+            esp_toolchain_bin_in(None, moved.to_str(), home.to_str()),
+            Some(from_moved.clone()),
+            "a relocated rustup home must be honoured"
+        );
+
+        // An explicit `ESP_TOOLCHAIN_BIN` wins over both.
+        let explicit = root.join("opt/esp/bin");
+        std::fs::create_dir_all(&explicit).unwrap();
+        assert_eq!(
+            esp_toolchain_bin_in(explicit.to_str(), moved.to_str(), home.to_str()),
+            Some(explicit.clone()),
+            "an explicit toolchain is an answer, not a hint"
+        );
+
+        // A set-but-wrong explicit path falls *through* rather than failing the build: a typo must
+        // not lose a discovery that would have worked.
+        assert_eq!(
+            esp_toolchain_bin_in(Some("/definitely/not/here"), moved.to_str(), home.to_str()),
+            Some(from_moved)
+        );
+        assert_eq!(
+            esp_toolchain_bin_in(Some("   "), None, home.to_str()),
+            Some(from_home),
+            "blank is not an answer"
+        );
+
+        // The versioned clang directory is what must not be hardcoded, so it is discovered from
+        // whichever toolchain won.
+        let toolchain = explicit.parent().unwrap();
+        assert!(libclang_path_in(toolchain).is_none());
         let lib = toolchain
             .join("xtensa-esp32-elf-clang")
             .join("esp-20.1.1_20250829")
             .join("esp-clang")
             .join("lib");
         std::fs::create_dir_all(&lib).unwrap();
-        assert_eq!(libclang_path_in(&toolchain), Some(lib));
+        assert_eq!(libclang_path_in(toolchain), Some(lib));
     }
 
     /// The invocation is only correct if these are present, and *each* failure is silent about
@@ -1035,6 +1119,7 @@ mod tests {
             Some(Path::new("/home/x/.rustup/toolchains/esp/bin")),
             Some(Path::new("/home/x/clang/lib")),
             "global",
+            None,
             Some("/usr/bin:/bin"),
         );
 
@@ -1068,13 +1153,74 @@ mod tests {
         );
     }
 
+    /// An inherited `LIBCLANG_PATH` wins over the one discovered under the esp toolchain.
+    ///
+    /// This is the "reference, don't own" rule applied to the one variable where it was previously
+    /// backwards: the discovered clang was written *over* whatever the user had exported. A user who
+    /// set `LIBCLANG_PATH` did so about their own clang — Spire's job is to supply it when the
+    /// machine has not, not to overrule it when it has.
+    #[test]
+    fn an_inherited_libclang_path_wins_over_the_discovered_one() {
+        let plan = esp_plan(&c6(), &BuildOptions::default()).expect("plan");
+        let env = |spec: &BuildSpec, key: &str| {
+            spec.env
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+
+        // Both present: the caller's wins.
+        let spec = spec_from_parts(
+            plan.clone(),
+            None,
+            Some(Path::new("/esp/toolchain/clang/lib")),
+            "global",
+            Some("/my/own/clang/lib"),
+            None,
+        );
+        assert_eq!(
+            env(&spec, "LIBCLANG_PATH").as_deref(),
+            Some("/my/own/clang/lib"),
+            "an explicit LIBCLANG_PATH is an instruction"
+        );
+
+        // Only the caller's: still theirs, and nothing is invented for it.
+        let spec = spec_from_parts(
+            plan.clone(),
+            None,
+            None,
+            "global",
+            Some("/my/own/clang/lib"),
+            None,
+        );
+        assert_eq!(
+            env(&spec, "LIBCLANG_PATH").as_deref(),
+            Some("/my/own/clang/lib")
+        );
+
+        // Only the discovered one: that is what discovery is for.
+        let spec = spec_from_parts(
+            plan,
+            None,
+            Some(Path::new("/esp/toolchain/clang/lib")),
+            "global",
+            None,
+            None,
+        );
+        assert_eq!(
+            env(&spec, "LIBCLANG_PATH").as_deref(),
+            Some("/esp/toolchain/clang/lib"),
+            "bindgen fails with an error that never mentions bindgen, so this must be filled in"
+        );
+    }
+
     /// And when they cannot be resolved, nothing is emitted for them: an empty `PATH` entry
     /// or a blank `LIBCLANG_PATH` would be worse than absent, because it would look
     /// deliberate and send the next reader hunting for a configuration mistake.
     #[test]
     fn the_spec_omits_environment_it_could_not_resolve() {
         let plan = esp_plan(&c6(), &BuildOptions::default()).expect("plan");
-        let spec = spec_from_parts(plan, None, None, "global", None);
+        let spec = spec_from_parts(plan, None, None, "global", None, None);
 
         let env = |key: &str| {
             spec.env
