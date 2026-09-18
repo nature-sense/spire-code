@@ -653,13 +653,24 @@ What that run turned up, in the order it bit:
   `cargo clean -p esp-idf-sys` forced a re-configure. Worth knowing before the next "why is the
   config ignored".
 
-**Still open on hardware:** the flash that would prove it end-to-end wedged this machine's USB-serial
-bridge. `espflash` reported `Timeout while running FlashDeflData command` (no baud is set, so the
-adapter's default is used), and after that **every** tool failed to open the port — `espflash`,
-`stty`, with `lsof` showing no holder: `Failed to open serial port … Invalid argument`, i.e. the
-bridge is wedged in the kernel, not locked by a process. A physical re-plug is the fix. Until the
-flash completes and the monitor shows the loop, the claim here is the *build* producing a table its
-app fits — not that the board has run from it.
+**Resolved on hardware, same day.** The flash completed through Spire's own leg, which now emits the
+full set itself — the command it ran was `espflash flash --chip esp32 --non-interactive --port …
+--bootloader …/out/build/bootloader/bootloader.bin --partition-table
+…/out/build/partition_table/partition-table.bin …/debug/blink-esp32` → exit 0, 66.6 s,
+`App/part. size: 1,181,776/1,536,000 bytes, 76.94%`. The chip's boot log then said what the build
+said: `I (13) boot: ESP-IDF v5.5.5-dirty 2nd stage bootloader` (not the `v6.1-beta1` it had been
+running) and `2 factory  factory app  00 00 00010000 00177000` — the build's **1500 KiB** factory
+partition, where it used to read `00fa0000` from a firmware nobody could name. Then `blink: on` /
+`blink: off`, 13 lines in 15 s, no panics. So both halves are now measured on the board rather than
+argued: the leg writes the set this build produced, and the table is one this build's image fits.
+
+The wedge that delayed it is worth keeping as an operational fact. An interrupted transfer left the
+adapter **readable but unprogrammable** — `stty -a` printed the settings while every `tcsetattr`
+returned `Invalid argument`, and a plain `cat` opened fine — and the driver instance survived a
+*quick* re-plug (`ioreg` showed `USB Single Serial`, `busy 0`, same node). What cleared it was
+**a different USB port**, i.e. a real re-enumeration, not just re-seating. espflash is invoked with
+no `--baud`, so it uses the adapter's default (460800 here); if this recurs on a long transfer, a
+conservative `--baud 115200` is the knob — and one the leg does not currently expose.
 
 **Resolved (2026-09-16): the example was missing its `build.rs`.** The link died in `ldproxy`
 with *Cannot locate argument '--ldproxy-linker <linker>'* because **no crate re-emitted the
