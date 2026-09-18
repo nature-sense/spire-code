@@ -964,13 +964,23 @@ test's project on disk so its backends can be built by hand; doing that found th
   nothing; and requiring a prior `build_analyze` was a hidden ordering requirement (the analysis store
   is best-effort: an analyze can succeed and the lookup still miss), so the verification now analyzes
   on demand and every skip names its reason — "written" and "verified to build" stay different claims.
-- **Still open (smaller)**: the esp32 leg's verification is **code-complete but untested here** — the
-  path exists (the esp module refuses without the SDK, and the scaffold/fill report `not_built` with
-  that reason rather than a failure); what is missing is a test that can only run where ESP-IDF is
-  installed. It is deliberately not folded into the creation test, because an esp-idf build compiles
-  the SDK and takes minutes — a default test doing it would punish every machine that *does* have it.
-  The deterministic tests cover rp2040 only. (The one-round limit this entry used to carry is
-  closed — see below.)
+- **The esp32 leg is verified, not assumed** (2026-09-18). The note here used to say its verification
+  needed an ESP-IDF SDK this machine did not have. That was **wrong**, and worth recording as wrong:
+  the SDK was installed all along (`~/espressif` at 7.0 GB, with the `esp-idf` v5.5.5 clone and the
+  `riscv32-esp-elf` / `xtensa-esp-elf` / `esp-clang` tools), and the thing that was missing was
+  `idf.py` *on `PATH`* — which esp-idf-sys never uses, because it manages the install itself through
+  `ESP_IDF_TOOLS_INSTALL_DIR`. Reading "not installed" off a missing human-facing CLI is exactly the
+  kind of inference this repo keeps catching in itself.
+  So it is measured now: `an_esp32_backend_builds_where_the_sdk_is_installed` scaffolds an esp32c6
+  project through the wizard's route and asserts the result —
+  `{"built":true,"crate":"blink-esp-hal-esp32","family":"esp32","platform":"esp32c6"}`, **110 s** for
+  a cold build of std and the SDK components for that chip. It is `#[ignore]`d (minutes, even warm)
+  and it needed one harness change: the integration harness registered only the rp2040 platform
+  module, so an esp `Build` had nowhere to route. Both modules are registered now, which is harmless
+  because routing keys on the platform's `os`.
+  That also means the env-resolution change above is exercised in production, not just in unit tests:
+  the same run finds the esp toolchain, sets `LIBCLANG_PATH` and pins
+  `ESP_IDF_TOOLS_INSTALL_DIR=global`.
 - **The loop is now bounded at three rounds, not one** (done 2026-09-17, and the first piece of the
   verify spine). `Repair` stopped being a special case of the fill: the shape gate → build → hand the
   compiler's errors back → rebuild now lives in `build/verify_spine.rs`, and the fill leg implements

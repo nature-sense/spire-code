@@ -23,7 +23,7 @@ use spire_code::actors::{
     ProjectAnalyzerMessage, ProjectCreationActor, ProjectQueryMessage, SystemActor,
     ToolRouterActor, ToolsActor,
 };
-use spire_code::build::{BuildModuleMessage, CargoBuildModule, Rp2040BuildModule};
+use spire_code::build::{BuildModuleMessage, CargoBuildModule, EspBuildModule, Rp2040BuildModule};
 use spire_code::subsystems::project::project_creation::ProjectCreationMessage;
 use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use tokio::sync::mpsc;
@@ -164,6 +164,24 @@ impl Wizard {
                     })
                     .await;
             }
+
+            // And the esp module, for the same reason: a `Build` for an esp-idf platform has to
+            // route somewhere. Registering both is harmless — routing is by the platform's `os` —
+            // and it is what lets an esp32 backend be built by a test rather than only by hand.
+            let esp_tx = spawn_module(EspBuildModule::new());
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let _ = esp_tx
+                .send(BuildModuleMessage::DescribeCapabilities { reply_to: reply_tx })
+                .await;
+            if let Ok(capability) = reply_rx.await {
+                let _ = bm_tx
+                    .send(BuildManagerMessage::AddPlatformModule {
+                        os: "esp-idf".to_string(),
+                        capability,
+                        module_tx: esp_tx,
+                    })
+                    .await;
+            }
         }
 
         let mut creation = ProjectCreationActor::new(fs_tx, bm_tx.clone(), mcp_tx.clone());
@@ -241,6 +259,75 @@ impl Wizard {
             .send(BuildManagerMessage::SetLlm { llm_tx })
             .await;
     }
+}
+
+/// The **esp32** leg, for real: scaffold a board project and let the wizard build the backend it
+/// wrote, with the ESP-IDF SDK this machine has (`~/.espressif`, shared via
+/// `ESP_IDF_TOOLS_INSTALL_DIR=global`).
+///
+/// Ignored because it genuinely compiles ESP-IDF for the chip and builds `std` from source —
+/// minutes, even with everything installed — so not something every `cargo test` should pay for.
+/// It is the check that was previously *assumed* to need an SDK this machine did not have; it did,
+/// and the only thing `idf.py`-on-`PATH` would have told us is that a different entry point exists.
+///
+///     cargo test -p spire-code --test embedded_hal_creation_tests -- --ignored an_esp32_backend
+#[ignore = "builds an esp32 backend for real: compiles ESP-IDF, takes minutes"]
+#[tokio::test]
+async fn an_esp32_backend_builds_where_the_sdk_is_installed() {
+    // The machine trap this repo keeps meeting: rustup`s cargo has to be the one that runs. The
+    // esp module prepends its own toolchain to the *child`s* PATH, but the analysis and the
+    // artifact paths still come from the cargo on this process`s PATH.
+    if let Ok(out) = std::process::Command::new("rustup")
+        .args(["which", "cargo"])
+        .output()
+    {
+        if out.status.success() {
+            let cargo = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(bin) = std::path::Path::new(&cargo).parent() {
+                let path = format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                );
+                std::env::set_var("PATH", path);
+            }
+        }
+    }
+
+    let _serialized = serialized().await;
+    let platforms = registry();
+    std::env::set_var("SPIRE_PLATFORM_DIR", platforms.path());
+    let dir = tempfile::tempdir().expect("project dir");
+    let root = dir.path().join("blink-esp");
+    let wizard = Wizard::build_with_rp2040(None).await;
+
+    let scaffold = wizard
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "blink-esp",
+                "rootDir": root.to_string_lossy(),
+                "language": "Rust",
+                "platforms": ["esp32c6"],
+                "structure": "embedded_hal",
+            }),
+        )
+        .await;
+    assert!(scaffold.get("error").is_none(), "{scaffold}");
+
+    let verification = scaffold["backend_verification"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the scaffold verifies its backends: {scaffold}"));
+    assert_eq!(verification.len(), 1, "{scaffold}");
+    let entry = &verification[0];
+    eprintln!("esp backend verification -> {entry}");
+    assert_eq!(entry["family"], serde_json::json!("esp32"));
+    assert_eq!(entry["crate"], serde_json::json!("blink-esp-hal-esp32"));
+    assert_eq!(
+        entry["built"],
+        serde_json::json!(true),
+        "an esp32 backend must build where the SDK is installed: {entry}"
+    );
 }
 
 /// The **from-scratch** route (no HAL, no embedded structure) — the one ISSUES.md listed as never
