@@ -1385,3 +1385,98 @@ prunes them.
 The four manifests are the whole change on the data side; the rest of it was one query bug and one glob
 semantic. Neither was in the plan, and both would have made the fill look like it had not worked.
 
+## 11. The HAL re-centers on `embedded-hal` — the actor stays ours
+
+A review of what `spire-hal` had become, and the decision that came out of it: **the peripheral traits
+are the ecosystem's, the actor contract stays ours, and drivers become the growth area.**
+
+### The finding
+
+`spire-hal` was two unrelated layers wearing one name:
+
+| layer | what was there | what it is |
+| --- | --- | --- |
+| hardware abstraction | `hal::{Led, DelayMs}`, `HalError` | a re-invention of `embedded-hal`'s `OutputPin` / `DelayNs` and its error philosophy |
+| firmware architecture | `actor::{Actor, Mailbox, Spawner}` | genuinely ours — no ecosystem crate has one |
+
+The first layer was costing the most and buying the least. Every vendor HAL (`esp-idf-hal`,
+`rp2040-hal`, `stm32-hal`) implements `embedded-hal`'s traits, and so does (almost) every driver crate
+in existence — so a trait of our own stood between a generated project and the entire driver ecosystem,
+and asked every backend to implement the same `set_high`/`delay_ms` twice: once as ours, once as the
+vendor's (which it already had). The scaffold's own manifests already said as much — the rp2040
+backend's has pinned `embedded-hal = "1"` since the day it was written, because `rp2040-hal`'s methods
+*are* `embedded-hal` methods and a model that imports the wrong major cannot call `set_high`.
+
+The second layer is not a HAL trait at all. It is the concurrency/architecture model the rest of Spire
+leans on: a firmware unit is a `Message` type plus a `handle`, the same shape as the host's
+`spire_actor::Actor`, and a message with no handler is a missing implementation — which is what the
+drift measure reads. `embedded-hal` has no opinion about any of that.
+
+### The decision
+
+- **Adopt `embedded-hal` 1.0 as the trait layer** and re-export it from `spire-hal`, so a project names
+  one version of it and gets the one its backends were compiled against.
+- **Keep the actor trio** (`Actor`, `Mailbox`, `Spawner`) as the only trait this workspace owns.
+- **Backends supply constructors, not implementations.** A board's facts — which pin, which polarity,
+  which executor — live in a `Board` in the backend crate. A `Board` **type**, deliberately not a
+  `trait Board`: a trait would be a contract of our invention again, one level up, and would need the
+  drift machinery this change removes.
+- **Drivers are the growth area.** They are written against `embedded-hal` traits (`SpiDevice`, `I2c`,
+  `DelayNs`), which is what makes them board-agnostic *and* host-testable; prefer an upstream crate and
+  wrap it in an actor only when it must participate in the actor model.
+
+
+### Landed (spire-hal, this change)
+
+- `spire-hal`: `hal/{led,time}.rs` and `error.rs` **deleted**; `embedded-hal = "1.0"` added and
+  re-exported. The crate is now the actor contract plus that re-export.
+- `spire-hal-esp32`: `GpioLed` and `FreeRtosDelay` **deleted** — wrappers whose only purpose was
+  implementing our traits, though both types they wrapped already implement the ecosystem's
+  (`PinDriver: OutputPin + StatefulOutputPin`, `FreeRtos: DelayNs`). Replaced by `Board::led(pin)` and
+  `Board::delay()`, which return those vendor types directly. The crate now has no `impl` block of our
+  own in it.
+- `contract.rs` (the portability test that justifies the seam): `Blink` is generic over
+  `OutputPin`/`DelayNs` and the fakes implement `embedded-hal` — the *same* test with the trait
+  swapped. `the_same_actor_runs_against_a_different_backend` still passes, which is the claim that had
+  to survive: the actor does not change when the board does.
+- `examples/blink-esp32` (the on-hardware proof): `Board::led` / `Board::delay` / `StdSpawner`, actor
+  unchanged in shape.
+
+Verified: `cargo test` in spire-hal (4 contract + 3 executor tests, zero warnings);
+`MCU=esp32c6 cargo check -p spire-hal-esp32 --target riscv32imac-esp-espidf` (the RISC-V variant); and
+`cargo build --release` of `examples/blink-esp32` for the classic ESP32 on the desk.
+
+### Two things worth knowing for the next person
+
+- **`embedded-hal` 1.0 splits the error out of the pin trait**: `OutputPin: ErrorType`, so an
+  implementation is two `impl` blocks (`impl ErrorType { type Error = … }`, then `impl OutputPin`). The
+  compiler reports the missing `ErrorType`, which reads like a typo in a trait name if you know only
+  0.2 or only the pin traits of 1.0.
+- **Polarity is the one thing the swap moved, and it moved to the right place.** `Led::set(on: bool)`
+  was *logical* (`on` = lit; an active-low board inverted in the backend); `OutputPin::set_high` is
+  *physical*. So the actor now drives levels and polarity is a fact of the backend's `Board::led` —
+  where board facts already live (`library_hints`, `sdkconfig`). The pilot board is active-high, so it
+  needs nothing; a backend with an active-low LED inverts in `Board::led` and the actor above it does
+  not change. Smaller surface than the old logical trait, and it says what it means.
+
+### Still to do (the spire-code side, in order)
+
+1. `build/embedded_hal_scaffold.rs` emits a contract crate containing `hal::{Led, DelayMs}` +
+   `HalError`; it must emit the re-export + actor, and a `Board` skeleton per backend instead. Until it
+   does, a scaffolded project does not match this crate.
+2. `build/embedded_hal_fill.rs` plans "the trait + its required methods" per backend file; the unit
+   becomes a `Board` constructor, and the prompt injects the vendor crate, the `embedded-hal` trait
+   names and the platform's `library_hints` (its existing job).
+3. The drift machinery (`hal_rust_contract`, `embedded_hal_contract`, `hal_diff_contracts`) measures
+   trait-method coverage, which the compiler now enforces. It re-scopes to **Board shape** and **actor
+   message** coverage — a smaller measure, and the one that still earns its keep.
+4. `embedded_app_scaffold.rs` writes `use spire_hal::hal::Led;` into the app it scaffolds; that becomes
+   the `embedded-hal` traits plus the backend's `Board`.
+5. Drivers: pick the first one (a WS2812 strip or an I²C sensor), land it against `embedded-hal` with
+   host tests, and settle the "upstream crate vs. actor-shaped wrapper" default in the fill prompt.
+
+The whole spiral — a bespoke trait per board family, a scaffold that generates it, a fill that
+implements it, a drift measure that scores it — existed to make a *contract* out of something the
+ecosystem had already standardised. Adopting the standard deletes the bottom layer and leaves the two
+things that were actually ours: the actor model, and the board.
+
