@@ -397,6 +397,13 @@ fn contract_lib(hal_id: &str) -> String {
          //!    because it is the unit the drift measure reads: a message with no handler is a\n\
          //!    missing implementation.\n\
          //!\n\
+         //! 3. **Devices are upstream crates by default.** A sensor, a display or a strip has a\n\
+         //!    crate written against these traits, and it drops onto a `Board` bus without an\n\
+         //!    adapter. Writing a driver is the fallback — for a device nobody has one for, or for\n\
+         //!    one that has to be actor-shaped — and its shape is then fixed: generic over the\n\
+         //!    traits, vendor types left in the backend, and host-tested against fakes. A driver\n\
+         //!    that names a chip is a driver that works on one chip.\n\
+         //!\n\
          //! A board family is a **backend** crate, and what it supplies is constructors —\n\
          //! `Board::led`, `Board::delay` — not a trait implementation: the compiler already\n\
          //! enforces the traits. Nothing here knows about a vendor SDK, an OS or an executor; the\n\

@@ -1525,10 +1525,34 @@ its own, still a supported path and still measured; `scaffolded_project` = what 
 and `a_scaffolded_backend_is_one_pending_plan_item` asserts against the latter — `board`, `Board`,
 `led`/`delay`.
 
+### Step 5 landed — one driver, and the policy that decides when to write one
+
+The decision the plan asked to settle is: **upstream crates are the default.** A sensor, a display or
+a strip has a crate written against these traits, and it drops onto a `Board` bus without an adapter —
+which is the whole reason the traits are re-exported rather than re-invented. That is now stated where
+a model reads it: point 3 of the scaffolded contract's `lib.rs`, which the HAL fill prompt injects
+verbatim as "the contract itself, not a paraphrase".
+
+Writing a driver is the fallback, for the two cases where the default is not the answer: no crate for
+the device, or a driver that has to be *actor-shaped*. `crates/spire-hal-drivers` is the first one —
+`Ws2812`, generic over `SpiBus<u8>` and `DelayNs`, with no vendor type, no `#[cfg(board)]` and no chip
+name — and it is host-tested against fakes (`cargo test -p spire-hal-drivers`). It is a `default-member`
+of the workspace *because* it is host-checkable, which is the point of writing drivers against traits.
+
+The test earned its keep immediately. Three things an eye cannot check on a bench are byte
+assertions: three SPI bits per data bit (`100` for a zero, `110` for a one), GRB channel order rather
+than the caller's RGB, and the latch *after* the frame. It failed first on a real bug: an unset pixel
+left as zero bytes sends 30 µs of low **inside** a frame — outside the protocol — so a new frame is
+now encoded black rather than cleared. That is exactly the class of mistake a driver is worth having a
+test for, and none of it needs hardware.
+
 ### Still to do
 
-Drivers: pick the first one (a WS2812 strip or an I²C sensor), land it against `embedded-hal` with
-host tests, and settle the "upstream crate vs. actor-shaped wrapper" default in the fill prompt.
+1. **The board's buses.** `Board` has `led` and `delay`; a bus driver needs `Board::spi`/`Board::i2c`
+   (esp-idf-hal's `SpiDriver`/`I2cDriver` already implement `SpiBus`/`I2c`, so they are constructor
+   wrappers like `led`). Until that lands, `Ws2812` is provable on a host fake but cannot be wired to
+   the pilot board — the driver is done, the board owes it a bus.
+2. Then the second driver, and the app's fill prompt reaching for an upstream crate by name.
 
 The whole spiral — a bespoke trait per board family, a scaffold that generates it, a fill that
 implements it, a drift measure that scores it — existed to make a *contract* out of something the
