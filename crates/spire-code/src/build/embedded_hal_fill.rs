@@ -1472,7 +1472,7 @@ mod tests {
     /// caller's decision rather than a test's:
     ///
     /// ```sh
-    /// SPIRE_FILL_PLAN_ROOT=../spire-hal cargo test -p spire-code --lib \
+    /// SPIRE_FILL_PLAN_ROOT=../spire-embedded cargo test -p spire-code --lib \
     ///     dump_fill_plan_for_a_real_project -- --ignored --nocapture
     /// ```
     #[test]
