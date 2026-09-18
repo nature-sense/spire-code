@@ -121,9 +121,17 @@ pub fn esp_flash_tool(platform: &Platform) -> Option<&str> {
 /// auto-detect is a **prompt**, and a `tools/call` has no terminal: measured on the attached
 /// ESP32, the un-flagged command dies with `espflash::dialoguer_error / IO error: not a
 /// terminal` — a failure that names neither the board nor the port.
+///
+/// `bootloader` and `partition_table` are the ones **this build** produced ([`esp_bootloader_path`],
+/// [`esp_partition_table_path`]). Without them espflash writes the app and nothing else, leaving the
+/// board's existing bootloader and table in place — which is how a `v5.5.5` app came to run under a
+/// `v6.1` bootloader, inside a partition from a firmware nobody could name. `None` keeps the
+/// app-only behaviour, which is still right for an esp artifact that is not esp-idf-sys's.
 pub fn esp_flash_command(
     platform: &Platform,
     artifact: &Path,
+    bootloader: Option<&Path>,
+    partition_table: Option<&Path>,
     port: Option<&Path>,
 ) -> Option<Vec<String>> {
     let tool = esp_flash_tool(platform)?;
@@ -138,6 +146,14 @@ pub fn esp_flash_command(
     if let Some(port) = port {
         command.push("--port".to_string());
         command.push(port.to_string_lossy().to_string());
+    }
+    if let Some(bootloader) = bootloader {
+        command.push("--bootloader".to_string());
+        command.push(bootloader.to_string_lossy().to_string());
+    }
+    if let Some(partition_table) = partition_table {
+        command.push("--partition-table".to_string());
+        command.push(partition_table.to_string_lossy().to_string());
     }
     command.push(artifact.to_string_lossy().to_string());
     Some(command)
@@ -206,6 +222,52 @@ pub fn esp_artifact_path(
     // where the triple comes from (this platform's `rust.target`).
     let rust = platform.rust.as_ref()?;
     crate::build::generic_helpers::cargo_artifact_path(root, &rust.target, mode, package, explicit)
+}
+
+/// A file `esp-idf-sys` left under a profile dir's `build/esp-idf-sys-*/out/build/`, or `None`.
+///
+/// The build directory is **globbed**, not named, because its hash is esp-idf-sys's own — and
+/// several can accumulate (a changed `sdkconfig.defaults` re-configures into a new one while the
+/// old stays behind). The **newest** is the one this build used; an older one still describes the
+/// previous partition table, which is the whole hazard this exists to avoid.
+///
+/// A directory parameter so the glob is provable on a temp dir, the same reason `serial_port_in`
+/// and `libclang_path_in` take one.
+fn esp_idf_build_file_in(profile_dir: &Path, relative: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(profile_dir.join("build")).ok()?;
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("esp-idf-sys-"))
+        })
+        .map(|entry| entry.path().join("out").join("build").join(relative))
+        .filter(|file| file.is_file())
+        .collect();
+    candidates.sort_by_key(|file| std::fs::metadata(file).and_then(|m| m.modified()).ok());
+    candidates.pop()
+}
+
+/// The bootloader **this build** produced, or `None` when the project is not an esp-idf one.
+///
+/// `espflash flash <elf>` deliberately writes only the app, so a board flashed that way keeps
+/// whatever bootloader it already had — measured: a `v6.1-beta1` bootloader under a `v5.5.5` app,
+/// reported by neither the tool nor the build. Carrying the one the build made is what makes
+/// "flash this project" mean what it says.
+pub fn esp_bootloader_path(artifact: &Path) -> Option<PathBuf> {
+    esp_idf_build_file_in(&artifact.parent()?, "bootloader/bootloader.bin")
+}
+
+/// The partition table **this build** produced, or `None`.
+///
+/// Flashed with the app because the two must agree: the app's size has to fit the partition it is
+/// written to, and a board's *existing* table is whatever some earlier firmware left there. Passing
+/// the build's own table turns "the image does not fit" into a failure at flash time instead of a
+/// silent write into someone else's layout.
+pub fn esp_partition_table_path(artifact: &Path) -> Option<PathBuf> {
+    esp_idf_build_file_in(&artifact.parent()?, "partition_table/partition-table.bin")
 }
 
 /// The esp toolchain's `bin` — the directory that must come first on the child build's `PATH`.
@@ -476,6 +538,10 @@ pub async fn run_esp_build(path: &Path, opts: &BuildOptions) -> Result<BuildOutp
 /// The port resolves explicit → `$ESPFLASH_PORT` → the single USB-serial device → refusal. It is
 /// named rather than left to espflash because espflash cannot see this adapter at all (see
 /// [`USB_SERIAL_MARKERS`]), and its fallback would be a prompt with no terminal to answer it.
+///
+/// The bootloader and partition table travel with the artifact when the build produced them
+/// ([`esp_bootloader_path`], [`esp_partition_table_path`]) — a board's existing ones belong to
+/// whatever firmware was flashed before, and those are not the ones this app was built against.
 pub async fn run_esp_flash(
     path: &Path,
     opts: &BuildOptions,
@@ -530,8 +596,14 @@ pub async fn run_esp_flash(
                 .to_string()
         })?;
 
-    let command = esp_flash_command(&platform, &artifact, Some(&port))
-        .ok_or_else(|| format!("platform '{}' has no flash command", platform.id))?;
+    let command = esp_flash_command(
+        &platform,
+        &artifact,
+        esp_bootloader_path(&artifact).as_deref(),
+        esp_partition_table_path(&artifact).as_deref(),
+        Some(&port),
+    )
+    .ok_or_else(|| format!("platform '{}' has no flash command", platform.id))?;
     crate::build::generic_helpers::run_build_spec(path, &spec_from_command(command)).await
 }
 
@@ -761,6 +833,8 @@ mod tests {
         let cmd = esp_flash_command(
             &c6(),
             Path::new("target/riscv32imac-esp-espidf/release/fw"),
+            None,
+            None,
             Some(Path::new("/dev/cu.usbserial-569C0028661")),
         )
         .expect("an esp platform with `flash` set flashes");
@@ -785,13 +859,100 @@ mod tests {
             cmd.last().expect("artifact").ends_with("release/fw"),
             "{cmd:?}"
         );
+        // Nothing was produced by a build here, so nothing is invented to flash with it: the
+        // app-only invocation is the fallback, not the shipping path.
+        assert!(!cmd.contains(&"--bootloader".to_string()), "{cmd:?}");
+        assert!(!cmd.contains(&"--partition-table".to_string()), "{cmd:?}");
+    }
+
+    /// The build's own bootloader and partition table are flashed **with** the app, because
+    /// espflash otherwise writes only the app and leaves the board's existing ones — measured: a
+    /// `v6.1-beta1` bootloader left under a `v5.5.5` app, inside a partition from an earlier
+    /// firmware. Both are named as flags before the artifact, which is the position espflash
+    /// expects them in.
+    #[test]
+    fn the_flash_command_carries_the_builds_own_bootloader_and_partition_table() {
+        let cmd = esp_flash_command(
+            &c6(),
+            Path::new("target/riscv32imac-esp-espidf/debug/fw"),
+            Some(Path::new("out/build/bootloader/bootloader.bin")),
+            Some(Path::new("out/build/partition_table/partition-table.bin")),
+            Some(Path::new("/dev/cu.usbserial-1")),
+        )
+        .expect("command");
+
+        for (flag, value) in [
+            ("--bootloader", "out/build/bootloader/bootloader.bin"),
+            (
+                "--partition-table",
+                "out/build/partition_table/partition-table.bin",
+            ),
+        ] {
+            let at = cmd
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} is part of the command: {cmd:?}"));
+            assert_eq!(cmd.get(at + 1).map(String::as_str), Some(value), "{cmd:?}");
+        }
+        assert!(
+            cmd.last().expect("artifact").starts_with("target/"),
+            "the artifact stays last, after every flag: {cmd:?}"
+        );
+    }
+
+    /// The discovery is a **glob with a newest-wins rule**, and both halves are pinned: several
+    /// `esp-idf-sys-*` build dirs accumulate across re-configurations, and the older one still
+    /// describes the *previous* partition table — flashing that would write the app into a layout
+    /// this build was not built for.
+    #[test]
+    fn the_bootloader_and_table_are_the_newest_esp_idf_sys_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("target/xtensa-esp32-espidf/debug");
+        let artifact = profile.join("blink");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(&artifact, b"app").unwrap();
+
+        // The old build, written first so the newer one is unambiguously newer.
+        let old = profile.join("build/esp-idf-sys-aaaa/out/build");
+        std::fs::create_dir_all(old.join("bootloader")).unwrap();
+        std::fs::create_dir_all(old.join("partition_table")).unwrap();
+        std::fs::write(old.join("bootloader/bootloader.bin"), b"old").unwrap();
+        std::fs::write(old.join("partition_table/partition-table.bin"), b"old").unwrap();
+
+        // Not an esp-idf-sys dir at all: globbed past rather than guessed at.
+        let noise = profile.join("build/some-other-crate-1234/out/build/bootloader");
+        std::fs::create_dir_all(&noise).unwrap();
+        std::fs::write(noise.join("bootloader.bin"), b"noise").unwrap();
+
+        let new = profile.join("build/esp-idf-sys-bbbb/out/build");
+        std::fs::create_dir_all(new.join("bootloader")).unwrap();
+        std::fs::create_dir_all(new.join("partition_table")).unwrap();
+        std::fs::write(new.join("bootloader/bootloader.bin"), b"new").unwrap();
+        std::fs::write(new.join("partition_table/partition-table.bin"), b"new").unwrap();
+
+        let bootloader = esp_bootloader_path(&artifact).expect("the newest bootloader");
+        assert_eq!(
+            std::fs::read(&bootloader).unwrap(),
+            b"new",
+            "{bootloader:?}"
+        );
+        let table = esp_partition_table_path(&artifact).expect("the newest table");
+        assert_eq!(std::fs::read(&table).unwrap(), b"new", "{table:?}");
+
+        // An artifact with no esp-idf-sys build beside it answers `None` — the app-only flash —
+        // rather than pointing at some path that is not there.
+        let bare = tmp.path().join("target/host/debug/tool");
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        std::fs::write(&bare, b"host binary").unwrap();
+        assert!(esp_bootloader_path(&bare).is_none());
+        assert!(esp_partition_table_path(&bare).is_none());
     }
 
     #[test]
     fn a_platform_without_a_flash_tool_has_no_flash_command() {
         let mut c6 = c6();
         c6.rust.as_mut().expect("rust").flash = None;
-        assert!(esp_flash_command(&c6, Path::new("fw"), None).is_none());
+        assert!(esp_flash_command(&c6, Path::new("fw"), None, None, None).is_none());
     }
 
     /// The port is the **single** USB-serial device, and ambiguity is `None` rather than a
@@ -910,6 +1071,10 @@ mod tests {
         let cmd = esp_flash_command(
             &c6(),
             Path::new("target/riscv32imac-esp-espidf/release/fw"),
+            Some(Path::new("/tmp/out/build/bootloader/bootloader.bin")),
+            Some(Path::new(
+                "/tmp/out/build/partition_table/partition-table.bin",
+            )),
             Some(Path::new("/dev/cu.usbserial-569C0028661")),
         )
         .expect("command");
@@ -928,6 +1093,18 @@ mod tests {
             "the port travels in the command, not in the environment: {:?}",
             spec.arguments
         );
+        // The bootloader and table are arguments too: an env var would be a second interface for
+        // the same two paths, and one this host tool never reads.
+        for path in [
+            "/tmp/out/build/bootloader/bootloader.bin",
+            "/tmp/out/build/partition_table/partition-table.bin",
+        ] {
+            assert!(
+                spec.arguments.contains(&path.to_string()),
+                "{path} travels in the command: {:?}",
+                spec.arguments
+            );
+        }
         assert!(
             spec.env.is_empty(),
             "espflash needs none of the build's environment: {:?}",

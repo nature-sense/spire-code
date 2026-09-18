@@ -632,11 +632,34 @@ What that run turned up, in the order it bit:
   certainly worked; with *today's* toolchain the loop is only true with this config, so that line
   now means "the flash was verified then, the loop is verified now" — and the difference between
   the two is exactly the kind of thing a hash match and a monitor capture settle.
+- **The flash leg now carries the build's own bootloader and partition table** (the change after
+  `e739c70`). `esp_flash_command` gained `--bootloader` / `--partition-table`, filled from
+  `esp_bootloader_path` / `esp_partition_table_path` — a glob of
+  `target/<triple>/<profile>/build/esp-idf-sys-*/out/build/`, newest match wins, `None` when the
+  project is not esp-idf-sys's (so a non-IDF esp artifact still flashes app-only). Both are
+  arguments, never environment, which the spec test pins. The behaviour change is deliberate: a
+  project whose table does not fit its own image now **fails at flash time** instead of silently
+  writing into whatever partition an earlier firmware left on the chip.
+- **The partition table that does fit is a project fact, and it is one line.** IDF's default
+  single-app layout gives `factory` 1 MB; `SINGLE_APP_LARGE` gives it **1500K**
+  (`partitions_singleapp_large.csv`), which holds a 1.18 MB debug std image at 76.94%
+  (`App/part. size: 1,181,776/1,536,000`). That is where the fix went — into the firmware's
+  `sdkconfig.defaults`, beside the stack size — because a *library* (what the embedded-HAL scaffold
+  produces) has no partition table at all.
+
 - **Spire's esp leg passes no IDF configuration at all** (no `ESP_IDF_SDKCONFIG_DEFAULTS`, and the
   registry entries carry none), so a project's `sdkconfig.defaults` is read only by esp-idf-sys's
   own convention, at *configure* time — adding the file after a first build changed nothing until
   `cargo clean -p esp-idf-sys` forced a re-configure. Worth knowing before the next "why is the
   config ignored".
+
+**Still open on hardware:** the flash that would prove it end-to-end wedged this machine's USB-serial
+bridge. `espflash` reported `Timeout while running FlashDeflData command` (no baud is set, so the
+adapter's default is used), and after that **every** tool failed to open the port — `espflash`,
+`stty`, with `lsof` showing no holder: `Failed to open serial port … Invalid argument`, i.e. the
+bridge is wedged in the kernel, not locked by a process. A physical re-plug is the fix. Until the
+flash completes and the monitor shows the loop, the claim here is the *build* producing a table its
+app fits — not that the board has run from it.
 
 **Resolved (2026-09-16): the example was missing its `build.rs`.** The link died in `ldproxy`
 with *Cannot locate argument '--ldproxy-linker <linker>'* because **no crate re-emitted the
