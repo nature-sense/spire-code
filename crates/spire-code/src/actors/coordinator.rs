@@ -5335,34 +5335,19 @@ impl CoordinatorActor {
                 }
             }
             "rag/install-bundle-manifests" => {
-                // Ship the application-wisdom corpora (spire-actor + spire-core
-                // docs) into the KnowledgeStore's manifest scan dirs so RagView
-                // discovers them and its existing Ingest buttons build the
-                // corpus. Portable: sources fetch from GitHub (cached).
+                // Write each bundled manifest into the KnowledgeStore's scan dirs, so RagView
+                // discovers it and its existing Ingest buttons build the corpus. The list itself
+                // lives in `actors::rag_bundle` — the installer, the manifest tests, and the live
+                // fill all read the same one, so "the bundle" cannot mean three different sets.
+                //
+                // Portable where it can be: the esp-rs/espressif corpora fetch from GitHub (cached),
+                // and only the std corpus names a local path, because `espup` installs the toolchain
+                // outside any project.
                 let dir = spire_core::config::knowledge_dir();
-                let bundles: [(&str, &str); 2] = [
-                    (
-                        "spire-core",
-                        include_str!("../../resources/rag-ingest/spire-core.ingest.yaml"),
-                    ),
-                    (
-                        "spire-actor",
-                        include_str!("../../resources/rag-ingest/spire-actor.ingest.yaml"),
-                    ),
-                ];
-                let mut installed: Vec<String> = Vec::new();
-                for (name, content) in bundles {
-                    let target = dir.join(name).join("ingest.yaml");
-                    if let Some(parent) = target.parent() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            return serde_json::json!({ "error": format!("create dir: {e}") });
-                        }
-                    }
-                    if let Err(e) = std::fs::write(&target, content) {
-                        return serde_json::json!({"error": format!("write {name}: {e}") });
-                    }
-                    installed.push(name.to_string());
-                }
+                let installed = match crate::actors::rag_bundle::install_into(&dir) {
+                    Ok(names) => names,
+                    Err(e) => return serde_json::json!({ "error": e }),
+                };
                 serde_json::json!({ "success": true, "installed": installed })
             }
             "rag/list-manifests" => {

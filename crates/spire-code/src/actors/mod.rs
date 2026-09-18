@@ -14,6 +14,9 @@ pub mod hal_fill;
 
 pub mod platform_codec;
 
+/// The bundled RAG corpora — one list, read by the installer and by the tests.
+pub mod rag_bundle;
+
 pub mod startup_phases;
 
 pub mod system;

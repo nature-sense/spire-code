@@ -1,0 +1,40 @@
+# Embedded wisdom corpus: **ESP-IDF** itself — the concepts, the Kconfig
+# options, the partition table, and the C API that the Rust bindings expose as
+# `esp_idf_sys`. A generated crate hits this layer whenever it needs a setting
+# (`sdkconfig.defaults`), a partition layout, or a capability the HAL does not
+# wrap.
+#
+# Scoped to the English docs tree on purpose: the repository is huge and mostly
+# not documentation, and everything outside `docs/en` would be noise in
+# retrieval. `.rst` is ingested as plain text — the parser list has no
+# reStructuredText reader, and for retrieval the difference is cosmetic.
+version: "1.0"
+pipeline:
+  name: ESP-IDF — concepts, configuration and the C API
+  corpus: esp-idf
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: esp-idf
+      patterns:
+        - "**/*.rst"
+        - "**/*.md"
+  sources:
+    - id: esp-idf-docs
+      type: github_repo
+      enabled: true
+      url: https://github.com/espressif/esp-idf.git
+      processing:
+        parser: text
+        # Every documented directory at both depths — `**/docs/en/**/*.rst` needs a directory under
+        # `docs/en/`, so `docs/en/index.rst` and the other top-level pages need the `*` form as well.
+        include_paths:
+          - "**/docs/en/*.rst"
+          - "**/docs/en/**/*.rst"
+          - "**/docs/en/*.md"
+          - "**/docs/en/**/*.md"
+        exclude_paths:
+          - "**/docs/en/**/_build/**"
+          - "**/docs/en/**/_static/**"

@@ -1,0 +1,43 @@
+# Embedded wisdom corpus: **The Rust on ESP Book** (esp-rs/book) — the canonical
+# guide to writing Rust for ESP32-class chips: the toolchain, `esp-idf-sys` and
+# the build's environment, the std-vs-no_std split, flashing and monitoring.
+#
+# It is the highest-value corpus for *generating* firmware, because it is prose
+# about the decisions a generated crate has to make, in the format the parser
+# handles best (markdown).
+version: "1.0"
+pipeline:
+  name: The Rust on ESP Book (esp-rs)
+  corpus: esp-rs-book
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: esp-rs-book
+      patterns:
+        - "**/*.md"
+  sources:
+    - id: esp-rs-book
+      type: github_repo
+      enabled: true
+      url: https://github.com/esp-rs/book.git
+      processing:
+        parser: markdown
+        # The book is an mdBook: chapters under `src/`, plus the landing README.
+        # Include patterns are matched against the **absolute** path inside the
+        # clone, so every directory pattern needs its `**/` prefix — a bare
+        # `src/**/*.md` matches nothing (the same trap the spire-core manifest
+        # documents for `include_files`).
+        #
+        # And both depths are listed. `**/src/**/*.md` expands to `.*/src/.*/[^/]*\.md`, which
+        # requires a directory *between* `src/` and the file: it matches `src/advanced/…md` and
+        # misses `src/index.md`, the book's own chapter list. `**/src/*.md` is the other half. One
+        # pattern per depth — a single `**/src/**` form silently ingests a fraction of the book.
+        include_paths:
+          - "**/src/*.md"
+          - "**/src/**/*.md"
+          - "**/README.md"
+        exclude_paths:
+          - "**/target/**"
+          - "**/theme/**"

@@ -1,0 +1,50 @@
+# Embedded wisdom corpus: **the Rust standard library, as the board toolchain
+# compiles it.** Ingested from the `esp` toolchain's `rust-src` (`-Zbuild-std`
+# builds std from exactly this tree), so the API a generated backend can call is
+# the API it will link against — not whatever a different nightly happens to
+# have.
+#
+# This is the one corpus whose source is a **local path**, and it has to be: the
+# toolchain is installed outside any project, by `espup`, and the ingest has no
+# variable expansion. On another machine, point `path` at that machine's
+# `$(rustup which --toolchain esp cargo)/../../lib/rustlib/src/rust/library`
+# (the `library/` directory next to the toolchain's `bin/`). If the path does
+# not exist the ingest reports the source as skipped rather than failing.
+#
+# It is also the largest corpus by a wide margin (~1000 files), so it is scoped
+# to the three crates a firmware crate actually calls into.
+version: "1.0"
+pipeline:
+  name: Rust std/core/alloc — the standard library source
+  corpus: rust
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: rust
+      patterns:
+        - "**/*.rs"
+  sources:
+    - id: rust-std-src
+      type: local
+      enabled: true
+      path: /Users/steve/.rustup/toolchains/esp/lib/rustlib/src/rust/library
+      processing:
+        parser: code
+        languages:
+          - "Rust"
+        # Absolute paths are matched, so the crate directories are named explicitly rather than
+        # relying on a bare `src/**` — and each at both depths, because `**/…/src/**/*.rs` cannot
+        # match `…/src/lib.rs`: `src/lib.rs` is the entry point of all three crates, so the
+        # nested-only form would drop the most-read file in the corpus.
+        include_paths:
+          - "**/library/core/src/*.rs"
+          - "**/library/core/src/**/*.rs"
+          - "**/library/std/src/*.rs"
+          - "**/library/std/src/**/*.rs"
+          - "**/library/alloc/src/*.rs"
+          - "**/library/alloc/src/**/*.rs"
+        exclude_paths:
+          - "**/tests/**"
+          - "**/benches/**"

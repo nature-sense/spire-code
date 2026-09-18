@@ -1,0 +1,45 @@
+# Embedded wisdom corpus: **esp-idf-hal** — the Rust API a generated backend
+# writes against. Its doc comments *are* the API reference (docs.rs renders the
+# same source), and its `examples/` are real, compiling usage of every
+# peripheral, which is exactly what a model needs to get a call shape right.
+#
+# Ingested as code: the chunks are source, so a retrieval for "toggle an output
+# pin" returns the `PinDriver` impls and the example that drives one, not prose
+# about them.
+version: "1.0"
+pipeline:
+  name: esp-idf-hal — the Rust API for ESP-IDF
+  corpus: esp-idf-hal
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: esp-idf-hal
+      patterns:
+        - "**/*.rs"
+  sources:
+    - id: esp-idf-hal
+      type: github_repo
+      enabled: true
+      url: https://github.com/esp-rs/esp-idf-hal.git
+      processing:
+        parser: code
+        languages:
+          - "Rust"
+        # `src/` is the API; `examples/` is how it is actually used. Both, because
+        # a generated backend needs the second as much as the first.
+        # (Patterns are matched against the absolute clone path — see the book's
+        # manifest for why every one of them starts with `**/`.)
+        #
+        # Each directory is listed at **both** depths: `**/src/**/*.rs` cannot match `src/gpio.rs`
+        # (its `**` must consume a directory), so the nested-only form quietly ingests 16 files where
+        # there are a hundred — measured, not theorised.
+        include_paths:
+          - "**/src/*.rs"
+          - "**/src/**/*.rs"
+          - "**/examples/*.rs"
+          - "**/examples/**/*.rs"
+          - "**/README.md"
+        exclude_paths:
+          - "**/target/**"

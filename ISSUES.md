@@ -1212,3 +1212,176 @@ anything). So "the plan is the scaffold" is not a shortcut; it is how this flow 
 
 
 
+## 10. The embedded corpora — and the retrieval bug that filling them exposed
+
+The RAG had two corpora about *spire itself* (`spire-core`, `spire-actor`) and nothing about the thing a
+generated firmware crate is actually written against. Four manifests were added to close that, and the
+exercise found a retrieval bug that made every one of them invisible.
+
+### The corpora, and why each one
+
+| corpus | source | what it is for |
+| --- | --- | --- |
+| `esp-rs-book` | github `esp-rs/book` | the *decisions*: toolchain, `esp-idf-sys` + the build env, std-vs-`no_std`, flashing. Prose, so the parser is at its best here |
+| `esp-idf-hal` | github `esp-rs/esp-idf-hal` | the API a generated backend calls: `src/` (doc comments *are* the reference) **and** `examples/` (real, compiling usage — a call shape is usually visible there and nowhere else) |
+| `esp-idf` | github `espressif/esp-idf` | the layer underneath: Kconfig settings, partition tables, the C API the bindings expose as `esp_idf_sys`. Scoped to `docs/en` — the repo is 22,010 files and almost none of the rest is documentation |
+| `rust` | **local** `~/.rustup/toolchains/esp/lib/rustlib/src/rust/library` | `core`/`std`/`alloc`, as the board toolchain compiles them: `-Zbuild-std` builds std from exactly this tree, so a generated crate calls the API it will link against |
+
+Board **facts** (pin numbers, target triple) did **not** become a corpus: they are a two-line table in
+`esp32.yaml`'s `library_hints`, where the prompt already reads them. A corpus is for what is too big to
+inline; a fact is not.
+
+The std corpus is the one source with a **local path**, and it has to be: `espup` installs the toolchain
+outside any project, and the ingest has no variable expansion. It is called out in the manifest, and a
+missing path is reported as a skipped source rather than as a failure. The three others clone (cached
+under `~/.spire/knowledge/.cache/<id>`) so the bundle stays portable.
+
+### One list, three readers
+
+`actors::rag_bundle` now owns `BUNDLE` (the six manifests, `include_str!`-embedded) and
+`install_into(dir)`, which writes `<corpus>/ingest.yaml` into the KnowledgeStore's scan dirs. The
+coordinator's `rag/install-bundle-manifests` calls it, the manifest tests parse it, and the live fill
+ingests it — so "the bundle" cannot come to mean three different sets, and a manifest that is not in
+`BUNDLE` is not shipped at all.
+
+### The pattern trap, measured
+
+`**/src/**/*.rs` does not match `src/gpio.rs`. `glob_to_regex` expands `**` to `.*` and `*` to `[^/]*`,
+so the pattern becomes `.*/src/.*/[^/]*\.rs` — the `.*` after `src/` must be followed by a `/`, i.e.
+nested-only. The first fill therefore ingested **16 files** of esp-idf-hal where the tree holds **84**,
+and 21 of the book's 25 pages. Nothing failed: an ingest that matches a third of its tree reports a
+smaller chunk count, which reads exactly like a small corpus.
+
+The fix is to list each directory at **both** depths (`**/src/*.rs` *and* `**/src/**/*.rs`), and the
+thing that keeps it fixed is a test that asserts each manifest against *paths from the tree it points
+at* rather than against its own count:
+
+- `include_patterns_match_the_real_files_and_not_the_neighbours` claims `/…/esp-idf-hal/src/gpio.rs`,
+  `/…/esp-idf/docs/en/index.rst`, `/…/library/core/src/lib.rs` (all of which the nested-only form
+  missed) and asserts it does *not* claim `/…/esp-idf-hal/tests/hil.rs`,
+  `/…/esp-idf/docs/zh_CN/index.rst`, `/…/library/portable-simd/…`;
+- `path_matches` was made `pub` for it — a pure predicate over (path, manifest), and the only way to
+  test patterns where the patterns are written, since they live in another crate.
+
+Chunk counts after the correction, measured on the fill: book 47 (was 37), esp-idf-hal **829** (was 177),
+ESP-IDF 3,732 from 508 files, std 8,952 from 1,014 files — each equal to the file count in the tree it
+points at, which is the check that matters.
+
+
+### The bug filling them exposed: retrieval could not see a small corpus
+
+`semantic_retrieve` used to read **the first 500 `rag_chunk` nodes in the whole store** and drop the
+other domains in-process:
+
+```
+QueryAttrNodes { subtype: "rag_chunk", limit: 500 }   // store-wide
+for n in nodes { if n["domain"] == domain { … } }     // then filter
+```
+
+While a store holds one corpus that is the same as filtering in the graph. This store holds eight —
+swift 11,206 chunks, swiftui 7,244, rpi5 573, raspberry-pi-5 570, a7s 90, spire-core 77, spire-actor 2
+— so **19,799 chunks**, and the window was filled long before it reached a freshly ingested corpus.
+The measured symptom, on a corpus that had just ingested cleanly:
+
+```
+esp-rs-book: 37 chunks, 21 sources        (ListDomains — counted straight from the graph)
+esp-rs-book: 0 hits                       (every query, for every one of its chunks)
+```
+
+That is the worst shape a bug can have: the ingestion was right, the count was right, and search
+returned nothing — which reads as "the embedding is poor" or "the corpus is thin", not as a one-line
+query bug.
+
+**Fixed** by scoping the read to the domain in the graph:
+
+- `MemoryGraphMessage::QueryAttrNodesWhere { subtype, props: Vec<(String, String)>, limit }` — an
+  **added** variant (the existing `QueryAttrNodes` would have needed a new field at all 62 call sites,
+  most of them in other products). It builds the same GQL with the property equalities ANDed into the
+  `WHERE`, so only the domain's rows are resolved.
+- `semantic_retrieve` asks for `subtype = "rag_chunk"` **and** `domain = <domain>`, and takes up to
+  `MAX_SCORED_CHUNKS` (500) of them.
+
+Same corpus, same store, after the fix — `3 hits, best 0.679` from
+`esp-rs-book/src/getting-started/index.md`. `rag/search` and `rag/find-interfaces` are the same path
+(`semantic_retrieve`), so this was every RAG tool, including the RagView search box.
+
+All four corpora after the fill, queried with `"toggle a GPIO output pin"`:
+
+| corpus | chunks | hits | best |
+| --- | --- | --- | --- |
+| `esp-rs-book` | 47 | 3 | 0.679 — `src/getting-started/index.md` |
+| `esp-idf-hal` | 829 | 3 | 0.819 — `src/reset.rs` |
+| `esp-idf` | 3,732 | 3 | 0.477 — `docs/en/migration-guides/…/peripherals.rst` |
+| `rust` | 8,952 | 3 | 0.489 — `library/alloc/src/lib.miri.rs` |
+
+(`esp-idf-hal` scoring only 500 of its 829 chunks is the truncation below, visible in the result: the
+best hit comes from the first 500. The other three are under the budget and fully scored.)
+
+**What is still limited** (deliberately, and worth knowing before reading a poor result as a bad
+corpus):
+
+- There is no vector index. Scoring **re-embeds every candidate** on every query, because a chunk
+  stores its `embedding_id` (a text hash) but not its vector, and the `Embedder` trait has no
+  lookup-by-hash. `MAX_SCORED_CHUNKS` is therefore a *latency* budget: a domain with more than 500
+  chunks is truncated for scoring, deterministically but arbitrarily. Fixing that properly means
+  persisting vectors (and a cosine scan or an ANN index) — a real change, not this one.
+- The 500 is now only ever spent *inside* one corpus, which is what makes a 47-chunk corpus searchable
+  next to an 11,000-chunk one. The truncation of a *big* domain is the remaining debt.
+
+Worth noticing: `count_type` and `delete_domain_nodes` already read with `limit: 1_000_000` and filter
+in-process, and that is why the chunk counts stayed right while search was not. The 500 was the odd one
+out.
+### Filling and refreshing (the part that is a command, not a button)
+
+Install writes six manifests into `~/.spire/knowledge/<corpus>/ingest.yaml`; ingesting is a separate,
+expensive step. RagView does both from the UI, and the same thing is available headlessly for filling a
+store in bulk — which is how these four were filled:
+
+```sh
+cd spire-code
+# one corpus (fast, while writing a manifest)
+SPIRE_FILL_CORPUS=esp-idf-hal cargo test --release -p spire-code --test rag_fill_tests -- --ignored --nocapture
+# all six
+cargo test --release -p spire-code --test rag_fill_tests -- --ignored --nocapture
+# a manifest changed -> REPLACE the corpus instead of merging into it
+SPIRE_FILL_REINGEST=1 SPIRE_FILL_CORPUS=esp-rs-book cargo test --release -p spire-code --test rag_fill_tests -- --ignored --nocapture
+```
+
+**`--release` is not a preference.** A debug build embeds roughly an order of magnitude slower (candle
+unoptimised): the std corpus alone took over eight minutes to get through a fraction of its files in
+debug and 9.5 minutes for *all four* corpora, start to finish, in release.
+
+`tests/rag_fill_tests.rs` builds the app's RAG wiring in miniature (a KnowledgeStore graph at
+`knowledge_dir`, a provenance graph, an embedder registered as a service, a `RagActor` from the
+registry) and then asserts what matters at the end: `chunks > 0` per corpus, and **a query that
+returns hits** — the second assertion is the one that would have caught the retrieval bug on day one.
+
+Two things to know before running it:
+
+- **Quit the app first.** It writes the same store (`~/.spire/knowledge`, or `$SPIRE_KNOWLEDGE_DIR`);
+  one writer at a time.
+- The output is the evidence: per-source file/chunk counts, the store's per-domain table
+  (`ListDomains`), and the best hit for `"toggle a GPIO output pin"` per corpus. Read it, not the exit
+  code — a corpus that matched a fraction of its tree passes `chunks > 0` (see the pattern trap above;
+  the count is the tell).
+
+To ask the *store* rather than the fill process what it holds — which is the only way to find out
+whether a fill survived, since the store is taken read-write and the app discards any WAL it finds on
+startup — `spire-core` has a read-only example for it:
+
+```sh
+cd spire-core && cargo run --release --example rag_domain_check -p spire-core   # [domain…] to filter
+```
+
+It is what confirmed the four corpora were really in the store and not only in the process that wrote
+them (33,322 chunks over 11 domains), and it is the fastest way to see a suspicious count.
+
+Store cost, measured: `~/.spire/knowledge` was 628 MB with eight domains and 19,799 chunks; after the
+fill it is 1.1 GB with eleven domains and **33,322 chunks** — the four embedded corpora are 13,560 of
+them (std 8,952, ESP-IDF 3,732, esp-idf-hal 829, book 47). Disk, not minutes, is the thing to watch when
+widening a corpus: a reingest rewrites the domain's nodes, and the older snapshots stay until SeleneDB
+prunes them.
+
+The four manifests are the whole change on the data side; the rest of it was one query bug and one glob
+semantic. Neither was in the plan, and both would have made the fill look like it had not worked.
+
