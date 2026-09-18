@@ -693,6 +693,28 @@ impl BuildManagerActor {
         }
     }
 
+    /// The analysis a build needs: the stored one, else a fresh one.
+    ///
+    /// The store is **best-effort** — `store_analysis` only warns on a persistence failure, because
+    /// losing the analyser's work would be worse than losing the cache — so "I analysed" is not
+    /// something a caller can rely on: an `analyze_project` can succeed and the lookup still miss.
+    /// Every build path went through `get_analysis(..).ok_or_else("run AnalyzeProject first")`, which
+    /// turned that into the most confusing failure available: the analyse call reports success, and
+    /// the build immediately asks the caller to analyse first.
+    ///
+    /// So the metadata `analyze_project` *returns* is used directly when the store is empty, rather
+    /// than being discarded and then looked for. The only case that still fails is a project nothing
+    /// can analyse, and then the message says that.
+    async fn analysis_for(&self, path: &Path) -> Result<BuildMetadata, String> {
+        let path_str = path.to_string_lossy().to_string();
+        if let Some(metadata) = self.get_analysis(&path_str).await {
+            return Ok(metadata);
+        }
+        self.analyze_project(path, None).await.map_err(|e| {
+            format!("no stored analysis for {path_str}, and it could not be analysed: {e}")
+        })
+    }
+
     /// Send a single operation through a transaction stream and await its result.
     async fn send_stream_op(
         stream: &mpsc::Sender<TransactionRequest>,
@@ -1288,13 +1310,7 @@ impl BuildManagerActor {
     /// Build: fetch stored analysis, route to module with the analysis in the
     /// message (the module stays stateless). Batch — returns only BuildOutput.
     async fn build_project(&self, path: &Path, opts: &BuildOptions) -> Result<BuildOutput, String> {
-        let path_str = path.to_string_lossy().to_string();
-        let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
-            format!(
-                "No stored analysis for {}; run AnalyzeProject first",
-                path_str
-            )
-        })?;
+        let metadata = self.analysis_for(path).await?;
 
         let config = metadata
             .config_files
@@ -1329,13 +1345,7 @@ impl BuildManagerActor {
         path: &Path,
         opts: &BuildOptions,
     ) -> Result<(BuildOutput, Vec<serde_json::Value>), String> {
-        let path_str = path.to_string_lossy().to_string();
-        let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
-            format!(
-                "No stored analysis for {}; run AnalyzeProject first",
-                path_str
-            )
-        })?;
+        let metadata = self.analysis_for(path).await?;
 
         let config = metadata
             .config_files
@@ -1428,13 +1438,7 @@ impl BuildManagerActor {
         path: &Path,
         platform: Option<String>,
     ) -> Result<(BuildOutput, Vec<serde_json::Value>), String> {
-        let path_str = path.to_string_lossy().to_string();
-        let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
-            format!(
-                "No stored analysis for {}; run AnalyzeProject first",
-                path_str
-            )
-        })?;
+        let metadata = self.analysis_for(path).await?;
 
         let config = metadata
             .config_files
@@ -1494,13 +1498,7 @@ impl BuildManagerActor {
         &self,
         path: &Path,
     ) -> Result<(BuildOutput, Vec<serde_json::Value>), String> {
-        let path_str = path.to_string_lossy().to_string();
-        let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
-            format!(
-                "No stored analysis for {}; run AnalyzeProject first",
-                path_str
-            )
-        })?;
+        let metadata = self.analysis_for(path).await?;
 
         let config = metadata
             .config_files
@@ -1561,13 +1559,7 @@ impl BuildManagerActor {
         opts: &TestOptions,
         platform: Option<String>,
     ) -> Result<BuildOutput, String> {
-        let path_str = path.to_string_lossy().to_string();
-        let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
-            format!(
-                "No stored analysis for {}; run AnalyzeProject first",
-                path_str
-            )
-        })?;
+        let metadata = self.analysis_for(path).await?;
 
         let config = metadata
             .config_files
@@ -1598,15 +1590,7 @@ impl BuildManagerActor {
         path: &Path,
         platform: Option<String>,
     ) -> Result<BuildOutput, String> {
-        let metadata = self
-            .get_analysis(path.to_string_lossy().as_ref())
-            .await
-            .ok_or_else(|| {
-                format!(
-                    "No stored analysis for {}; run AnalyzeProject first",
-                    path.display()
-                )
-            })?;
+        let metadata = self.analysis_for(path).await?;
 
         let config = metadata
             .config_files
@@ -1920,13 +1904,7 @@ impl BuildManagerActor {
             .filter(|p| !p.is_empty())
             .ok_or_else(|| "flashing needs a platform, e.g. \"esp32c6\"".to_string())?;
 
-        let path_str = path.to_string_lossy().to_string();
-        let metadata = self.get_analysis(&path_str).await.ok_or_else(|| {
-            format!(
-                "No stored analysis for {}; run AnalyzeProject first",
-                path_str
-            )
-        })?;
+        let metadata = self.analysis_for(path).await?;
         let config = metadata
             .config_files
             .first()
@@ -2046,15 +2024,7 @@ impl BuildManagerActor {
 
     /// Format: same pattern as build — route to module via a proper message.
     async fn format_project(&self, path: &Path) -> Result<BuildOutput, String> {
-        let metadata = self
-            .get_analysis(path.to_string_lossy().as_ref())
-            .await
-            .ok_or_else(|| {
-                format!(
-                    "No stored analysis for {}; run AnalyzeProject first",
-                    path.display()
-                )
-            })?;
+        let metadata = self.analysis_for(path).await?;
 
         let config = metadata
             .config_files

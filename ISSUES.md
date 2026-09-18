@@ -407,8 +407,9 @@ entry tracks the work end to end.
       Still open: no UI yet for trap control (the Device group has Connect / Run tests on board /
       Deploy binary), and a board is needed to exercise the pass-through end to end — what is pinned
       here is the board's behaviour and the host's validation.
-- [x] 6. Backlog — first-class prompt→generate→verify everywhere (partly done 2026-09-17: the spine
-      exists and now has **three** implementations). Wire the
+- [x] 6. Backlog — first-class prompt→generate→verify everywhere (2026-09-17: the spine exists and
+      every generator that writes code now reports through it; what remains is the from-scratch
+      non-HAL route, which has not been exercised). Wire the
       generate tools (`createProject/*`, `hal_*`) into the verify spine so new
       code is compile-verified as it is generated; covers brand-new HAL
       contracts, new toolkits, and from-scratch projects. The spine itself landed
@@ -420,6 +421,23 @@ entry tracks the work end to end.
       C++ placeholder writers (`CppStubArtifact`). An authored contract needed no cross toolchain:
       the contract crate is `no_std` but dependency-free and host-testable by design, so it is
       verified everywhere.
+  - **The scaffold's own backends** (done 2026-09-17). `createProject/Scaffold` now reports
+    `backend_verification: [{family, platform, crate, built, errors?, not_built?}]` — one entry per
+    family, three-valued like everything else on the spine: **built**, **broken** with the compiler's
+    words, or **not built** with the reason (this machine's missing target or SDK). The scaffold never
+    fails for a missing toolchain — the project exists either way — and `verifyBackends: false` opts
+    out, because each entry is a real cross-build (minutes on a cold cache).
+    This is the check that previously happened **by hand** and found the scaffold's own gaps
+    (`#![no_std]` missing, `embedded-hal = "0.2"` where the HAL implements 1.0, `cortex-m`
+    undeclared) — so the next such gap surfaces when a project is created rather than the first time
+    someone builds a board. Verified end to end: the wizard's route scaffolds an rp2040 project and
+    the result says `built: true`; on a machine without the target the test asserts the other honest
+    outcome (a non-empty reason, never `false`).
+    It also uncovered a **third instance of the same hidden ordering trap** and fixed it at the
+    source: every build path did `get_analysis(..).ok_or_else("run AnalyzeProject first")`, and the
+    store is best-effort — so an analyse could report success and the build then demand one. Build,
+    test, format and lint now go through `analysis_for(path)`, which uses the metadata
+    `analyze_project` *returns* when the store is empty instead of discarding it and looking for it.
   - **The C++ writers** (done 2026-09-17). `hal_add_target` used to write a `<stem>_stub.cpp` per
     interface, wire `hal/meson.build` and report — nothing between the write and the claim. It now
     reports `compile: {built, refused, not_built, errors}` from the spine, where the gate parses

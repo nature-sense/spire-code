@@ -4666,7 +4666,6 @@ impl CoordinatorActor {
             .unwrap_or_default();
 
         let (structure, embedded) = Self::params_structure_embedded(params);
-
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
             let _ = registry
@@ -4796,6 +4795,14 @@ impl CoordinatorActor {
             .unwrap_or_default();
 
         let (structure, embedded) = Self::params_structure_embedded(params);
+        // Building each backend is a real cross-build — minutes on a cold cache — so a caller that
+        // would rather create the project now and build later can say so. Default on, because the
+        // gaps this catches (a missing `#![no_std]`, a dependency at the wrong major) are otherwise
+        // invisible until someone tries to build a board.
+        let verify_backends = params
+            .get("verifyBackends")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
@@ -4804,7 +4811,7 @@ impl CoordinatorActor {
                 .unwrap_or_else(dummy_tx)
                 .send(ProjectCreationMessage::ScaffoldProject {
                     project_name,
-                    root_dir: PathBuf::from(root_dir),
+                    root_dir: PathBuf::from(&root_dir),
                     language,
                     platforms,
                     structure,
@@ -4817,7 +4824,26 @@ impl CoordinatorActor {
         .await;
         match result {
             Ok(Ok(spec)) => {
-                serde_json::to_value(spec).unwrap_or(serde_json::json!({"error": "serialize"}))
+                let mut value = serde_json::to_value(&spec)
+                    .unwrap_or(serde_json::json!({ "error": "serialize" }));
+                // Then the backends, where this machine can build them. Never an error and never a
+                // failure of the scaffold: the project exists either way, and what the caller needs
+                // to know is which of its backends were actually checked.
+                let verification = if verify_backends {
+                    self.verify_scaffolded_backends(std::path::Path::new(&root_dir), &value)
+                        .await
+                } else {
+                    Vec::new()
+                };
+                if !verification.is_empty() {
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "backend_verification".to_string(),
+                            serde_json::Value::Array(verification),
+                        );
+                    }
+                }
+                value
             }
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
@@ -4825,6 +4851,150 @@ impl CoordinatorActor {
     }
 
     /// `createProject/Fill` — constrained LLM fill of a materialized scaffold.
+    /// Build each backend the scaffold just wrote, where this machine has its toolchain.
+    ///
+    /// The scaffold's own verification, and the same three-valued discipline the fill leg uses: a
+    /// backend is either **built**, **reported as broken** with the compiler's words, or **not
+    /// built** with the reason (`thumbv6m-none-eabi` is not installed, the ESP-IDF SDK is absent).
+    /// The distinction matters most right here — a wizard that failed to create a project because the
+    /// user's board SDK is not installed would be wrong, and a wizard that silently claimed the
+    /// backends compile would be worse.
+    ///
+    /// This is what caught the scaffold's own gaps by hand (`#![no_std]` missing, the wrong
+    /// `embedded-hal` major, `cortex-m` undeclared); doing it here means the next such gap is visible
+    /// when the project is created rather than the first time someone builds a board.
+    async fn verify_scaffolded_backends(
+        &self,
+        root: &Path,
+        spec: &serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        let Some(files) = spec.get("files").and_then(|files| files.as_array()) else {
+            return Vec::new();
+        };
+        let root_str = root.to_string_lossy().to_string();
+
+        // The contract crate's name is the `-hal` one; every backend is `<hal>-<family>`. Read from
+        // the paths that were written rather than re-deriving the naming rule.
+        let hal = files
+            .iter()
+            .filter_map(|file| file.get("path").and_then(|p| p.as_str()))
+            .find_map(|path| {
+                let name = path.strip_prefix("crates/")?.split('/').next()?;
+                name.ends_with("-hal").then(|| name.to_string())
+            });
+        let Some(hal) = hal else {
+            return Vec::new();
+        };
+
+        // Which registry id serves each family: the spec carries the ids the user chose, and the
+        // family comes from the registry exactly as it did at scaffold time.
+        let targets: Vec<String> = spec
+            .get("platform_targets")
+            .and_then(|t| t.as_array())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut families: Vec<(String, String)> = Vec::new();
+        for path in files
+            .iter()
+            .filter_map(|file| file.get("path").and_then(|p| p.as_str()))
+        {
+            let Some(name) = path
+                .strip_prefix("crates/")
+                .and_then(|r| r.split('/').next())
+            else {
+                continue;
+            };
+            let Some(family) = name.strip_prefix(&format!("{hal}-")) else {
+                continue;
+            };
+            if family == "std" || families.iter().any(|(known, _)| known == family) {
+                continue;
+            }
+            let platform = targets.iter().find(|id| {
+                crate::platform::Platform::from_registry(id)
+                    .and_then(|platform| platform.family)
+                    .is_some_and(|f| f == family)
+            });
+            if let Some(platform) = platform {
+                families.push((family.to_string(), platform.clone()));
+            }
+        }
+        families.sort();
+        self.build_scaffolded_families(&root_str, &hal, &families)
+            .await
+    }
+
+    /// The build half of [`Self::verify_scaffolded_backends`]: one result per family, never an error
+    /// — the scaffold has already happened and nothing here may undo it.
+    async fn build_scaffolded_families(
+        &self,
+        root: &str,
+        hal: &str,
+        families: &[(String, String)],
+    ) -> Vec<serde_json::Value> {
+        if families.is_empty() {
+            return Vec::new();
+        }
+        // No explicit `build_analyze`: `build_build` analyses on demand when the store is empty,
+        // which is where that ordering requirement belongs (the store is best-effort, so asking for
+        // the analyse here and then building would still be able to miss).
+        let mut out = Vec::new();
+        for (family, platform) in families {
+            let package = format!("{hal}-{family}");
+            let built = self
+                .call_tool_json(
+                    "build_build",
+                    serde_json::json!({
+                        "path": root,
+                        "platform": platform,
+                        "package": package,
+                        "mode": "debug",
+                    }),
+                )
+                .await;
+            match built.get("success").and_then(|value| value.as_bool()) {
+                Some(true) => out.push(serde_json::json!({
+                    "family": family,
+                    "platform": platform,
+                    "crate": package,
+                    "built": true,
+                })),
+                Some(false) => {
+                    let output = built
+                        .get("output")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    let tail: Vec<&str> = output.lines().rev().take(30).collect();
+                    out.push(serde_json::json!({
+                        "family": family,
+                        "platform": platform,
+                        "crate": package,
+                        "built": false,
+                        "errors": tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+                    }));
+                }
+                // The build module refused before compiling: no toolchain for this target, or no
+                // module for this platform. *Not checked* — never broken code.
+                None => out.push(serde_json::json!({
+                    "family": family,
+                    "platform": platform,
+                    "crate": package,
+                    "built": serde_json::Value::Null,
+                    "not_built": built
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("the build did not run"),
+                })),
+            }
+        }
+        out
+    }
+
     async fn handle_create_project_fill(&self, params: &serde_json::Value) -> serde_json::Value {
         let (registry, _ffi_state) = match self.ffi_deps() {
             Ok(d) => d,

@@ -511,6 +511,37 @@ async fn a_scaffolded_backend_builds_after_one_repair_round() {
         .await;
     assert!(scaffold.get("error").is_none(), "{scaffold}");
 
+    // The scaffold reports which of its backends it could build here — the check that caught the
+    // scaffold's own gaps by hand. Printed so a run says which case it was.
+    eprintln!(
+        "backend_verification → {}",
+        scaffold["backend_verification"]
+    );
+    let verification = scaffold["backend_verification"]
+        .as_array()
+        .expect("the scaffold verifies its backends");
+    assert_eq!(verification.len(), 1, "one backend family: {scaffold}");
+    assert_eq!(verification[0]["family"], serde_json::json!("rp2040"));
+    assert_eq!(
+        verification[0]["crate"],
+        serde_json::json!("blink-wired-hal-rp2040")
+    );
+    // A scaffolded stub is valid Rust, so it must never come back *broken* — the two honest
+    // outcomes are "built" and, on a machine without this board's target installed, "not built"
+    // with the reason. `false` would mean the scaffold shipped something that does not compile.
+    match verification[0]["built"].as_bool() {
+        Some(true) => {}
+        Some(false) => panic!("the scaffold's own backend does not compile: {scaffold}"),
+        None => {
+            let reason = verification[0]["not_built"].as_str().unwrap_or_default();
+            assert!(
+                !reason.is_empty(),
+                "an unchecked backend must say why it was not checked: {scaffold}"
+            );
+            eprintln!("rp2040 backend not checked here: {reason}");
+        }
+    }
+
     let plan = wizard
         .tool(
             "embedded_hal_fill_plan",
