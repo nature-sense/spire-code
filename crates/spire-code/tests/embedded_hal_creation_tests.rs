@@ -503,8 +503,7 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
     );
     for path in [
         "crates/blink-workshop-hal/src/lib.rs",
-        "crates/blink-workshop-hal/src/hal/led.rs",
-        "crates/blink-workshop-hal/src/hal/time.rs",
+        "crates/blink-workshop-hal/src/actor.rs",
         "crates/blink-workshop-hal-std/src/lib.rs",
         "crates/blink-workshop-hal-esp32/src/lib.rs",
         "crates/blink-workshop-hal-rp2040/src/lib.rs",
@@ -520,20 +519,23 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
         )
         .await;
     for family in ["esp32", "rp2040"] {
-        let led = &coverage["platforms"][family]["led"];
+        let board = &coverage["platforms"][family]["board"];
         assert_eq!(
-            led["is_stub"],
+            board["is_stub"],
             serde_json::json!(true),
             "{family}: {coverage}"
         );
-        assert_eq!(led["implemented"], serde_json::json!(false), "{family}");
-        assert_eq!(led["kind"], serde_json::json!("stub"), "{family}");
+        assert_eq!(board["implemented"], serde_json::json!(false), "{family}");
+        assert_eq!(board["kind"], serde_json::json!("stub"), "{family}");
+        // The stub *declares* both constructors, so nothing is `missing` — and neither is written,
+        // which is what `is_stub` says. A stub that omitted one would report it as missing instead;
+        // both are ways of being unfinished, and the measure names which one it is.
+        assert_eq!(
+            board["missing"],
+            serde_json::json!([]),
+            "{family}: {coverage}"
+        );
     }
-    assert_eq!(
-        coverage["platforms"]["esp32"]["time"]["is_stub"],
-        serde_json::json!(true),
-        "the interface whose trait name differs from its file stem is measured too: {coverage}"
-    );
 
     // ── 4. The fill plan names the files and carries the boards' notes ──
     let fill = wizard
@@ -561,8 +563,13 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
         "the board's own hints reach the prompt: {esp_prompt}"
     );
     assert!(
-        esp_prompt.contains("crates/blink-workshop-hal/src/hal/led.rs"),
-        "and so does the contract it must implement: {esp_prompt}"
+        esp_prompt.contains("crates/blink-workshop-hal/src/lib.rs"),
+        "and so does the seam that re-exports the traits the constructors must return: {esp_prompt}"
+    );
+    assert!(
+        esp_prompt.contains("PENDING IN THIS FILE")
+            && esp_prompt.contains("board [stub]: Board — led, delay"),
+        "the board's constructors are what is owed, and the plan says so: {esp_prompt}"
     );
 }
 
@@ -629,10 +636,10 @@ async fn a_scaffolded_backend_builds_after_one_repair_round() {
         .set_llm(scripted_llm(vec![
             // What a real model gave, measured: the GPIO *mode* type invented, and the pin written
             // with a parameter list the crate does not have. Both are errors a compiler names.
-            "```rust\n#![no_std]\n\nuse blink_wired_hal::hal::{DelayMs, Led};\nuse rp2040_hal::gpio::{Output, Pin, PinId, PullDown};\n\npub struct GpioLed {\n    pin: Pin<PinId, Output<PullDown>>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+"```rust\n#![no_std]\n\nuse blink_wired_hal::embedded_hal::delay::DelayNs;\nuse rp2040_hal::gpio::{Output, Pin, PinId, PullDown};\n\npub struct Board;\n\npub struct FamilyDelay;\n\nimpl DelayNs for FamilyDelay {\n    fn delay_ns(&mut self, _ns: u32) {}\n}\n\nimpl Board {\n    pub fn led(pin: Pin<PinId, Output<PullDown>>) -> impl OutputPin {\n        pin\n    }\n\n    pub fn delay() -> impl DelayNs {\n        FamilyDelay\n    }\n}\n```",
             // The shape rp2040-hal 0.10 actually has — including the `OutputPin` import the fixed
             // types make load-bearing (`set_high`/`set_low` come from the trait, not the type).
-            "```rust\n#![no_std]\n\nuse blink_wired_hal::hal::{DelayMs, Led};\nuse embedded_hal::digital::OutputPin;\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct GpioLed {\n    pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+"```rust\n#![no_std]\n\nuse blink_wired_hal::embedded_hal::delay::DelayNs;\nuse blink_wired_hal::embedded_hal::digital::OutputPin;\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct Board;\n\npub struct FamilyDelay;\n\nimpl DelayNs for FamilyDelay {\n    fn delay_ns(&mut self, _ns: u32) {}\n}\n\nimpl Board {\n    pub fn led(pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>) -> impl OutputPin {\n        pin\n    }\n\n    pub fn delay() -> impl DelayNs {\n        FamilyDelay\n    }\n}\n```",
         ]))
         .await;
 
@@ -764,12 +771,12 @@ async fn a_second_wrong_answer_still_gets_a_third_round() {
     wizard
         .set_llm(scripted_llm(vec![
             // 1. The type that does not exist — the measured first failure of a real model.
-            "```rust\n#![no_std]\n\nuse blink_stubborn_hal::hal::{DelayMs, Led};\nuse rp2040_hal::gpio::{Output, Pin, PinId, PullDown};\n\npub struct GpioLed {\n    pin: Pin<PinId, Output<PullDown>>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+"```rust\n#![no_std]\n\nuse blink_stubborn_hal::embedded_hal::delay::DelayNs;\nuse rp2040_hal::gpio::{Output, Pin, PinId, PullDown};\n\npub struct Board;\n\npub struct FamilyDelay;\n\nimpl DelayNs for FamilyDelay {\n    fn delay_ns(&mut self, _ns: u32) {}\n}\n\nimpl Board {\n    pub fn led(pin: Pin<PinId, Output<PullDown>>) -> impl OutputPin {\n        pin\n    }\n\n    pub fn delay() -> impl DelayNs {\n        FamilyDelay\n    }\n}\n```",
             // 2. The right *types*, but the trait is not in scope, so `set_high` still will not
             //    resolve — the second-order error, and a different compiler message from round 1.
-            "```rust\n#![no_std]\n\nuse blink_stubborn_hal::hal::{DelayMs, Led};\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct GpioLed {\n    pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+"```rust\n#![no_std]\n\nuse blink_stubborn_hal::embedded_hal::delay::DelayNs;\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct Board;\n\npub struct FamilyDelay;\n\nimpl DelayNs for FamilyDelay {\n    fn delay_ns(&mut self, _ns: u32) {}\n}\n\nimpl Board {\n    pub fn led(pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>) -> impl OutputPin {\n        pin\n    }\n\n    pub fn delay() -> impl DelayNs {\n        FamilyDelay\n    }\n}\n```",
             // 3. Both fixed.
-            "```rust\n#![no_std]\n\nuse blink_stubborn_hal::hal::{DelayMs, Led};\nuse embedded_hal::digital::OutputPin;\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct GpioLed {\n    pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>,\n}\n\nimpl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = if on { self.pin.set_high() } else { self.pin.set_low() };\n    }\n}\n\npub struct FamilyDelay;\n\nimpl DelayMs for FamilyDelay {\n    fn delay_ms(&mut self, ms: u32) {\n        let _ = ms;\n    }\n}\n```",
+"```rust\n#![no_std]\n\nuse blink_stubborn_hal::embedded_hal::delay::DelayNs;\nuse blink_stubborn_hal::embedded_hal::digital::OutputPin;\nuse rp2040_hal::gpio::{DynPinId, FunctionSio, Pin, PullDown, SioOutput};\n\npub struct Board;\n\npub struct FamilyDelay;\n\nimpl DelayNs for FamilyDelay {\n    fn delay_ns(&mut self, _ns: u32) {}\n}\n\nimpl Board {\n    pub fn led(pin: Pin<DynPinId, FunctionSio<SioOutput>, PullDown>) -> impl OutputPin {\n        pin\n    }\n\n    pub fn delay() -> impl DelayNs {\n        FamilyDelay\n    }\n}\n```",
         ]))
         .await;
 
@@ -816,8 +823,12 @@ async fn a_second_wrong_answer_still_gets_a_third_round() {
     let written =
         std::fs::read_to_string(root.join("crates/blink-stubborn-hal-rp2040/src/lib.rs")).unwrap();
     assert!(
-        written.contains("use embedded_hal::digital::OutputPin;"),
-        "the file on disk is the third answer: {written}"
+        written.contains("use blink_stubborn_hal::embedded_hal::digital::OutputPin;"),
+        "the file on disk is the third answer, with the trait it needed in scope: {written}"
+    );
+    assert!(
+        written.contains("Pin<DynPinId, FunctionSio<SioOutput>, PullDown>"),
+        "and the third answer's own types, which is what the two repairs converged on: {written}"
     );
 }
 
@@ -1233,12 +1244,7 @@ async fn a_real_model_fills_the_backends_it_is_asked_for() {
         .await;
     for family in ["esp32", "rp2040"] {
         assert_eq!(
-            coverage["platforms"][family]["led"]["implemented"],
-            serde_json::json!(true),
-            "{family}: {coverage}"
-        );
-        assert_eq!(
-            coverage["platforms"][family]["time"]["implemented"],
+            coverage["platforms"][family]["board"]["implemented"],
             serde_json::json!(true),
             "{family}: {coverage}"
         );

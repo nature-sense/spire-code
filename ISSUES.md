@@ -1459,20 +1459,52 @@ Verified: `cargo test` in spire-hal (4 contract + 3 executor tests, zero warning
   needs nothing; a backend with an active-low LED inverts in `Board::led` and the actor above it does
   not change. Smaller surface than the old logical trait, and it says what it means.
 
-### Still to do (the spire-code side, in order)
+### Landed (spire-code, this change) — steps 1–3
 
-1. `build/embedded_hal_scaffold.rs` emits a contract crate containing `hal::{Led, DelayMs}` +
-   `HalError`; it must emit the re-export + actor, and a `Board` skeleton per backend instead. Until it
-   does, a scaffolded project does not match this crate.
-2. `build/embedded_hal_fill.rs` plans "the trait + its required methods" per backend file; the unit
-   becomes a `Board` constructor, and the prompt injects the vendor crate, the `embedded-hal` trait
-   names and the platform's `library_hints` (its existing job).
-3. The drift machinery (`hal_rust_contract`, `embedded_hal_contract`, `hal_diff_contracts`) measures
-   trait-method coverage, which the compiler now enforces. It re-scopes to **Board shape** and **actor
-   message** coverage — a smaller measure, and the one that still earns its keep.
-4. `embedded_app_scaffold.rs` writes `use spire_hal::hal::Led;` into the app it scaffolds; that becomes
-   the `embedded-hal` traits plus the backend's `Board`.
-5. Drivers: pick the first one (a WS2812 strip or an I²C sensor), land it against `embedded-hal` with
+They were coupled (the fill reads the measure, the scaffold's output is the measure's input), so doing
+one alone would have left the suite red. As one change:
+
+- **The scaffold** (`embedded_hal_scaffold.rs`) emits the new shape. The contract crate is `lib.rs` +
+  `actor.rs` with `embedded-hal = "1.0"` re-exported and **no authored traits** — nothing in it is
+  fillable. Each backend is a `Board` whose constructors are `unimplemented!()`. `hal/{led,time}.rs`,
+  `error.rs` and `HalError` are gone from the emission entirely.
+- **The measure** (`hal_rust_contract.rs`) knows what is owed when the traits are the ecosystem's:
+  `BOARD_INTERFACE`/`BOARD_TYPE`/`BOARD_METHODS`, a `board_coverage` measure, and
+  `extract_inherent_methods_rust` + `placeholder_methods_rust` — because a board's constructors are
+  **inherent** methods (`impl Board`), which `impl Trait for Type` never sees. The coverage map reports
+  `board` for a backend that declares one and *only* for those, so a hand-written HAL without a board
+  is never asked for a constructor it never had. The early return in `rust_platform_coverage_map` no
+  longer fires on an empty contract set: a scaffolded project has no contract traits **by design**.
+- **The fill** (`embedded_hal_fill.rs`) plans the board: its source is the contract's `lib.rs` (the
+  seam that re-exports what a constructor must return), its methods are the constructors, and the gate
+  reads both impl forms. The prompt's rules were re-aimed — return `embedded-hal` types, keep vendor
+  types inside the crate, and give a constructor the right *signature* for its vendor.
+- `write_contract` now creates `src/hal` and `hal/mod.rs`: a scaffolded project has no `src/hal` until
+  a project authors its first trait, and requiring the directory made the crate invisible to the very
+  tool that writes it. Its refusal message was corrected to "`crates/*-hal` with a `src`".
+
+**The stub's first shape did not compile, and only a real build found it.**
+`pub fn led() -> impl OutputPin { unimplemented!() }` fails with *"the trait bound `(): OutputPin` is
+not satisfied"* — for a body that never returns the compiler infers the opaque type as `()`. The stub
+returns a concrete `UnimplementedLed`/`UnimplementedDelay` instead, so a scaffolded project builds
+while still measuring as a stub.
+
+Also found by the fixtures: a "corrected" answer that only *looks* right can be unparsable — the test's
+first rp2040 answer lost the third parameter of `Pin<DynPinId, FunctionSio<SioOutput>, PullDown>` and
+the gate refused it as "does not parse as Rust" with an **empty reason**, which is a message worth
+fixing some day (a parse refusal should name the first error, as the C++ side does).
+
+Verified: the full spire-code suite, including the integration tests that run **real cargo builds** —
+`the_wizard_creates_an_embedded_hal_project_and_the_loop_closes`,
+`a_scaffolded_backend_builds_after_one_repair_round` (plan → generate → gate → build → repair → build,
+for rp2040) and `a_second_wrong_answer_still_gets_a_third_round` (three answers, two repairs).
+
+### Still to do
+
+1. `embedded_app_scaffold.rs` still writes `use spire_hal::hal::Led;` into the application it
+   scaffolds. That becomes the `embedded-hal` traits plus the backend's `Board`, and the app's plan is
+   what calls `Board::led`.
+2. Drivers: pick the first one (a WS2812 strip or an I²C sensor), land it against `embedded-hal` with
    host tests, and settle the "upstream crate vs. actor-shaped wrapper" default in the fill prompt.
 
 The whole spiral — a bespoke trait per board family, a scaffold that generates it, a fill that

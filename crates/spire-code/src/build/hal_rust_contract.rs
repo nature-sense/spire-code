@@ -231,6 +231,180 @@ fn collect_placeholder_impls(node: Node, content: &str, out: &mut Vec<String>) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────
+// The board contract — what a backend owes when the traits are `embedded-hal`'s
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The interface key a backend's **board** is measured under.
+///
+/// With the peripheral traits coming from `embedded-hal`, a scaffolded project has no contract
+/// traits of its own to drift from: the compiler enforces those. What its backend still owes is
+/// **constructors** — the board's own facts (which pin, which polarity, which delay), which nothing
+/// outside the backend can supply. That is a smaller contract than the one it replaced, and it is a
+/// real one: it is what a second family has to reproduce, and what a generated application calls.
+pub const BOARD_INTERFACE: &str = "board";
+
+/// The type the constructors hang off.
+///
+/// A type, deliberately not a trait: a `trait Board` would be a contract of our invention again, one
+/// level up, and would need exactly the machinery this measure replaced.
+pub const BOARD_TYPE: &str = "Board";
+
+/// The constructors every backend owes — and nothing more. A method is added here when a *second*
+/// family needs it, the same rule the contract traits used to follow.
+pub const BOARD_METHODS: &[&str] = &["led", "delay"];
+
+/// Methods of every **inherent** `impl <Type> { … }` in `content` → `(type, methods)`.
+///
+/// `extract_impl_methods_rust` reads `impl Trait for Type`, which is what a contract trait produces
+/// and therefore what the drift measure has always counted. A board's constructors are inherent
+/// (`impl Board { fn led(…) }`), so they need their own reading — without it a scaffolded backend
+/// reports as having no implementation of anything, and the fill queue stays empty.
+pub fn extract_inherent_methods_rust(content: &str) -> Vec<(String, Vec<String>)> {
+    let mut parser = rust_parser();
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    collect_inherent_impls(tree.root_node(), content, &mut out);
+    out
+}
+
+fn collect_inherent_impls(node: Node, content: &str, out: &mut Vec<(String, Vec<String>)>) {
+    // The `trait` field is what tells the two `impl` forms apart; absent means inherent.
+    if node.kind() == "impl_item" && node.child_by_field_name("trait").is_none() {
+        if let (Some(type_node), Some(body)) = (
+            node.child_by_field_name("type"),
+            node.child_by_field_name("body"),
+        ) {
+            let type_name = type_node
+                .utf8_text(content.as_bytes())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let mut methods = Vec::new();
+            for child in named_children(body) {
+                if child.kind() == "function_item" {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        if let Ok(text) = name.utf8_text(content.as_bytes()) {
+                            methods.push(text.trim().to_string());
+                        }
+                    }
+                }
+            }
+            out.push((type_name, methods));
+        }
+    }
+    for child in named_children(node) {
+        collect_inherent_impls(child, content, out);
+    }
+}
+
+/// Method names whose body is still a placeholder — `unimplemented!()` or `todo!()`.
+///
+/// `placeholder_impls_rust` answers the same question for a whole `impl Trait for Type` block, which
+/// is enough when every owed method comes from a trait. A board's constructors are inherent methods,
+/// so it has to be asked per method — and `todo!()` counts, because a stub may be saying only "the
+/// signature is here, the body is not".
+pub fn placeholder_methods_rust(content: &str) -> Vec<String> {
+    let mut parser = rust_parser();
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_placeholder_methods(tree.root_node(), content, &mut out);
+    out
+}
+
+fn collect_placeholder_methods(node: Node, content: &str, out: &mut Vec<String>) {
+    if node.kind() == "function_item" {
+        if let Some(body) = node.child_by_field_name("body") {
+            let text = body.utf8_text(content.as_bytes()).unwrap_or("");
+            if text.contains("unimplemented!") || text.contains("todo!") {
+                if let Some(name) = node.child_by_field_name("name") {
+                    if let Ok(name) = name.utf8_text(content.as_bytes()) {
+                        out.push(name.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    for child in named_children(node) {
+        collect_placeholder_methods(child, content, out);
+    }
+}
+
+/// Every `.rs` file under `dir`, recursively, as source text.
+///
+/// Recursive because a backend starts as the scaffold's one `lib.rs` and the fill may move the board
+/// into a module of its own (the fill's own file lookup allows exactly that), so "the file that
+/// declares the board" is not known in advance.
+fn rust_sources(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rust_sources(&path));
+        } else if path.extension().and_then(|x| x.to_str()) == Some("rs") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                out.push(content);
+            }
+        }
+    }
+    out
+}
+
+/// What one backend crate's board still owes — or `None` when it declares no `Board` at all.
+///
+/// `None` rather than "everything missing" on purpose: a project without a board (a hand-written
+/// HAL, or one mid-migration from the C++ layout) must not be reported as owing a constructor it
+/// never had. Only a backend that has a board owes one.
+fn board_coverage(src_dir: &Path) -> Option<HalInterfaceCoverage> {
+    let sources = rust_sources(src_dir);
+    let mut has_impl = false;
+    let mut provided: Vec<String> = Vec::new();
+    for content in &sources {
+        for (type_name, methods) in extract_inherent_methods_rust(content) {
+            if type_name == BOARD_TYPE {
+                has_impl = true;
+                provided.extend(methods);
+            }
+        }
+    }
+    if !has_impl {
+        return None;
+    }
+    let placeholders: Vec<String> = sources
+        .iter()
+        .flat_map(|c| placeholder_methods_rust(c))
+        .collect();
+    let missing: Vec<String> = BOARD_METHODS
+        .iter()
+        .filter(|method| !provided.iter().any(|p| p == *method))
+        .map(|method| (*method).to_string())
+        .collect();
+    // A placeholder is not coverage, one level down from the trait-impl rule below: the scaffold's
+    // stub declares every constructor and implements none, and without this a fresh backend would
+    // report complete exactly when the fill queue should be full.
+    let is_stub = !BOARD_METHODS.is_empty()
+        && BOARD_METHODS
+            .iter()
+            .all(|method| placeholders.iter().any(|p| p == method));
+    Some(HalInterfaceCoverage {
+        implemented: missing.is_empty() && !is_stub,
+        has_impl,
+        is_stub,
+        missing,
+        // As for the traits: the fill prompt carries the file and the re-exported traits instead, so
+        // a signature list would be a thinner second copy of what the model is given.
+        missing_sigs: Vec::new(),
+        drifted: Vec::new(),
+    })
+}
+
 /// **The drift measure for Rust**: contract methods with no implementation.
 ///
 /// A trait with no `impl` at all reports all of its required methods, which is the case the
@@ -399,7 +573,11 @@ pub fn rust_platform_coverage_map(
     // between the two layouts still measures everything it has.
     let (rust_contracts, rust_backends) = embedded_hal_layout(root);
     contracts.extend(rust_contracts);
-    if contracts.is_empty() {
+    // A scaffolded project has **no contract traits of its own** — the traits are `embedded-hal`'s —
+    // so the contract set is legitimately empty and only its backends' boards are measured. The
+    // early return therefore waits for both to be empty, or a freshly scaffolded HAL would report
+    // nothing at all and the fill queue would never fill.
+    if contracts.is_empty() && rust_backends.is_empty() {
         return BTreeMap::new();
     }
 
@@ -532,11 +710,18 @@ pub fn rust_platform_coverage_map(
                 },
             );
         }
+        // A Rust backend also owes its **board** — the constructors nothing else can supply. Measured
+        // both when the project declares no contract traits of its own (the scaffolded shape) and
+        // when it does, because either way it is something a second family must reproduce.
+        // `None` when the directory declares no `Board`, so a C++ platform — or a hand-written HAL
+        // with no board — is never asked for a constructor it never had.
+        if let Some(board) = board_coverage(&dir) {
+            iface_map.insert(BOARD_INTERFACE.to_string(), board);
+        }
         coverage.insert(plat, iface_map);
     }
     coverage
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

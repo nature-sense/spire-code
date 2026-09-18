@@ -129,13 +129,17 @@ fn contract_crate_of(root: &Path) -> Result<(String, String), String> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with("-hal") || !path.join("src").join("hal").is_dir() {
+        // The contract crate is `<prefix>-hal` with a `src`. **Not** `src/hal`: a scaffolded project
+        // has no authored traits — the peripheral ones are `embedded-hal`'s — so `src/hal` only
+        // appears once someone *writes* a trait of their own, and requiring it here would make the
+        // crate invisible to the very tool that writes the first one.
+        if !name.ends_with("-hal") || !path.join("src").is_dir() {
             continue;
         }
         return Ok((name.to_string(), name.replace('-', "_")));
     }
     Err(format!(
-        "no contract crate (`crates/*-hal` with `src/hal`) under {}",
+        "no contract crate (`crates/*-hal` with a `src`) under {}",
         root.display()
     ))
 }
@@ -183,8 +187,22 @@ fn wire_module(
     stem: &str,
     traits: &[(String, Vec<String>)],
 ) -> Result<bool, String> {
-    let content = std::fs::read_to_string(mod_path)
-        .map_err(|e| format!("cannot read {}: {e}", mod_path.display()))?;
+    // A scaffolded project has **no** `src/hal` at all — its peripheral traits are `embedded-hal`'s —
+    // so the first trait a project authors brings the module with it. The header states the rule the
+    // file exists to keep, so it reads as though it had always been there.
+    let content = match std::fs::read_to_string(mod_path) {
+        Ok(content) => content,
+        Err(e) if !mod_path.exists() => {
+            "//! The traits this project authors.\n\
+             //!\n\
+             //! `embedded-hal`'s are re-exported at the crate root, and they are the ones a driver\n\
+             //! can be used with. A trait belongs *here* only when it is narrower than the\n\
+             //! ecosystem's — a driver's own abstraction, say — and it is added when a second\n\
+             //! backend needs it, not in anticipation.\n\n"
+                .to_string()
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", mod_path.display())),
+    };
     let mod_line = format!("pub mod {stem};");
     let mut changed = false;
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
@@ -250,6 +268,11 @@ pub(crate) fn write_contract(
         .join("src")
         .join("hal");
     let target = hal_dir.join(format!("{stem}.rs"));
+    // `src/hal` does **not** exist in a scaffolded project: its traits are `embedded-hal`'s, so the
+    // directory appears with the first trait a project authors — which is this call, and this is the
+    // one place that knows it is about to exist.
+    std::fs::create_dir_all(&hal_dir)
+        .map_err(|e| format!("cannot create {}: {e}", hal_dir.display()))?;
     // The validated summary already carries the traits, so they are read once and returned as they
     // were validated rather than recomputed from the same string.
     let with_methods: Vec<(String, Vec<String>)> = validated["traits"]
@@ -553,13 +576,22 @@ mod tests {
 
     #[test]
     fn a_contract_is_validated_against_what_the_measure_needs() {
-        // The scaffold's own contract passes.
+        // The scaffold's contract crate has no authored traits to validate — they are `embedded-hal`'s
+        // — so the validation is exercised on a trait of the kind a project *would* author: narrower
+        // than the ecosystem's, one required method, and nothing else in the file.
         let f = Fixture::new("weather");
-        let led = read(f.root(), "crates/weather-hal/src/hal/led.rs");
-        let ok = validate_contract(&led).expect("the emitted contract validates");
+        let sensor = "//! A sensor on this family's bus.\n\
+                      pub trait Sensor {\n    fn read_celsius(&mut self) -> i32;\n}\n";
+        let ok = validate_contract(sensor).expect("a project-authored contract validates");
         assert_eq!(ok["valid"], json!(true));
-        assert_eq!(ok["traits"][0]["trait"], json!("Led"));
-        assert_eq!(ok["traits"][0]["methods"][0], json!("set"));
+        assert_eq!(ok["traits"][0]["trait"], json!("Sensor"));
+        assert_eq!(ok["traits"][0]["methods"][0], json!("read_celsius"));
+        // And the scaffolded crate really has none, which is the shape this change introduced.
+        let scaffolded = read(f.root(), "crates/weather-hal/src/lib.rs");
+        assert!(
+            scaffolded.contains("pub use embedded_hal;"),
+            "the seam re-exports the traits instead of declaring them: {scaffolded}"
+        );
 
         // A trait whose methods are all defaulted needs no implementation, so the measure skips it:
         // accepting it would hand back a contract that behaves as if it were absent.
@@ -597,7 +629,12 @@ mod tests {
         let f = Fixture::new("weather");
         let root = f.root();
         let before = crate::build::hal_rust_contract::embedded_hal_layout(root);
-        assert_eq!(before.0.len(), 2, "the scaffold's two interfaces");
+        assert_eq!(
+            before.0.len(),
+            0,
+            "a scaffolded contract authors no traits of its own — the peripheral ones are \
+             `embedded-hal`'s, and what a backend owes is its board"
+        );
 
         let source = "//! A sensor on this family's bus.\n\
                       pub trait Sensor {\n    fn read_celsius(&mut self) -> i32;\n}\n";
@@ -609,9 +646,14 @@ mod tests {
         let module = read(root, "crates/weather-hal/src/hal/mod.rs");
         assert!(module.contains("pub mod sensor;"), "{module}");
         assert!(module.contains("pub use sensor::Sensor;"), "{module}");
-        // Beside the other declarations, not appended after them: the groups stay groups.
+        // The two groups stay groups: every declaration precedes every re-export. That is the
+        // invariant the insertion rule exists to keep as more traits arrive, and it is checkable with
+        // one trait — there is no `led::Led` to compare against any more, because the peripheral
+        // traits are `embedded-hal`'s.
+        let last_mod = module.rfind("pub mod ").expect("a declaration");
+        let first_use = module.find("pub use ").expect("a re-export");
         assert!(
-            module.find("pub mod sensor;").unwrap() < module.find("pub use led::Led;").unwrap(),
+            last_mod < first_use,
             "the module list stays one list:\n{module}"
         );
 
@@ -680,7 +722,7 @@ mod tests {
         assert!(backend.contains("esp-idf-hal = \"0.47\""), "{backend}");
         let source = read(root, "crates/weather-hal-esp32/src/lib.rs");
         assert!(
-            source.contains("unimplemented!(\"GpioLed::set\")"),
+            source.contains("unimplemented!(\"Board::led\")"),
             "{source}"
         );
 

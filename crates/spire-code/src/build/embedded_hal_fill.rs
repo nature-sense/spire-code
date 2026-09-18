@@ -45,6 +45,10 @@ struct Pending {
     /// The contract's own source, injected so the model implements the trait it was given rather
     /// than a reconstituted idea of it.
     source: String,
+    /// Where that source came from, for the prompt's block header: a contract trait is
+    /// `crates/<hal>/src/hal/led.rs`, and a board is the contract's `lib.rs` — the seam that
+    /// re-exports the traits a constructor has to return.
+    source_label: String,
     /// The file of the backend that declares this trait's impl. A backend starts as the scaffold's
     /// one `lib.rs` but does not have to stay one file; the fill must name the file that actually
     /// holds the impl, or hand the model the wrong one.
@@ -151,26 +155,38 @@ fn impl_lines(source: &str) -> String {
 
 /// The gate between a model's answer and the file it would become.
 ///
-/// Both halves are what the plan promised: every pending trait is implemented, and no placeholder
+/// Both halves are what the plan promised: every pending item is implemented, and no placeholder
 /// is left behind. A generation failing either is reported rather than written — a file that parses
 /// but still says `unimplemented!()` looks finished to every later reader, and the whole point of
 /// the placeholder convention is that it does not.
+///
+/// "Pending item" covers both forms a backend can owe: a **contract trait** (`impl Trait for Type`)
+/// and the **board's constructors** (inherent methods on `Board`). They are read by different
+/// extractors, which is why both are consulted here and below.
 fn verify_generated(source: &str, pending: &[PlannedTrait]) -> Result<(), String> {
-    let impls = crate::build::hal_rust_contract::extract_impl_methods_rust(source);
-    let placeholders = crate::build::hal_rust_contract::placeholder_impls_rust(source);
+    let traits = crate::build::hal_rust_contract::extract_impl_methods_rust(source);
+    let inherent = crate::build::hal_rust_contract::extract_inherent_methods_rust(source);
+    let stub_traits = crate::build::hal_rust_contract::placeholder_impls_rust(source);
+    let stub_methods = crate::build::hal_rust_contract::placeholder_methods_rust(source);
+    let declared = traits.iter().chain(inherent.iter());
 
     for owed in pending {
-        let Some((_, provided)) = impls
+        let is_declared = traits
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&owed.trait_name))
-        else {
+            .chain(inherent.iter())
+            .any(|(name, _)| name.eq_ignore_ascii_case(&owed.trait_name));
+        if !is_declared {
             return Err(format!(
-                "the generated file has no `impl {} for …` — the trait was in the prompt and must \
-                 stay{}",
+                "the generated file declares no `{}` — it was in the prompt and must stay{}",
                 owed.trait_name,
                 impl_lines(source)
             ));
-        };
+        }
+        let provided: Vec<String> = declared
+            .clone()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(&owed.trait_name))
+            .flat_map(|(_, methods)| methods.clone())
+            .collect();
         let missing: Vec<&str> = owed
             .methods
             .iter()
@@ -179,17 +195,25 @@ fn verify_generated(source: &str, pending: &[PlannedTrait]) -> Result<(), String
             .collect();
         if !missing.is_empty() {
             return Err(format!(
-                "`impl {}` still has no {}",
+                "`{}` still has no {}",
                 owed.trait_name,
                 missing.join(", ")
             ));
         }
-        if placeholders
+        // A placeholder is one of two things: a whole `impl Trait for Type` block whose body is
+        // still `unimplemented!()`, or an individual method whose body is (a board constructor, or
+        // a `todo!()`). Either one means the item is not done.
+        let stub_trait = stub_traits
             .iter()
-            .any(|name| name.eq_ignore_ascii_case(&owed.trait_name))
-        {
+            .any(|name| name.eq_ignore_ascii_case(&owed.trait_name));
+        let stub_method = owed
+            .methods
+            .iter()
+            .any(|method| stub_methods.iter().any(|name| name == method));
+        if stub_trait || stub_method {
             return Err(format!(
-                "`impl {}` still contains `unimplemented!()` — the placeholder is to be replaced, not kept",
+                "`{}` still contains a placeholder (`unimplemented!()`/`todo!()`) — it is to be \
+                 replaced, not kept",
                 owed.trait_name
             ));
         }
@@ -547,8 +571,13 @@ fn impl_file(src_dir: &Path, trait_name: &str) -> PathBuf {
     // nothing has been split out of.
     for path in files.iter().filter(|p| !is_lib(p)) {
         if let Ok(content) = std::fs::read_to_string(path) {
+            // Both impl forms: a contract trait is `impl Trait for Type`, while the board's
+            // constructors are inherent (`impl Board`) — and the board is what a backend owes now.
             let declares = crate::build::hal_rust_contract::extract_impl_methods_rust(&content)
                 .iter()
+                .chain(
+                    crate::build::hal_rust_contract::extract_inherent_methods_rust(&content).iter(),
+                )
                 .any(|(name, _)| name.eq_ignore_ascii_case(trait_name));
             if declares {
                 return path.clone();
@@ -624,12 +653,11 @@ fn render_prompt(f: &FillFacts<'_>) -> String {
         p.push_str(&format!("{}\n\n", f.hints.trim()));
     }
 
-    p.push_str("THE CONTRACTS — implement these, never edit them\n");
+    p.push_str("THE CONTRACT — implement it, never edit it\n");
     for pending in f.pending {
         p.push_str(&format!(
-            "--- crates/{}/src/hal/{}.rs ---\n{}\n",
-            f.hal_crate,
-            pending.interface,
+            "--- {} ---\n{}\n",
+            pending.source_label,
             pending.source.trim_end()
         ));
     }
@@ -668,9 +696,9 @@ fn render_prompt(f: &FillFacts<'_>) -> String {
         f.dependencies.trim_end()
     ));
     p.push_str(
-        "4. The `hal` module is the contract, shared by every backend. Implement it as declared —\n\
-         \x20  same names, same types, same semantics as its doc comments — and change nothing in\n\
-         \x20  it, not even to make an implementation easier.\n",
+        "4. The peripheral traits are `embedded-hal`'s, re-exported by the contract crate — return\n\
+         \x20  those (`OutputPin`, `DelayNs`, …) from the constructors, and keep every vendor type\n\
+         \x20  inside this crate. Do not add a trait of your own: a driver crate could not use it.\n",
     );
     if !f.spec.uses_std_executor {
         p.push_str(
@@ -680,9 +708,9 @@ fn render_prompt(f: &FillFacts<'_>) -> String {
     }
     if f.pending.iter().any(|p| p.status == "none") {
         p.push_str(
-            "6. A trait with no impl yet needs a concrete type for this family and its\n\
-             \x20  `impl <Trait> for <Type>` declared in this file, matching the struct shape the\n\
-             \x20  other traits here already use.\n",
+            "6. A constructor the stub does not declare yet needs the right **signature** for this\n\
+             \x20  vendor: take its pin type and return its own driver (it already implements the\n\
+             \x20  `embedded-hal` trait). Name no type of ours in a signature.\n",
         );
     }
     p.push_str(
@@ -721,23 +749,45 @@ pub(crate) fn plan(root: &Path, platform: Option<&str>) -> serde_json::Value {
             if cov.implemented {
                 continue;
             }
-            let source = std::fs::read_to_string(
+            // A contract trait lives in the contract crate (`src/hal/<stem>.rs`); the **board** does
+            // not — it is the seam's own shape, so its source is the contract's `lib.rs` (the
+            // re-export a constructor has to return a trait *from*) and its methods are the
+            // constructors every family owes.
+            let is_board = interface == crate::build::hal_rust_contract::BOARD_INTERFACE;
+            let source_path = if is_board {
+                root.join("crates")
+                    .join(hal_crate)
+                    .join("src")
+                    .join("lib.rs")
+            } else {
                 root.join("crates")
                     .join(hal_crate)
                     .join("src")
                     .join("hal")
-                    .join(format!("{interface}.rs")),
-            )
-            .unwrap_or_default();
-            let traits = crate::build::hal_rust_contract::required_trait_methods_rust(&source);
-            let trait_name = traits
-                .first()
-                .map(|(name, _)| name.clone())
-                .unwrap_or_else(|| interface.clone());
-            let required: Vec<String> = traits
-                .iter()
-                .flat_map(|(_, methods)| methods.clone())
-                .collect();
+                    .join(format!("{interface}.rs"))
+            };
+            let source = std::fs::read_to_string(&source_path).unwrap_or_default();
+            let source_label = relative(root, &source_path);
+            let (trait_name, required): (String, Vec<String>) = if is_board {
+                (
+                    crate::build::hal_rust_contract::BOARD_TYPE.to_string(),
+                    crate::build::hal_rust_contract::BOARD_METHODS
+                        .iter()
+                        .map(|m| (*m).to_string())
+                        .collect(),
+                )
+            } else {
+                let traits = crate::build::hal_rust_contract::required_trait_methods_rust(&source);
+                let name = traits
+                    .first()
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_else(|| interface.clone());
+                let methods = traits
+                    .iter()
+                    .flat_map(|(_, methods)| methods.clone())
+                    .collect();
+                (name, methods)
+            };
             let (status, methods) = if !cov.has_impl {
                 ("none", required)
             } else if cov.is_stub {
@@ -751,6 +801,7 @@ pub(crate) fn plan(root: &Path, platform: Option<&str>) -> serde_json::Value {
                 status,
                 methods,
                 source,
+                source_label,
                 file: impl_file(src_dir, &trait_name),
             });
         }
@@ -1123,31 +1174,35 @@ mod tests {
     #[test]
     fn the_gate_refuses_a_generation_that_would_look_finished() {
         let owed = vec![PlannedTrait {
-            interface: "led".to_string(),
-            trait_name: "Led".to_string(),
-            methods: vec!["set".to_string()],
+            interface: "board".to_string(),
+            trait_name: "Board".to_string(),
+            methods: vec!["led".to_string(), "delay".to_string()],
         }];
-        let real = "use demo_hal::hal::Led;\n\npub struct GpioLed;\n\n\
-                    impl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n";
+        let real = "use demo_hal::embedded_hal::delay::DelayNs;\n\
+                    use demo_hal::embedded_hal::digital::OutputPin;\n\n\
+                    pub struct Board;\n\n\
+                    impl Board {\n    \
+                    pub fn led() -> impl OutputPin {\n        BoardLed\n    }\n\n    \
+                    pub fn delay() -> impl DelayNs {\n        BoardDelay\n    }\n}\n";
         assert_eq!(verify_generated(real, &owed), Ok(()), "a real body passes");
 
-        let kept = real.replace("let _ = on;", "unimplemented!(\"GpioLed::set\")");
+        let kept = real.replace("BoardLed", "unimplemented!(\"Board::led\")");
         let reason =
             verify_generated(&kept, &owed).expect_err("a kept placeholder must be refused");
         assert!(reason.contains("unimplemented!()"), "{reason}");
         assert!(
-            reason.contains("Led"),
-            "the refusal names the trait: {reason}"
+            reason.contains("Board"),
+            "the refusal names the type: {reason}"
         );
 
-        let dropped = "pub struct GpioLed;\n";
+        let dropped = "pub struct Board;\n";
         let reason = verify_generated(dropped, &owed).expect_err("a dropped impl must be refused");
-        assert!(reason.contains("no `impl Led for"), "{reason}");
+        assert!(reason.contains("declares no `Board`"), "{reason}");
 
-        let empty_impl = "impl Led for GpioLed {}\n";
+        let empty_impl = "pub struct Board;\nimpl Board {}\n";
         let reason =
             verify_generated(empty_impl, &owed).expect_err("a missing method must be refused");
-        assert!(reason.contains("still has no set"), "{reason}");
+        assert!(reason.contains("still has no led"), "{reason}");
     }
 
     /// Every pending trait is gated, not just the first: a file that satisfies `Led` and leaves

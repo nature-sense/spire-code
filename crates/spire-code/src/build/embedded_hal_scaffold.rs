@@ -332,12 +332,13 @@ __BUILDS__
     .replace("__HAL__", hal)
 }
 
-/// The contract crate: `no_std`, dependency-free, host-testable.
+/// The contract crate: `no_std`, `embedded-hal` re-exported, host-testable.
 ///
-/// `lib.rs`, `actor.rs`, `hal/mod.rs` and the error type are **structural** — they are the seam,
-/// and a hand edit there is how a family quietly stops being portable. `hal/led.rs` and
-/// `hal/time.rs` are **fillable** with `fill_role: HalInterface`: authoring the contract *is* the
-/// work of this project type, so those are the files the fill phase may write.
+/// **Nothing here is fillable, and that is the change.** The peripheral traits are `embedded-hal`'s
+/// — every vendor HAL and every driver crate implements them, so authoring our own was the
+/// re-invention that stood between this project and the ecosystem. What the crate still owns is the
+/// *actor* contract (`actor.rs`), and what a backend now owes is its **board**: constructors, not a
+/// trait implementation, because the compiler already enforces the traits.
 fn contract_files(hal: &str, hal_id: &str, display: &str) -> Vec<super::ScaffoldFile> {
     let structural = |path: String, content: String| super::ScaffoldFile {
         path,
@@ -345,80 +346,74 @@ fn contract_files(hal: &str, hal_id: &str, display: &str) -> Vec<super::Scaffold
         structural: true,
         ..Default::default()
     };
-    let contract_trait = |path: String, content: &str| super::ScaffoldFile {
-        path,
-        content: content.to_string(),
-        structural: false,
-        fill_role: Some(spire_core::build_types::SourceRole::HalInterface),
-    };
 
     vec![
         structural(
             format!("crates/{hal}/Cargo.toml"),
-            format!(
-                "[package]\n\
-                 name = \"{hal}\"\n\
-                 description = \"The board-family-agnostic HAL contract for {display} firmware.\"\n\
-                 version.workspace = true\n\
-                 edition.workspace = true\n\
-                 license.workspace = true\n\
-                 \n\
-                 # Intentionally dependency-free.\n\
-                 #\n\
-                 # Every dependency is one more thing that can drag `std`, a vendor SDK or an\n\
-                 # allocator into the abstraction, which is exactly what this crate exists to\n\
-                 # prevent. A backend is where dependencies belong.\n\
-                 [dependencies]\n"
-            ),
+            [
+                "[package]",
+                &format!("name = \"{hal}\""),
+                &format!(
+                    "description = \"The board-family-agnostic seam for {display} firmware: the \
+                     actor contract plus the embedded-hal traits a project programs against.\""
+                ),
+                "version.workspace = true",
+                "edition.workspace = true",
+                "license.workspace = true",
+                "",
+                "# One dependency, and it is the point of the crate: the peripheral traits are the",
+                "# ecosystem's (`OutputPin`, `DelayNs`, `I2c`, …), re-exported so the project names",
+                "# one version of them — the one its backends were compiled against. A trait of our",
+                "# own would be one no driver crate could be used with.",
+                "#",
+                "# Everything else stays out: a further dependency is one more thing that can drag",
+                "# `std`, a vendor SDK or an allocator into the seam. A backend is where",
+                "# dependencies belong.",
+                "[dependencies]",
+                "embedded-hal = \"1.0\"",
+                "",
+            ]
+            .join("\n"),
         ),
         structural(format!("crates/{hal}/src/lib.rs"), contract_lib(hal_id)),
-        structural(format!("crates/{hal}/src/error.rs"), ERROR_RS.to_string()),
         structural(format!("crates/{hal}/src/actor.rs"), ACTOR_RS.to_string()),
-        structural(
-            format!("crates/{hal}/src/hal/mod.rs"),
-            HAL_MOD_RS.to_string(),
-        ),
-        contract_trait(format!("crates/{hal}/src/hal/led.rs"), LED_RS),
-        contract_trait(format!("crates/{hal}/src/hal/time.rs"), TIME_RS),
     ]
 }
-
-/// The contract crate's `lib.rs`. `no_std` outside tests, so the host can still test it — which
-/// is what makes the abstraction verifiable without hardware.
+/// The contract crate's `lib.rs`. `no_std` outside tests, so the host can still test it — which is
+/// what makes the abstraction verifiable without hardware.
 fn contract_lib(hal_id: &str) -> String {
     format!(
-        "//! `{hal_id}` — the board-family-agnostic HAL contract.\n\
+        "//! `{hal_id}` — the board-family-agnostic seam for this firmware project.\n\
          //!\n\
-         //! A firmware project depends on this crate and nothing else; supporting a board family\n\
-         //! adds a **backend** crate that implements these traits. Nothing here knows about a\n\
-         //! vendor SDK, an OS or an executor — the executor is injected (see `actor::Spawner`).\n\
+         //! Two layers, and only one of them is ours to design:\n\
+         //!\n\
+         //! 1. **The peripheral traits are `embedded-hal`'s**, re-exported below. A GPIO is a\n\
+         //!    `digital::OutputPin`, a delay is a `delay::DelayNs`, a bus is an `i2c::I2c` or a\n\
+         //!    `spi::SpiDevice`. Every vendor HAL implements them and so does every driver crate,\n\
+         //!    so this crate does not define its own: a trait of ours is a trait no driver can be\n\
+         //!    used with.\n\
+         //!\n\
+         //! 2. **The actor contract is ours** (`actor`), because no ecosystem crate has one and\n\
+         //!    because it is the unit the drift measure reads: a message with no handler is a\n\
+         //!    missing implementation.\n\
+         //!\n\
+         //! A board family is a **backend** crate, and what it supplies is constructors —\n\
+         //! `Board::led`, `Board::delay` — not a trait implementation: the compiler already\n\
+         //! enforces the traits. Nothing here knows about a vendor SDK, an OS or an executor; the\n\
+         //! executor is injected (see `actor::Spawner`).\n\
          \n\
          #![cfg_attr(not(test), no_std)]\n\
          \n\
          pub mod actor;\n\
-         pub mod error;\n\
-         pub mod hal;\n\
          \n\
-         pub use error::HalError;\n"
+         /// The ecosystem peripheral traits, at the version the backends were compiled against.\n\
+         ///\n\
+         /// Re-exported rather than left to each crate so the project names one version of\n\
+         /// `embedded-hal`: two copies of it in one workspace are two different `OutputPin`\n\
+         /// traits, and the error reads like the wrong import.\n\
+         pub use embedded_hal;\n"
     )
 }
-
-/// The error type: ours, not `std::io::Error` — a trait signature is a promise to every family.
-const ERROR_RS: &str = r#"/// The contract's error type.
-///
-/// Ours rather than `std::io::Error`, because a trait signature is a promise to every board
-/// family and `std` is not available on all of them. Deliberately small: add a variant when a
-/// family needs one, not in anticipation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HalError {
-    /// The hardware cannot do this at all — a peripheral this variant does not have.
-    Unsupported,
-    /// It could, but the request was invalid: range, mode, timing.
-    Invalid,
-    /// Another owner holds it.
-    Busy,
-}
-"#;
 
 /// The actor contract: the same *shape* as the host's `spire_actor::Actor`, synchronously.
 ///
@@ -483,48 +478,6 @@ pub trait Spawner {
     where
         A: Actor + Send + 'static,
         A::Message: Send + 'static;
-}
-"#;
-
-/// The `hal` module: the traits, and the rule for adding them.
-const HAL_MOD_RS: &str = r#"//! The HAL traits a firmware project programs against.
-//!
-//! A project depends on the contract and sees only these; which board it runs on is decided by
-//! which backend crate is linked in. So project code never contains a `#[cfg(board)]`.
-//!
-//! Traits are added here when a *second* board family needs them, not in anticipation: an
-//! abstraction built speculatively is a guess about what the vendor HALs have in common, and the
-//! guess is cheapest to make once the second backend exists.
-
-pub mod led;
-pub mod time;
-
-pub use led::Led;
-pub use time::DelayMs;
-"#;
-
-/// The first contract trait — the smallest one that exercises the whole stack.
-const LED_RS: &str = r#"/// A single binary output.
-///
-/// The smallest contract that exercises the whole stack — trait, backend, actor, drift — and the
-/// one thing every board family has, which is why it is first.
-pub trait Led {
-    /// Drive the output. `on` is the **logical** state: an active-low board inverts here, in its
-    /// backend, so the inversion is written once instead of leaking into every caller.
-    fn set(&mut self, on: bool);
-}
-"#;
-
-/// The embedded primitive every family has, and the reason an actor is testable off-hardware.
-const TIME_RS: &str = r#"/// Blocking delay — the embedded primitive.
-///
-/// A millisecond delay rather than a timestamped clock: an actor needs "wait", and a clock API
-/// would drag an associated `Instant` type — a different one per family — into the abstraction
-/// for no gain.
-pub trait DelayMs {
-    /// Block the current task for `ms` milliseconds. Deliberately `&mut self`: on a single-core
-    /// part, who waits is a real decision, and two actors must not share one time source.
-    fn delay_ms(&mut self, ms: u32);
 }
 "#;
 
@@ -690,48 +643,68 @@ fn backend_lib(hal_id: &str, family: &str, spec: &FamilySpec) -> String {
         )
         .replace("__EXECUTOR__", &executor)
 }
-
-/// The backend template. Stubs are `unimplemented!()` on purpose — see the header.
+/// The backend template. Constructors with `unimplemented!()` bodies — see the header.
 ///
 /// `__NO_STD__` is the crate-level attribute a `no_std` family needs and a `std` one must not have:
 /// a `thumbv6m` target has no `std` to link, and an esp-idf backend that declared `no_std` could not
 /// call `std::thread` — which *is* its executor. It sits after the `//!` block because inner
 /// attributes may follow inner doc comments, and before `use` because that is where an inner
 /// attribute must be.
-const BACKEND_LIB_RS: &str = r#"//! The __FAMILY__ backend: the contract, implemented with `__VENDOR__`.
+const BACKEND_LIB_RS: &str = r#"//! The __FAMILY__ backend: the board, over `__VENDOR__`.
 //!
-//! Types from `__VENDOR__` live here and nowhere else: a firmware actor holds the *traits*, so
-//! it does not change when the board does.
+//! Types from `__VENDOR__` live here and nowhere else: an actor holds the *traits* — `embedded-hal`'s
+//! `OutputPin`, `DelayNs`, … — so it does not change when the board does.
 //!
-//! The stubs below are `unimplemented!()` on purpose. This is the file the contract's drift
-//! measure reports as not implemented and the fill phase writes; a stub that quietly did nothing
-//! would look implemented, which is worse than one that fails loudly.
+//! What this crate supplies is **constructors**, not a trait implementation: the compiler already
+//! enforces the peripheral contract, so what is left is the board's own facts — which pin, which
+//! polarity, which delay. The stub bodies below are `unimplemented!()` on purpose: the board measure
+//! reports them as unfinished and the fill writes them, and a stub that quietly did nothing would
+//! look finished, which is worse than one that fails loudly.
 __NO_STD__
-use __HAL_ID__::hal::{DelayMs, Led};
+// The two traits the constructors must return come from the contract's re-export, and the fill will
+// need them in scope:
+//
+//     use __HAL_ID__::embedded_hal::delay::DelayNs;
+//     use __HAL_ID__::embedded_hal::digital::OutputPin;
+//
+// They are not imported here on purpose — a constructor that returns a placeholder type cannot use
+// them yet, and an unused import is a warning in a project that should start clean.
 
 __EXECUTOR__
-/// An LED on this family's GPIO.
+/// This board family's constructors.
 ///
-/// The pin is handed to the struct and never named by an actor; an active-low board inverts in
-/// `new` (see the `Led` contract).
-pub struct GpioLed {
-    // TODO: the pin type from __VENDOR__.
-}
+/// A **type**, not a trait: a `trait Board` would be a contract of our own invention again, one level
+/// up, and the peripheral contract is already the compiler's job.
+pub struct Board;
 
-impl Led for GpioLed {
-    fn set(&mut self, _on: bool) {
-        unimplemented!("GpioLed::set")
+/// What `led` returns until its body is written.
+///
+/// A concrete type rather than `impl OutputPin` with a diverging body: `-> impl Trait { unimplemented!() }`
+/// does **not** compile — the compiler infers the hidden type as `()` for a body that never returns,
+/// and `()` is not an output pin. The stub has to be a project that builds.
+pub struct UnimplementedLed;
+
+/// What `delay` returns until its body is written. Same reason as [`UnimplementedLed`].
+pub struct UnimplementedDelay;
+
+impl Board {
+    /// The LED, as an `embedded-hal` output.
+    ///
+    /// TODO: take this family's pin type, hand it to __VENDOR__'s own output driver, and return that
+    /// — it already implements `OutputPin`. An active-low LED inverts here, once, so nothing above
+    /// the board has to know.
+    pub fn led() -> UnimplementedLed {
+        unimplemented!("Board::led")
+    }
+
+    /// This family's blocking delay, as an `embedded-hal` `DelayNs`.
+    ///
+    /// TODO: return __VENDOR__'s delay type — it already implements `DelayNs`.
+    pub fn delay() -> UnimplementedDelay {
+        unimplemented!("Board::delay")
     }
 }
-
-/// This family's blocking delay.
-pub struct FamilyDelay;
-
-impl DelayMs for FamilyDelay {
-    fn delay_ms(&mut self, _ms: u32) {
-        unimplemented!("FamilyDelay::delay_ms")
-    }
-}"#;
+"#;
 
 /// For a `std` family the executor is the shared one — no per-family task code to write.
 const STD_EXECUTOR_REEXPORT: &str = r#"/// The executor is not this family's: under esp-idf a `std::thread` **is** a FreeRTOS task, so

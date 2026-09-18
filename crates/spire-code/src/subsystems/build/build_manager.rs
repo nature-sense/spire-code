@@ -5945,21 +5945,32 @@ public:
         tx
     }
 
-    /// A scaffolded project in miniature: the contract's `led` trait and a backend whose body is
-    /// still the placeholder.
+    /// A scaffolded project in miniature: the contract's seam (the `embedded-hal` re-export) and a
+    /// backend whose board is still the placeholder the scaffold writes.
     fn rust_hal_project(root: &std::path::Path) {
-        std::fs::create_dir_all(root.join("crates/demo-hal/src/hal")).unwrap();
+        std::fs::create_dir_all(root.join("crates/demo-hal/src")).unwrap();
         std::fs::write(
-            root.join("crates/demo-hal/src/hal/led.rs"),
-            "/// A single binary output.\npub trait Led {\n    fn set(&mut self, on: bool);\n}\n",
+            root.join("crates/demo-hal/src/lib.rs"),
+            "//! The seam: the actor contract, plus `embedded-hal` re-exported.\n\n\
+             pub mod actor;\n\npub use embedded_hal;\n",
         )
         .unwrap();
         std::fs::create_dir_all(root.join("crates/demo-hal-esp32/src")).unwrap();
         std::fs::write(
             root.join("crates/demo-hal-esp32/src/lib.rs"),
-            "use demo_hal::hal::Led;\n\npub struct GpioLed;\n\n\
-             impl Led for GpioLed {\n    fn set(&mut self, _on: bool) {\n        \
-             unimplemented!(\"GpioLed::set\")\n    }\n}\n",
+            "use demo_hal::embedded_hal::delay::DelayNs;\n\
+             use demo_hal::embedded_hal::digital::{ErrorType, OutputPin};\n\n\
+             pub struct Board;\n\n\
+             impl Board {\n    \
+             pub fn led() -> impl OutputPin {\n        unimplemented!(\"Board::led\")\n    }\n\n    \
+             pub fn delay() -> impl DelayNs {\n        unimplemented!(\"Board::delay\")\n    }\n}\n\n\
+             pub struct BoardLed;\n\
+             impl ErrorType for BoardLed {\n    type Error = core::convert::Infallible;\n}\n\
+             impl OutputPin for BoardLed {\n    \
+             fn set_high(&mut self) -> Result<(), Self::Error> {\n        Ok(())\n    }\n    \
+             fn set_low(&mut self) -> Result<(), Self::Error> {\n        Ok(())\n    }\n}\n\n\
+             pub struct BoardDelay;\n\
+             impl DelayNs for BoardDelay {\n    fn delay_ns(&mut self, _ns: u32) {}\n}\n",
         )
         .unwrap();
     }
@@ -5978,8 +5989,17 @@ public:
 
         let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
         manager.set_llm(answering_llm(
-            "Sure — here it is:\n\n```rust\nuse demo_hal::hal::Led;\n\npub struct GpioLed;\n\n\
-             impl Led for GpioLed {\n    fn set(&mut self, on: bool) {\n        let _ = on;\n    }\n}\n```\n",
+            "Sure — here it is:\n\n```rust\nuse demo_hal::embedded_hal::delay::DelayNs;\n\
+             use demo_hal::embedded_hal::digital::{ErrorType, OutputPin};\n\npub struct Board;\n\n\
+             impl Board {\n    pub fn led() -> impl OutputPin {\n        BoardLed\n    }\n\n    \
+             pub fn delay() -> impl DelayNs {\n        BoardDelay\n    }\n}\n\n\
+             pub struct BoardLed;\n\
+             impl ErrorType for BoardLed {\n    type Error = core::convert::Infallible;\n}\n\
+             impl OutputPin for BoardLed {\n    \
+             fn set_high(&mut self) -> Result<(), Self::Error> {\n        Ok(())\n    }\n    \
+             fn set_low(&mut self) -> Result<(), Self::Error> {\n        Ok(())\n    }\n}\n\n\
+             pub struct BoardDelay;\n\
+             impl DelayNs for BoardDelay {\n    fn delay_ns(&mut self, _ns: u32) {}\n}\n```\n",
         ));
 
         let plan = manager
@@ -6008,7 +6028,7 @@ public:
         assert_eq!(applied["failures"], serde_json::json!([]), "{applied}");
         assert_eq!(
             applied["applied"][0]["interfaces_done"],
-            serde_json::json!(["led"]),
+            serde_json::json!(["board"]),
             "{applied}"
         );
         assert_eq!(
@@ -6026,13 +6046,16 @@ public:
             "an unbuildable project is reported as such, with the reason: {applied}"
         );
 
-        // The fence came off, the body landed, the placeholder is gone, and the rest of the file
-        // — the import and the struct — is what it was.
+        // The fence came off, the bodies landed, no placeholder is left, and the rest of the file
+        // — the imports and the types — is what it was.
         let written = std::fs::read_to_string(&backend).unwrap();
-        assert!(written.contains("let _ = on;"), "{written}");
+        assert!(written.contains("BoardLed"), "{written}");
         assert!(!written.contains("unimplemented!"), "{written}");
-        assert!(written.contains("use demo_hal::hal::Led;"), "{written}");
-        assert!(written.contains("pub struct GpioLed;"), "{written}");
+        assert!(
+            written.contains("use demo_hal::embedded_hal::digital::{ErrorType, OutputPin};"),
+            "{written}"
+        );
+        assert!(written.contains("pub struct Board;"), "{written}");
 
         // And the indicator agrees: the interface is no longer in the missing queue.
         let coverage = manager
@@ -6042,12 +6065,12 @@ public:
             )
             .await;
         assert_eq!(
-            coverage["platforms"]["esp32"]["led"]["implemented"],
+            coverage["platforms"]["esp32"]["board"]["implemented"],
             serde_json::json!(true),
             "{coverage}"
         );
         assert_eq!(
-            coverage["platforms"]["esp32"]["led"]["is_stub"],
+            coverage["platforms"]["esp32"]["board"]["is_stub"],
             serde_json::json!(false),
             "{coverage}"
         );
@@ -6067,10 +6090,13 @@ public:
         let before = std::fs::read_to_string(&backend).unwrap();
 
         let mut manager = BuildManagerActor::new(mpsc::channel(1).0);
-        // Parses as Rust, declares the impl, provides the method — and still does nothing.
+        // Parses as Rust, declares the board, provides both constructors — and still does nothing.
         manager.set_llm(answering_llm(
-            "```rust\nimpl Led for GpioLed {\n    fn set(&mut self, _on: bool) {\n        \
-             unimplemented!(\"GpioLed::set\")\n    }\n}\n```",
+            "```rust\npub struct Board;\n\n\
+             impl Board {\n    pub fn led() -> impl embedded_hal::digital::OutputPin {\n        \
+             unimplemented!(\"Board::led\")\n    }\n\n    \
+             pub fn delay() -> impl embedded_hal::delay::DelayNs {\n        \
+             unimplemented!(\"Board::delay\")\n    }\n}\n```",
         ));
 
         let plan = manager
@@ -6090,8 +6116,8 @@ public:
         let reason = applied["failures"][0]["reason"].as_str().expect("a reason");
         assert!(reason.contains("unimplemented!()"), "{reason}");
         assert!(
-            reason.contains("Led"),
-            "the refusal names the trait: {reason}"
+            reason.contains("Board"),
+            "the refusal names the type: {reason}"
         );
         assert_eq!(
             std::fs::read_to_string(&backend).unwrap(),
