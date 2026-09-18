@@ -571,6 +571,11 @@ esp32 --non-interactive --port /dev/cu.usbserial-569C0028661 <elf>` → exit 0, 
 console showed the actor loop (`blink: on` / `blink: off`). Two real bugs fell out of doing
 it, both fixed:
 
+> The *flash* in that sentence is verified; the *blink* is qualified by the 2026-09-18 section
+> below, where the same firmware panicked in the actor's mailbox until the pthread stack was
+> raised. Read the two together: the flash leg worked here, and the loop is what the config
+> below makes true.
+
 - **`build_build` ignored the platform when routing.** `build_project_with_events` — the path
   a UI Build click and a `build_build` tool call share — called `module_tx_for(config, None)`,
   so an ESP32 build went to the **cargo** module while the batch `build_project` sent the same
@@ -586,6 +591,52 @@ it, both fixed:
   `--non-interactive` and names the port, discovered as the single USB-serial device
   (`serial_port_in`, refusing when there are none or several), with `port=` / `$ESPFLASH_PORT`
   as escape hatches.
+
+### 8, on the board again (2026-09-18): the flash leg verified to the byte, and the actor loop that stayed silent
+
+Same board (ESP32 rev v3.0 / M5Stack Core2), same firmware, same platform. This run added the
+step the earlier one did not have: **the check that the chip is running the bytes we built.**
+IDF prints `ELF file SHA256` at app startup, and it matched our ELF's own prefix — `shasum -a
+256 …/blink-esp32` → `00f1a099d`, device → `ELF file SHA256: 00f1a099d…`. An exit-0 flash says
+the tool believed it worked; a hash match says the *silicon* is running this build. The leg's
+shape is now pinned by `a_real_board_is_flashed_through_the_flash_leg` (`#[ignore]`d, skipped
+unless `SPIRE_FLASH_PROJECT` names a project with a binary — an embedded-HAL project is a library,
+so there is nothing in *it* to flash). It asserts the command too, not just the exit code, because
+`--chip <platform>` and `--port` are where the leg's decisions show up.
+
+What that run turned up, in the order it bit:
+
+- **`espflash flash <elf>` writes only the app.** The board was left with a bootloader from a
+  *different* IDF (`v6.1-beta1`) while the app was `v5.5.5`, and nothing said so — the flash
+  succeeded either way. Flashing our own bootloader (`--bootloader <build>/bootloader/bootloader.bin`)
+  is possible, and the panic below was *not* caused by the mismatch (it survived the fix), but a
+  leg that claims "the board runs this build" should carry the bootloader and partition table
+  from the same build. Ours passes neither.
+- **The build's own partition table cannot hold the app.** IDF's default single-app layout gives
+  the app 1 MB; a std **debug** Rust app is 1.13 MB (`App/part. size: 1,181,776/16,384,000` — and
+  16,384,000 is the *stale* table's factory partition, not ours). Flashing our table fails with
+  *"Supplied ELF image of 1181792B is too big"*. The board only ran the app because it happened to
+  carry a 16 MB factory partition from an earlier life. A firmware project needs a `partitions.csv`
+  (this is a *project* fact, not a platform one — but it is the reason "it flashed fine" proves less
+  than it looks).
+- **The actor loop printed nothing: `Guru Meditation (LoadProhibited)` at `app_main`.** Symbolized
+  with the toolchain's `xtensa-esp32-elf-addr2line`: `pthread_mutex_unlock` ← std's
+  `MutexGuard<Waker>::drop` ← `SyncWaker::register` ← `std::sync::mpmc::array::Channel::recv` —
+  i.e. the *actor's mailbox*, before a single message was handled. The cause is a default, not a
+  bug in the code: `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=3072` in IDF, and Rust's `std::thread`
+  **is** a pthread — so `spire-hal-std`'s executor gave the actor a 3 KB stack, which std's mpmc
+  receive path (deep frames in a debug build) overflows into a wild pointer. Adding
+  `examples/blink-esp32/sdkconfig.defaults` with `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=16384`
+  flipped it from panic to `blink: on` / `blink: off`, 15 lines in 16 seconds, no panics. The
+  earlier note that "the console showed the actor loop" was written from a flash that had
+  certainly worked; with *today's* toolchain the loop is only true with this config, so that line
+  now means "the flash was verified then, the loop is verified now" — and the difference between
+  the two is exactly the kind of thing a hash match and a monitor capture settle.
+- **Spire's esp leg passes no IDF configuration at all** (no `ESP_IDF_SDKCONFIG_DEFAULTS`, and the
+  registry entries carry none), so a project's `sdkconfig.defaults` is read only by esp-idf-sys's
+  own convention, at *configure* time — adding the file after a first build changed nothing until
+  `cargo clean -p esp-idf-sys` forced a re-configure. Worth knowing before the next "why is the
+  config ignored".
 
 **Resolved (2026-09-16): the example was missing its `build.rs`.** The link died in `ldproxy`
 with *Cannot locate argument '--ldproxy-linker <linker>'* because **no crate re-emitted the

@@ -1048,8 +1048,10 @@ async fn live_fill(platform: &str, project_name: &str) -> Option<serde_json::Val
 //
 // The fill's gate is structural; this is the part that can only be answered by a compiler.
 // Both families are run, because their failures are different: rp2040's is a type that does not
-// exist (`gpio::Output` where the type is `FunctionSio<SioOutput>`), while esp-idf's is a shape
-// (`PinDriver<'d, MODE>` takes one generic, not two). The board-specific setup and the whole
+// exist (`gpio::AnyOutput`, where the type is `Pin<Gpio25, FunctionSio<SioOutput>, PullDown>`),
+// while esp-idf's is a shape (`PinDriver<'d, MODE>` carries the *mode* only — the pin is erased
+// by `PinDriver::output`, so naming a second generic or a pin type there does not compile). The
+// board-specific setup and the whole
 // sequence live in `live_fill`, so the two runs cannot drift in the part that matters — the
 // assertions.
 //
@@ -1078,6 +1080,67 @@ async fn a_real_model_fills_and_the_esp32_backend_builds() {
     assert!(
         verification["built"] == serde_json::json!(true),
         "the generated esp32 backend must build: {verification}"
+    );
+}
+
+// The last leg, live: a board on the other end of a USB cable
+// ─────────────────────────────────────────────────────────────────────────────────────
+//
+// Everything above stops at "the binary compiles". This is the only check that talks to silicon,
+// and the leg whose plumbing fails silently when it is wrong: the platform's *chip* has to become
+// `--chip`, the artifact has to be the one the build wrote for that chip's triple, and the port
+// has to be the board's — each of which can be wrong while the command still "succeeds" somewhere.
+//
+// It needs a project with a **binary**, which is why the path is passed in rather than scaffolded:
+// an embedded-HAL project is a library (there is nothing to flash), so this runs against a firmware
+// example that depends on one:
+//
+//     SPIRE_FLASH_PROJECT=/…/blink-esp32 \
+//       cargo test -p spire-code --test embedded_hal_creation_tests -- --ignored a_real_board_is_flashed
+//
+// Unset skips (like the API-key gate above), so `--ignored` on a machine with no board wired stays
+// green rather than failing for the one thing a test cannot provide.
+#[ignore = "live hardware: needs a board on USB and a project with a built binary"]
+#[tokio::test]
+async fn a_real_board_is_flashed_through_the_flash_leg() {
+    let Some(project) = std::env::var("SPIRE_FLASH_PROJECT")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+    else {
+        eprintln!(
+            "skipping: set SPIRE_FLASH_PROJECT=<project with a built binary> to flash a board"
+        );
+        return;
+    };
+    // The board's platform, by registry id — the chip the tool talks to comes from it, so it is
+    // never inferred from the binary.
+    let platform = std::env::var("SPIRE_FLASH_PLATFORM").unwrap_or_else(|_| "esp32".to_string());
+    let wizard = Wizard::build_with_rp2040(None).await;
+
+    // Analyze first. The flash leg routes from the analysis (that is where the config file, and so
+    // the build system, is recorded), so without this it refuses for a reason that has nothing to
+    // do with the board — and a refusal is easy to mistake for a hardware problem.
+    let analyzed = wizard
+        .tool("build_analyze", serde_json::json!({ "path": project }))
+        .await;
+    assert!(analyzed.get("error").is_none(), "{analyzed}");
+
+    let flashed = wizard
+        .tool(
+            "build_flash",
+            serde_json::json!({ "path": project, "platform": platform }),
+        )
+        .await;
+    eprintln!("flash -> {flashed}");
+
+    // The command is asserted, not just the exit code: it is the only place `--chip` and the port
+    // appear, and a flash that reported success against the wrong chip is exactly the failure worth
+    // catching. `--port` proves discovery found the board rather than espflash being left to prompt.
+    let command = flashed["command"].as_str().unwrap_or_default();
+    assert_eq!(flashed["success"], serde_json::json!(true), "{flashed}");
+    assert!(
+        command.contains(&platform) && command.contains("--port"),
+        "the flash must name the platform's chip and the board's port: {flashed}"
     );
 }
 
