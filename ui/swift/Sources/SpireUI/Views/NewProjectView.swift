@@ -1,43 +1,80 @@
 import SwiftUI
 import AppKit
 
-/// Step-wise "Start New Project" wizard (embedded-first).
+/// Step-wise "Start New Project" wizard: a **tree**, because the shape of a project decides which
+/// questions are worth asking.
 ///
-/// Flow:
-///   1. Environment   → Embedded | Native
-///   2. Targets       → multi-select platforms (≥1 for embedded, NO host)
-///   3. Toolchain     → C++ / Meson | Rust / Cargo
-///   4. Structure     → Meson: Hardware abstraction (recommended) | Single source base
-///                      Cargo/Rust: fixed "multi-target build" label
-///   5. Details       → name + parent dir + description (collected ONCE on the
-///                      final step — description only drives plan *content*,
-///                      structure is already fixed by steps 1–4)
-///   Generate Plan    → bridge.generateProjectPlan(…)
+///   Environment ─┬─ Native ────┬─ Spire UI App         → `spire_app`
+///                │             └─ CLI                  → `native`
+///                └─ Embedded ─┬─ Linux SBC (C++) ───── Targets → Structure
+///                             │                          → `single_source` | `hal`  (unchanged)
+///                             └─ Controller (Rust) ─┬─ HAL + Frameworks → `embedded_hal`
+///                                                  └─ Application      → `embedded_app`
 ///
-/// The Rust core's `ProjectStructure` enum (`native | single_source | hal`)
-/// and `embedded` flag ride through `generateProjectPlan`, so the scaffold
-/// (Meson HAL container vs single-source; no-host Cargo) matches the choice.
+/// The steps are therefore **data, not an enum's order**: a Native CLI needs three, a Linux SBC five
+/// (exactly the Meson shape this wizard has always had), a Controller five. `path` computes the
+/// sequence for the current choices and the footer walks it, so a branch that does not apply is
+/// never a step the user has to get past.
+///
+/// Each leaf is one `ProjectStructure` key plus the `embedded` flag, and the `embedded` flag is the
+/// tree's own answer: Native is host-only, an embedded leaf is *defined* by its targets.
 struct NewProjectView: View {
     @Environment(SpireBridge.self) private var bridge
     @Environment(AppTheme.self) private var theme
 
-    enum Step: Int, CaseIterable {
-        case environment = 0
-        case targets = 1
-        case toolchain = 2
-        case structure = 3
-        case details = 4
+    /// Host or hardware — the top of the tree.
+    ///
+    /// Named `ProjectEnvironment`, not `Environment`: the latter is SwiftUI's property wrapper, and
+    /// shadowing it breaks every `@Environment` in this file.
+    enum ProjectEnvironment: String, CaseIterable {
+        case native, embedded
     }
 
-    @State private var step: Step = .environment
-    @State private var isEmbedded: Bool = true
+    /// The two host shapes.
+    enum NativeKind: String, CaseIterable {
+        /// Rust core + SwiftUI on the Spire framework (`spire_app`).
+        case spireApp
+        /// A plain Cargo binary — the command-line tool (`native`).
+        case cli
+    }
+
+    /// Embedded: a Linux SBC (C++/Meson) or a **controller** (Rust/Cargo, firmware).
+    enum DeviceClass: String, CaseIterable {
+        case linuxSbc
+        case controller
+    }
+
+    /// A controller project is either the HAL + frameworks themselves, or an application that
+    /// depends on one.
+    enum ControllerRole: String, CaseIterable {
+        /// The contract crate plus one backend per board family — a library (`embedded_hal`).
+        case halFrameworks
+        /// A firmware binary that path-deps an existing HAL project (`embedded_app`).
+        ///
+        /// Its own structure, because the two are **separate projects**: the app is not a HAL with a
+        /// `main`, it depends on one. Scaffolding it arrives with that structure in the core; the
+        /// wizard shows the choice now so the tree is complete, and does not offer it until then —
+        /// a selectable card here would scaffold a plain host crate instead, silently.
+        case application
+    }
+
+    enum Step: String, CaseIterable {
+        case environment, nativeKind, deviceClass, controllerRole, targets, structure, details
+    }
+
+    @State private var stepIndex = 0
+    @State private var environment: ProjectEnvironment = .embedded
+    @State private var nativeKind: NativeKind = .spireApp
+    @State private var deviceClass: DeviceClass = .linuxSbc
+    @State private var controllerRole: ControllerRole = .halFrameworks
     /// Loaded from the Rust registry via `bridge.fetchPlatforms()`.
     @State private var availableTargets: [Platform] = []
     /// Selected cross-compilation target registry ids (e.g. ["rpi5", "rock3c"]).
+    ///
+    /// Cleared whenever the branch changes, because the two branches never offer the same platform:
+    /// a kept selection would be a build for hardware the branch does not have.
     @State private var selectedTargets: Set<String> = []
-    @State private var isRust: Bool = false           // false = C++ / Meson
-    @State private var useHal: Bool = true            // Meson structure: HAL vs single-source
-    @State private var useSpireApp: Bool = false      // Rust structure: Spire app (Rust core + SwiftUI)
+    @State private var useHal: Bool = true            // Linux SBC structure: HAL vs single-source
 
     @State private var goal: String = ""
     @State private var projectName: String = ""
@@ -45,7 +82,7 @@ struct NewProjectView: View {
     @State private var isGenerating = false
     @State private var errorMessage: String?
 
-    private var isNative: Bool { !isEmbedded }
+    private var isNative: Bool { environment == .native }
 
     // MARK: - Derived wizard state
 
@@ -67,33 +104,132 @@ struct NewProjectView: View {
         return "\(dir)/\(cleanName)"
     }
 
-    private var toolchainLabel: String {
-        isRust ? "Rust / Cargo" : "C++ / Meson"
+    // MARK: - The branch
+
+    /// The steps this branch actually needs, in order.
+    ///
+    /// Data rather than an enum's order: `environment → nativeKind → details` for a Native CLI,
+    /// five steps for a Linux SBC (the Meson shape, unchanged), five for a Controller. The indicator
+    /// and the footer both read this, so a step a branch does not have is not a step at all.
+    private var path: [Step] {
+        Self.path(environment: environment, deviceClass: deviceClass)
     }
 
-    private var structureLabel: String {
-        if isRust {
-            return useSpireApp
-                ? "Spire app (Rust core + SwiftUI)"
-                : "Multi-target build (one source set, cross-compiled per target)"
+    /// The steps a branch has — **pure and static** so the shape is testable without a view, the same
+    /// reason the add-board menu is. `controllerRole` is deliberately not a parameter: the role
+    /// changes *what* the Controller branch scaffolds, not how many questions it asks.
+    static func path(environment: ProjectEnvironment, deviceClass: DeviceClass) -> [Step] {
+        var steps: [Step] = [.environment]
+        switch environment {
+        case .native:
+            steps.append(.nativeKind)
+        case .embedded:
+            steps.append(.deviceClass)
+            switch deviceClass {
+            case .linuxSbc:
+                steps.append(.targets)
+                steps.append(.structure)
+            case .controller:
+                steps.append(.controllerRole)
+                steps.append(.targets)
+            }
         }
-        return useHal ? "Hardware abstraction (recommended)" : "Single source base (no hardware-specific layer)"
+        steps.append(.details)
+        return steps
     }
 
+    /// The step being shown — clamped, because a branch change can shorten the path under the user's
+    /// feet (Back from Details, then a shallower branch).
+    private var step: Step {
+        path[min(stepIndex, path.count - 1)]
+    }
+
+    private var isLastStep: Bool { stepIndex >= path.count - 1 }
+
+    /// The targets this branch offers, and therefore the only ones it can select.
+    private var offeredTargets: [Platform] {
+        Self.offeredTargets(availableTargets, environment: environment, deviceClass: deviceClass)
+    }
+
+    /// The branch's targets: boards for a Controller, Linux SBCs for a Linux SBC, none for Native.
+    ///
+    /// Pure and static so a test can pin the split against the registry flags it reads — `embedded`
+    /// and `family` — without a view. A second copy of this rule in the view is exactly how the
+    /// wizard and the build would come to disagree about what a board is.
+    static func offeredTargets(_ platforms: [Platform], environment: ProjectEnvironment,
+                               deviceClass: DeviceClass) -> [Platform] {
+        guard environment == .embedded else { return [] }
+        switch deviceClass {
+        case .linuxSbc: return platforms.filter { $0.embedded && $0.family == nil }
+        case .controller: return platforms.filter { $0.embedded && $0.family != nil }
+        }
+    }
+
+    private var language: String {
+        isNative || deviceClass == .controller ? "Rust" : "Meson"
+    }
+
+    private var toolchainLabel: String {
+        language == "Rust" ? "Rust / Cargo" : "C++ / Meson"
+    }
+
+    /// What the leaf becomes: the exact `ProjectStructure` key the core parses.
     private var structureKey: String {
-        if isRust { return useSpireApp ? "spire_app" : "native" }
-        return useHal ? "hal" : "single_source"
+        Self.structureKey(environment: environment, nativeKind: nativeKind,
+                          deviceClass: deviceClass, controllerRole: controllerRole, useHal: useHal)
     }
 
-    /// Next-step gating: each step must satisfy its requirement before the
-    /// user can move on (embedded requires ≥1 target).
+    /// The leaf → `ProjectStructure` mapping: **pure**, so a test can walk the tree without a view.
+    ///
+    /// This is the whole contract between the wizard and the core. A key the core does not know falls
+    /// back to `native`, silently — which is why the mapping is pinned in `SpireUITests` rather than
+    /// left implicit in a view's `switch`es.
+    static func structureKey(environment: ProjectEnvironment, nativeKind: NativeKind,
+                             deviceClass: DeviceClass, controllerRole: ControllerRole,
+                             useHal: Bool) -> String {
+        switch environment {
+        case .native:
+            return nativeKind == .spireApp ? "spire_app" : "native"
+        case .embedded:
+            switch deviceClass {
+            case .linuxSbc:
+                return useHal ? "hal" : "single_source"
+            case .controller:
+                return controllerRole == .halFrameworks ? "embedded_hal" : "embedded_app"
+            }
+        }
+    }
+
+    /// The same choice as a sentence, for the Details summary.
+    private var structureLabel: String {
+        switch environment {
+        case .native:
+            return nativeKind == .spireApp
+                ? "Spire UI App (Rust core + SwiftUI)"
+                : "CLI (native Cargo binary)"
+        case .embedded:
+            switch deviceClass {
+            case .linuxSbc:
+                return useHal
+                    ? "Linux SBC — hardware abstraction (recommended)"
+                    : "Linux SBC — single source base (no hardware-specific layer)"
+            case .controller:
+                return controllerRole == .halFrameworks
+                    ? "Controller — HAL + frameworks (contract + one backend per board family)"
+                    : "Controller — application (firmware binary that depends on a HAL)"
+            }
+        }
+    }
+
+    /// Next-step gating: a step the user cannot satisfy does not let them past.
     private var canAdvance: Bool {
         switch step {
-        case .environment: return true
+        case .environment, .nativeKind, .deviceClass, .controllerRole, .structure:
+            return true
         case .targets:
-            return isNative || !selectedTargets.isEmpty
-        case .toolchain: return true
-        case .structure: return true
+            // A branch with no targets in the registry cannot be advanced past on an empty
+            // selection, and saying so beats scaffolding a project with nothing to build for.
+            return !offeredTargets.isEmpty && !selectedTargets.isEmpty
         case .details:
             return !goal.trimmingCharacters(in: .whitespaces).isEmpty
                 && !projectName.trimmingCharacters(in: .whitespaces).isEmpty
@@ -104,12 +240,15 @@ struct NewProjectView: View {
     private var stepTitle: String {
         switch step {
         case .environment: return "Environment"
-        case .targets: return "Target Hardware"
-        case .toolchain: return "Toolchain"
+        case .nativeKind: return "Project Type"
+        case .deviceClass: return "Device Class"
+        case .controllerRole: return "Controller Project"
+        case .targets: return deviceClass == .controller ? "Target Board" : "Target Hardware"
         case .structure: return "Project Structure"
         case .details: return "Name & Description"
         }
     }
+
 
     // MARK: - Body
 
@@ -152,14 +291,16 @@ struct NewProjectView: View {
 
     private var stepIndicator: some View {
         HStack(spacing: 8) {
-            ForEach(Step.allCases, id: \.self) { s in
+            // One dot per step *this branch* has, so the count never promises steps the branch
+            // does not ask for.
+            ForEach(Array(path.enumerated()), id: \.offset) { index, _ in
                 Circle()
-                    .fill(s.rawValue <= step.rawValue ? Color.orange : theme.border)
+                    .fill(index <= stepIndex ? Color.orange : theme.border)
                     .frame(width: 10, height: 10)
                     .overlay(Circle().stroke(theme.border, lineWidth: 1))
             }
             Spacer()
-            Text("\(step.rawValue + 1) / \(Step.allCases.count)")
+            Text("\(min(stepIndex, path.count - 1) + 1) / \(path.count) · \(stepTitle)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -170,14 +311,16 @@ struct NewProjectView: View {
     private var stepContent: some View {
         switch step {
         case .environment: environmentStep
+        case .nativeKind: nativeKindStep
+        case .deviceClass: deviceClassStep
+        case .controllerRole: controllerRoleStep
         case .targets: targetsStep
-        case .toolchain: toolchainStep
         case .structure: structureStep
         case .details: detailsStep
         }
     }
 
-    // MARK: Step 1 — Environment
+    // MARK: Step 1 — Environment (the top of the tree)
 
     private var environmentStep: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -186,169 +329,242 @@ struct NewProjectView: View {
             HStack(spacing: 12) {
                 choiceCard(
                     title: "Embedded",
-                    subtitle: "Cross-compile for specific hardware targets",
+                    subtitle: "Firmware or a Linux SBC — cross-compiled for hardware",
                     systemImage: "cpu",
-                    selected: isEmbedded,
-                    select: { isEmbedded = true }
+                    selected: environment == .embedded,
+                    select: { selectEnvironment(.embedded) }
                 )
                 choiceCard(
                     title: "Native",
-                    subtitle: "Build for this machine (host)",
+                    subtitle: "Runs on this machine (macOS)",
                     systemImage: "macbook",
-                    selected: isNative,
-                    select: { isEmbedded = false }
+                    selected: environment == .native,
+                    select: { selectEnvironment(.native) }
                 )
             }
-            if isEmbedded {
-                Label("Targets only — no host build option.", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Label(
+                environment == .embedded
+                    ? "Targets only — no host build option."
+                    : "Host only — the Spire app, or a CLI.",
+                systemImage: environment == .embedded ? "exclamationmark.triangle" : "macbook"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: 480, alignment: .leading)
     }
 
-    // MARK: Step 2 — Targets (embedded only)
+    /// Changing the environment clears any target selection: the two branches never offer the same
+    /// platform, so a kept selection would be a build for hardware this branch does not have.
+    private func selectEnvironment(_ next: ProjectEnvironment) {
+        guard environment != next else { return }
+        environment = next
+        selectedTargets.removeAll()
+        errorMessage = nil
+    }
+
+    // MARK: Native — the two host shapes
+
+    private var nativeKindStep: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("What are you building?")
+                .font(.headline)
+            HStack(spacing: 12) {
+                choiceCard(
+                    title: "Spire UI App",
+                    subtitle: "Rust core + SwiftUI, built on spire-actor & spire-core",
+                    systemImage: "sparkles",
+                    selected: nativeKind == .spireApp,
+                    select: { nativeKind = .spireApp }
+                )
+                choiceCard(
+                    title: "CLI",
+                    subtitle: "A Cargo binary for the command line",
+                    systemImage: "terminal",
+                    selected: nativeKind == .cli,
+                    select: { nativeKind = .cli }
+                )
+            }
+            Label(
+                nativeKind == .spireApp
+                    ? "A Cargo workspace crate plus the SwiftUI app (ui/swift) that embeds it as a dylib. Host-only (macOS)."
+                    : "One Cargo binary, built for this machine. No SwiftUI, no hardware.",
+                systemImage: nativeKind == .spireApp ? "sparkles" : "terminal"
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+    }
+
+    // MARK: Embedded — Linux SBC (C++) or Controller (Rust)
+
+    private var deviceClassStep: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("What kind of embedded project?")
+                .font(.headline)
+            HStack(spacing: 12) {
+                choiceCard(
+                    title: "Linux SBC (C++)",
+                    subtitle: "Cross-compile C++ for a single-board computer",
+                    systemImage: "server.rack",
+                    selected: deviceClass == .linuxSbc,
+                    select: { selectDeviceClass(.linuxSbc) }
+                )
+                choiceCard(
+                    title: "Controller (Rust)",
+                    subtitle: "Firmware for a board — Cargo, one backend per family",
+                    systemImage: "cpu",
+                    selected: deviceClass == .controller,
+                    select: { selectDeviceClass(.controller) }
+                )
+            }
+            Label(
+                deviceClass == .linuxSbc
+                    ? "Meson plus a C++ toolchain per target (rpi5, rock3c, …)."
+                    : "Cargo plus a board toolchain (rp2040, esp32, …).",
+                systemImage: deviceClass == .linuxSbc ? "server.rack" : "cpu"
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+    }
+
+    /// Same reason as `selectEnvironment`: the two classes offer different platforms (boards vs Linux
+    /// SBCs), so a selection cannot survive the switch.
+    private func selectDeviceClass(_ next: DeviceClass) {
+        guard deviceClass != next else { return }
+        deviceClass = next
+        selectedTargets.removeAll()
+        errorMessage = nil
+    }
+
+    // MARK: Controller — the HAL + frameworks, or an application that depends on one
+
+    private var controllerRoleStep: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("HAL or application?")
+                .font(.headline)
+            HStack(spacing: 12) {
+                choiceCard(
+                    title: "HAL + Frameworks",
+                    subtitle: "Contract crate + one backend per board family",
+                    systemImage: "square.stack.3d.up",
+                    selected: controllerRole == .halFrameworks,
+                    select: { controllerRole = .halFrameworks }
+                )
+                // Shown, not offered: the app structure does not exist in the core yet, and a
+                // selectable card would scaffold a plain host crate instead — silently. It becomes
+                // a choice by turning `enabled` on, in the change that lands `embedded_app`.
+                choiceCard(
+                    title: "Application",
+                    subtitle: "Firmware that depends on a HAL project",
+                    systemImage: "app.badge",
+                    selected: controllerRole == .application,
+                    enabled: false,
+                    select: { controllerRole = .application }
+                )
+            }
+            Label(
+                controllerRole == .application
+                    ? "Arrives with the embedded-app scaffold: a separate project whose Cargo.toml path-deps a HAL's contract and board backend crates."
+                    : "The traits a firmware programs against plus the per-family implementations — a library, filled by the drift cascade.",
+                systemImage: controllerRole == .application ? "clock" : "square.stack.3d.up"
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: 520, alignment: .leading)
+    }
+
+
+    // MARK: Targets — the boards (Controller) or the Linux SBCs (Linux SBC)
 
     private var targetsStep: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if isEmbedded {
-                Text("Select at least one hardware target (no host option)")
-                    .font(.headline)
-                if availableTargets.isEmpty {
-                    Label("No targets in the registry yet (check ~/.spire/platforms).",
-                          systemImage: "tray")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    let columns = [GridItem(.adaptive(minimum: 220), spacing: 10)]
-                    ScrollView {
-                        LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
-                            ForEach(availableTargets, id: \.id) { platform in
-                                let isSelected = selectedTargets.contains(platform.id)
-                                Button {
-                                    if isSelected {
-                                        selectedTargets.remove(platform.id)
-                                    } else {
-                                        selectedTargets.insert(platform.id)
-                                    }
-                                } label: {
-                                    HStack(spacing: 8) {
-                                        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                                            .foregroundStyle(isSelected ? Color.orange : .secondary)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(platform.name)
-                                                .font(.callout.weight(.medium))
-                                                .foregroundStyle(.primary)
-                                            Text(platform.id)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Spacer()
-                                    }
-                                    .padding(8)
-                                    .background(RoundedRectangle(cornerRadius: 6).fill(theme.surface))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(isSelected ? Color.orange : theme.border, lineWidth: 1)
-                                    )
+            Text(deviceClass == .controller
+                 ? "Select at least one board (no host option)"
+                 : "Select at least one hardware target (no host option)")
+                .font(.headline)
+            if offeredTargets.isEmpty {
+                Label(
+                    deviceClass == .controller
+                        ? "No boards in the registry yet — a board declares a `family`."
+                        : "No Linux SBC targets in the registry yet (check ~/.spire/platforms).",
+                    systemImage: "tray"
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            } else {
+                let columns = [GridItem(.adaptive(minimum: 220), spacing: 10)]
+                ScrollView {
+                    LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
+                        ForEach(offeredTargets, id: \.id) { platform in
+                            let isSelected = selectedTargets.contains(platform.id)
+                            Button {
+                                if isSelected {
+                                    selectedTargets.remove(platform.id)
+                                } else {
+                                    selectedTargets.insert(platform.id)
                                 }
-                                .buttonStyle(.plain)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(isSelected ? Color.orange : .secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(platform.name)
+                                            .font(.callout.weight(.medium))
+                                            .foregroundStyle(.primary)
+                                        Text(platform.id)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                }
+                                .padding(8)
+                                .background(RoundedRectangle(cornerRadius: 6).fill(theme.surface))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(isSelected ? Color.orange : theme.border, lineWidth: 1)
+                                )
                             }
+                            .buttonStyle(.plain)
                         }
                     }
-                    .frame(maxHeight: 220)
                 }
-            } else {
-                // Native path — the target list is implicit (host only).
-                Label("Native project — one host build target.", systemImage: "macbook")
-                    .font(.headline)
+                .frame(maxHeight: 220)
             }
         }
         .frame(maxWidth: 520, alignment: .leading)
     }
 
-    // MARK: Step 3 — Toolchain
-
-    private var toolchainStep: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Choose your toolchain")
-                .font(.headline)
-            HStack(spacing: 12) {
-                choiceCard(
-                    title: "C++ / Meson",
-                    subtitle: isEmbedded
-                        ? "Per-target executables with shared + HAL sources"
-                        : "Meson build system",
-                    systemImage: "hammer",
-                    selected: !isRust,
-                    select: { isRust = false }
-                )
-                choiceCard(
-                    title: "Rust / Cargo",
-                    subtitle: "One source set, cross-compiled per target",
-                    systemImage: "gear",
-                    selected: isRust,
-                    select: { isRust = true }
-                )
-            }
-        }
-        .frame(maxWidth: 480, alignment: .leading)
-    }
-
-    // MARK: Step 4 — Structure
+    // MARK: Structure — the Linux SBC's two shapes (unchanged by this refinement)
 
     private var structureStep: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Project structure")
                 .font(.headline)
-            if isRust {
-                HStack(spacing: 12) {
-                    choiceCard(
-                        title: "Spire app",
-                        subtitle: "Rust core + SwiftUI, built on spire-actor & spire-core",
-                        systemImage: "sparkles",
-                        selected: useSpireApp,
-                        select: { useSpireApp = true }
-                    )
-                    choiceCard(
-                        title: "Plain Cargo crate",
-                        subtitle: "Single source set, cross-compiled per target",
-                        systemImage: "gear",
-                        selected: !useSpireApp,
-                        select: { useSpireApp = false }
-                    )
-                }
-                Label(
-                    useSpireApp
-                        ? "Spire app: Cargo workspace crate + SwiftUI app (ui/swift) that embeds the Rust core as a dylib. Host-only (macOS)."
-                        : "Cargo uses a single source set, cross-compiled for every selected target (via .cargo/config.toml).",
-                    systemImage: useSpireApp ? "sparkles" : "gearshape"
+            HStack(spacing: 12) {
+                choiceCard(
+                    title: "Hardware abstraction",
+                    subtitle: "Common core + hal/api contract + per-target implementations",
+                    systemImage: "cpu",
+                    selected: useHal,
+                    select: { useHal = true }
                 )
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            } else {
-                HStack(spacing: 12) {
-                    choiceCard(
-                        title: "Hardware abstraction",
-                        subtitle: "Common core + hal/api contract + per-target implementations",
-                        systemImage: "cpu",
-                        selected: useHal,
-                        select: { useHal = true }
-                    )
-                    choiceCard(
-                        title: "Single source base",
-                        subtitle: "Portable — no hardware-specific layer",
-                        systemImage: "doc.text",
-                        selected: !useHal,
-                        select: { useHal = false }
-                    )
-                }
-                if useHal {
-                    Label("Recommended default for most embedded projects.", systemImage: "checkmark.seal")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                choiceCard(
+                    title: "Single source base",
+                    subtitle: "Portable — no hardware-specific layer",
+                    systemImage: "doc.text",
+                    selected: !useHal,
+                    select: { useHal = false }
+                )
+            }
+            if useHal {
+                Label("Recommended default for most embedded projects.", systemImage: "checkmark.seal")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: 520, alignment: .leading)
@@ -426,11 +642,11 @@ struct NewProjectView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(structureLabel)
                     .font(.callout.weight(.medium))
-                if !isNative {
-                    Text("Targets: \(selectedTargets.isEmpty ? "host" : selectedTargets.sorted().joined(separator: ", "))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Text(isNative
+                     ? "Targets: this machine (host)"
+                     : "Targets: \(selectedTargets.sorted().joined(separator: ", "))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text("Toolchain: \(toolchainLabel)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -447,17 +663,17 @@ struct NewProjectView: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            if step != .environment {
+            if stepIndex > 0 {
                 Button("Back") {
-                    step = Step(rawValue: step.rawValue - 1) ?? .environment
+                    stepIndex = max(0, stepIndex - 1)
                     errorMessage = nil
                 }
             }
             Spacer()
-            if step != .details {
+            if !isLastStep {
                 Button("Next") {
                     if canAdvance {
-                        step = Step(rawValue: step.rawValue + 1) ?? .details
+                        stepIndex = min(path.count - 1, stepIndex + 1)
                         errorMessage = nil
                     }
                 }
@@ -490,8 +706,11 @@ struct NewProjectView: View {
 
     // MARK: - Helpers
 
+    /// One card. `enabled: false` shows a choice without offering it — for a leaf whose scaffold has
+    /// not landed yet, where a selectable card would scaffold something else instead.
     private func choiceCard(title: String, subtitle: String, systemImage: String,
-                            selected: Bool, select: @escaping () -> Void) -> some View {
+                            selected: Bool, enabled: Bool = true,
+                            select: @escaping () -> Void) -> some View {
         Button(action: select) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
@@ -516,6 +735,8 @@ struct NewProjectView: View {
             )
         }
         .buttonStyle(.plain)
+        .opacity(enabled ? 1 : 0.45)
+        .disabled(!enabled)
     }
 
     private func chooseDirectory() {
@@ -560,14 +781,15 @@ struct NewProjectView: View {
         isGenerating = true
         errorMessage = nil
         Task {
-            let language = isRust ? "Rust" : "Meson"
             let plan = await bridge.generateProjectPlan(
                 goal: goal,
                 rootDir: resolvedProjectDirectory,
                 language: language,
-                platforms: (isNative || useSpireApp) ? [] : selectedTargets.sorted(),
+                // Native is host-only; an embedded leaf is *defined* by its targets, which is why
+                // the two branches cannot share a platform list.
+                platforms: isNative ? [] : selectedTargets.sorted(),
                 structure: structureKey,
-                embedded: isEmbedded && !useSpireApp
+                embedded: !isNative
             )
             await MainActor.run {
                 if let plan {

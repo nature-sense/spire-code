@@ -1098,4 +1098,50 @@ test's project on disk so its backends can be built by hand; doing that found th
   refused repair, a gate refusal, a setup failure, `max_rounds: 0`) that need no model, no toolchain
   and no files.
 
+### 9, the wizard becomes a tree (2026-09-18): two projects, not one project type
+
+The new-project wizard asked its questions in a **fixed order** — Environment → Targets → Toolchain →
+Structure → Details — which meant every project walked past every question, including the ones its own
+shape had already answered. It is now a tree, and the branch decides the steps:
+
+    Environment ─┬─ Native ────┬─ Spire UI App         → spire_app
+                 │             └─ CLI                  → native
+                 └─ Embedded ─┬─ Linux SBC (C++) ───── Targets → Structure
+                              │                          → single_source | hal   (unchanged)
+                              └─ Controller (Rust) ─┬─ HAL + Frameworks → embedded_hal
+                                                   └─ Application      → embedded_app
+
+Why it is data rather than an enum's order: a Native CLI is three steps, a Linux SBC five, a
+Controller five, and the two Embedded branches never offer each other's platforms. The split falls out
+of the registry's own flags — boards are embedded platforms with a `family`, Linux SBCs are embedded
+platforms without one — so the wizard filters on what `platforms/list` already says instead of
+re-deriving "is this a board" a second time.
+
+**The decision worth recording: the HAL and the application are two projects, not two shapes of one.**
+The embedded-HAL project stays a **library** (contract + one backend per board family + the executors)
+— what the drift cascade fills. An application is a **separate project** that *depends on* it: its
+Cargo.toml path-deps the HAL's contract crate and the chosen board's backend crate, exactly the
+`blink-esp32 → spire-hal` relationship that has been hand-written until now. That is why Application is
+its own structure (`embedded_app`) rather than a flag on `embedded_hal`, and why the wizard will ask
+for the **HAL project directory** (a path picker) as well as the board: the board names the backend it
+depends on, the directory names the HAL it belongs to.
+
+Landed so far (this change): the tree, the branch filtering, and the leaf → `ProjectStructure` mapping,
+with three tests pinning it — the steps per branch, the key each leaf becomes (an unknown key falls
+back to `native` **silently**, so a typo would scaffold a host crate for a firmware choice), and the
+board/SBC split. The **Application leaf is shown but not offered** (`enabled: false`), because
+`embedded_app` does not exist in the core yet and a selectable card would scaffold that host crate.
+Turning it on is one flag, in the change that lands the structure and its scaffold:
+
+- `spire-core` — `ProjectStructure::EmbeddedApp` (`"embedded_app"`), recognized by a declaration
+  (`[workspace.metadata.spire] structure = "embedded_app"` plus the HAL path it depends on), not by a
+  layout guess — the same rule `EmbeddedHal` follows.
+- the scaffold — a Cargo **binary** crate (`main.rs`, an actor driving the HAL's traits), `[dependencies]`
+  path-deps read from the chosen HAL's workspace manifest, and the board's build wiring: for esp,
+  `.cargo/config.toml` (target / `build-std` / `MCU` / `ldproxy`), `sdkconfig.defaults` (the 16 KB
+  pthread stack **and** the 1500K partition table — both learned on the board) and a `build.rs` with
+  `embuild::espidf::sysenv::output()`; for rp2040, `memory.x` and the probe-rs/picotool flash step.
+- the plan — the LLM writes `main.rs` inside that scaffold. The HAL cascade is *not* part of an app's
+  plan; it belongs to the HAL project, which is the point of splitting them.
+
 

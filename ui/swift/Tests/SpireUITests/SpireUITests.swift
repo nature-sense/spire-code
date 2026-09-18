@@ -360,3 +360,146 @@ func gitStatusCleanTree() {
     #expect(!s.isDirty)
 }
 
+
+// MARK: - The new-project wizard's tree
+
+/// The platforms the branch filter is pinned against: a board of each family, a Linux SBC (embedded,
+/// **no** `family`), and the host.
+///
+/// Shaped like the real `platforms/list` payload — the model's `architecture`/`toolchain`/`sysroot`
+/// are required keys, so a fixture that omitted them would be testing a payload the core never sends.
+private func wizardPlatforms() throws -> [Platform] {
+    try MessageSerializer.decode(Data("""
+    [{ "id": "esp32c6", "name": "ESP32-C6", "os": "esp-idf", "family": "esp32", "embedded": true,
+       "architecture": { "cpu_family": "riscv", "cpu": "esp32c6", "endian": "little",
+                         "target_triple": "riscv32imac-esp-espidf" },
+       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+       "rust": { "target": "riscv32imac-esp-espidf", "idf_target": "esp32c6", "flash": "espflash" }
+    }, { "id": "rp2040", "name": "Raspberry Pi Pico", "os": "rp2040", "family": "rp2040", "embedded": true,
+       "architecture": { "cpu_family": "arm", "cpu": "rp2040", "endian": "little",
+                         "target_triple": "thumbv6m-none-eabi" },
+       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+       "rust": { "target": "thumbv6m-none-eabi", "idf_target": "RP2040", "flash": "picotool" }
+    }, { "id": "rock3c", "name": "Radxa Rock 3C", "os": "linux", "embedded": true,
+       "architecture": { "cpu_family": "aarch64", "cpu": "armv8-a", "endian": "little",
+                         "target_triple": "aarch64-linux-gnu" },
+       "toolchain": { "c": "aarch64-linux-gnu-gcc", "cpp": "aarch64-linux-gnu-g++",
+                      "ar": "aarch64-linux-gnu-ar", "strip": "aarch64-linux-gnu-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "/usr/aarch64-linux-gnu", "lib_dirs": [], "include_dirs": [],
+                    "pkg_config_libdir": [] }
+    }, { "id": "rpi5", "name": "Raspberry Pi 5", "os": "linux", "embedded": false,
+       "architecture": { "cpu_family": "aarch64", "cpu": "armv8-a", "endian": "little",
+                         "target_triple": "aarch64-linux-gnu" },
+       "toolchain": { "c": "aarch64-linux-gnu-gcc", "cpp": "aarch64-linux-gnu-g++",
+                      "ar": "aarch64-linux-gnu-ar", "strip": "aarch64-linux-gnu-strip",
+                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
+                      "needs_exe_wrapper": false },
+       "sysroot": { "root": "/usr/aarch64-linux-gnu", "lib_dirs": [], "include_dirs": [],
+                    "pkg_config_libdir": [] }
+    }]
+    """.utf8))
+}
+
+/// The wizard is a **tree**, so which questions get asked is a property of the branch.
+///
+/// Pinned because the step count is now data rather than an enum's order: a branch that gained a step
+/// it does not need (or lost one it does) would still compile, and would show up only as a user being
+/// asked something irrelevant — or never being asked their board.
+@Test("The wizard's tree decides its own steps")
+func wizardTreeDecidesItsOwnSteps() {
+    // Native: host only — the shape, then the details.
+    #expect(NewProjectView.path(environment: .native, deviceClass: .linuxSbc)
+            == [.environment, .nativeKind, .details])
+
+    // Linux SBC: the Meson shape, unchanged — targets, then single-source vs HAL.
+    #expect(NewProjectView.path(environment: .embedded, deviceClass: .linuxSbc)
+            == [.environment, .deviceClass, .targets, .structure, .details])
+
+    // Controller: HAL vs application comes *before* the board, because the role decides what a board
+    // selection means — a backend to implement, or one to depend on.
+    let controller = NewProjectView.path(environment: .embedded, deviceClass: .controller)
+    #expect(controller == [.environment, .deviceClass, .controllerRole, .targets, .details])
+    #expect(controller.firstIndex(of: .controllerRole)! < controller.firstIndex(of: .targets)!)
+}
+
+
+/// Every leaf is exactly one `ProjectStructure` key — the whole contract with the core.
+///
+/// Pinned because an unknown key falls back to `native` **silently** (`ProjectStructure::from_str`),
+/// so a typo here would scaffold a host crate for a firmware choice and report nothing.
+@Test("Each leaf of the wizard becomes one project structure")
+func wizardLeavesBecomeProjectStructures() {
+    func key(environment: NewProjectView.ProjectEnvironment,
+             nativeKind: NewProjectView.NativeKind = .spireApp,
+             deviceClass: NewProjectView.DeviceClass = .linuxSbc,
+             controllerRole: NewProjectView.ControllerRole = .halFrameworks,
+             useHal: Bool = true) -> String {
+        NewProjectView.structureKey(environment: environment, nativeKind: nativeKind,
+                                    deviceClass: deviceClass, controllerRole: controllerRole,
+                                    useHal: useHal)
+    }
+
+    // Native: the Spire UI App, or the CLI.
+    #expect(key(environment: .native, nativeKind: .spireApp) == "spire_app")
+    #expect(key(environment: .native, nativeKind: .cli) == "native")
+
+    // Linux SBC: the two Meson shapes, chosen by the structure step.
+    #expect(key(environment: .embedded, deviceClass: .linuxSbc, useHal: true) == "hal")
+    #expect(key(environment: .embedded, deviceClass: .linuxSbc, useHal: false) == "single_source")
+
+    // Controller: the HAL + frameworks — the library the drift cascade fills.
+    #expect(key(environment: .embedded, deviceClass: .controller,
+                controllerRole: .halFrameworks) == "embedded_hal")
+
+    // Controller: the application. Keyed now, scaffolded by the change that lands the structure — and
+    // until then the wizard must not offer it, which is what `enabled: false` on its card says.
+    #expect(key(environment: .embedded, deviceClass: .controller,
+                controllerRole: .application) == "embedded_app")
+
+    // Nothing in the tree can produce a key the core would not understand. `embedded_app` is the one
+    // the core does not have yet; when it lands, this set is what has to grow with it.
+    let known: Set<String> = ["native", "single_source", "hal", "spire_app", "embedded_hal", "embedded_app"]
+    for environment in NewProjectView.ProjectEnvironment.allCases {
+        for kind in NewProjectView.NativeKind.allCases {
+            for device in NewProjectView.DeviceClass.allCases {
+                for role in NewProjectView.ControllerRole.allCases {
+                    for useHal in [true, false] {
+                        let value = NewProjectView.structureKey(
+                            environment: environment, nativeKind: kind, deviceClass: device,
+                            controllerRole: role, useHal: useHal)
+                        #expect(known.contains(value), "\(environment)/\(device)/\(role) → \(value)")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The two embedded branches never offer each other's targets.
+///
+/// Pinned because the split is the registry's `family` flag, and offering a Linux SBC to a Controller
+/// (or a board to the Meson path) is a mistake the *build* refuses much later — after the plan.
+@Test("Boards and Linux SBCs are offered to their own branch only")
+func wizardBranchTargetsDoNotOverlap() throws {
+    let platforms = try wizardPlatforms()
+
+    let boards = NewProjectView.offeredTargets(platforms, environment: .embedded, deviceClass: .controller)
+    #expect(boards.map(\.id) == ["esp32c6", "rp2040"], "boards: \(boards.map(\.id))")
+
+    let sbcs = NewProjectView.offeredTargets(platforms, environment: .embedded, deviceClass: .linuxSbc)
+    #expect(sbcs.map(\.id) == ["rock3c"], "an embedded target with no family is an SBC: \(sbcs.map(\.id))")
+
+    // Native has no targets at all, and the host is never one: `embedded` is the registry's answer,
+    // not a rule this view re-derives.
+    #expect(NewProjectView.offeredTargets(platforms, environment: .native, deviceClass: .linuxSbc).isEmpty)
+    #expect(!boards.contains { !$0.embedded } && !sbcs.contains { !$0.embedded })
+}
+
