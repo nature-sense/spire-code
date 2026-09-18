@@ -987,6 +987,14 @@ struct ActionPanelView: View {
             }
             .disabled(!online || runningDevice != nil)
 
+            // Trap control (M5): what the board is running, and the three actions that address it.
+            // Below Connect/Run/Deploy because it acts on what those produced.
+            Divider()
+            DeviceProcessesSection(
+                platform: platform,
+                artifactPath: productionBinaryPath(platform)
+            )
+
             if let deviceNote {
                 Text(deviceNote)
                     .font(.caption2)

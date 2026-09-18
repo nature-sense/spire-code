@@ -1138,6 +1138,53 @@ final class SpireBridge {
         return deviceOnline(platform: platform)
     }
 
+    /// Trap control (M5): the processes this board is running, and what to do with them.
+    ///
+    /// All four pass through to the board's own tools, because the board holds the process table —
+    /// mirroring it here would give two answers to "what is running" with the stale one on screen.
+    /// A tool-level failure arrives as `error` with the board's words (which name the pid, the signal
+    /// and the log path), so these return the reply object as-is rather than reshaping it.
+    func deviceProcesses(platform: String) async -> [String: Any]? {
+        await deviceCommand("device/procs", params: ["platform": platform])
+    }
+
+    /// Read a started binary's log. `lines` bounds the tail (the board caps it at 5000).
+    func deviceLogs(platform: String, name: String, lines: Int = 100) async -> [String: Any]? {
+        await deviceCommand(
+            "device/logs",
+            params: ["platform": platform, "name": name, "lines": lines]
+        )
+    }
+
+    /// Stop a started binary by name: SIGTERM, a 2s grace, then SIGKILL. Stopping something that
+    /// already exited is not an error — it is the state the caller wanted.
+    func deviceStop(platform: String, name: String) async -> [String: Any]? {
+        await deviceCommand("device/stop", params: ["platform": platform, "name": name])
+    }
+
+    /// Start a binary on the board in the background, under a name, logging its output.
+    ///
+    /// `path` is relative to the project root (an absolute path works too). Refused when that name is
+    /// already running, so `stop` always means what this call started.
+    func deviceStart(platform: String, name: String, path: String, args: [String] = []) async -> [String: Any]? {
+        var params: [String: Any] = ["platform": platform, "name": name, "path": path]
+        if !args.isEmpty { params["args"] = args }
+        return await deviceCommand("device/start", params: params)
+    }
+
+    /// Run a binary on the board and wait — `runDeviceTests`' synchronous sibling, for a binary that
+    /// returns a meaningful exit code without being a test.
+    func deviceRun(
+        platform: String,
+        path: String,
+        args: [String] = [],
+        timeoutSecs: Int = 60
+    ) async -> [String: Any]? {
+        var params: [String: Any] = ["platform": platform, "path": path, "timeout_secs": timeoutSecs]
+        if !args.isEmpty { params["args"] = args }
+        return await deviceCommand("device/run", params: params)
+    }
+
     /// Deploy a cross-built test binary to the board and run it there.
     ///
     /// `path` is relative to the project root (an absolute path works too). With `build` the call

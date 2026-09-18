@@ -404,9 +404,10 @@ entry tracks the work end to end.
       status` is Spire's own listing of the *boards* it knows, and a name that answered both questions
       would be the confusing one — pinned by a test. Validation paths (no platform, unknown platform,
       a platform with no board) match the existing `device/*` family.
-      Still open: no UI yet for trap control (the Device group has Connect / Run tests on board /
-      Deploy binary), and a board is needed to exercise the pass-through end to end — what is pinned
-      here is the board's behaviour and the host's validation.
+      The UI followed (Batch B): the Device group gained a **Board processes** panel — the list from
+      `device/procs`, per-row Logs and Stop, and a Start button for the artifact this project built for
+      that platform. Still open: a board to exercise it against (connect, start, read, stop), and a
+      per-process name field, since the panel starts everything under the platform's name.
 - [x] 6. Backlog — first-class prompt→generate→verify everywhere (2026-09-17: the spine exists and
       every generator that writes code now reports through it; what remains is the from-scratch
       non-HAL route, which has not been exercised). Wire the
@@ -949,9 +950,13 @@ test's project on disk so its backends can be built by hand; doing that found th
   nothing; and requiring a prior `build_analyze` was a hidden ordering requirement (the analysis store
   is best-effort: an analyze can succeed and the lookup still miss), so the verification now analyzes
   on demand and every skip names its reason — "written" and "verified to build" stay different claims.
-- **Still open (smaller)**: the esp32 leg's build needs the ESP-IDF SDK, so its verification runs only
-  where that is installed; the deterministic tests cover rp2040 only. (The one-round limit this entry
-  used to carry is closed — see below.)
+- **Still open (smaller)**: the esp32 leg's verification is **code-complete but untested here** — the
+  path exists (the esp module refuses without the SDK, and the scaffold/fill report `not_built` with
+  that reason rather than a failure); what is missing is a test that can only run where ESP-IDF is
+  installed. It is deliberately not folded into the creation test, because an esp-idf build compiles
+  the SDK and takes minutes — a default test doing it would punish every machine that *does* have it.
+  The deterministic tests cover rp2040 only. (The one-round limit this entry used to carry is
+  closed — see below.)
 - **The loop is now bounded at three rounds, not one** (done 2026-09-17, and the first piece of the
   verify spine). `Repair` stopped being a special case of the fill: the shape gate → build → hand the
   compiler's errors back → rebuild now lives in `build/verify_spine.rs`, and the fill leg implements

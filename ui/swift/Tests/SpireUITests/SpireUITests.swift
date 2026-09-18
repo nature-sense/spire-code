@@ -157,6 +157,67 @@ func contractValidationSummaryDescribesTraits() throws {
     #expect(EmbeddedHalContractSheet.describeTraits(summary: [:]).isEmpty)
 }
 
+/// The `device/procs` payload, as the processes panel renders it.
+///
+/// Pinned against the tool's exact JSON, because this view's failure mode is quiet: a field that
+/// stopped decoding would show *"Nothing started by Spire is running"* — which reads as a fact about
+/// the board rather than as a bug in the panel. The uptime formatting is pinned too, since "up 0s"
+/// for a process started two minutes ago would be equally believable.
+@Test("A board process listing describes what is running")
+func deviceProcessListingDescribesWhatIsRunning() throws {
+    let reply: [String: Any] = [
+        "platform": "rpi5",
+        "result": [
+            "count": 2,
+            "running": [
+                [
+                    "name": "trap", "pid": 4242, "alive": true, "uptime_ms": 125_000,
+                    "path": "/home/pi/ai-traps/trap-rpi5", "args": ["--verbose"],
+                    "log": "/home/pi/spire-target-work/logs/trap.log",
+                ],
+                [
+                    "name": "old-run", "pid": 4100, "alive": false, "uptime_ms": 0,
+                    "log": "/home/pi/spire-target-work/logs/old-run.log",
+                ],
+            ],
+        ],
+    ]
+    let processes = DeviceProcessesSection.DeviceProcess.from(reply)
+    #expect(processes.count == 2)
+
+    let running = processes[0]
+    #expect(running.name == "trap")
+    #expect(running.pid == 4242)
+    #expect(running.alive)
+    #expect(running.label == "trap · pid 4242 · up 2m 5s", "\(running.label)")
+
+    // A process that exited is shown as exited, not dropped and not shown as running.
+    let exited = processes[1]
+    #expect(!exited.alive)
+    #expect(exited.label == "old-run · pid 4100 · exited", "\(exited.label)")
+
+    // Uptime, at the boundaries where a naive division reads wrong.
+    #expect(DeviceProcessesSection.DeviceProcess.humanUptime(0) == "0s")
+    #expect(DeviceProcessesSection.DeviceProcess.humanUptime(59_000) == "59s")
+    #expect(DeviceProcessesSection.DeviceProcess.humanUptime(60_000) == "1m 0s")
+    #expect(DeviceProcessesSection.DeviceProcess.humanUptime(3_600_000) == "1h 0m")
+    #expect(DeviceProcessesSection.DeviceProcess.humanUptime(7_500_000) == "2h 5m")
+
+    // An empty board, and a flat reply (no `result` wrapper) — both shapes are answers, not bugs.
+    #expect(DeviceProcessesSection.DeviceProcess.from(["result": ["running": []]]).isEmpty)
+    #expect(DeviceProcessesSection.DeviceProcess.from(nil).isEmpty)
+    let flat = DeviceProcessesSection.DeviceProcess.from([
+        "running": [["name": "solo", "pid": 1, "alive": true, "uptime_ms": 1_000]],
+    ])
+    #expect(flat.map(\.name) == ["solo"])
+
+    // An entry with no name cannot be addressed by logs or stop, so it is not offered.
+    let nameless = DeviceProcessesSection.DeviceProcess.from([
+        "result": ["running": [["pid": 9, "alive": true]]],
+    ])
+    #expect(nameless.isEmpty, "an unnamed process is not addressable")
+}
+
 @Test("Bridge initialises without crashing")
 func bridgeInit() {
     let bridge = SpireBridge()
