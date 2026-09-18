@@ -1335,6 +1335,18 @@ impl CargoBuildModule {
         if structure == spire_core::build_types::ProjectStructure::EmbeddedHal {
             return super::embedded_hal_scaffold::embedded_hal_scaffold(project_name, platforms);
         }
+        // Embedded application: emitted by `project_creation`, which is the layer that has the
+        // embedded-HAL project's *directory* — the module layer only ever sees names, a goal, a
+        // platform list and a structure. Reaching here means that path was bypassed, so refuse
+        // rather than fall through to the Cargo layout below: a silent fall-through would emit a
+        // plain host crate for a firmware choice, and report nothing wrong.
+        if structure == spire_core::build_types::ProjectStructure::EmbeddedApp {
+            return Err(
+                "an embedded application is scaffolded by the project-creation layer, which reads \
+                 the embedded-HAL project it depends on; this path was given no HAL directory"
+                    .to_string(),
+            );
+        }
         let cross: Vec<&String> = platforms.iter().filter(|p| *p != "host").collect();
         if cross.is_empty() {
             // Legacy single-binary scaffold.

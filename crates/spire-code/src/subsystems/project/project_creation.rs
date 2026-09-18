@@ -958,6 +958,10 @@ and NEVER repeat any line or block."
     /// scaffold layout via BuildManager and maps it into a ScaffoldSpec with
     /// structural (locked) vs fillable files. Used by `PlanScaffold` so the
     /// LLM plans against the real structure before it exists on disk.
+    /// Resolve the structural spec for a new project without writing anything.
+    // The arguments are the creation request's own fields plus the two the wizard adds: splitting
+    // them into a struct would move the same list one line up, and every caller already has them.
+    #[allow(clippy::too_many_arguments)]
     async fn scaffold_spec_in_memory(
         &self,
         project_name: &str,
@@ -965,8 +969,36 @@ and NEVER repeat any line or block."
         language: &str,
         platforms: &[String],
         structure: Option<spire_core::build_types::ProjectStructure>,
+        // Where the embedded-HAL project an **application** depends on lives.
+        //
+        // `None` for every other structure, and for an application whose caller has not named one —
+        // which is refused below rather than guessed at: an app that invents its own dependency is a
+        // build failure several steps later, in a place that names neither the app nor the HAL.
+        hal_root: Option<&Path>,
         embedded: bool,
     ) -> Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> {
+        // Embedded **application**: a firmware binary that path-deps a HAL project.
+        //
+        // Emitted here rather than through the build module, because it is not a per-language
+        // layout: it is one fixed emission whose *input* is another project's directory — something
+        // the module layer never sees (it gets a name, a goal, platforms and a structure, and no
+        // paths at all). The module layer stays the owner of "how does a language lay itself out";
+        // this needs a file to read.
+        if structure == Some(spire_core::build_types::ProjectStructure::EmbeddedApp) {
+            let hal_root = hal_root.ok_or_else(|| {
+                "an embedded application needs the embedded-HAL project it depends on: pass \
+                 `hal_root` — the directory of the HAL this app builds against"
+                    .to_string()
+            })?;
+            let out = crate::build::embedded_app_scaffold::embedded_app_scaffold(
+                project_name,
+                platforms,
+                &hal_root.to_string_lossy(),
+                hal_root,
+            )?;
+            return Ok(spec_from_scaffold_output(out, language));
+        }
+
         let build_file = match language.to_lowercase().as_str() {
             "swift" => "Package.swift",
             "python" => "pyproject.toml",
@@ -993,30 +1025,7 @@ and NEVER repeat any line or block."
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
 
-        let build_system = ProjectCreationActor::build_system_for_language(language);
-        let mut spec = crate::subsystems::build::build_manager::ScaffoldSpec {
-            structural_files: Vec::new(),
-            fill_roots: out.fill_roots.clone(),
-            dependency_sections: out.dependency_sections.clone(),
-            platform_targets: out.platform_targets.clone(),
-            build_system: build_system.to_string(),
-            files: out.files.clone(),
-            structure: out.structure,
-            embedded: out.embedded,
-        };
-        for f in &out.files {
-            if f.structural {
-                spec.structural_files.push(f.path.clone());
-            }
-        }
-        // Legacy single-file scaffold fallback (same shape as ScaffoldProject).
-        if out.files.is_empty() {
-            spec.structural_files.push(out.build_file.clone());
-            if spec.fill_roots.is_empty() {
-                spec.fill_roots = vec![out.source_dir.clone()];
-            }
-        }
-        Ok(spec)
+        Ok(spec_from_scaffold_output(out, language))
     }
 
     pub fn set_project_analyzer(&mut self, tx: mpsc::Sender<ProjectAnalyzerMessage>) {
@@ -1493,6 +1502,8 @@ Project:
                 language,
                 platforms,
                 Some(spire_core::build_types::ProjectStructure::SpireApp),
+                // A Spire app is host-only: it depends on no HAL project.
+                None,
                 false,
             )
             .await
@@ -1547,6 +1558,8 @@ Project:
                 language,
                 platforms,
                 Some(spire_core::build_types::ProjectStructure::EmbeddedHal),
+                // The HAL *is* the project being scaffolded; it depends on no other.
+                None,
                 true,
             )
             .await
@@ -2556,6 +2569,10 @@ impl Actor for ProjectCreationActor {
                             &language,
                             &platforms,
                             structure,
+                            // The HAL directory travels with the *scaffold* request (the wizard's
+                            // picker). A plan that needs one asks for it there rather than
+                            // guessing: an `embedded_app` plan without it is refused by name.
+                            None,
                             embedded,
                         )
                         .await?;
@@ -2669,6 +2686,41 @@ impl Actor for ProjectCreationActor {
 ///
 /// `reason` lands in `fallback_reason`, which the wizard surfaces as "this is a template, not a
 /// generated plan" — honest, since no model was involved.
+/// A build module's [`crate::build::ScaffoldOutput`] as the `ScaffoldSpec` the creation flow
+/// passes around.
+///
+/// Factored out because there are two producers now: the build module (every language layout) and
+/// the embedded-application emitter, which is not a layout — see `scaffold_spec_in_memory`.
+fn spec_from_scaffold_output(
+    out: crate::build::ScaffoldOutput,
+    language: &str,
+) -> crate::subsystems::build::build_manager::ScaffoldSpec {
+    let build_system = ProjectCreationActor::build_system_for_language(language);
+    let mut spec = crate::subsystems::build::build_manager::ScaffoldSpec {
+        structural_files: Vec::new(),
+        fill_roots: out.fill_roots.clone(),
+        dependency_sections: out.dependency_sections.clone(),
+        platform_targets: out.platform_targets.clone(),
+        build_system: build_system.to_string(),
+        files: out.files.clone(),
+        structure: out.structure,
+        embedded: out.embedded,
+    };
+    for f in &out.files {
+        if f.structural {
+            spec.structural_files.push(f.path.clone());
+        }
+    }
+    // Legacy single-file scaffold fallback (same shape as ScaffoldProject).
+    if out.files.is_empty() {
+        spec.structural_files.push(out.build_file.clone());
+        if spec.fill_roots.is_empty() {
+            spec.fill_roots = vec![out.source_dir.clone()];
+        }
+    }
+    spec
+}
+
 fn scaffold_plan_from_spec(
     goal: &str,
     root_dir: &std::path::Path,

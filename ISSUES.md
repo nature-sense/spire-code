@@ -1143,5 +1143,43 @@ Turning it on is one flag, in the change that lands the structure and its scaffo
   `embuild::espidf::sysenv::output()`; for rp2040, `memory.x` and the probe-rs/picotool flash step.
 - the plan — the LLM writes `main.rs` inside that scaffold. The HAL cascade is *not* part of an app's
   plan; it belongs to the HAL project, which is the point of splitting them.
+**Landed (2026-09-18): the application structure and its scaffold.** `ProjectStructure::EmbeddedApp`
+(`"embedded_app"`) exists in `spire-core`, and `build/embedded_app_scaffold.rs` emits the project:
+a package whose `Cargo.toml` path-deps the HAL's **contract crate and the board's backend crate**
+(read from that HAL's `members` and each crate's own `[package] name`, so the `use` lines are right
+whenever the project name has a dash in it), a `.cargo/config.toml` with the target / `MCU` /
+`ldproxy` / runner, the `build.rs` whose absence fails in a place that names nothing, and the
+`sdkconfig.defaults` carrying **both** measured settings. The marker records
+`structure = "embedded_app"` *and* `hal_path`, so the dependency is a fact rather than something to
+infer from `../..`.
+
+Two things about it are worth keeping:
+
+- **Only `src/main.rs` is fillable.** The actor is written out in full — it holds the contract's
+  traits and no vendor type, which is what makes it the same file on any board — but the one line
+  that cannot be known there is the board's LED constructor, which belongs to the *backend* crate and
+  so is written by the **HAL project's** fill. It is a `todo!()` rather than a guess, and because
+  `todo!()` type-checks, the wiring around it is compiled and linked before any fill has run.
+- **The scaffold is emitted from `project_creation`, not from a build module.** It is not a
+  per-language layout: it is one fixed emission whose *input* is another project's directory, and the
+  module layer never sees a path (it gets a name, a goal, platforms and a structure). `cargo.rs`
+  therefore **refuses** `EmbeddedApp` by name rather than falling through to its Cargo layout — a
+  silent fall-through would emit a plain host crate for a firmware choice and report nothing.
+
+Verified by a real cross-build, not by reading: `an_app_cross_compiles_against_a_real_hal`
+(`#[ignore]`d) writes a HAL *and* an app to a temp dir and builds the app with the esp toolchain and
+the SDK, using the build module's own environment helpers so the test cannot pass with a second copy
+of that resolution — **ok in 92 s**. Five unit tests pin the refusals (no board, two boards, a
+directory that is not a HAL, a HAL with no backend for the board, a host platform) and the emitted
+files (both path dependencies, the marker, the config's target/`MCU`/linker, `build.rs`, the two
+sdkconfig settings, and that only `src/main.rs` is fillable).
+
+Still to come, and the reason the wizard's Application card is still off: the **HAL directory has to
+reach `project_creation` from the FFI** (a `hal_root` argument on `createProject/Scaffold`, plus the
+wizard's picker), after which flipping `enabled: true` on that card is the whole UI change. Two
+smaller follow-ons: no `embedded_app_template_plan` yet (an app's plan falls through to the LLM path,
+which is arguably right — the app's one job is writing `main.rs`), and no `no_std` app wiring, which
+is not writable until a backend supplies the executor an app spawns on.
+
 
 

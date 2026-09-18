@@ -257,7 +257,7 @@ fn esp_idf_build_file_in(profile_dir: &Path, relative: &str) -> Option<PathBuf> 
 /// reported by neither the tool nor the build. Carrying the one the build made is what makes
 /// "flash this project" mean what it says.
 pub fn esp_bootloader_path(artifact: &Path) -> Option<PathBuf> {
-    esp_idf_build_file_in(&artifact.parent()?, "bootloader/bootloader.bin")
+    esp_idf_build_file_in(artifact.parent()?, "bootloader/bootloader.bin")
 }
 
 /// The partition table **this build** produced, or `None`.
@@ -267,7 +267,7 @@ pub fn esp_bootloader_path(artifact: &Path) -> Option<PathBuf> {
 /// the build's own table turns "the image does not fit" into a failure at flash time instead of a
 /// silent write into someone else's layout.
 pub fn esp_partition_table_path(artifact: &Path) -> Option<PathBuf> {
-    esp_idf_build_file_in(&artifact.parent()?, "partition_table/partition-table.bin")
+    esp_idf_build_file_in(artifact.parent()?, "partition_table/partition-table.bin")
 }
 
 /// The esp toolchain's `bin` — the directory that must come first on the child build's `PATH`.
