@@ -948,7 +948,21 @@ test's project on disk so its backends can be built by hand; doing that found th
   from the registry), so the test asserts `repaired: true` and `built: true`, and that the file on
   disk is the repaired one. No API key, no flakiness, and it is the failing case: swap the second
   answer for a wrong one and it fails.
-- **And with the real model** (`a_real_model_fills_and_the_backend_builds`, now passing): the hints
+- **And the esp32 family, live** (2026-09-18). The fill leg had only ever been run against rp2040,
+  because the esp32 leg was believed to need an SDK this machine lacked. With that corrected (the SDK
+  was installed; see below), the same loop runs for esp32c6 and **passed on the first answer**:
+  `{"built":true,"repaired":false,"rounds":0}` — no repair needed. What the model wrote is worth
+  recording, because it is the shape the platform hints describe: `PinDriver<'static, Output>` with the
+  pin **erased** by `PinDriver::output(pin)` and a generic `P: OutputPin + 'static` on `new`, plus
+  `set_level(Level::High/Low)` and `active_low` inverted once in `new`.
+  That also corrects the note in this entry that said "esp32: `AnyOutput` does not exist and
+  `PinDriver<'d, MODE>` takes **one** generic where the model wrote two". The generic count is right —
+  one — and `esp_idf_hal::gpio::Output` *does* exist as the driver's mode type; what was wrong in the
+  earlier answer was `AnyOutput` and a second generic, and the hints added for it are evidently enough
+  for a model to get it right unaided. The two live tests now share one `live_fill` body (scaffold →
+  plan → apply → build) so the families cannot drift in the part that matters — the assertions.
+- **And with the real model, before that** (`a_real_model_fills_and_the_rp2040_backend_builds`): the
+  hints
   did their job — the first live answer since them declared
   `Pin<Gpio25, FunctionSio<SioOutput>, PullDown>` and `use embedded_hal::digital::OutputPin;`
   correctly, and the IO traits resolved. The failure moved to the *crate list*: the model wrote

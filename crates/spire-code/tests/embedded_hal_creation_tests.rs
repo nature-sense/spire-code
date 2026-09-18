@@ -952,28 +952,22 @@ async fn a_new_contract_and_a_new_board_both_become_fill_work() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────
-// The whole loop, live: fill → build → repair with the compiler's words → build again
-// ─────────────────────────────────────────────────────────────────────────────────────
-//
-// The fill's gate is structural; this is the part that can only be answered by a compiler. One
-// board family (rp2040) is enough: its build needs no SDK, and its failure mode is exactly the one
-// the repair exists for — a vendor API guessed wrong (`gpio::Output` where the type is
-// `FunctionSio<SioOutput>`). `#[ignore]`d and key-gated like the other two live tests.
-//
-//     cargo test -p spire-code --test embedded_hal_creation_tests -- --ignored
-#[ignore = "live model + real cross-build: run explicitly with `--ignored`"]
-#[tokio::test]
-async fn a_real_model_fills_and_the_backend_builds() {
+/// The live fill, shared by both families: scaffold → plan → apply → build, asserting the backend
+/// *compiles*.
+///
+/// Returns `None` when there is no API key, so a machine without one skips cleanly rather than
+/// failing — the gate the other live tests use. The verification is printed, because a real run's
+/// value is in what the model wrote and what the compiler said, not only in the verdict.
+async fn live_fill(platform: &str, project_name: &str) -> Option<serde_json::Value> {
     let llm_config = spire_core::config::load_global_llm_config();
     if llm_config.api_key.trim().is_empty() {
         eprintln!("skipping: no API key in ~/.spire/llm-config.json");
-        return;
+        return None;
     }
 
-    // This machine's trap, and the one the rp2040 module's refusal describes: `cargo`/`rustc` on
-    // PATH are not rustup's, so a `--target thumbv6m-none-eabi` build cannot find `core`. Put the
-    // rustup toolchain first for the whole process — which is what a user is told to do, so the
-    // test does it rather than working around it.
+    // This machine's trap: `cargo`/`rustc` on PATH are not rustup's, so a cross build cannot find
+    // `core`. Put the rustup toolchain first for the whole process — what a user is told to do, so
+    // the test does it rather than working around it.
     if let Ok(out) = std::process::Command::new("rustup")
         .args(["which", "cargo"])
         .output()
@@ -1000,32 +994,27 @@ async fn a_real_model_fills_and_the_backend_builds() {
         keep.clone()
             .unwrap_or_else(|| _temp.path().to_string_lossy().to_string()),
     );
-    let root = dir.join("blink-build");
+    let root = dir.join(project_name);
+    // `build_with_rp2040` registers the platform modules (rp2040 *and* esp-idf) — what any real
+    // build needs in order to route, whichever board this run is for.
     let wizard = Wizard::build_with_rp2040(Some(llm_config)).await;
 
     let scaffold = wizard
         .call(
             "createProject/Scaffold",
             serde_json::json!({
-                "projectName": "blink-build",
+                "projectName": project_name,
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
-                "platforms": ["rp2040"],
+                "platforms": [platform],
                 "structure": "embedded_hal",
+                // The fill is what this run measures; the scaffold building the same backend would
+                // do the same work twice.
+                "verifyBackends": false,
             }),
         )
         .await;
     assert!(scaffold.get("error").is_none(), "{scaffold}");
-
-    // Analyze first: a build routes on the stored analysis, and the verification says so when it is
-    // missing rather than pretending to have checked.
-    let analyzed = wizard
-        .tool(
-            "build_analyze",
-            serde_json::json!({ "path": root.to_string_lossy() }),
-        )
-        .await;
-    assert!(analyzed.get("error").is_none(), "{analyzed}");
 
     let plan = wizard
         .tool(
@@ -1044,19 +1033,51 @@ async fn a_real_model_fills_and_the_backend_builds() {
         .await;
     assert_eq!(applied["failures"], serde_json::json!([]), "{applied}");
 
-    let verification = &applied["build_verification"][0];
-    // Printed so a real run is readable: which answer was written, whether it was repaired, and the
-    // compiler's words when it still does not build.
-    eprintln!("verification → {verification}");
+    let verification = applied["build_verification"][0].clone();
+    eprintln!("{platform} verification -> {verification}");
     assert_ne!(
         verification["built"],
         serde_json::Value::Null,
         "the verification could not build — nothing was actually checked: {applied}"
     );
-    assert_eq!(
-        verification["built"],
-        serde_json::json!(true),
-        "the generated backend does not build, and the repair did not rescue it: {applied}"
+    Some(verification)
+}
+
+// The whole loop, live: fill → build → repair with the compiler's words → build again
+// ─────────────────────────────────────────────────────────────────────────────────────
+//
+// The fill's gate is structural; this is the part that can only be answered by a compiler.
+// Both families are run, because their failures are different: rp2040's is a type that does not
+// exist (`gpio::Output` where the type is `FunctionSio<SioOutput>`), while esp-idf's is a shape
+// (`PinDriver<'d, MODE>` takes one generic, not two). The board-specific setup and the whole
+// sequence live in `live_fill`, so the two runs cannot drift in the part that matters — the
+// assertions.
+//
+//     cargo test -p spire-code --test embedded_hal_creation_tests -- --ignored
+#[ignore = "live model + real cross-build: run explicitly with `--ignored`"]
+#[tokio::test]
+async fn a_real_model_fills_and_the_rp2040_backend_builds() {
+    let Some(verification) = live_fill("rp2040", "blink-build").await else {
+        return;
+    };
+    assert!(
+        verification["built"] == serde_json::json!(true),
+        "the generated rp2040 backend must build: {verification}"
+    );
+}
+
+/// The same loop for the esp32 family, which needs the ESP-IDF SDK — present on this machine, and
+/// the reason this leg went untested for so long (see ISSUES.md: the missing thing was `idf.py` on
+/// `PATH`, which esp-idf-sys never uses).
+#[ignore = "live model + real esp-idf build: minutes, needs the SDK"]
+#[tokio::test]
+async fn a_real_model_fills_and_the_esp32_backend_builds() {
+    let Some(verification) = live_fill("esp32c6", "blink-esp-live").await else {
+        return;
+    };
+    assert!(
+        verification["built"] == serde_json::json!(true),
+        "the generated esp32 backend must build: {verification}"
     );
 }
 
