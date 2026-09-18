@@ -408,26 +408,30 @@ entry tracks the work end to end.
       Deploy binary), and a board is needed to exercise the pass-through end to end — what is pinned
       here is the board's behaviour and the host's validation.
 - [x] 6. Backlog — first-class prompt→generate→verify everywhere (partly done 2026-09-17: the spine
-      exists and now has two implementations). Wire the
+      exists and now has **three** implementations). Wire the
       generate tools (`createProject/*`, `hal_*`) into the verify spine so new
       code is compile-verified as it is generated; covers brand-new HAL
       contracts, new toolkits, and from-scratch projects. The spine itself landed
       (`build/verify_spine.rs`): gate → build → hand the compiler's errors back to the generator →
-      rebuild, bounded. It has **two** implementations now, which is what justified extracting it:
-      the fill leg (`FillArtifact`, three repair rounds) and `embedded_hal_write_contract`
+      rebuild, bounded. Its implementations, which is what justified extracting it:
+      the fill leg (`FillArtifact`, three repair rounds), `embedded_hal_write_contract`
       (`ContractArtifact`, zero rounds — the source is the user's own, so there is no generator to
-      hand errors to, and the result carries the compiler's words for the caller to act on). The
-      contract case is the one that needed no cross toolchain: the contract crate is `no_std` but
-      dependency-free and host-testable by design, so an authored contract is verified everywhere.
-      Two differences from the fill leg are deliberate and documented in place: the **gate is real**
-      (it re-reads the file that landed and parses it, because the write validated the *submitted*
-      text, not what survived the filesystem) and the repair is never reached. Writing the tests
-      established which layer refuses what: an invalid contract is refused by the write's own
-      validation before anything lands, so the gate is unreachable through the tool and is covered
-      by a direct test of the artifact instead of a contrived one.
-      Remaining: the C++ generators (`hal_generate_impl` already has a `meson compile` gate;
-      `hal_generate_placeholder`, the `createProject/*` scaffold's cross backends) and the
-      from-scratch project route still write without a spine behind them.
+      hand errors to, and the result carries the compiler's words for the caller to act on), and the
+      C++ placeholder writers (`CppStubArtifact`). An authored contract needed no cross toolchain:
+      the contract crate is `no_std` but dependency-free and host-testable by design, so it is
+      verified everywhere.
+  - **The C++ writers** (done 2026-09-17). `hal_add_target` used to write a `<stem>_stub.cpp` per
+    interface, wire `hal/meson.build` and report — nothing between the write and the claim. It now
+    reports `compile: {built, refused, not_built, errors}` from the spine, where the gate parses
+    every stub that landed (with the same tree-sitter CST the HAL analyzer uses: a stub that does
+    not parse is one the coverage map reads as an *absent* interface, not as a placeholder) and the
+    build is the platform's own `meson compile`. The `meson compile` gate is now **one** helper
+    (`cpp_compile_gate`) shared with `hal_generate_apply`, which had its own inline copy — two copies
+    would drift exactly where it matters. Writing it taught the distinction the hard way: a
+    `build-rpi5` *directory* is not a build directory (meson writes `build.ninja` at setup, and its
+    own answer for a bare directory is "Current directory is not a meson build directory"), so the
+    gate checks for a configured build dir and reports the rest as `not_built` with the `meson setup`
+    command that would fix it — a fabricated build directory must not yield a fabricated verdict.
 
 ## 8. Embedded targets — ESP32 first, via a reusable HAL + actor framework
 

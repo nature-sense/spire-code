@@ -2229,6 +2229,96 @@ impl BuildManagerActor {
         })
     }
 
+    /// The C++ compile gate: `meson compile -C build-<platform> [target]`.
+    ///
+    /// One implementation for every C++ writer on the verify spine — the approved module pair
+    /// (`hal_generate_apply`, which names the interface's own target) and the generated placeholders
+    /// (`hal_add_target`, which compiles the platform's whole build directory). Two copies of this
+    /// would drift in exactly the place that matters: whether a missing build directory is a *setup*
+    /// problem or a compile failure. It is setup — a platform that has never been `meson setup`ed has
+    /// no compiler verdict to report, and saying "does not build" about that would be a lie the user
+    /// has to un-believe.
+    async fn cpp_compile_gate(
+        &self,
+        root: &Path,
+        platform: &str,
+        target: Option<&str>,
+    ) -> Result<(), crate::build::verify_spine::BuildFailure> {
+        use crate::build::verify_spine::BuildFailure;
+        let build_dir = format!("build-{platform}");
+        // A directory is not a build directory: `meson setup` is what writes `build.ninja`, and a
+        // bare `mkdir build-rpi5` (or a failed setup) produces the directory without one. Checking
+        // only for the directory would turn that into a compile failure — meson's own answer is
+        // "Current directory is not a meson build directory" — which is exactly the lie this gate
+        // exists to avoid. Found by a test that created the directory and expected `not_built`.
+        if !root.join(&build_dir).join("build.ninja").is_file() {
+            return Err(BuildFailure::Setup(format!(
+                "{build_dir} is not a configured meson build directory (no build.ninja) — run \
+                 `meson setup {build_dir}` for platform '{platform}', which cannot be done from here"
+            )));
+        }
+        let mut args: Vec<&str> = vec!["compile", "-C", &build_dir];
+        if let Some(target) = target {
+            args.push(target);
+        }
+        match crate::build::generic_helpers::run_cmd(root, "meson", &args).await {
+            Ok(output) if output.success => Ok(()),
+            Ok(output) => Err(BuildFailure::Compiler(output.output)),
+            // No meson on this machine: an environment answer, not a verdict on the code.
+            Err(e) => Err(BuildFailure::Setup(format!("meson is unavailable: {e}"))),
+        }
+    }
+
+    /// Check the placeholders a `hal_*` writer just generated, on the spine, and attach what happened.
+    ///
+    /// Returns the outcome as JSON so the caller's result can carry it beside `placeholders_written`:
+    /// "written" and "written and it compiles" are different claims, and the C++ writers used to make
+    /// only the first one.
+    async fn verify_written_placeholders(
+        &self,
+        root: &Path,
+        platform: &str,
+        written: &[PathBuf],
+    ) -> serde_json::Value {
+        if written.is_empty() {
+            return serde_json::json!({
+                "built": serde_json::Value::Null,
+                "not_built": "no placeholder was written, so there was nothing to compile",
+            });
+        }
+        let artifact = CppStubArtifact {
+            manager: self,
+            root: root.to_path_buf(),
+            platform: platform.to_string(),
+            files: written.to_vec(),
+        };
+        let outcome = crate::build::verify_spine::verify_generated(&artifact, 0).await;
+        let mut json = outcome.to_json();
+        if let Some(errors) = json.get("errors").and_then(|e| e.as_str()) {
+            let kept = Self::tail_lines(errors, 40);
+            json["errors"] = serde_json::json!(kept);
+        }
+        json
+    }
+
+    /// The C++ compile gate for an approved module pair, as a status string.
+    async fn cpp_gate_status(&self, root: &str, interface: &str, platform: &str) -> String {
+        let target = format!("{interface}-{platform}");
+        match self
+            .cpp_compile_gate(Path::new(root), platform, Some(&target))
+            .await
+        {
+            Ok(()) => "build passed".to_string(),
+            Err(crate::build::verify_spine::BuildFailure::Compiler(output)) => format!(
+                "build FAILED:\n{}",
+                output.lines().take(20).collect::<Vec<_>>().join("\n")
+            ),
+            Err(crate::build::verify_spine::BuildFailure::Setup(reason)) => {
+                format!("build gate unavailable: {reason}")
+            }
+        }
+    }
+
     /// Semantic Stage-1 (LLM half, APPLY): write an APPROVED module pair
     /// (header + source from the plan), remove stale stubs for the interface,
     /// wire hal/meson.build and run the meson compile gate. No LLM call here —
@@ -2306,34 +2396,15 @@ impl BuildManagerActor {
                 let _ = std::fs::write(&meson_path, updated);
             }
         }
-        // Build gate.
-        let gate = format!("meson compile -C build-{platform} {interface}-{platform}");
-        let gate_status = match crate::build::generic_helpers::run_cmd(
-            std::path::Path::new(root),
-            "meson",
-            &[
-                "compile",
-                "-C",
-                &format!("build-{platform}"),
-                &format!("{interface}-{platform}"),
-            ],
-        )
-        .await
-        {
-            Ok(o) if o.success => "build passed".to_string(),
-            Ok(o) => format!(
-                "build FAILED:\n{}",
-                o.output.lines().take(20).collect::<Vec<_>>().join("\n")
-            ),
-            Err(e) => format!("build gate unavailable: {e}"),
-        };
+        // Build gate — the shared one, so the pair and the placeholders cannot disagree about what
+        // "does not build" means.
+        let gate_status = self.cpp_gate_status(root, interface, platform).await;
         serde_json::json!({
             "interface": interface,
             "platform": platform,
             "class_name": class_name,
             "written": vec![hpp_path.to_string(), cpp_path.to_string()],
             "removed_stubs": removed_stubs,
-            "gate": gate,
             "gate_status": gate_status,
         })
     }
@@ -3196,10 +3267,24 @@ impl BuildManagerActor {
                                 Ok(_) => "re-analyzed (queued impls ready)".to_string(),
                                 Err(e) => format!("re-analyze failed: {e}"),
                             };
+                        // The placeholders, on the spine: each must parse (the analyzer sees what
+                        // it can parse, so an unparseable stub would read as an *absent* interface),
+                        // and the platform must compile with them in place. Reported as `not built`
+                        // when there is no build directory yet, never as broken stubs.
+                        let written_paths: Vec<PathBuf> =
+                            written.iter().map(PathBuf::from).collect();
+                        let compile = self
+                            .verify_written_placeholders(
+                                std::path::Path::new(root),
+                                platform,
+                                &written_paths,
+                            )
+                            .await;
                         serde_json::json!({
                             "platform": platform,
                             "interfaces": interfaces.iter().map(|(s, _, _)| s.clone()).collect::<Vec<_>>(),
                             "placeholders_written": written,
+                            "compile": compile,
                             "failures": failures,
                             "meson": meson_status,
                             "analysis": analysis_status,
@@ -4810,6 +4895,66 @@ impl crate::build::verify_spine::GeneratedArtifact for ContractArtifact<'_> {
     /// user's own. Present because the trait asks, and honest about why.
     async fn repair(&self, _errors: &str) -> Result<(), String> {
         Err("an authored contract is not repaired by a model — fix the source".to_string())
+    }
+}
+
+/// C++ placeholder stubs that were just written into a HAL project, seen by the verify spine.
+///
+/// The second C++ generator: `hal_add_target` and `hal_add_platform` write a `<stem>_stub.cpp` per
+/// contract interface and wire `hal/meson.build`, with nothing between the write and the report. The
+/// spine's shape fits exactly, and this artifact supplies the two C++-specific halves:
+///
+/// - **gate** — every stub that landed must parse, checked with the same `tree-sitter-cpp` CST the
+///   HAL analyzer uses. A stub that does not parse is one the analyzer cannot see either, so the
+///   coverage map would show the interface as *absent* rather than as a placeholder.
+/// - **build** — `meson compile -C build-<platform>`, the platform's whole build directory. Not a
+///   named target: the point is "the files I just wrote take part in a real compile", and the
+///   per-interface target name is the project's convention, not something this writer knows.
+///   A build directory that does not exist yet (a platform scaffolded but never set up) is a **setup**
+///   failure, so it is reported as `not built` with the reason rather than as broken stubs.
+struct CppStubArtifact<'a> {
+    manager: &'a BuildManagerActor,
+    root: PathBuf,
+    platform: String,
+    /// The stubs that were written, so the gate checks what actually landed.
+    files: Vec<PathBuf>,
+}
+
+#[async_trait::async_trait]
+impl crate::build::verify_spine::GeneratedArtifact for CppStubArtifact<'_> {
+    fn describe(&self) -> String {
+        format!("{} placeholder(s) for {}", self.files.len(), self.platform)
+    }
+
+    fn gate(&self) -> Result<(), String> {
+        for file in &self.files {
+            let content = std::fs::read_to_string(file)
+                .map_err(|e| format!("cannot re-read {}: {e}", file.display()))?;
+            let syntax = crate::build::generic_helpers::cpp_syntax_check(&content);
+            if syntax.ok {
+                continue;
+            }
+            let first = syntax
+                .errors
+                .first()
+                .map(|e| format!("line {}:{}: {}", e.line, e.col, e.context))
+                .unwrap_or_else(|| "unknown position".to_string());
+            return Err(format!("{} does not parse ({first})", file.display()));
+        }
+        Ok(())
+    }
+
+    async fn build(&self) -> Result<(), crate::build::verify_spine::BuildFailure> {
+        self.manager
+            .cpp_compile_gate(&self.root, &self.platform, None)
+            .await
+    }
+
+    /// Never reached: a placeholder is generated deterministically from the contract, so there is
+    /// nothing for a model to repair — the gate or the compiler finding a problem means the *writer*
+    /// is wrong, and the caller is told rather than retried.
+    async fn repair(&self, _errors: &str) -> Result<(), String> {
+        Err("a generated placeholder is not repaired by a model".to_string())
     }
 }
 
@@ -6652,6 +6797,87 @@ executable('ai-trap-rpi5', 'main.cpp' + rpi5_hal_sources, dependencies: core_dep
         assert!(
             !root.join("crates/demo-hal/src/hal/broken.rs").exists(),
             "an invalid contract never touches disk"
+        );
+    }
+
+    /// The C++ placeholders, on the spine.
+    ///
+    /// Three levels, none of which needs a C++ toolchain: a project with no build directory is
+    /// reported as **not built** (a setup problem — "does not build" would be a lie about a platform
+    /// nobody has configured), a stub that does not parse is refused **before** any compile is
+    /// attempted, and a project where meson cannot run is a setup failure rather than a verdict.
+    #[tokio::test]
+    async fn generated_placeholders_are_gated_before_they_are_called_built() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let stub = root.join("hal/implementations/rpi5/camera_stub.cpp");
+        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+        std::fs::write(
+            &stub,
+            "#pragma message(\"SPIRE-HAL-STUB\")\n#include \"camera_hal.hpp\"\n\n\
+         void camera_set_zoom(int) {}\n",
+        )
+        .unwrap();
+
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
+
+        // No `build-rpi5` directory: setup, not a verdict.
+        let outcome = manager
+            .verify_written_placeholders(root, "rpi5", &[stub.clone()])
+            .await;
+        assert_eq!(
+            outcome["built"],
+            serde_json::Value::Null,
+            "no compiler ran: {outcome}"
+        );
+        let not_built = outcome["not_built"].as_str().unwrap_or_default();
+        assert!(not_built.contains("build-rpi5"), "{outcome}");
+        assert!(
+            not_built.contains("meson setup"),
+            "and names the one command that would let it be checked: {outcome}"
+        );
+        assert!(outcome["errors"].as_str().unwrap_or_default().is_empty());
+
+        // The gate re-reads what landed: a stub that cannot parse is refused before the build, even
+        // though a build directory now exists.
+        std::fs::create_dir_all(root.join("build-rpi5")).unwrap();
+        std::fs::write(&stub, "void camera_set_zoom(int) { if }\n").unwrap();
+        let outcome = manager
+            .verify_written_placeholders(root, "rpi5", &[stub.clone()])
+            .await;
+        assert_eq!(outcome["built"], serde_json::Value::Null, "{outcome}");
+        let refused = outcome["refused"].as_str().unwrap_or_default();
+        assert!(refused.contains("does not parse"), "{outcome}");
+        assert!(
+            refused.contains("camera_stub.cpp"),
+            "the gate names the file: {outcome}"
+        );
+
+        // A good stub with a `build.ninja` meson did not write: meson's own answer is still "not a
+        // meson build directory", so the report stays a setup problem. Which is the honest outcome —
+        // a fabricated build directory produces no compiler verdict, and a gate that guessed one
+        // would be inventing the failure it claims to have found.
+        std::fs::write(&stub, "void camera_set_zoom(int) {}\n").unwrap();
+        let outcome = manager
+            .verify_written_placeholders(root, "rpi5", &[stub])
+            .await;
+        let not_built = outcome["not_built"].as_str().unwrap_or_default();
+        assert!(
+            not_built.contains("not a configured meson build directory"),
+            "an unconfigured build dir is reported as one: {outcome}"
+        );
+        assert_eq!(outcome["built"], serde_json::Value::Null, "{outcome}");
+
+        // Nothing written is not a failure, it is nothing to check.
+        let outcome = manager.verify_written_placeholders(root, "rpi5", &[]).await;
+        assert!(
+            outcome["not_built"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nothing to compile"),
+            "{outcome}"
         );
     }
 
