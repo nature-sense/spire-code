@@ -912,8 +912,11 @@ mod tests {
         dir
     }
 
-    /// A project in the shape the scaffold emits: the contract crate with one trait per file, and
-    /// one backend crate per family whose bodies are `led_body`.
+    /// A project that **authors a trait of its own** — the path a project takes when one of the
+    /// ecosystem's traits is not narrow enough (a driver's own abstraction, say). It is a supported
+    /// path, and the measure still reads it, so it keeps its own fixture.
+    ///
+    /// For the shape the *scaffold* emits, see [`scaffolded_project`].
     fn project(root: &Path, led_body: &str) {
         std::fs::create_dir_all(root.join("crates/demo-hal/src/hal")).unwrap();
         std::fs::write(
@@ -936,6 +939,48 @@ mod tests {
                 "use demo_hal::hal::Led;\n\npub struct GpioLed;\n\n\
                  impl Led for GpioLed {{\n    fn set(&mut self, _on: bool) {{\n{led_body}\n    }}\n}}\n"
             ),
+        )
+        .unwrap();
+    }
+
+    /// A project in the shape the **scaffold** emits: the contract crate is the seam (`embedded-hal`
+    /// re-exported, no authored traits), and each backend is a `Board` whose constructors are
+    /// `unimplemented!()` — returning a concrete stand-in so the project builds before the fill runs.
+    fn scaffolded_project(root: &Path) {
+        std::fs::create_dir_all(root.join("crates/demo-hal/src")).unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal/src/lib.rs"),
+            "//! The seam: the actor contract, plus `embedded-hal` re-exported.\n\n\
+             pub mod actor;\n\npub use embedded_hal;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("crates/demo-hal-esp32/src")).unwrap();
+        // The manifest matters: it is what the prompt shows the model as the crates it may use, and
+        // it is where the version pin the compiler will enforce comes from.
+        std::fs::write(
+            root.join("crates/demo-hal-esp32/Cargo.toml"),
+            "[package]\nname = \"demo-hal-esp32\"\n\n[dependencies]\n\
+             demo-hal = { path = \"../demo-hal\" }\nesp-idf-hal = \"0.47\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("crates/demo-hal-esp32/src/lib.rs"),
+            "use demo_hal::embedded_hal::delay::DelayNs;\n\
+             use demo_hal::embedded_hal::digital::{ErrorType, OutputPin};\n\n\
+             pub struct Board;\n\n\
+             pub struct UnimplementedLed;\n\
+             impl ErrorType for UnimplementedLed {\n    type Error = core::convert::Infallible;\n}\n\
+             impl OutputPin for UnimplementedLed {\n    \
+             fn set_high(&mut self) -> Result<(), Self::Error> {\n        \
+             unimplemented!(\"Board::led has not been written yet\")\n    }\n    \
+             fn set_low(&mut self) -> Result<(), Self::Error> {\n        \
+             unimplemented!(\"Board::led has not been written yet\")\n    }\n}\n\n\
+             pub struct UnimplementedDelay;\n\
+             impl DelayNs for UnimplementedDelay {\n    fn delay_ns(&mut self, _ns: u32) {\n        \
+             unimplemented!(\"Board::delay has not been written yet\")\n    }\n}\n\n\
+             impl Board {\n    \
+             pub fn led() -> UnimplementedLed {\n        unimplemented!(\"Board::led\")\n    }\n\n    \
+             pub fn delay() -> UnimplementedDelay {\n        unimplemented!(\"Board::delay\")\n    }\n}\n",
         )
         .unwrap();
     }
@@ -1000,7 +1045,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        project(root, "        unimplemented!(\"GpioLed::set\")");
+        scaffolded_project(root);
 
         let out = plan(root, None);
         let items = out["plan"].as_array().unwrap();
@@ -1021,15 +1066,18 @@ mod tests {
         // board's — the chip the pilot build runs on.
         assert_eq!(item["platform"], "esp32c6");
 
+        // What a scaffolded backend owes is its **board**, under the interface key `board`, and the
+        // prompt's contract block is the seam it has to return traits from — not a trait file, which
+        // a scaffolded project does not have.
         let pending = item["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1, "{pending:?}");
-        assert_eq!(pending[0]["interface"], "led");
-        assert_eq!(pending[0]["trait"], "Led");
+        assert_eq!(pending[0]["interface"], "board");
+        assert_eq!(pending[0]["trait"], "Board");
         assert_eq!(pending[0]["status"], "stub");
         assert_eq!(
             pending[0]["methods"],
-            serde_json::json!(["set"]),
-            "a stub owes every required method"
+            serde_json::json!(["led", "delay"]),
+            "a stub owes every constructor"
         );
 
         let prompt = item["prompt"].as_str().unwrap();
@@ -1050,15 +1098,15 @@ mod tests {
             "the platform's own hints: {prompt}"
         );
         assert!(
-            prompt.contains("pub trait Led"),
-            "the contract itself, not a paraphrase: {prompt}"
+            prompt.contains("pub use embedded_hal;"),
+            "the contract itself, not a paraphrase — the seam a constructor returns traits from: {prompt}"
         );
         assert!(
             prompt.contains("crates/demo-hal-esp32/src/lib.rs"),
             "the file to edit: {prompt}"
         );
         assert!(
-            prompt.contains("led [stub]: Led — set"),
+            prompt.contains("board [stub]: Board — led, delay"),
             "what is pending: {prompt}"
         );
         assert!(

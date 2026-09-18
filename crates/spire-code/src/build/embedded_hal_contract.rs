@@ -192,7 +192,9 @@ fn wire_module(
     // file exists to keep, so it reads as though it had always been there.
     let content = match std::fs::read_to_string(mod_path) {
         Ok(content) => content,
-        Err(e) if !mod_path.exists() => {
+        // The `e` is not needed here: the guard already said the file is absent, which is not an
+        // error — it is the state a scaffolded project starts in.
+        Err(_) if !mod_path.exists() => {
             "//! The traits this project authors.\n\
              //!\n\
              //! `embedded-hal`'s are re-exported at the crate root, and they are the ones a driver\n\

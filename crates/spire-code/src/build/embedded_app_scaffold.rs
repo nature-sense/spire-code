@@ -558,17 +558,22 @@ __LINKER_BLOCK__runner = "__RUNNER__"
 const APP_MAIN_RS: &str = r#"//! The application: one actor, one board, written against the HAL's traits.
 //!
 //! Note what this file does *not* contain: no vendor type in the actor, no chip name, no `unsafe`.
-//! The actor below would be the same on any board the HAL has a backend for — which is what makes
-//! the HAL a dependency rather than a copy.
+//! The actor below holds `embedded-hal` traits — the ones the HAL re-exports, and the ones every
+//! driver crate speaks — so it would be the same on any board the HAL has a backend for, which is
+//! what makes the HAL a dependency rather than a copy.
 
 __VENDOR_USE__
 
 use __CONTRACT_ID__::actor::{Actor, Mailbox, Spawner};
-use __CONTRACT_ID__::hal::{DelayMs, Led};
-use __BACKEND_ID__::{FamilyDelay, GpioLed, __SPAWNER__};
+use __CONTRACT_ID__::embedded_hal::delay::DelayNs;
+use __CONTRACT_ID__::embedded_hal::digital::{ErrorType, OutputPin};
+use __BACKEND_ID__::{Board, __SPAWNER__};
 
 /// Half a second on, half a second off.
 const PERIOD_MS: u32 = 500;
+
+/// One millisecond in the nanoseconds `DelayNs` speaks.
+const MS: u32 = 1_000_000;
 
 /// What the actor understands.
 ///
@@ -590,19 +595,25 @@ struct Blinker<L, D> {
     on: bool,
 }
 
-impl<L: Led, D: DelayMs> Actor for Blinker<L, D> {
+impl<L: OutputPin, D: DelayNs> Actor for Blinker<L, D> {
     type Message = Blink;
 
     fn handle(&mut self, msg: Self::Message) {
         match msg {
             Blink::Toggle => {
                 self.on = !self.on;
-                self.led.set(self.on);
+                // The `Result` is discarded deliberately: on a chip pin a level write cannot fail,
+                // and the error type exists for expanders and buses.
+                let _ = if self.on {
+                    self.led.set_high()
+                } else {
+                    self.led.set_low()
+                };
                 // Observable with nothing wired: the console is the first proof that the firmware
                 // runs and the actor handles messages; the LED is the second.
                 println!("blink: {}", if self.on { "on" } else { "off" });
             }
-            Blink::Wait(ms) => self.delay.delay_ms(ms),
+            Blink::Wait(ms) => self.delay.delay_ns(ms * MS),
             // Never returns, so this actor processes no further messages. For a blink that is the
             // point; an actor that must stay responsive would self-schedule instead.
             Blink::Repeat { period_ms } => loop {
@@ -617,7 +628,7 @@ fn main() {
 __LINK_PATCHES__
     let led = board_led();
     let spawner = __SPAWNER__;
-    let mailbox = spawner.spawn(Blinker { led, delay: FamilyDelay, on: false });
+    let mailbox = spawner.spawn(Blinker { led, delay: Board::delay(), on: false });
 
     // One instruction, then supervise. `try_send` hands the message back rather than dropping it,
     // so the expect is a real assertion that the task started.
@@ -632,12 +643,35 @@ __LINK_PATCHES__
 
 /// TODO: this board's LED, from the backend crate.
 ///
-/// The pin is a board fact. Take it from `Peripherals::take()`, hand it to the constructor
-/// `__BACKEND_ID__::GpioLed` documents, and return the driver — a wrong pin here is the most
-/// likely reason nothing blinks, and it is the one line this scaffold cannot know.
-fn board_led() -> GpioLed {
+/// The pin is a board fact. Take it from `Peripherals::take()`, hand it to
+/// `__BACKEND_ID__::Board::led`, and return what that gives back — the value *is* the
+/// `embedded-hal` output the actor is generic over. A wrong pin here is the most likely reason
+/// nothing blinks, and it is the one line this scaffold cannot know.
+fn board_led() -> UnimplementedLed {
     let _peripherals = Peripherals::take().expect("peripherals are taken once, and here");
-    todo!("construct __BACKEND_ID__::GpioLed from this board's pin")
+    todo!("construct __BACKEND_ID__::Board::led from this board's pin")
+}
+
+/// The type `board_led` returns until that line is written.
+///
+/// A stand-in rather than `impl OutputPin`: `-> impl Trait { todo!() }` does not compile, because
+/// the compiler infers the hidden type as `()` for a body that never returns. Being a real
+/// `OutputPin` is what lets this project type-check, link and flash *before* the fill has run —
+/// and the fill replaces both this and `board_led`.
+struct UnimplementedLed;
+
+impl ErrorType for UnimplementedLed {
+    type Error = core::convert::Infallible;
+}
+
+impl OutputPin for UnimplementedLed {
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        todo!("__BACKEND_ID__::Board::led")
+    }
+
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        todo!("__BACKEND_ID__::Board::led")
+    }
 }
 "#;
 
@@ -657,7 +691,7 @@ build.rs           re-emits the ESP-IDF link args for this binary
 ```
 
 The board's LED is the one thing left to write: `board_led()` in `src/main.rs` returns
-`__BACKEND__::GpioLed`, whose constructor the HAL's backend crate provides.
+`__BACKEND__::Board::led`, whose constructor the HAL's backend crate provides.
 
 ## Build and run
 
@@ -856,20 +890,28 @@ mod tests {
         );
         assert_eq!(out.fill_roots, vec!["src".to_string()]);
 
-        // The actor holds the contract's traits; the one line that belongs to the backend is named,
-        // not guessed.
+        // The actor holds `embedded-hal`'s traits — the ones the HAL re-exports — and the line that
+        // belongs to the backend is named, not guessed.
         let main_rs = out.files.iter().find(|f| f.path == "src/main.rs").unwrap();
+        for expected in [
+            "use weather_hal::embedded_hal::delay::DelayNs;",
+            "use weather_hal::embedded_hal::digital::{ErrorType, OutputPin};",
+            "use weather_hal_esp32::{Board, StdSpawner};",
+            "impl<L: OutputPin, D: DelayNs> Actor for Blinker<L, D>",
+            "delay: Board::delay()",
+            "fn board_led() -> UnimplementedLed",
+        ] {
+            assert!(
+                main_rs.content.contains(expected),
+                "the app's source must contain `{expected}`:\n{}",
+                main_rs.content
+            );
+        }
         assert!(
-            main_rs
-                .content
-                .contains("use weather_hal::hal::{DelayMs, Led};"),
-            "{}",
+            !main_rs.content.contains("GpioLed"),
+            "no trait or type of the workspace's own survives in the app:\n{}",
             main_rs.content
         );
-        assert!(main_rs
-            .content
-            .contains("use weather_hal_esp32::{FamilyDelay, GpioLed, StdSpawner};"));
-        assert!(main_rs.content.contains("fn board_led() -> GpioLed"));
     }
 
     /// One board, and the refusal names why: a `main` is written for one chip.

@@ -661,14 +661,8 @@ const BACKEND_LIB_RS: &str = r#"//! The __FAMILY__ backend: the board, over `__V
 //! reports them as unfinished and the fill writes them, and a stub that quietly did nothing would
 //! look finished, which is worse than one that fails loudly.
 __NO_STD__
-// The two traits the constructors must return come from the contract's re-export, and the fill will
-// need them in scope:
-//
-//     use __HAL_ID__::embedded_hal::delay::DelayNs;
-//     use __HAL_ID__::embedded_hal::digital::OutputPin;
-//
-// They are not imported here on purpose — a constructor that returns a placeholder type cannot use
-// them yet, and an unused import is a warning in a project that should start clean.
+use __HAL_ID__::embedded_hal::delay::DelayNs;
+use __HAL_ID__::embedded_hal::digital::{ErrorType, OutputPin};
 
 __EXECUTOR__
 /// This board family's constructors.
@@ -680,12 +674,34 @@ pub struct Board;
 /// What `led` returns until its body is written.
 ///
 /// A concrete type rather than `impl OutputPin` with a diverging body: `-> impl Trait { unimplemented!() }`
-/// does **not** compile — the compiler infers the hidden type as `()` for a body that never returns,
-/// and `()` is not an output pin. The stub has to be a project that builds.
+/// does not **compile** — for a body that never returns the compiler infers the hidden type as `()`, and
+/// `()` is not an output pin. It implements the trait *for real* so the application above it can be
+/// built, linked and flashed before this backend is filled, and every method panics: reaching one would
+/// mean the constructor it came from had not been written.
 pub struct UnimplementedLed;
+
+impl ErrorType for UnimplementedLed {
+    type Error = core::convert::Infallible;
+}
+
+impl OutputPin for UnimplementedLed {
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        unimplemented!("Board::led has not been written yet")
+    }
+
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        unimplemented!("Board::led has not been written yet")
+    }
+}
 
 /// What `delay` returns until its body is written. Same reason as [`UnimplementedLed`].
 pub struct UnimplementedDelay;
+
+impl DelayNs for UnimplementedDelay {
+    fn delay_ns(&mut self, _ns: u32) {
+        unimplemented!("Board::delay has not been written yet")
+    }
+}
 
 impl Board {
     /// The LED, as an `embedded-hal` output.

@@ -1499,13 +1499,36 @@ Verified: the full spire-code suite, including the integration tests that run **
 `a_scaffolded_backend_builds_after_one_repair_round` (plan → generate → gate → build → repair → build,
 for rp2040) and `a_second_wrong_answer_still_gets_a_third_round` (three answers, two repairs).
 
+### Step 4 landed — the application
+
+`embedded_app_scaffold.rs` emits the app's `main.rs` against the new shape: the actor is generic over
+`OutputPin`/`DelayNs` (the traits the HAL re-exports), `main` takes its delay from `Board::delay()`,
+and the one line that belongs to the board — `board_led()` — is named as `Board::led` rather than
+guessed. The app's own placeholder is `UnimplementedLed` in `main.rs`, and it **implements**
+`OutputPin` for real (panicking bodies), because the invariant "the project type-checks, links and
+flashes before the fill has run" has to survive.
+
+That invariant is what failed first, and the fix was in the *backend*: its stub returned bare
+`UnimplementedLed`/`UnimplementedDelay` types that implemented nothing, so a scaffolded app could not
+construct the actor (`UnimplementedDelay: DelayNs` not satisfied). The backend's stand-ins now
+implement their traits with panicking bodies — unreachable in practice, since the only way to obtain
+one is the constructor that panics — which keeps the measure honest (`is_stub` is still true: the
+board's own methods are the placeholders) and lets the app build, link and flash beforehand.
+
+Verified by the test that was written for exactly this: `an_app_cross_compiles_against_a_real_hal`
+(`--ignored`, live) scaffolds a HAL plus an application and cross-builds the application for the
+classic ESP32 with the `esp` toolchain and the real SDK — 114 s, green.
+
+Also tidied: the fill's unit tests had one fixture described as "the scaffold's output" while writing
+the *authored-trait* shape. The two are now separate (`project` = a project that authors a trait of
+its own, still a supported path and still measured; `scaffolded_project` = what the scaffold emits),
+and `a_scaffolded_backend_is_one_pending_plan_item` asserts against the latter — `board`, `Board`,
+`led`/`delay`.
+
 ### Still to do
 
-1. `embedded_app_scaffold.rs` still writes `use spire_hal::hal::Led;` into the application it
-   scaffolds. That becomes the `embedded-hal` traits plus the backend's `Board`, and the app's plan is
-   what calls `Board::led`.
-2. Drivers: pick the first one (a WS2812 strip or an I²C sensor), land it against `embedded-hal` with
-   host tests, and settle the "upstream crate vs. actor-shaped wrapper" default in the fill prompt.
+Drivers: pick the first one (a WS2812 strip or an I²C sensor), land it against `embedded-hal` with
+host tests, and settle the "upstream crate vs. actor-shaped wrapper" default in the fill prompt.
 
 The whole spiral — a bespoke trait per board family, a scaffold that generates it, a fill that
 implements it, a drift measure that scores it — existed to make a *contract* out of something the
