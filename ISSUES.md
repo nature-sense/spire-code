@@ -1611,31 +1611,40 @@ disagree with the first. The screen sections by it, boards first. The rule is de
 with the one the build keys on. It is derived *today*; the split below turns it into a declared
 field, and only this method changes when it does.
 
-**Stage 2 — the store split (specified, not yet built).** The declared field and the two stores are
-**one change**, not two: adding the field alone changes no behaviour, because the derivation is
-already correct for every current entry. So:
+**Stage 2 — every entry is a board (specified, not yet built).** The registry holds **boards only** —
+specific manufacturers' boards, never generic silicon: `m5stack-core3`, `raspberry-pi-pico`,
+`raspberry-pi-5`, `rock-3c`, … The chip is a **property** of a board (`chip: esp32s3`), not a thing
+in the list, so there is no `esp32c3` entry to pick.
 
-- `kind` becomes a **declared** field (`kind: board` / `kind: chip`), defaulting to today's
-  derivation, so no existing seed has to change to keep working.
-- A board declares the chip it carries (`chip: esp32c3`), which is what makes "one chip, N boards"
-  expressible — and is why `spire-bsp-<chip>` was never the right unit.
-- The load path reads **`boards/` beside `platforms/`**, and `platform_codec` carries both fields so
-  the graph holds the *declaration* rather than re-deriving it (the graph is the source of truth for
-  everything else on `Platform` nodes; these must not be the exception).
+That changes two things stage 1 assumed:
 
-The split for the nine entries we have:
+- **`kind` stops being a picker distinction.** With every entry a board, there are no chips to
+  contrast with — so stage 1's sections become "Linux boards" / "bare-metal boards" (what genuinely
+  differs is the toolchain world) or disappear entirely. `PlatformKind` survives only as long as the
+  mixture does.
+- **There is no `chips/` store.** What a chip *contributes* — the vendor HAL, its feature name, the
+  stock triple, the flash tool — is a **lookup keyed by the chip id**: facts, not an entry, and not
+  something a picker shows. That is also where `vendor_for`'s chip→crate match belongs, beside every
+  other chip fact instead of in a second table in Rust.
+
+Mechanically: a board declares `chip:`; the load path reads **`boards/`** (renaming `platforms/`,
+which was never "platforms" — it was a mixture); and `platform_codec` carries `chip` so the graph
+holds the declaration rather than re-deriving it.
+
+The conversion of the nine entries we have:
 
 | today | becomes | carries |
 |---|---|---|
-| `rpi5`, `rock3c`, `a7s` | **boards** | the SBC's arch + sysroot; its chip (`bcm2712` / RK3566 / A523) |
-| `esp32c3` | **chip** | `esp-hal` 1.2, the stock `riscv32imc-unknown-none-elf`, `espflash` |
-| `esp32c6`, `esp32s3`, `esp32p4`, `rp2040` | **chips** | their triples, vendor HALs, flash tools |
-| *(new)* `devkitm1` | **board** | `chip: esp32c3` + the LED/WS2812 facts moved out of the chip's `library_hints` |
+| `rpi5`, `rock3c`, `a7s` | boards, as they already are | the SBC's arch + sysroot; its SoC |
+| `esp32c3` | a board (M5Stack …) | `chip: esp32c3` + the LED/WS2812 pin facts |
+| `esp32s3` | a board (`m5stack-core3`) | `chip: esp32s3` + its own board facts |
+| `rp2040` | a board (`raspberry-pi-pico`) | `chip: rp2040` + its own board facts |
+| `esp32`, `esp32c6`, `esp32p4` | named M5Stack boards | `chip:` + their own board facts |
 
-**The one thing that is a decision, not a mechanic:** each of `esp32c6`/`esp32s3`/`esp32p4`/`rp2040`
-needs its **board** named — the devkit its hints actually describe — before its board facts can move
-off the chip entry. `esp32c3` is unambiguous (`DevKitM-1`); the others are not derivable from the
-silicon, and inventing them would put the same guess in the data that we are removing from the code.
+**The one thing that is a decision, not a mechanic:** which M5Stack boards `esp32`, `esp32c6` and
+`esp32p4` are (and confirmation of `CoreS3` for `esp32s3`, `Pico` for `rp2040`). That is a choice
+about physical hardware, not something derivable from the silicon — inventing them would put into the
+registry the same guess we are removing from the code.
 
 **Stage 3 — HAL → a referenced driver library.** Extract ai-traps' `hal/` so `Hal` and `Embedded`
 are the same concept: a project of drivers an application depends on, with a board's BSP as that
