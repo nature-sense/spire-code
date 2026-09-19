@@ -5698,6 +5698,7 @@ mod platform_listing_tests {
             device: None,
             family: Some("x".into()),
             chip: None,
+            hal: None,
             rust: None,
             library_hints: Some("the board's own notes".into()),
         }

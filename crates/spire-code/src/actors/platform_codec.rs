@@ -7,7 +7,7 @@
 //! generic JSON; the platform YAML schema + typed view live in `crate::platform`.
 
 use crate::platform::{
-    Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp,
+    Platform, PlatformArchitecture, PlatformDeploy, PlatformDevice, PlatformDeviceMcp, PlatformHal,
     PlatformRust, PlatformSysroot, PlatformToolchain,
 };
 
@@ -109,6 +109,16 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
     if let Some(chip) = &p.chip {
         props.insert("chip".into(), serde_json::json!(chip));
     }
+    // The chip's vendor HAL, flattened the way the graph stores every other fact —
+    // one typed key per field, never a JSON fragment.
+    if let Some(hal) = &p.hal {
+        props.insert("hal_crate".into(), serde_json::json!(hal.crate_name));
+        props.insert("hal_version".into(), serde_json::json!(hal.version));
+        props.insert(
+            "hal_features".into(),
+            serde_json::json!(str_list(&hal.features)),
+        );
+    }
 
     serde_json::json!({
         "id": p.id,
@@ -195,6 +205,14 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
         },
         family: get_opt("family"),
         chip: get_opt("chip"),
+        hal: props
+            .get("hal_crate")
+            .and_then(|v| v.as_str())
+            .map(|krate| PlatformHal {
+                crate_name: krate.to_string(),
+                version: get_str("hal_version"),
+                features: get_list("hal_features"),
+            }),
         // An empty `rust_target` means "no Rust toolchain", not a platform with a blank
         // one — the `device` block above follows the same rule.
         rust: {
@@ -234,6 +252,7 @@ mod tests {
             device: None,
             family: Some("esp32".into()),
             chip: None,
+            hal: None,
             rust: Some(PlatformRust {
                 target: "riscv32imac-esp-espidf".into(),
                 idf_target: Some("esp32c6".into()),
@@ -262,6 +281,7 @@ mod tests {
             device: None,
             family: None,
             chip: None,
+            hal: None,
             rust: None,
             library_hints: None,
         }

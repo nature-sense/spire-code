@@ -822,6 +822,7 @@ mod tests {
             device: None,
             family: Some("esp32".into()),
             chip: None,
+            hal: None,
             rust: rust.map(|(target, idf)| PlatformRust {
                 target: target.into(),
                 idf_target: Some(idf.into()),

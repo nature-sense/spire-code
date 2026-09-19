@@ -62,6 +62,25 @@ fn graph_registry() -> Option<Vec<Platform>> {
 // Platform definitions — cross-compilation targets (rpi5, rock3c, …)
 // ============================================================================
 
+/// The vendor HAL this chip's BSPs are written against — the crate, its version, and
+/// the features this chip needs from it.
+///
+/// Data on the chip, not a `match` in Rust. That is the point: `add_bsp` resolving
+/// this per chip is what replaces the hardcoded `"esp32c3" => ("esp-hal", "1.2",
+/// &["unstable"])` table, and it is the same shape for a chip with no BSP yet — absent,
+/// which is what `add_bsp` refuses on rather than picking a crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformHal {
+    /// The crate name — `esp-hal`, `rp2040-hal`. `crate` is a Rust keyword, so the
+    /// field is renamed for YAML and the keyword stays out of the code.
+    #[serde(rename = "crate")]
+    pub crate_name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
 /// A cross-compilation platform target (e.g. Raspberry Pi 5, Rock 3C).
 ///
 /// The graph is the canonical store for these; the YAML files under
@@ -112,6 +131,10 @@ pub struct Platform {
     /// a chip-name table in Rust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chip: Option<String>,
+    /// The vendor HAL a **chip's** BSPs are written against. Present on a chip whose
+    /// BSP has been proven on a board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hal: Option<PlatformHal>,
     /// Rust toolchain, for targets whose build is not a C cross-compile (`os: "esp-idf"`).
     ///
     /// Absent for the C platforms, whose toolchain is [`PlatformToolchain`]. Kept separate
@@ -796,6 +819,25 @@ mod tests {
         assert_eq!(by_id["esp32c3"].kind(), PlatformKind::Chip);
     }
 
+    /// The vendor HAL is **data on the chip**, so the one hardcoded table in Rust
+    /// (`vendor_for`) has somewhere to go.
+    #[test]
+    fn a_chips_vendor_hal_is_declared_not_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "esp32s3.yaml",
+            &(platform_yaml("esp32s3", "ESP32-S3").replace("os: linux", "os: esp-hal")
+                + "hal:\n  crate: esp-hal\n  version: \"1.2\"\n  features: [esp32s3, unstable]\n"),
+        );
+        let chip = Platform::chip_facts_in(tmp.path(), "esp32s3").expect("the chip resolves");
+        let hal = chip.hal.expect("the vendor HAL is declared");
+
+        assert_eq!(hal.crate_name, "esp-hal");
+        assert_eq!(hal.version, "1.2");
+        assert_eq!(hal.features, vec!["esp32s3", "unstable"]);
+    }
+
     /// A board's `chip:` resolves to that chip's facts, and an unknown chip is a
     ///**refusal** rather than a guess.
     ///
@@ -1170,6 +1212,7 @@ sysroot:
             sysroot: PlatformSysroot::default(),
             family: None,
             chip: None,
+            hal: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1197,7 +1240,6 @@ id: esp32c6
 name: ESP32-C6
 os: esp-idf
 family: esp32
-chip: None,
 architecture:
   cpu_family: riscv
   cpu: esp32c6
@@ -1220,7 +1262,6 @@ id: esp32s3
 name: ESP32-S3
 os: esp-idf
 family: esp32
-chip: None,
 architecture:
   cpu_family: xtensa
   cpu: esp32s3
@@ -1306,6 +1347,7 @@ rust:
             },
             family: None,
             chip: None,
+            hal: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1337,6 +1379,7 @@ rust:
             },
             family: None,
             chip: None,
+            hal: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1368,6 +1411,7 @@ rust:
             },
             family: None,
             chip: None,
+            hal: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1391,6 +1435,7 @@ rust:
             sysroot: PlatformSysroot::default(),
             family: None,
             chip: None,
+            hal: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1544,6 +1589,7 @@ sysroot:
             sysroot: PlatformSysroot::default(),
             family: None,
             chip: None,
+            hal: None,
             rust: None,
             device: None,
             library_hints: None,

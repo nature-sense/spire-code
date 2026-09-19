@@ -564,6 +564,7 @@ mod tests {
             device: None,
             family: Some("rp2040".into()),
             chip: None,
+            hal: None,
             rust: Some(PlatformRust {
                 target: triple.to_string(),
                 idf_target: Some("RP2040".to_string()),
