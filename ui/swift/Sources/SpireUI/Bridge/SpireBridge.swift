@@ -453,9 +453,9 @@ final class SpireBridge {
     /// `"native" | "single_source" | "hal"`; `embedded` is true for
     /// cross-compile projects (no host target). Calls FFI:
     /// createProject/GeneratePlan { goal, rootDir, language, platforms }.
-    /// - Parameter halRoot: the embedded-HAL project an `EmbeddedApp` depends on. The core requires
-    ///   it for that structure (the app's whole dependency graph is read from it) and omits it from
-    ///   every other request, so nothing else changes.
+    /// - Parameter embeddedRoot: the container an `EmbeddedApp` depends on. The core requires it for
+    ///   that structure (the app's path dependency is read from it) and omits it from every other
+    ///   request, so nothing else changes.
     func generateProjectPlan(
         goal: String,
         rootDir: String,
@@ -463,7 +463,7 @@ final class SpireBridge {
         platforms: [String] = [],
         structure: String = "native",
         embedded: Bool = false,
-        halRoot: String? = nil
+        embeddedRoot: String? = nil
     ) async -> PlanGenerationResult? {
         do {
             var params: [String: Any] = [
@@ -474,8 +474,8 @@ final class SpireBridge {
                 "structure": structure,
                 "embedded": embedded
             ]
-            if let halRoot, !halRoot.trimmingCharacters(in: .whitespaces).isEmpty {
-                params["halRoot"] = halRoot
+            if let embeddedRoot, !embeddedRoot.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["embeddedRoot"] = embeddedRoot
             }
             let body: [String: Any] = [
                 "method": "createProject/GeneratePlan",
@@ -1587,96 +1587,6 @@ final class SpireBridge {
         return (written, failures, nil)
     }
 
-    /// Rust embedded-HAL fill — plan: one item per backend **file** that still owes something, each
-    /// carrying the pending traits and the constrained prompt (the platform's hints, a hardware
-    /// profile, the contract's own source). Read-only, and read from the same coverage measure the
-    /// maturity chips use — so this list and those chips cannot disagree.
-    func embeddedHalFillPlan(root: String, platform: String? = nil) async -> (items: [[String: Any]], error: String?) {
-        var args: [String: Any] = ["root": root]
-        if let platform, !platform.isEmpty { args["platform"] = platform }
-        guard let json = await callBuildTool("embedded_hal_fill_plan", args: args) else {
-            return ([], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([], err)
-        }
-        return ((json["plan"] as? [[String: Any]]) ?? [], nil)
-    }
-
-    /// Rust embedded-HAL authoring — **validate a contract**, before anything is written.
-    ///
-    /// Read-only, and the same gate `embeddedHalWriteContract` passes: the rules are what the drift
-    /// measure needs (it parses, it declares an implementable trait, it implements nothing, no name
-    /// twice), so a contract that validates here is one the measure will see. `summary["traits"]` is
-    /// what the sheet lists; `error` is the refusal, in the user's terms.
-    func embeddedHalValidateContract(content: String) async -> (summary: [String: Any]?, error: String?) {
-        guard let json = await callBuildTool("embedded_hal_validate_contract", args: ["content": content]) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        // The tool reports a refusal as `valid: false` *with* an error string; both spellings mean
-        // the same thing to the caller, so they are folded here rather than in every view.
-        if json["valid"] as? Bool == false {
-            return (nil, (json["error"] as? String) ?? "the contract is not valid")
-        }
-        return (json, nil)
-    }
-
-    /// Rust embedded-HAL authoring — **write a contract**, declaring and re-exporting its module so
-    /// the drift measure can see it.
-    ///
-    /// `result["wired"]` says whether `hal/mod.rs` needed changing, `unchanged` that the file was
-    /// already there byte for byte, and the errors are the tool's: a contract that would replace one
-    /// backends implement is refused rather than silently rewritten.
-    func embeddedHalWriteContract(root: String, filename: String, content: String) async -> (result: [String: Any]?, error: String?) {
-        guard let json = await callBuildTool(
-            "embedded_hal_write_contract",
-            args: ["root": root, "filename": filename, "content": content]
-        ) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        return (json, nil)
-    }
-
-    /// Rust embedded-HAL authoring — **add a board**: the backend crate for that platform's family
-    /// (emitted by the scaffold's own code path) plus the workspace member line that makes it part of
-    /// the project.
-    ///
-    /// The refusals are the tool's and arrive as `error`: a platform that is not a board, an unknown
-    /// registry id, and a family that already has a backend crate — that last one is the guard against
-    /// a second click forking the crate. `result["written"]` and `result["workspace_member"]` say
-    /// what landed; `result["note"]` is what the tool did *not* do.
-    func embeddedHalAddPlatform(root: String, platform: String) async -> (result: [String: Any]?, error: String?) {
-        guard let json = await callBuildTool("embedded_hal_add_platform", args: ["root": root, "platform": platform]) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        return (json, nil)
-    }
-
-    /// Rust embedded-HAL fill — apply: one model call per item, **gated** before anything is
-    /// written (every pending trait implemented by name, no `unimplemented!()` left behind), then
-    /// the project is re-measured. `applied` therefore reports what the measure says afterwards,
-    /// not what the model claimed.
-    func embeddedHalFillApply(root: String, plan: [[String: Any]]) async -> (applied: [[String: Any]], failures: [[String: Any]], error: String?) {
-        guard let json = await callBuildTool("embedded_hal_fill_apply", args: ["root": root, "plan": plan]) else {
-            return ([], [], "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return ([], [], err)
-        }
-        let applied = (json["applied"] as? [[String: Any]]) ?? []
-        let failures = (json["failures"] as? [[String: Any]]) ?? []
-        return (applied, failures, nil)
-    }
-
     /// SEMANTIC Stage-1 (deterministic half): build the constrained module-pair
     /// implementation prompt for one interface × platform via
     /// `hal_build_impl_prompt` (contract + structured docs + hardware profile +
@@ -1793,12 +1703,12 @@ final class SpireBridge {
     /// returns the ScaffoldSpec (locked files, fill roots, platforms, layout).
     /// Returns nil on success, error string on failure.
     ///
-    /// `halRoot` is the embedded-HAL project an `EmbeddedApp` depends on. It travels only for that
-    /// structure — the core refuses an application without it — and is omitted entirely otherwise, so
-    /// every other request is byte-for-byte what it was.
+    /// `embeddedRoot` is the container an `EmbeddedApp` depends on. It travels only for that structure
+    /// — the core refuses an application without it — and is omitted entirely otherwise, so every
+    /// other request is byte-for-byte what it was.
     func scaffoldProject(buildSystem: String, projectName: String, root: String,
                          platforms: [String] = [], structure: String = "native",
-                         embedded: Bool = false, halRoot: String? = nil) async -> String? {
+                         embedded: Bool = false, embeddedRoot: String? = nil) async -> String? {
         do {
             var params: [String: Any] = [
                 "projectName": projectName,
@@ -1808,8 +1718,8 @@ final class SpireBridge {
                 "structure": structure,
                 "embedded": embedded
             ]
-            if let halRoot, !halRoot.trimmingCharacters(in: .whitespaces).isEmpty {
-                params["halRoot"] = halRoot
+            if let embeddedRoot, !embeddedRoot.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["embeddedRoot"] = embeddedRoot
             }
             let body: [String: Any] = [
                 "method": "createProject/Scaffold",

@@ -8,7 +8,7 @@ import AppKit
 ///                │             └─ CLI                  → `native`
 ///                └─ Embedded ─┬─ Linux SBC (C++) ───── Targets → Structure
 ///                             │                          → `single_source` | `hal`  (unchanged)
-///                             └─ Controller (Rust) ─┬─ HAL + Frameworks → `embedded_hal`
+///                             └─ Controller (Rust) ─┬─ Container     → `embedded`
 ///                                                  └─ Application      → `embedded_app`
 ///
 /// The steps are therefore **data, not an enum's order**: a Native CLI needs three, a Linux SBC five
@@ -44,29 +44,28 @@ struct NewProjectView: View {
         case controller
     }
 
-    /// A controller project is either the HAL + frameworks themselves, or an application that
-    /// depends on one.
+    /// A controller project is either the **container** itself, or an application that depends on
+    /// one.
     enum ControllerRole: String, CaseIterable {
-        /// The contract crate plus one backend per board family — a library (`embedded_hal`).
-        case halFrameworks
-        /// A firmware binary that path-deps an existing HAL project (`embedded_app`).
+        /// The container: the actor framework, the peripheral drivers, and a BSP crate per board —
+        /// a library (`embedded`). Applications are built *against* it rather than containing it.
+        case container
+        /// A firmware binary that path-deps an existing container (`embedded_app`).
         ///
-        /// Its own structure, because the two are **separate projects**: the app is not a HAL with a
-        /// `main`, it depends on one. Scaffolding it arrives with that structure in the core; the
-        /// wizard shows the choice now so the tree is complete, and does not offer it until then —
-        /// a selectable card here would scaffold a plain host crate instead, silently.
+        /// Its own structure, because the two are **separate projects**: the app is not a container
+        /// with a `main`, it depends on one.
         case application
     }
 
     enum Step: String, CaseIterable {
-        case environment, nativeKind, deviceClass, controllerRole, targets, structure, halProject, details
+        case environment, nativeKind, deviceClass, controllerRole, targets, structure, containerProject, details
     }
 
     @State private var stepIndex = 0
     @State private var environment: ProjectEnvironment = .embedded
     @State private var nativeKind: NativeKind = .spireApp
     @State private var deviceClass: DeviceClass = .linuxSbc
-    @State private var controllerRole: ControllerRole = .halFrameworks
+    @State private var controllerRole: ControllerRole = .container
     /// Loaded from the Rust registry via `bridge.fetchPlatforms()`.
     @State private var availableTargets: [Platform] = []
     /// Selected cross-compilation target registry ids (e.g. ["rpi5", "rock3c"]).
@@ -75,11 +74,11 @@ struct NewProjectView: View {
     /// a kept selection would be a build for hardware the branch does not have.
     @State private var selectedTargets: Set<String> = []
     @State private var useHal: Bool = true            // Linux SBC structure: HAL vs single-source
-    /// The embedded-HAL project a Controller **application** builds against.
+    /// The **container** a Controller **application** builds against.
     ///
     /// A directory the user picks, because the two are separate projects: the app's manifest
-    /// path-deps that HAL's contract and backend crates, and the core reads its members to name them.
-    @State private var halProject: String = ""
+    /// path-deps that container's crate, and the core reads it to name the dependency.
+    @State private var containerProject: String = ""
 
     @State private var goal: String = ""
     @State private var projectName: String = ""
@@ -124,10 +123,10 @@ struct NewProjectView: View {
     /// reason the add-board menu is.
     ///
     /// `controllerRole` decides the *last* question on the Controller branch: an application is built
-    /// against a HAL project that nothing else implies, so it is asked for one more answer than the
-    /// HAL — which is the project itself.
+    /// against a container, which nothing else in the wizard implies — so the application role asks
+    /// one more question than the container role does.
     static func path(environment: ProjectEnvironment, deviceClass: DeviceClass,
-                     controllerRole: ControllerRole = .halFrameworks) -> [Step] {
+                     controllerRole: ControllerRole = .container) -> [Step] {
         var steps: [Step] = [.environment]
         switch environment {
         case .native:
@@ -142,7 +141,7 @@ struct NewProjectView: View {
                 steps.append(.controllerRole)
                 steps.append(.targets)
                 if controllerRole == .application {
-                    steps.append(.halProject)
+                    steps.append(.containerProject)
                 }
             }
         }
@@ -207,7 +206,7 @@ struct NewProjectView: View {
             case .linuxSbc:
                 return useHal ? "hal" : "single_source"
             case .controller:
-                return controllerRole == .halFrameworks ? "embedded_hal" : "embedded_app"
+                return controllerRole == .container ? "embedded" : "embedded_app"
             }
         }
     }
@@ -226,9 +225,9 @@ struct NewProjectView: View {
                     ? "Linux SBC — hardware abstraction (recommended)"
                     : "Linux SBC — single source base (no hardware-specific layer)"
             case .controller:
-                return controllerRole == .halFrameworks
-                    ? "Controller — HAL + frameworks (contract + one backend per board family)"
-                    : "Controller — application (firmware binary that depends on a HAL)"
+                return controllerRole == .container
+                    ? "Controller — container (actor framework + drivers + a BSP per board)"
+                    : "Controller — application (firmware binary that depends on a container)"
             }
         }
     }
@@ -242,10 +241,10 @@ struct NewProjectView: View {
             // A branch with no targets in the registry cannot be advanced past on an empty
             // selection, and saying so beats scaffolding a project with nothing to build for.
             return !offeredTargets.isEmpty && !selectedTargets.isEmpty
-        case .halProject:
+        case .containerProject:
             // The application's dependency: without it the core refuses, so the wizard does not
             // pretend the answer is optional.
-            return !halProject.trimmingCharacters(in: .whitespaces).isEmpty
+            return !containerProject.trimmingCharacters(in: .whitespaces).isEmpty
         case .details:
             return !goal.trimmingCharacters(in: .whitespaces).isEmpty
                 && !projectName.trimmingCharacters(in: .whitespaces).isEmpty
@@ -266,7 +265,7 @@ struct NewProjectView: View {
             }
             return deviceClass == .controller ? "Target Board" : "Target Hardware"
         case .structure: return "Project Structure"
-        case .halProject: return "HAL Project"
+        case .containerProject: return "Container"
         case .details: return "Name & Description"
         }
     }
@@ -338,7 +337,7 @@ struct NewProjectView: View {
         case .controllerRole: controllerRoleStep
         case .targets: targetsStep
         case .structure: structureStep
-        case .halProject: halProjectStep
+        case .containerProject: containerProjectStep
         case .details: detailsStep
         }
     }
@@ -463,23 +462,23 @@ struct NewProjectView: View {
         errorMessage = nil
     }
 
-    // MARK: Controller — the HAL + frameworks, or an application that depends on one
+    // MARK: Controller — the container, or an application that depends on one
 
     private var controllerRoleStep: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("HAL or application?")
+            Text("Container or application?")
                 .font(.headline)
             HStack(spacing: 12) {
                 choiceCard(
-                    title: "HAL + Frameworks",
-                    subtitle: "Contract crate + one backend per board family",
+                    title: "Container",
+                    subtitle: "Actor framework + drivers + a BSP per board",
                     systemImage: "square.stack.3d.up",
-                    selected: controllerRole == .halFrameworks,
-                    select: { controllerRole = .halFrameworks }
+                    selected: controllerRole == .container,
+                    select: { controllerRole = .container }
                 )
                 choiceCard(
                     title: "Application",
-                    subtitle: "Firmware that depends on a HAL project",
+                    subtitle: "Firmware that depends on a container",
                     systemImage: "app.badge",
                     selected: controllerRole == .application,
                     select: { controllerRole = .application }
@@ -487,8 +486,8 @@ struct NewProjectView: View {
             }
             Label(
                 controllerRole == .application
-                    ? "One board, one binary — a *separate* project whose Cargo.toml path-deps a HAL's contract and backend crates. The next step asks which HAL."
-                    : "The traits a firmware programs against plus the per-family implementations — a library, filled by the drift cascade.",
+                    ? "One board, one binary — a *separate* project whose Cargo.toml path-deps a container's crate. The next step asks which container."
+                    : "The actor framework, the peripheral drivers and a BSP crate per board — a library an application is built against.",
                 systemImage: controllerRole == .application ? "app.badge" : "square.stack.3d.up"
             )
             .font(.callout)
@@ -594,38 +593,37 @@ struct NewProjectView: View {
         .frame(maxWidth: 520, alignment: .leading)
     }
 
-    // MARK: HAL project (Controller → Application)
+    // MARK: container (Controller → Application)
 
-    /// Which HAL the application depends on.
+    /// Which container the application depends on.
     ///
     /// Asked of the user because the two are **separate projects** and nothing else in the wizard
-    /// implies the answer: the app's `Cargo.toml` path-deps that HAL's contract crate and the chosen
-    /// board's backend crate, and the core reads that project's members to name them. The family in
-    /// the hint is the suggestion, not the rule — a HAL whose backend for this board is missing is
-    /// refused by the core, with the members it did find.
-    private var halProjectStep: some View {
+    /// implies the answer: the app's `Cargo.toml` path-deps the container's library crate — named
+    /// after the container's project — and the core reads that directory to name it. A directory
+    /// that holds no such crate is refused by the core, by name.
+    private var containerProjectStep: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Which HAL does this application build against?")
+            Text("Which container does this application build against?")
                 .font(.headline)
-            Text("The application is a project of its own. This is the embedded-HAL project it path-deps — the same relationship `blink-esp32` has with `spire-hal`.")
+            Text("The application is a project of its own. This is the container it path-deps — the actor framework, the drivers and the BSPs, in one workspace.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 8) {
-                TextField("/path/to/my-hal", text: $halProject)
+                TextField("/path/to/weather-embedded", text: $containerProject)
                     .textFieldStyle(.roundedBorder)
                     .font(.callout.monospaced())
-                Button("Choose…") { chooseHalProject() }
+                Button("Choose…") { chooseContainerProject() }
             }
             .frame(maxWidth: 520)
 
-            if let expectation = backendCrateHint {
-                Label("Expects a backend crate: \(expectation)", systemImage: "shippingbox")
+            if let expectation = containerCrateHint {
+                Label("Expected crate: \(expectation)", systemImage: "shippingbox")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Label(
-                "The HAL is not copied and not modified — it is depended on, so several applications can build against one.",
+                "The container is not copied and not modified — it is depended on, so several applications can build against one.",
                 systemImage: "arrow.triangle.branch"
             )
             .font(.caption)
@@ -634,29 +632,32 @@ struct NewProjectView: View {
         .frame(maxWidth: 520, alignment: .leading)
     }
 
-    /// The backend crate the chosen board implies, when a board is chosen: `<hal>-<family>`.
+    /// The crate the chosen container should hold: its library crate is named after the container's
+    /// project, which is the directory's own name.
     ///
-    /// Derived from the *family*, not the platform id, because one backend serves every chip of a
-    /// family — the same rule the core's own refusal names when it cannot find one.
-    private var backendCrateHint: String? {
-        guard let family = offeredTargets.first(where: { selectedTargets.contains($0.id) })?.family
-        else { return nil }
-        return "crates/<hal>-\(family)"
+    /// The same rule the core's add-operations use — which is why the name is not normalised here
+    /// either. A container whose directory is called something else holds a crate of that name, so
+    /// the hint follows the directory rather than a convention of ours.
+    private var containerCrateHint: String? {
+        let path = containerProject.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return nil }
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        return name.isEmpty ? nil : "crates/\(name)"
     }
 
-    private func chooseHalProject() {
+    private func chooseContainerProject() {
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Choose HAL Project"
-        panel.message = "Select the embedded-HAL project this application depends on"
-        if !halProject.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: halProject)
+        panel.prompt = "Choose Container"
+        panel.message = "Select the container this application builds against"
+        if !containerProject.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: containerProject)
         }
         if panel.runModal() == .OK, let url = panel.url {
-            halProject = url.path
+            containerProject = url.path
         }
     }
 
@@ -742,7 +743,7 @@ struct NewProjectView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if structureKey == "embedded_app" {
-                    Text("HAL: \(halProject.isEmpty ? "not chosen" : halProject)")
+                    Text("Container: \(containerProject.isEmpty ? "not chosen" : containerProject)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -890,7 +891,7 @@ struct NewProjectView: View {
                 embedded: !isNative,
                 // Keyed on the *structure*, not the role: an application is the only leaf whose
                 // dependencies come from another project, so that is exactly when it travels.
-                halRoot: structureKey == "embedded_app" ? halProject : nil
+                embeddedRoot: structureKey == "embedded_app" ? containerProject : nil
             )
             await MainActor.run {
                 if let plan {
