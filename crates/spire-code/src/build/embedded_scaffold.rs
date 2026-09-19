@@ -30,6 +30,7 @@
 //!    abstraction testable without hardware.
 
 use spire_core::build_types::ProjectStructure;
+use toml_edit::DocumentMut;
 
 /// What a backend crate needs for one board family.
 ///
@@ -771,9 +772,14 @@ const EMBEDDED_CRATE: &str = "spire-embedded";
 ///
 /// One row per chip, and only for chips proven on a board: `esp32c3` is the pilot. A BSP for a chip
 /// nobody has flashed is a crate whose `todo!()`s might never be fillable.
-fn vendor_for(platform_id: &str) -> Option<(&'static str, &'static str)> {
+fn vendor_for(platform_id: &str) -> Option<(&'static str, &'static str, &'static [&'static str])> {
     match platform_id {
-        "esp32c3" => Some(("esp-hal", "1.2")),
+        // `unstable` is **measured, not assumed**: `esp_hal::delay` is gated behind it, and the compiler
+        // says so in as many words ("found an item that was configured out … gated behind the `unstable`
+        // feature") when a BSP built without it fails on `use esp_hal::delay::Delay`. A BSP's second job
+        // is a delay for the drivers' `DelayNs`, so that absence is not a nicety — and the version is the
+        // one the pilot application was built, flashed and run with.
+        "esp32c3" => Some(("esp-hal", "1.2", &["unstable"])),
         _ => None,
     }
 }
@@ -783,13 +789,26 @@ pub(crate) fn bsp_files(
     platform_id: &str,
     vendor: &str,
     vendor_version: &str,
+    vendor_features: &[&str],
 ) -> Vec<super::ScaffoldFile> {
     let name = bsp_crate(platform_id);
+    // One list, chip first: the chip selects the vendor crate's build, and the rest are what this board's
+    // facts need from it. Joined here rather than templated as fragments, so the manifest reads as one
+    // feature array however many there are.
+    let features = std::iter::once(format!("\"{platform_id}\""))
+        .chain(
+            vendor_features
+                .iter()
+                .map(|feature| format!("\"{feature}\"")),
+        )
+        .collect::<Vec<String>>()
+        .join(", ");
     let manifest = BSP_MANIFEST
         .replace("__NAME__", &name)
         .replace("__CHIP__", platform_id)
         .replace("__VENDOR__", vendor)
-        .replace("__VENDOR_VERSION__", vendor_version);
+        .replace("__VENDOR_VERSION__", vendor_version)
+        .replace("__FEATURES__", &features);
     vec![
         super::ScaffoldFile {
             path: format!("crates/{name}/Cargo.toml"),
@@ -835,8 +854,10 @@ license.workspace = true
 [dependencies]
 # The actor system and the peripherals module, for the trait names this crate's signatures use.
 spire-embedded = { path = "../spire-embedded" }
-# The vendor HAL: the only crate here that knows a chip, and the crate the feature selects.
-__VENDOR__ = { version = "__VENDOR_VERSION__", features = ["__CHIP__"] }
+# The vendor HAL: the only crate here that knows a chip, and the crate the feature selects. The features
+# are the chip, plus whatever this board's facts ask of the vendor — `unstable`, here, because a delay
+# lives behind it and this crate's second job is a delay.
+__VENDOR__ = { version = "__VENDOR_VERSION__", features = [__FEATURES__] }
 "#;
 
 /// A BSP's source: the board's constructors, with the pins left to the fill.
@@ -854,6 +875,12 @@ const BSP_LIB_RS: &str = r#"//! The `__NAME__` BSP: **this board's facts**, over
 //! The `todo!()`s are the fill's. They are **typed**, so this crate compiles and links before any of
 //! them is written — which is what lets an application that depends on it be built and flashed while
 //! the board's pins are still unknown.
+//!
+//! `no_std` is not decoration here. A bare-metal target has no `std` to link, so a library that does not
+//! say so fails with "can't find crate for `std`" — and, far less legibly, with "cannot find macro
+//! `todo`", because the prelude it was silently using is std's.
+
+#![no_std]
 
 use __VENDOR_ID__::delay::Delay;
 use __VENDOR_ID__::gpio::Output;
@@ -911,7 +938,7 @@ pub(crate) fn add_bsp(
             platform.os
         ));
     }
-    let (vendor, version) = vendor_for(platform_id).ok_or_else(|| {
+    let (vendor, version, features) = vendor_for(platform_id).ok_or_else(|| {
         format!(
             "no BSP wiring is known for '{platform_id}' yet. `esp32c3` is the one row measured on a \
              board — built, flashed, LED cycling — and another chip is a row here, not a guess"
@@ -927,20 +954,25 @@ pub(crate) fn add_bsp(
         ));
     }
 
-    // The member list is what makes the crate part of the container, so it is read *before* anything
-    // is written: a container whose manifest is unreadable is refused, not half-edited.
+    // The member list is what makes the crate part of the container, so it is read and **edited**
+    // before anything is written: a container whose manifest cannot be read, or cannot take the
+    // member, is refused — not half-edited.
     let manifest_path = root.join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
     let member = format!("crates/{name}");
-    if manifest.contains(&format!("\"{member}\"")) {
+    if workspace_members(&manifest)?
+        .iter()
+        .any(|listed| listed == &member)
+    {
         return Err(format!(
             "`{member}` is already a workspace member — the manifest and the crate directory \
              disagree, so nothing was written"
         ));
     }
+    let updated = with_workspace_member(&manifest, &member)?;
 
-    let files = bsp_files(platform_id, vendor, version);
+    let files = bsp_files(platform_id, vendor, version, features);
     let mut written: Vec<String> = Vec::new();
     for file in &files {
         let target = root.join(&file.path);
@@ -953,20 +985,7 @@ pub(crate) fn add_bsp(
         written.push(file.path.clone());
     }
 
-    // Beside the other members, so the list stays one list.
-    let mut lines: Vec<String> = manifest.lines().map(str::to_string).collect();
-    let at = lines
-        .iter()
-        .rposition(|line| {
-            let trimmed = line.trim();
-            trimmed.starts_with('"') && trimmed.ends_with("\",")
-        })
-        .map(|index| index + 1)
-        .unwrap_or(lines.len());
-    lines.insert(at, format!("    \"{member}\","));
-    let mut updated = lines.join("\n");
-    updated.push('\n');
-    std::fs::write(&manifest_path, updated)
+    std::fs::write(&manifest_path, &updated)
         .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
 
     Ok(serde_json::json!({
@@ -978,6 +997,59 @@ pub(crate) fn add_bsp(
         "note": "the board's facts are typed `todo!()`s in src/lib.rs, so the crate builds and links \
                  until the fill writes them",
     }))
+}
+
+/// The workspace members a container declares, parsed.
+///
+/// Parsed rather than grepped, because it is the *shape* of this list that decides whether an edit lands
+/// in it — and because a substring test for the member is what let the first version of `add_bsp`
+/// believe a manifest it had just broken was fine.
+fn workspace_members(manifest: &str) -> Result<Vec<String>, String> {
+    let doc: DocumentMut = manifest
+        .parse()
+        .map_err(|e| format!("the container's Cargo.toml does not parse: {e}"))?;
+    doc.get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(|members| members.as_array())
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(|member| member.as_str().map(str::to_string))
+                .collect()
+        })
+        .ok_or_else(|| {
+            "the container's Cargo.toml has no `[workspace] members` array — there is nothing to add \
+             the crate to"
+                .to_string()
+        })
+}
+
+/// The container's manifest, with one more workspace member.
+///
+/// `toml_edit` rather than an inserted line, for two **measured** reasons. First, **the file is not
+/// ours**: it carries the prose explaining why the crate set is what it is, and a round-trip through a
+/// plain TOML parser would delete every comment in it. Second, **the list has more than one shape**: a
+/// scaffolded container writes one member per line, while the framework's own manifest writes them
+/// *inline* (`members = ["crates/spire-embedded"]`). A line-oriented insertion that understood only the
+/// first shape appended the new member after the last line of the file — inside `[workspace.package]`,
+/// as a bare string with no `=` — and cargo then refused to read the container's own manifest. The
+/// fixture could not notice, because it was written in the other shape; the live build could not help
+/// but notice.
+fn with_workspace_member(manifest: &str, member: &str) -> Result<String, String> {
+    let mut doc: DocumentMut = manifest
+        .parse()
+        .map_err(|e| format!("the container's Cargo.toml does not parse: {e}"))?;
+    let array = doc
+        .get_mut("workspace")
+        .and_then(|workspace| workspace.get_mut("members"))
+        .and_then(|members| members.as_array_mut())
+        .ok_or_else(|| {
+            "the container's Cargo.toml has no `[workspace] members` array — there is nothing to add \
+             the crate to"
+                .to_string()
+        })?;
+    array.push(member);
+    Ok(doc.to_string())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1494,12 +1566,30 @@ mod tests {
         println!("{}", root.display());
     }
 
-    /// A container on disk: a workspace manifest with a members list, as the framework's own is.
+    /// A container on disk: a workspace manifest with a members list, one member per line.
     fn container_on_disk(root: &Path) -> PathBuf {
         std::fs::write(
             root.join("Cargo.toml"),
-            "[workspace]\nresolver = \"2\"\nmembers = [\n    \"crates/spire-embedded\",\n]\n\
+            "[workspace]\nresolver = \"2\"\n# One crate, and it is host-checkable.\nmembers = [\n    \"crates/spire-embedded\",\n]\n\
              \n[workspace.metadata.spire]\nstructure = \"embedded\"\n",
+        )
+        .unwrap();
+        root.join("Cargo.toml")
+    }
+
+    /// The same, with the members **inline** — which is how the framework's own manifest writes them.
+    ///
+    /// A second shape because one was not enough. The editor's first version inserted the new member on
+    /// the line after the last `"…",` line it could find; this file has no such line, so it appended the
+    /// member to the *end of the file* — inside `[workspace.package]`, as a bare string with no `=`. Cargo
+    /// then refused to read the container's own manifest, and nothing in the fixture's shape could have
+    /// shown that.
+    fn container_on_disk_inline(root: &Path) -> PathBuf {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "# A container with its crate set on one line.\n[workspace]\nresolver = \"2\"\n\
+             members = [\"crates/spire-embedded\"]\n\n[workspace.package]\nversion = \"0.1.0\"\n\
+             edition = \"2021\"\n",
         )
         .unwrap();
         root.join("Cargo.toml")
@@ -1529,6 +1619,7 @@ mod tests {
         let lib = std::fs::read_to_string(root.path().join("crates/spire-bsp-esp32c3/src/lib.rs"))
             .expect("the BSP's source");
         for expected in [
+            "#![no_std]",
             "pub struct Board",
             "pub fn led(&self) -> Output<'static>",
             "todo!(\"this board's LED pin\")",
@@ -1544,7 +1635,9 @@ mod tests {
         for expected in [
             "name = \"spire-bsp-esp32c3\"",
             "spire-embedded = { path = \"../spire-embedded\" }",
-            "esp-hal = { version = \"1.2\", features = [\"esp32c3\"] }",
+            // The chip **and** `unstable`, not the chip alone: pinning the feature list as it was is what
+            // let a BSP that cannot see `esp_hal::delay` pass every host test it had.
+            "esp-hal = { version = \"1.2\", features = [\"esp32c3\", \"unstable\"] }",
         ] {
             assert!(
                 manifest.contains(expected),
@@ -1552,16 +1645,59 @@ mod tests {
             );
         }
 
-        // The workspace member, beside the one that was already there rather than after the bracket.
+        // The member, in the one list — asserted by *parsing* the result. Presence was never the thing
+        // that could go wrong here; the shape was.
         let after = std::fs::read_to_string(&manifest_path).unwrap();
-        let embedded_at = after
-            .find("\"crates/spire-embedded\",")
-            .expect("the first member");
-        let bsp_at = after
-            .find("\"crates/spire-bsp-esp32c3\",")
-            .expect("the new member");
-        assert!(embedded_at < bsp_at, "the members stay one list:\n{after}");
+        assert_eq!(
+            workspace_members(&after).expect("the edited manifest still parses"),
+            vec![
+                "crates/spire-embedded".to_string(),
+                "crates/spire-bsp-esp32c3".to_string()
+            ],
+            "the members stay one list:\n{after}"
+        );
         assert!(after.contains("structure = \"embedded\""), "{after}");
+        // And the container's prose survives. This file is not ours: it explains why the crate set is
+        // what it is, and a plain TOML round-trip would have deleted every word of it.
+        assert!(
+            after.contains("# One crate, and it is host-checkable."),
+            "{after}"
+        );
+    }
+
+    /// The shape that broke it: a container whose members are listed **inline**.
+    ///
+    /// This is what the framework's own manifest looks like — `members = ["crates/spire-embedded"]` on one
+    /// line — so `add_bsp` is run against this shape in practice, not hypothetically. The first version
+    /// appended the new member to the wrong end of the file and produced a manifest cargo would not read.
+    /// The assertion that catches it is not "the member is present" but "the result still parses".
+    #[test]
+    fn a_bsp_is_added_to_a_container_whose_members_are_inline() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[("esp32c3", "esp-hal", Some("esp32"))]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        let root = tempfile::tempdir().unwrap();
+        let manifest_path = container_on_disk_inline(root.path());
+
+        add_bsp(root.path(), "esp32c3").expect("a BSP for the pilot board");
+
+        let after = std::fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(
+            workspace_members(&after).expect("the edited manifest still parses"),
+            vec![
+                "crates/spire-embedded".to_string(),
+                "crates/spire-bsp-esp32c3".to_string()
+            ],
+            "the member goes into the list, wherever the list is:\n{after}"
+        );
+        // The comment above `[workspace]` is still there: the container's prose is not ours to lose.
+        assert!(
+            after.starts_with("# A container with its crate set on one line."),
+            "{after}"
+        );
     }
 
     /// Adding the same board twice is refused — before anything is written, not after.
@@ -1707,5 +1843,144 @@ mod tests {
                 .exists(),
             "a refused add must not leave a module behind"
         );
+    }
+
+    /// The live test: a generated BSP, **built** for its chip inside a real container.
+    ///
+    /// The fixtures prove the emission — the files, the content, the refusals. This proves the
+    /// emission *compiles*: against the real `spire-embedded` library, against the real `esp-hal`, in
+    /// a workspace whose manifests resolve. That is a check no string can make, and it is the one that
+    /// catches a constructor whose shape does not typecheck against the vendor crate — a `&self` that
+    /// hands out a peripheral the vendor only gives away by value, say.
+    ///
+    /// The container is **copied** first, so the user's checkout is never written to: a test that
+    /// added a crate to it would change the thing it measures.
+    ///
+    /// Ignored by default: it needs the target, a container checkout and a network.
+    ///
+    /// ```sh
+    /// SPIRE_EMBEDDED_ROOT=../spire-embedded cargo test -p spire-code --lib \
+    ///     a_generated_bsp_builds_for_its_chip -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "live build: needs the target, a container checkout and a network"]
+    fn a_generated_bsp_builds_for_its_chip() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[("esp32c3", "esp-hal", Some("esp32"))]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        let source = std::env::var("SPIRE_EMBEDDED_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spire-embedded")
+            });
+        if !source.join("crates/spire-embedded/Cargo.toml").is_file() {
+            println!(
+                "no spire-embedded container at {} — set SPIRE_EMBEDDED_ROOT to build this",
+                source.display()
+            );
+            return;
+        }
+
+        let work = tempfile::tempdir().unwrap();
+        copy_sources(&source, work.path());
+        add_bsp(work.path(), "esp32c3").expect("a BSP for the pilot board");
+
+        let toolchain = stable_toolchain();
+        let mut build = std::process::Command::new(
+            toolchain
+                .as_ref()
+                .map(|dir| dir.join("bin/cargo"))
+                .unwrap_or_else(|| PathBuf::from("cargo")),
+        );
+        build
+            .args([
+                "build",
+                "-p",
+                "spire-bsp-esp32c3",
+                "--target",
+                "riscv32imc-unknown-none-elf",
+            ])
+            .current_dir(work.path());
+        if let Some(dir) = &toolchain {
+            build
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        dir.join("bin").display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("DYLD_FALLBACK_LIBRARY_PATH", dir.join("lib"));
+        }
+
+        let output = build.output().expect("cargo runs");
+        assert!(
+            output.status.success(),
+            "a generated BSP must build for its chip.\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Linked, not merely compiled: the `.rlib` is the artifact a dependent crate would get.
+        let artifact = work
+            .path()
+            .join("target/riscv32imc-unknown-none-elf/debug/libspire_bsp_esp32c3.rlib");
+        let size = std::fs::metadata(&artifact)
+            .map(|meta| meta.len())
+            .unwrap_or_default();
+        assert!(
+            size > 0,
+            "no rlib at {} (the BSP compiled nothing)",
+            artifact.display()
+        );
+    }
+
+    /// Copy a container's sources, skipping what a build regenerates or git owns.
+    fn copy_sources(from: &Path, to: &Path) {
+        for entry in std::fs::read_dir(from).unwrap().flatten() {
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            if matches!(text.as_ref(), "target" | ".git" | ".embuild") {
+                continue;
+            }
+            let source = entry.path();
+            let target = to.join(&name);
+            if source.is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_sources(&source, &target);
+            } else {
+                std::fs::copy(&source, &target).unwrap();
+            }
+        }
+    }
+
+    /// The machine's stable rustup toolchain, if it has one.
+    ///
+    /// A bare-metal target needs *that* toolchain's `core`, and the `cargo` a machine happens to have
+    /// first may know nothing about it — which fails as "can't find crate for `core`" and reads like a
+    /// missing target rather than a missing toolchain. (The app scaffold's live test carries its own
+    /// copy: they are separate test modules with no shared home yet.)
+    fn stable_toolchain() -> Option<PathBuf> {
+        let toolchains =
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".rustup/toolchains");
+        let mut stable: Vec<PathBuf> = std::fs::read_dir(&toolchains)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().starts_with("stable-"))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        stable.sort();
+        stable.pop()
     }
 }

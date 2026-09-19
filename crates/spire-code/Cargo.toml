@@ -79,6 +79,7 @@ num_cpus = "1"
 
 # Cargo metadata (for Rust project analysis)
 cargo_metadata = "0.19"
+toml_edit = "0.25.15"
 
 [dev-dependencies]
 tempfile = "3"
