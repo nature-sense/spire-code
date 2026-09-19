@@ -3954,6 +3954,34 @@ executable('{project_name}-{platform}',
                 }
             }
 
+            // Adding a driver to the container: the module, its host test, and the module-list line
+            // that makes the module exist at all.
+            "embedded_add_driver" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let device = args
+                    .get("device")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let bus = args.get("bus").and_then(|v| v.as_str()).unwrap_or_default();
+                if root.is_empty() || device.is_empty() || bus.is_empty() {
+                    serde_json::json!({
+                        "error": "embedded_add_driver: 'root' (the container directory), 'device', and 'bus' ('spi' or 'i2c') are required"
+                    })
+                } else {
+                    match crate::build::embedded_scaffold::add_driver(
+                        std::path::Path::new(root),
+                        device,
+                        bus,
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => serde_json::json!({ "error": e }),
+                    }
+                }
+            }
+
             "hal_diff_contracts" => {
                 let old_summary = args
                     .get("old_summary")
@@ -4512,6 +4540,13 @@ executable('{project_name}-{platform}',
                   "board": { "type": "string", "description": "Platform registry id of the board (e.g. esp32c3)" }
               }),
               &["root", "board"]),
+            t("embedded_add_driver", "Add a device driver to the spire-embedded container: the bus-generic module and a host test that proves it against a fake bus recording. The protocol is the fill's; the skeleton is generic over `embedded-hal`'s traits, so the driver runs on any board.",
+              serde_json::json!({
+                  "root": { "type": "string", "description": "The container directory (the spire-embedded workspace root)" },
+                  "device": { "type": "string", "description": "The device, e.g. bme280 — becomes the module and type name" },
+                  "bus": { "type": "string", "enum": ["spi", "i2c"], "description": "Which bus the device is on: a device fact, not a guess" }
+              }),
+              &["root", "device", "bus"]),
             t("hal_diff_contracts", "Diff two HAL contract summaries (added/removed/changed methods).",
               serde_json::json!({ "old_summary": { "type": "object" }, "new_summary": { "type": "object" } }),
               &["old_summary", "new_summary"]),

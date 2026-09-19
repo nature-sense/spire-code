@@ -761,6 +761,12 @@ pub(crate) fn bsp_crate(platform_id: &str) -> String {
     format!("spire-bsp-{platform_id}")
 }
 
+/// The container's library crate — the actor framework, the drivers and the executors.
+///
+/// **One name, not one per project.** The container is a singleton: applications of this family are
+/// built against it, and each names it by this same string wherever it lives.
+const EMBEDDED_CRATE: &str = "spire-embedded";
+
 /// The vendor crate a board's BSP wraps, and the version to ask for.
 ///
 /// One row per chip, and only for chips proven on a board: `esp32c3` is the pilot. A BSP for a chip
@@ -972,6 +978,289 @@ pub(crate) fn add_bsp(
         "note": "the board's facts are typed `todo!()`s in src/lib.rs, so the crate builds and links \
                  until the fill writes them",
     }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The other routine operation: a driver added as required.
+// ---------------------------------------------------------------------------------------------
+
+/// A driver's bus: the trait as a bound writes it, the `use` that names it, and its module's name.
+///
+/// A device's bus is a **device fact**, so it is an input rather than a guess: a strip is on SPI, a
+/// sensor on I²C, and a driver written for the wrong one is a driver that never compiles.
+fn driver_bus(bus: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match bus {
+        "spi" => Some(("SpiBus<u8>", "embedded_hal::spi::SpiBus", "spi")),
+        "i2c" => Some(("I2c", "embedded_hal::i2c::I2c", "i2c")),
+        _ => None,
+    }
+}
+
+/// A device's module identifier, from whatever a caller called it.
+fn driver_id(device: &str) -> String {
+    device
+        .trim()
+        .to_lowercase()
+        .replace(' ', "-")
+        .replace('-', "_")
+}
+
+/// The driver's type name: the module's identifier with its first letter raised.
+///
+/// Crude but honest, and the fill is free to rename it — the file is the fill's.
+fn driver_type(id: &str) -> String {
+    format!("{}{}", id[..1].to_uppercase(), &id[1..])
+}
+
+/// A driver: the module, and the host test that proves it against a fake bus.
+///
+/// Both are fillable — the *protocol* is the thing no scaffold can know — and the role is `Shared`
+/// rather than a HAL role: a driver is code every board of the family uses, not one board's
+/// implementation of anything.
+pub(crate) fn driver_files(device: &str, bus: &str) -> Result<Vec<super::ScaffoldFile>, String> {
+    let (bound, use_path, bus_name) = driver_bus(bus).ok_or_else(|| {
+        format!(
+            "'{bus}' is not a bus this scaffold knows — pass `spi` or `i2c`, because a device's bus \
+             is a device fact and a driver written for the wrong one never compiles"
+        )
+    })?;
+    let id = driver_id(device);
+    let type_name = driver_type(&id);
+
+    let fill = |template: &str| {
+        template
+            .replace("__TYPE__", &type_name)
+            .replace("__DEVICE__", &id)
+            .replace("__BUS__", bus_name)
+            .replace("__BUS_USE__", use_path)
+            .replace("__BUS_BOUND__", bound)
+    };
+
+    Ok(vec![
+        super::ScaffoldFile {
+            path: format!("crates/spire-embedded/src/drivers/{id}.rs"),
+            content: fill(DRIVER_RS),
+            structural: false,
+            fill_role: Some(spire_core::build_types::SourceRole::Shared),
+        },
+        super::ScaffoldFile {
+            path: format!("crates/spire-embedded/tests/{id}.rs"),
+            content: fill(DRIVER_TEST_RS),
+            structural: false,
+            fill_role: Some(spire_core::build_types::SourceRole::Shared),
+        },
+    ])
+}
+
+/// A driver's module: the bus-generic skeleton, with the device's protocol left to the fill.
+const DRIVER_RS: &str = r#"//! A `__DEVICE__` driver, over an `__BUS__` bus.
+//!
+//! It lives here rather than as a dependency for one of the two reasons this container exists: no
+//! upstream crate speaks `embedded-hal` 1.x for this device, or the project needs the driver to be
+//! *actor-shaped* — behind a message type rather than a call surface.
+//!
+//! What the skeleton fixes is what every driver here looks like: generic over the bus and the delay,
+//! no vendor type in sight, and errors that pass the bus's own through untouched. What the fill
+//! writes is the device's protocol — the part no scaffold can know, and the part the host test is
+//! for.
+
+use embedded_hal::delay::DelayNs;
+use __BUS_USE__;
+
+/// Why a driver call failed.
+///
+/// The bus's own error is passed through **untouched** in [`DriverError::Bus`] rather than flattened
+/// into an error type of ours: the peripheral's failure modes are the peripheral's, and a driver that
+/// invents its own vocabulary for them hides what the vendor crate actually reported.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DriverError<E> {
+    /// The bus refused the transfer.
+    Bus(E),
+    /// TODO: this device's own failure modes, if it has any worth naming.
+    Protocol,
+}
+
+/// A `__DEVICE__`.
+pub struct __TYPE__<S, D> {
+    bus: S,
+    delay: D,
+}
+
+impl<S, D> __TYPE__<S, D> {
+    /// Build one over a bus and a delay.
+    pub fn new(bus: S, delay: D) -> Self {
+        Self { bus, delay }
+    }
+}
+
+impl<S, D> __TYPE__<S, D>
+where
+    S: __BUS_BOUND__,
+    D: DelayNs,
+{
+    /// TODO: what this device is for, in the terms a caller thinks in.
+    ///
+    /// TODO: if this is an I²C device, its **address** is a device fact — one board may carry two of
+    /// the same part on different addresses, which is why the constructor is where it belongs.
+    pub fn read(&mut self) -> Result<u16, DriverError<S::Error>> {
+        let _ = (&mut self.bus, &mut self.delay);
+        todo!("the __DEVICE__ protocol")
+    }
+}
+"#;
+
+/// A driver's host test: a fake bus that records, and an assertion the *board* cannot make.
+const DRIVER_TEST_RS: &str = r#"//! The `__DEVICE__` driver against a **fake bus** — no hardware.
+//!
+//! This file exists before the driver is written, and that is the point: a driver whose first real
+//! test is a board is a driver that gets debugged on a board. A fake bus records what it was given,
+//! so the protocol's **bytes** — the one thing an eye cannot check — become assertions.
+
+use core::cell::RefCell;
+use std::rc::Rc;
+
+use embedded_hal::delay::DelayNs;
+use __BUS_USE__;
+
+/// A bus that keeps what it was given, behind an `Rc` so the test can read it after the driver has
+/// taken the bus by value — which is how the driver takes it, because a bus has exactly one owner.
+#[derive(Clone, Default)]
+struct FakeBus {
+    sent: Rc<RefCell<Vec<u8>>>,
+}
+
+impl FakeBus {
+    fn sent(&self) -> Vec<u8> {
+        self.sent.borrow().clone()
+    }
+}
+
+/// TODO: implement `__BUS_USE__` for `FakeBus`. Every method records into `self.sent` and returns
+/// `Ok(())`; the recording is what the test asserts on, so none of them has to be clever.
+
+/// A delay that records instead of sleeping, so the test is instantaneous and can assert the *value*.
+#[derive(Clone, Default)]
+struct FakeDelay {
+    waited: Rc<RefCell<Vec<u32>>>,
+}
+
+impl DelayNs for FakeDelay {
+    fn delay_ns(&mut self, ns: u32) {
+        self.waited.borrow_mut().push(ns);
+    }
+}
+
+#[test]
+#[ignore = "the __DEVICE__ protocol is not written yet — the fill writes it, and removes this"]
+fn a_driver_writes_what_the_device_expects() {
+    // TODO: build the driver over the fakes, make one call, and assert the recorded bytes against
+    // the datasheet's sequence. Start with the encoding: the wire format is the protocol, and it is
+    // the part that a fake bus checks better than a board ever could.
+    todo!("assert `FakeBus::sent()` against the __DEVICE__ datasheet")
+}
+"#;
+
+/// Add a device driver to the container — **the other routine operation**.
+///
+/// The skeleton is fixed and the protocol is the fill's, so this writes the module and its host test
+/// and *registers* the module. The last part matters as much as the first two: a file the module list
+/// does not name is a file the compiler never reads, and the failure looks like "my driver does not
+/// exist" rather than a missing line.
+///
+/// It refuses rather than half-does, for the same reasons `add_bsp` does: a container with no library
+/// crate, a device that already has a driver, or a bus this scaffold does not know all stop before
+/// anything is written.
+pub(crate) fn add_driver(
+    root: &std::path::Path,
+    device: &str,
+    bus: &str,
+) -> Result<serde_json::Value, String> {
+    // Validates the bus, and refuses by name if it is one this scaffold does not know.
+    let files = driver_files(device, bus)?;
+    let id = driver_id(device);
+    let type_name = driver_type(&id);
+
+    let library = root.join("crates").join(EMBEDDED_CRATE);
+    if !library.join("Cargo.toml").is_file() {
+        return Err(format!(
+            "no `{EMBEDDED_CRATE}` library at {} — a driver belongs to the container's library, so \
+             this needs the container's directory",
+            library.display()
+        ));
+    }
+    let module_path = library.join("src/drivers").join(format!("{id}.rs"));
+    if module_path.exists() {
+        return Err(format!(
+            "device '{id}' already has a driver ({})",
+            module_path.display()
+        ));
+    }
+
+    // The module list is read before anything is written: absent is fine (it is created below),
+    // unreadable is not.
+    let list_path = library.join("src/drivers/mod.rs");
+    let existing = match std::fs::read_to_string(&list_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("cannot read {}: {e}", list_path.display())),
+    };
+
+    let mut written: Vec<String> = Vec::new();
+    for file in &files {
+        let target = root.join(&file.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&target, &file.content)
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+        written.push(file.path.clone());
+    }
+
+    let list = match existing {
+        None => format!(
+            "//! Peripheral drivers, one device per module.\n\npub mod {id};\n\n\
+             pub use {id}::{type_name};\n"
+        ),
+        Some(text) => insert_into_driver_list(&text, &id, &type_name),
+    };
+    std::fs::write(&list_path, list)
+        .map_err(|e| format!("cannot write {}: {e}", list_path.display()))?;
+
+    Ok(serde_json::json!({
+        "device": id,
+        "bus": bus,
+        "written": written,
+        "registered_in": format!("crates/{EMBEDDED_CRATE}/src/drivers/mod.rs"),
+        "note": "the protocol is a `todo!()` and the host test is ignored until the fill writes it — \
+                 the crate builds either way",
+    }))
+}
+
+/// Add a module and its re-export to a `drivers/mod.rs`, beside the others.
+///
+/// Anchored on the *last* `pub mod`/`pub use` line rather than appended to the end, so the file keeps
+/// the shape a hand-written one has — modules first, then re-exports — and so that adding two drivers
+/// in a row leaves a file that still reads like one a person wrote.
+fn insert_into_driver_list(text: &str, id: &str, type_name: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let after_last = |prefix: &str, lines: &[String]| {
+        lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with(prefix))
+            .map(|index| index + 1)
+    };
+    match after_last("pub mod ", &lines) {
+        Some(at) => lines.insert(at, format!("pub mod {id};")),
+        None => lines.push(format!("pub mod {id};")),
+    }
+    match after_last("pub use ", &lines) {
+        Some(at) => lines.insert(at, format!("pub use {id}::{type_name};")),
+        None => lines.push(format!("pub use {id}::{type_name};")),
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    updated
 }
 
 #[cfg(test)]
@@ -1324,5 +1613,99 @@ mod tests {
         // A host platform is not a board.
         let err = add_bsp(root.path(), "x86-64").unwrap_err();
         assert!(err.contains("not an embedded platform"), "{err}");
+    }
+
+    /// A container's library, with a driver already in it — the state a second add must respect.
+    fn library_on_disk(root: &Path) {
+        let library = root.join("crates").join(EMBEDDED_CRATE);
+        std::fs::create_dir_all(library.join("src/drivers")).unwrap();
+        std::fs::write(
+            library.join("Cargo.toml"),
+            "[package]\nname = \"spire-embedded\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            library.join("src/drivers/mod.rs"),
+            "//! Peripheral drivers, one device per module.\n\npub mod ws2812;\n\npub use ws2812::Ws2812;\n",
+        )
+        .unwrap();
+    }
+
+    /// A driver is added **and registered**: the module file alone would be a file the compiler never
+    /// reads, and that failure looks like the driver not existing.
+    #[test]
+    fn a_driver_is_added_and_registered_beside_the_others() {
+        let root = tempfile::tempdir().unwrap();
+        library_on_disk(root.path());
+
+        let out = add_driver(root.path(), "BME280", "i2c").expect("a sensor driver");
+        assert_eq!(out["device"], "bme280", "the name is normalized");
+        assert_eq!(out["bus"], "i2c");
+
+        let module = std::fs::read_to_string(
+            root.path()
+                .join("crates/spire-embedded/src/drivers/bme280.rs"),
+        )
+        .expect("the driver's module");
+        for expected in [
+            "use embedded_hal::i2c::I2c;",
+            "pub struct Bme280<S, D>",
+            "S: I2c,",
+            "todo!(\"the bme280 protocol\")",
+        ] {
+            assert!(module.contains(expected), "missing `{expected}`:\n{module}");
+        }
+
+        // The host test exists, is *ignored* rather than failing, and says who un-ignores it.
+        let test =
+            std::fs::read_to_string(root.path().join("crates/spire-embedded/tests/bme280.rs"))
+                .expect("the driver's test");
+        assert!(
+            test.contains("#[ignore = \"the bme280 protocol is not written yet"),
+            "{test}"
+        );
+
+        // Registered beside the existing module, modules before re-exports.
+        let list =
+            std::fs::read_to_string(root.path().join("crates/spire-embedded/src/drivers/mod.rs"))
+                .unwrap();
+        assert!(list.contains("pub mod bme280;"), "{list}");
+        assert!(list.contains("pub use bme280::Bme280;"), "{list}");
+        assert!(
+            list.find("pub mod ws2812;").unwrap() < list.find("pub mod bme280;").unwrap(),
+            "the new module joins the list rather than replacing it:\n{list}"
+        );
+        assert!(
+            list.find("pub use ws2812::Ws2812;").unwrap()
+                < list.find("pub use bme280::Bme280;").unwrap(),
+            "{list}"
+        );
+    }
+
+    /// The two refusals, both before anything is written: no library, and a bus nobody knows.
+    #[test]
+    fn a_driver_needs_a_library_and_a_known_bus() {
+        // A directory that is not a container: no library crate to add to.
+        let empty = tempfile::tempdir().unwrap();
+        container_on_disk(empty.path());
+        let err = add_driver(empty.path(), "bme280", "i2c").unwrap_err();
+        assert!(err.contains("no `spire-embedded` library at"), "{err}");
+
+        // A bus this scaffold does not know: refused by name, and the refusal says what it takes.
+        let root = tempfile::tempdir().unwrap();
+        library_on_disk(root.path());
+        let err = add_driver(root.path(), "bme280", "uart").unwrap_err();
+        assert!(
+            err.contains("'uart' is not a bus this scaffold knows"),
+            "{err}"
+        );
+        assert!(err.contains("`spi` or `i2c`"), "{err}");
+        assert!(
+            !root
+                .path()
+                .join("crates/spire-embedded/src/drivers/bme280.rs")
+                .exists(),
+            "a refused add must not leave a module behind"
+        );
     }
 }
