@@ -117,10 +117,19 @@ fn init_tracing() {
     };
     let (writer, guard) = tracing_appender::non_blocking(log_file);
     std::mem::forget(guard);
+    // Honor `RUST_LOG`, like the standalone binary, so this crate's `debug!`
+    // traces (including the full `serialize_analysis` subproject dump) can be
+    // turned on when the dylib is loaded by the app. Without it the filter is
+    // fixed at `info` and every debug trace is unreachable. The default stays
+    // `info`, matching the previous behavior.
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(
-            "info,rust_mcp_sdk::mcp_runtimes::client_runtime=off",
-        ))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info").add_directive(
+                "rust_mcp_sdk::mcp_runtimes::client_runtime=off"
+                    .parse()
+                    .expect("valid filter directive"),
+            )
+        }))
         .with_writer(writer)
         .with_ansi(false)
         .try_init();
@@ -1451,23 +1460,32 @@ pub(crate) fn serialize_analysis(
                 json
             );
         }
+        // INFO, not debug: `structure` is the key the UI gates per-shape action
+        // surfaces on (the container's board/driver actions, say), and the app's
+        // tracing filter defaults to `info` (see `init_tracing`) — so a
+        // debug-only line could never be seen where the gate actually matters.
+        // The file LIST is deliberately not logged (it reaches ~50 KB for Hal
+        // projects); only its count is.
         for sp in &subprojects {
             let name = sp.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let path = sp.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let files: Vec<&str> = sp
+            let kind = sp.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let structure = sp
+                .get("structure")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<none>");
+            let file_count = sp
                 .get("files")
                 .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|f| f.get("path").and_then(|p| p.as_str()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            tracing::debug!(
-                "serialize_analysis: subproject name={} path={} files={:?}",
+                .map(|arr| arr.len())
+                .unwrap_or(0);
+            tracing::info!(
+                "serialize_analysis: subproject name={} path={} kind={} structure={} files={}",
                 name,
                 path,
-                files
+                kind,
+                structure,
+                file_count
             );
         }
     }

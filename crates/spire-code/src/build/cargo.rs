@@ -2078,4 +2078,83 @@ mod tests {
             "the emitted marker must be what the analyzer reads"
         );
     }
+
+    /// **The container, end to end, through the serializer the UI decodes.**
+    ///
+    /// `embedded_scaffold_is_recognized_by_the_analyzer` above stops at the `BuildMetadata`, and
+    /// `serialize_analysis_tests::container_members_inherit_the_workspace_structure` proves the
+    /// *serializer* copies `structure` through — but only from a hand-built fixture. Nothing joined
+    /// them, and that unjoined seam is exactly where "the container's crate decodes as native in the
+    /// app" lived: the member crate is emitted by the workspace-member branch, which derived nothing
+    /// of its own and so reported nothing for the field the pane gates on.
+    ///
+    /// So this runs the real scaffold through the real analyzer and the real serializer, and asserts
+    /// the member crate's subproject reports `"embedded"`.
+    #[test]
+    fn a_real_container_serializes_its_member_crate_as_embedded() {
+        // A container is board-agnostic — the platform list is echoed, never looked up — so creation
+        // needs no platform registry.
+        let out = crate::build::embedded_scaffold::embedded_scaffold(
+            "spire-embedded-container",
+            &["esp32c6".to_string()],
+        )
+        .expect("the container scaffold emits");
+        let tmp = tempfile::tempdir().unwrap();
+        for f in &out.files {
+            let p = tmp.path().join(&f.path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, &f.content).unwrap();
+        }
+
+        // The REAL analyzer on the REAL bytes.
+        let mut cargo = CargoBuildModule::new()
+            .analyze(tmp.path())
+            .expect("the container analyzes");
+        // Normalize `project_path` relative to the scan root, exactly as
+        // `ProjectAnalyzerActor` does — that is what leaves the workspace root's path empty (hence
+        // skipped) and the member's `crates/<name>`.
+        if let Some(ref path) = cargo.project_path {
+            let rel = std::path::Path::new(path)
+                .strip_prefix(tmp.path())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.clone());
+            cargo.project_path = Some(rel);
+        }
+        assert_eq!(
+            cargo.structure,
+            spire_core::build_types::ProjectStructure::Embedded,
+            "the scaffold's marker must survive the analyzer"
+        );
+
+        let analysis = crate::subsystems::project::project_analyzer::ProjectAnalysis {
+            project_root: tmp.path().to_string_lossy().to_string(),
+            project_name: "spire-embedded-container".to_string(),
+            file_tree: spire_core::analyzer::models::DirectoryNode::default(),
+            build_systems: vec![cargo],
+            languages: Vec::new(),
+            directory_roles: Vec::new(),
+            file_roles: Vec::new(),
+            entry_points: Vec::new(),
+            architecture_summary: String::new(),
+            total_files: 0,
+            total_dirs: 0,
+            total_lines: 0,
+        };
+        let json = crate::ffi::serialize_analysis(&analysis);
+        let subs = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .expect("subprojects is an array");
+        let member = subs
+            .iter()
+            .find(|s| {
+                s.get("path").and_then(|v| v.as_str()) == Some("crates/spire-embedded-container")
+            })
+            .unwrap_or_else(|| panic!("the member crate is a subproject: {subs:?}"));
+        assert_eq!(
+            member.get("structure").and_then(|v| v.as_str()),
+            Some("embedded"),
+            "a container's crate must report `embedded` straight from the scaffold: {member}"
+        );
+    }
 }
