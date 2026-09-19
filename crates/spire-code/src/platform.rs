@@ -429,6 +429,37 @@ impl Platform {
         (true, String::new())
     }
 
+    /// Discover the **board** directory: `$SPIRE_BOARD_DIR` or the application-scoped
+    /// `~/.spire/<app>/boards`.
+    ///
+    /// The boards a picker offers, in the same shape as a chip entry: a board is a
+    /// `Platform` that declares the `chip:` it carries. Separate from the chips store
+    /// because the two answer different questions — "which board do I have" versus
+    /// "what does its silicon need to build" — and only the first is ever shown.
+    pub fn default_board_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("SPIRE_BOARD_DIR") {
+            if !dir.trim().is_empty() {
+                return PathBuf::from(dir);
+            }
+        }
+        spire_core::config::config_dir().join("boards")
+    }
+
+    /// Every board in the board store.
+    ///
+    /// Returns the `Result` rather than swallowing it: an *empty* store (not yet
+    /// seeded) and a store that *failed* to read are different answers, and only the
+    /// caller can decide what a missing catalogue means.
+    pub fn load_boards() -> Result<Vec<Platform>> {
+        Self::load_boards_in(Self::default_board_dir())
+    }
+
+    /// [`Self::load_boards`] against an explicit directory, so the store is testable
+    /// without the process-global `SPIRE_BOARD_DIR`.
+    pub fn load_boards_in(dir: impl AsRef<Path>) -> Result<Vec<Platform>> {
+        Self::load_directory(dir)
+    }
+
     /// Discover the **chip-facts** directory: `$SPIRE_CHIP_DIR` or the
     /// application-scoped `~/.spire/<app>/chips`.
     ///
@@ -836,6 +867,23 @@ mod tests {
         assert_eq!(hal.crate_name, "esp-hal");
         assert_eq!(hal.version, "1.2");
         assert_eq!(hal.features, vec!["esp32s3", "unstable"]);
+    }
+
+    /// The board store reads boards that declare their chip — which is the whole
+    /// conversion, expressed in one fixture.
+    #[test]
+    fn the_board_store_reads_boards_that_declare_their_chip() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "m5stack-core-s3.yaml",
+            &platform_yaml("m5stack-core-s3", "M5Stack Core S3")
+                .replace("os: linux", "os: esp-hal\nchip: esp32s3"),
+        );
+
+        let boards = Platform::load_boards_in(tmp.path()).expect("the store reads");
+        assert_eq!(boards.len(), 1);
+        assert_eq!(boards[0].chip_id(), "esp32s3");
     }
 
     /// A board's `chip:` resolves to that chip's facts, and an unknown chip is a
