@@ -103,6 +103,15 @@ pub struct Platform {
     /// way rpi5 ≠ rock3c.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
+    /// The **chip** this board carries (`esp32s3`, `rp2040`, `esp32-pico-d4`).
+    ///
+    /// Absent for a Linux SBC, whose entry *is* its board. Present on a bare-metal
+    /// board, where it selects the chip's build facts — the stock triple, the vendor
+    /// HAL, the flash tool. The registry holds **boards**, never generic silicon: this
+    /// is how a board says which silicon it is, and what `add_bsp` resolves instead of
+    /// a chip-name table in Rust.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chip: Option<String>,
     /// Rust toolchain, for targets whose build is not a C cross-compile (`os: "esp-idf"`).
     ///
     /// Absent for the C platforms, whose toolchain is [`PlatformToolchain`]. Kept separate
@@ -304,6 +313,13 @@ impl Platform {
         } else {
             PlatformKind::Board
         }
+    }
+
+    /// The chip this entry is for: the one it declares, or — for an entry that still
+    /// names silicon rather than a board — its own id, so a chip-shaped seed keeps
+    /// resolving while the store converts.
+    pub fn chip_id(&self) -> &str {
+        self.chip.as_deref().unwrap_or(&self.id)
     }
 
     /// Load a platform definition from a YAML file.
@@ -747,6 +763,37 @@ mod tests {
         assert_eq!(by_id["esp32c3"].kind(), PlatformKind::Chip);
     }
 
+    /// A board declares the chip it carries, and the declaration is what resolves.
+    ///
+    /// The fallback to the entry's own id is what lets the store convert one entry at
+    /// a time: a chip-shaped seed (`esp32c3`, no `chip:`) keeps resolving to itself
+    /// until its board names it.
+    #[test]
+    fn a_board_declares_the_chip_it_carries() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "m5stack-core-s3.yaml",
+            &platform_yaml("m5stack-core-s3", "M5Stack Core S3")
+                .replace("os: linux", "os: esp-hal\nchip: esp32s3"),
+        );
+        write_yaml(
+            tmp.path(),
+            "esp32c3.yaml",
+            &platform_yaml("esp32c3", "ESP32-C3"),
+        );
+        let all = Platform::load_directory(tmp.path()).unwrap();
+        let board = all.iter().find(|p| p.id == "m5stack-core-s3").unwrap();
+        let chip_shaped = all.iter().find(|p| p.id == "esp32c3").unwrap();
+
+        assert_eq!(board.chip_id(), "esp32s3", "the declaration wins");
+        assert_eq!(
+            chip_shaped.chip_id(),
+            "esp32c3",
+            "an entry that names silicon resolves to itself"
+        );
+    }
+
     /// The graph-held view wins, and an id it does not hold is *not* looked for in
     /// the seed — once the graph exists it is authoritative.
     ///
@@ -1065,6 +1112,7 @@ sysroot:
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
             family: None,
+            chip: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1092,6 +1140,7 @@ id: esp32c6
 name: ESP32-C6
 os: esp-idf
 family: esp32
+chip: None,
 architecture:
   cpu_family: riscv
   cpu: esp32c6
@@ -1114,6 +1163,7 @@ id: esp32s3
 name: ESP32-S3
 os: esp-idf
 family: esp32
+chip: None,
 architecture:
   cpu_family: xtensa
   cpu: esp32s3
@@ -1198,6 +1248,7 @@ rust:
                 pkg_config_libdir: Vec::new(),
             },
             family: None,
+            chip: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1228,6 +1279,7 @@ rust:
                 pkg_config_libdir: Vec::new(),
             },
             family: None,
+            chip: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1258,6 +1310,7 @@ rust:
                 pkg_config_libdir: Vec::new(),
             },
             family: None,
+            chip: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1280,6 +1333,7 @@ rust:
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
             family: None,
+            chip: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1432,6 +1486,7 @@ sysroot:
             toolchain: PlatformToolchain::default(),
             sysroot: PlatformSysroot::default(),
             family: None,
+            chip: None,
             rust: None,
             device: None,
             library_hints: None,

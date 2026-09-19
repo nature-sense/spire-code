@@ -5697,6 +5697,7 @@ mod platform_listing_tests {
             sysroot: Default::default(),
             device: None,
             family: Some("x".into()),
+            chip: None,
             rust: None,
             library_hints: Some("the board's own notes".into()),
         }

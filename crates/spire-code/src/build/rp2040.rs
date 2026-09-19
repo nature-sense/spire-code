@@ -563,6 +563,7 @@ mod tests {
             sysroot: PlatformSysroot::default(),
             device: None,
             family: Some("rp2040".into()),
+            chip: None,
             rust: Some(PlatformRust {
                 target: triple.to_string(),
                 idf_target: Some("RP2040".to_string()),

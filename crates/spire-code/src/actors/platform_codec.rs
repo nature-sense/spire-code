@@ -104,6 +104,11 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
     if let Some(hints) = &p.library_hints {
         props.insert("library_hints".into(), serde_json::json!(hints));
     }
+    // The board's chip travels with it, so a graph round-trip cannot lose the
+    // declaration and silently fall back to deriving one.
+    if let Some(chip) = &p.chip {
+        props.insert("chip".into(), serde_json::json!(chip));
+    }
 
     serde_json::json!({
         "id": p.id,
@@ -189,6 +194,7 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
             }
         },
         family: get_opt("family"),
+        chip: get_opt("chip"),
         // An empty `rust_target` means "no Rust toolchain", not a platform with a blank
         // one — the `device` block above follows the same rule.
         rust: {
@@ -227,6 +233,7 @@ mod tests {
             sysroot: PlatformSysroot::default(),
             device: None,
             family: Some("esp32".into()),
+            chip: None,
             rust: Some(PlatformRust {
                 target: "riscv32imac-esp-espidf".into(),
                 idf_target: Some("esp32c6".into()),
@@ -254,6 +261,7 @@ mod tests {
             sysroot: PlatformSysroot::default(),
             device: None,
             family: None,
+            chip: None,
             rust: None,
             library_hints: None,
         }
