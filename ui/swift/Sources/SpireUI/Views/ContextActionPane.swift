@@ -133,21 +133,26 @@ struct ContextActionPane: View {
             if sub.buildSystem == "Cargo" {
                 dependencyCard
             }
-            // A container is *grown*, not configured: the framework is scaffolded once, and everything
-            // after it is one board's BSP or one device's driver. So the surface is those two
-            // operations, on the project they belong to.
-            if sub.structure == "embedded" {
-                actionCard(title: "Container",
-                           subtitle: "Add a board's BSP, or a device driver",
-                           icon: "square.stack.3d.up",
-                           accent: theme.surface) {
-                    showingContainer = true
-                }
-                .sheet(isPresented: $showingContainer) {
-                    EmbeddedContainerSheet(projectRoot: project.root)
-                        .environment(bridge)
-                        .environment(theme)
-                }
+        }
+
+        // A container is *grown*, not configured: the framework is scaffolded once, and everything
+        // after it is one board's BSP or one device's driver. The surface is those two operations,
+        // and it belongs to the PROJECT they act on (`project.root`) — not to whichever node happens
+        // to be selected. Gating it on the *selection's* structure is what made the actions appear
+        // and vanish as the user clicked around: the pane's default selection, a clicked crate, and
+        // a clicked directory are three different nodes, and only some of them decode `embedded`.
+        // So the gate is the project's shape, which is a fact about the project.
+        if project.subprojects.contains(where: { $0.structure == "embedded" }) {
+            actionCard(title: "Container",
+                       subtitle: "Add a board's BSP, or a device driver",
+                       icon: "square.stack.3d.up",
+                       accent: theme.surface) {
+                showingContainer = true
+            }
+            .sheet(isPresented: $showingContainer) {
+                EmbeddedContainerSheet(projectRoot: project.root)
+                    .environment(bridge)
+                    .environment(theme)
             }
         }
 

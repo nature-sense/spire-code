@@ -306,7 +306,8 @@ final class SpireBridge {
             // This is the REFRESH / menu path — the dashboard is loaded here.
             NSLog("[Bridge] fetchProjectAnalysis root=%@ subprojects=%d", decoded.root, decoded.subprojects.count)
             for s in decoded.subprojects {
-                NSLog("[Bridge]   sub=%@ path=%@ files=%d", s.name, s.path, s.files?.count ?? -1)
+                NSLog("[Bridge]   sub=%@ path=%@ kind=%@ structure=%@ files=%d",
+                      s.name, s.path, s.kind.rawValue, s.structure, s.files?.count ?? -1)
             }
             let resolvedRoot = decoded.root
             await MainActor.run {
@@ -353,11 +354,21 @@ final class SpireBridge {
             // subproject pipeline can be localized (decode drop vs render).
             NSLog("[Bridge] openProject root=%@ subprojects=%d", decoded.root, decoded.subprojects.count)
             for s in decoded.subprojects {
-                NSLog("[Bridge]   sub=%@ path=%@ files=%d", s.name, s.path, s.files?.count ?? -1)
+                NSLog("[Bridge]   sub=%@ path=%@ kind=%@ structure=%@ files=%d",
+                      s.name, s.path, s.kind.rawValue, s.structure, s.files?.count ?? -1)
             }
             await MainActor.run {
                 self.projectRoot = decoded.root
                 currentMode = .project
+                // A freshly opened project starts with nothing selected. Without
+                // this, a subproject selected in the PREVIOUS project stays
+                // selected, and the right pane — which gates per-structure
+                // actions on the selection — keeps rendering the old project's
+                // actions for the new one. `closeProject` cleared these; opening
+                // a second project in the same session did not.
+                selectedSubproject = nil
+                selectedBuildTarget = nil
+                selectedDomain = nil
                 RecentProject.record(path: decoded.root, name: decoded.name)
                 recentProjects = RecentProject.load()
                 NSLog("[OpenTiming] .idle state set after %.3fs total", Date().timeIntervalSince(t0))
