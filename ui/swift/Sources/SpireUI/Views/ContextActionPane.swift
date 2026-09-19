@@ -19,6 +19,8 @@ struct ContextActionPane: View {
 
     /// Presents the HAL workflow (propose → approve → add target) as a sheet.
     @State private var showingHALWorkflow = false
+    /// Growing the container: a BSP for a board, or a driver for a device.
+    @State private var showingContainer = false
     /// HAL viewer: documentation + verification are separate floating dialogs.
     @State private var showingHALDocs = false
     @State private var showingHALVerify = false
@@ -130,6 +132,22 @@ struct ContextActionPane: View {
             }
             if sub.buildSystem == "Cargo" {
                 dependencyCard
+            }
+            // A container is *grown*, not configured: the framework is scaffolded once, and everything
+            // after it is one board's BSP or one device's driver. So the surface is those two
+            // operations, on the project they belong to.
+            if sub.structure == "embedded" {
+                actionCard(title: "Container",
+                           subtitle: "Add a board's BSP, or a device driver",
+                           icon: "square.stack.3d.up",
+                           accent: theme.surface) {
+                    showingContainer = true
+                }
+                .sheet(isPresented: $showingContainer) {
+                    EmbeddedContainerSheet(projectRoot: project.root)
+                        .environment(bridge)
+                        .environment(theme)
+                }
             }
         }
 

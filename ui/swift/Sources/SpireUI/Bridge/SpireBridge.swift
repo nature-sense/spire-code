@@ -1541,6 +1541,44 @@ final class SpireBridge {
         return (interfaces, placeholders, nil)
     }
 
+    /// Add a board's **BSP** to a container: the board's own facts — which pin its LED is on, whether
+    /// it is active-low, which bus its display is on — emitted as *typed* `todo!()`s, plus the
+    /// workspace member that makes the crate exist. Typed, so the container and every application
+    /// built against it compile and link before the pins are known.
+    ///
+    /// The container's framework is scaffolded once; a BSP is added as required, for a board with no
+    /// upstream BSP. The refusals are the tool's and arrive as `error`: an unknown platform, a
+    /// platform that is not a board, a chip with no vendor-crate row, and a board that already has a
+    /// BSP — that last one is the guard against a second click forking the crate.
+    func embeddedAddBsp(root: String, board: String) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool("embedded_add_bsp", args: ["root": root, "board": board]) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
+    /// Add a **device driver** to a container: the bus-generic module and a host test that proves it
+    /// against a fake bus recording. The *protocol* is the fill's; the skeleton is generic over
+    /// `embedded-hal`'s traits, so the same driver runs on any board — and on a host fake.
+    ///
+    /// `bus` is a device fact and the tool validates it: `spi` or `i2c`, because a driver written for
+    /// the wrong one never compiles.
+    func embeddedAddDriver(root: String, device: String, bus: String) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "embedded_add_driver",
+            args: ["root": root, "device": device, "bus": bus]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
     /// Project-level "add platform": scaffold a FULL new platform target into
     /// an existing HAL project — <plat>/ (meson.build + main.cpp) templated from
     /// an existing platform, per-contract `SPIRE-HAL-STUB` placeholders,
