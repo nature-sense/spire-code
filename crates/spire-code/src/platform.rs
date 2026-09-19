@@ -298,6 +298,24 @@ impl Platform {
         matches!(self.os.as_str(), "esp-idf" | "esp-hal" | "rp2040")
     }
 
+    /// The build facts for a chip id, from the chip store.
+    ///
+    /// `None` when the chip is unknown, which is a **refusal, not a default**: a board
+    /// naming a chip nobody has described cannot be built, and inventing a triple is
+    /// how you build for the wrong silicon.
+    pub fn chip_facts(id: &str) -> Option<Platform> {
+        Self::chip_facts_in(Self::default_chip_dir(), id)
+    }
+
+    /// [`Self::chip_facts`] against an explicit directory, so the lookup is testable
+    /// without the process-global `SPIRE_CHIP_DIR`.
+    pub fn chip_facts_in(dir: impl AsRef<Path>, id: &str) -> Option<Platform> {
+        Self::load_directory(dir)
+            .ok()?
+            .into_iter()
+            .find(|chip| chip.id == id)
+    }
+
     /// Which kind of thing this entry names — the axis the platforms list groups by.
     ///
     /// The inverse of [`Self::is_embedded`], and deliberately the *only* rule: an
@@ -386,6 +404,21 @@ impl Platform {
             );
         }
         (true, String::new())
+    }
+
+    /// Discover the **chip-facts** directory: `$SPIRE_CHIP_DIR` or the
+    /// application-scoped `~/.spire/<app>/chips`.
+    ///
+    /// A board declares `chip:`; this is where that id's build facts live — the stock
+    /// triple, the vendor HAL, the flash tool. Separate from the board list because a
+    /// chip is not a thing a picker offers: it is what a board *is*.
+    pub fn default_chip_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("SPIRE_CHIP_DIR") {
+            if !dir.trim().is_empty() {
+                return PathBuf::from(dir);
+            }
+        }
+        spire_core::config::config_dir().join("chips")
     }
 
     /// Discover the seed platform directory: `$SPIRE_PLATFORM_DIR` (for
@@ -761,6 +794,30 @@ mod tests {
 
         assert_eq!(by_id["rpi5"].kind(), PlatformKind::Board);
         assert_eq!(by_id["esp32c3"].kind(), PlatformKind::Chip);
+    }
+
+    /// A board's `chip:` resolves to that chip's facts, and an unknown chip is a
+    ///**refusal** rather than a guess.
+    ///
+    /// `chip_facts_in` takes the store explicitly, so this needs no `SPIRE_CHIP_DIR`
+    /// guard and cannot leak into a parallel test.
+    #[test]
+    fn a_chips_facts_resolve_by_id_and_an_unknown_chip_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "esp32s3.yaml",
+            &platform_yaml("esp32s3", "ESP32-S3").replace("os: linux", "os: esp-hal"),
+        );
+
+        let facts = Platform::chip_facts_in(tmp.path(), "esp32s3").expect("the chip resolves");
+        assert_eq!(facts.id, "esp32s3");
+        assert!(facts.is_embedded(), "a chip is bare-metal");
+        assert_eq!(facts.chip_id(), "esp32s3", "a chip resolves to itself");
+        assert!(
+            Platform::chip_facts_in(tmp.path(), "esp32c9").is_none(),
+            "an unknown chip is a refusal, not a guessed triple"
+        );
     }
 
     /// A board declares the chip it carries, and the declaration is what resolves.
