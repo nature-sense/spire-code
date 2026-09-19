@@ -4666,11 +4666,11 @@ impl CoordinatorActor {
             .unwrap_or_default();
 
         let (structure, embedded) = Self::params_structure_embedded(params);
-        // Where the embedded-HAL project an application depends on lives, when the wizard's picker
+        // Where the container an application depends on lives, when the wizard's picker
         // supplied one. Absent for every other structure — and an application without it is refused
         // downstream by name, rather than scaffolded against nothing.
-        let hal_root = params
-            .get("halRoot")
+        let embedded_root = params
+            .get("embeddedRoot")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -4687,7 +4687,7 @@ impl CoordinatorActor {
                     language,
                     platforms,
                     structure,
-                    hal_root,
+                    embedded_root,
                     embedded,
                     reply_to: t,
                 })
@@ -4743,8 +4743,8 @@ impl CoordinatorActor {
         let (structure, embedded) = Self::params_structure_embedded(params);
         // The HAL directory an application depends on — the plan *is* its scaffold (see
         // `embedded_app_template_plan`), so this matters here and not only at write time.
-        let hal_root = params
-            .get("halRoot")
+        let embedded_root = params
+            .get("embeddedRoot")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -4761,7 +4761,7 @@ impl CoordinatorActor {
                     language,
                     platforms,
                     structure,
-                    hal_root,
+                    embedded_root,
                     embedded,
                     reply_to: t,
                 })
@@ -4824,8 +4824,8 @@ impl CoordinatorActor {
             .unwrap_or(true);
         // The HAL directory an application depends on: out of the registry for a HAL project, out of
         // a *sibling* project for an application. See the plan handler for the same field.
-        let hal_root = params
-            .get("halRoot")
+        let embedded_root = params
+            .get("embeddedRoot")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -4842,7 +4842,7 @@ impl CoordinatorActor {
                     language,
                     platforms,
                     structure,
-                    hal_root,
+                    embedded_root,
                     embedded,
                     reply_to: t,
                 })
@@ -5653,7 +5653,7 @@ impl CoordinatorActor {
 /// `embedded` is `Platform::is_embedded()` **sent** rather than recomputed by the client: the rule
 /// is `os`, which is what the build itself keys on, and a second copy of it in another language
 /// could only ever disagree with the first. The create-project wizard filters its platform list on
-/// this flag, so an embedded-HAL project can never be offered a Linux cross-target.
+/// this flag, so an embedded project can never be offered a Linux cross-target.
 #[derive(serde::Serialize)]
 struct PlatformListing<'a> {
     #[serde(flatten)]

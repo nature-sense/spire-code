@@ -1559,3 +1559,16 @@ implements it, a drift measure that scores it — existed to make a *contract* o
 ecosystem had already standardised. Adopting the standard deletes the bottom layer and leaves the two
 things that were actually ours: the actor model, and the board.
 
+
+**Renamed, and re-shaped: the "HAL" an application depends on is a *container*.** The
+`EmbeddedHal` structure became `Embedded` (the `spire-embedded` container: the actor framework, the
+peripheral drivers, a BSP crate per board), so the argument that names it was renamed with it. The
+wire field is **`embeddedRoot`** (was `halRoot`) and the Rust parameter `embedded_root` (was
+`hal_root`), on the same three tools (`createProject/GeneratePlan`, `/Plan` and `/Scaffold`). The
+refusal an application without it gets now says so: *"an embedded application needs the container it
+depends on: pass `embeddedRoot`"* — so a UI still sending `halRoot` fails by name rather than being
+scaffolded against nothing.
+
+The same rename dropped the phrase "embedded-HAL project" from the docs: it named a shape that no
+longer exists (a contract crate implementing our own traits). What an application path-deps is the
+container's library crate, `crates/<project>`.
