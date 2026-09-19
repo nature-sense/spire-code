@@ -762,11 +762,31 @@ pub(crate) fn bsp_crate(platform_id: &str) -> String {
     format!("spire-bsp-{platform_id}")
 }
 
-/// The container's library crate — the actor framework, the drivers and the executors.
+/// The container's library crate **name** — the crate the driver modules live in.
 ///
-/// **One name, not one per project.** The container is a singleton: applications of this family are
-/// built against it, and each names it by this same string wherever it lives.
-const EMBEDDED_CRATE: &str = "spire-embedded";
+/// Named **after the project**, which is what makes it relative rather than fixed: our container is
+/// the project `spire-embedded` holding `crates/spire-embedded`, and a container named
+/// `weather-embedded` holds `crates/weather-embedded`. `spire-embedded` is the name of *one* project,
+/// not a crate id every container shares, so it is read from the directory the caller passed.
+///
+/// Refuses rather than guessing when there is nothing there: a driver written into a directory that
+/// does not exist would be a file no compiler reads, and the failure would look like a missing module.
+fn container_crate(root: &std::path::Path) -> Result<String, String> {
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("cannot read a project name from {}", root.display()))?;
+    let dir = format!("crates/{name}");
+    if !root.join(&dir).join("Cargo.toml").is_file() {
+        return Err(format!(
+            "no container library at {} — the container's crate is named after its project, so \
+             '{dir}' is what this expects",
+            root.join(&dir).display()
+        ));
+    }
+    Ok(name)
+}
 
 /// The vendor crate a board's BSP wraps, and the version to ask for.
 ///
@@ -786,6 +806,7 @@ fn vendor_for(platform_id: &str) -> Option<(&'static str, &'static str, &'static
 
 /// A board's BSP: two files, one of which is the fill's.
 pub(crate) fn bsp_files(
+    container: &str,
     platform_id: &str,
     vendor: &str,
     vendor_version: &str,
@@ -808,7 +829,8 @@ pub(crate) fn bsp_files(
         .replace("__CHIP__", platform_id)
         .replace("__VENDOR__", vendor)
         .replace("__VENDOR_VERSION__", vendor_version)
-        .replace("__FEATURES__", &features);
+        .replace("__FEATURES__", &features)
+        .replace("__CONTAINER__", container);
     vec![
         super::ScaffoldFile {
             path: format!("crates/{name}/Cargo.toml"),
@@ -852,8 +874,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# The actor system and the peripherals module, for the trait names this crate's signatures use.
-spire-embedded = { path = "../spire-embedded" }
+# The actor system and the peripherals module, for the trait names this crate's signatures use. The
+# container's crate is named after its project, so this is a sibling of it under `crates/`.
+__CONTAINER__ = { path = "../__CONTAINER__" }
 # The vendor HAL: the only crate here that knows a chip, and the crate the feature selects. The features
 # are the chip, plus whatever this board's facts ask of the vendor — `unstable`, here, because a delay
 # lives behind it and this crate's second job is a delay.
@@ -946,6 +969,9 @@ pub(crate) fn add_bsp(
     })?;
 
     let name = bsp_crate(platform_id);
+    // The container this BSP is a sibling of, named after its project — refused here, before anything is
+    // written, because the BSP's manifest path-deps that crate.
+    let container = container_crate(root)?;
     let crate_dir = root.join("crates").join(&name);
     if crate_dir.exists() {
         return Err(format!(
@@ -972,7 +998,7 @@ pub(crate) fn add_bsp(
     }
     let updated = with_workspace_member(&manifest, &member)?;
 
-    let files = bsp_files(platform_id, vendor, version, features);
+    let files = bsp_files(&container, platform_id, vendor, version, features);
     let mut written: Vec<String> = Vec::new();
     for file in &files {
         let target = root.join(&file.path);
@@ -1089,7 +1115,11 @@ fn driver_type(id: &str) -> String {
 /// Both are fillable — the *protocol* is the thing no scaffold can know — and the role is `Shared`
 /// rather than a HAL role: a driver is code every board of the family uses, not one board's
 /// implementation of anything.
-pub(crate) fn driver_files(device: &str, bus: &str) -> Result<Vec<super::ScaffoldFile>, String> {
+pub(crate) fn driver_files(
+    container_dir: &str,
+    device: &str,
+    bus: &str,
+) -> Result<Vec<super::ScaffoldFile>, String> {
     let (bound, use_path, bus_name) = driver_bus(bus).ok_or_else(|| {
         format!(
             "'{bus}' is not a bus this scaffold knows — pass `spi` or `i2c`, because a device's bus \
@@ -1110,13 +1140,13 @@ pub(crate) fn driver_files(device: &str, bus: &str) -> Result<Vec<super::Scaffol
 
     Ok(vec![
         super::ScaffoldFile {
-            path: format!("crates/spire-embedded/src/drivers/{id}.rs"),
+            path: format!("{container_dir}/src/drivers/{id}.rs"),
             content: fill(DRIVER_RS),
             structural: false,
             fill_role: Some(spire_core::build_types::SourceRole::Shared),
         },
         super::ScaffoldFile {
-            path: format!("crates/spire-embedded/tests/{id}.rs"),
+            path: format!("{container_dir}/tests/{id}.rs"),
             content: fill(DRIVER_TEST_RS),
             structural: false,
             fill_role: Some(spire_core::build_types::SourceRole::Shared),
@@ -1247,19 +1277,16 @@ pub(crate) fn add_driver(
     device: &str,
     bus: &str,
 ) -> Result<serde_json::Value, String> {
+    // The container's crate — named after its project — read and refused here, before anything is
+    // written: a driver written into a crate that is not there is a module no compiler reads.
+    let container = container_crate(root)?;
+    let container_dir = format!("crates/{container}");
     // Validates the bus, and refuses by name if it is one this scaffold does not know.
-    let files = driver_files(device, bus)?;
+    let files = driver_files(&container_dir, device, bus)?;
     let id = driver_id(device);
     let type_name = driver_type(&id);
 
-    let library = root.join("crates").join(EMBEDDED_CRATE);
-    if !library.join("Cargo.toml").is_file() {
-        return Err(format!(
-            "no `{EMBEDDED_CRATE}` library at {} — a driver belongs to the container's library, so \
-             this needs the container's directory",
-            library.display()
-        ));
-    }
+    let library = root.join(&container_dir);
     let module_path = library.join("src/drivers").join(format!("{id}.rs"));
     if module_path.exists() {
         return Err(format!(
@@ -1303,7 +1330,7 @@ pub(crate) fn add_driver(
         "device": id,
         "bus": bus,
         "written": written,
-        "registered_in": format!("crates/{EMBEDDED_CRATE}/src/drivers/mod.rs"),
+        "registered_in": format!("crates/{container}/src/drivers/mod.rs"),
         "note": "the protocol is a `todo!()` and the host test is ignored until the fill writes it — \
                  the crate builds either way",
     }))
@@ -1566,14 +1593,29 @@ mod tests {
         println!("{}", root.display());
     }
 
-    /// A container on disk: a workspace manifest with a members list, one member per line.
+    /// The container's crate, relative to `root`, as the derivation names it: after the project.
+    ///
+    /// A temporary directory's own name — deliberately **not** `spire-embedded`. That name belongs to one
+    /// project, and a fixture that reused it would pass while every other container's crate was looked
+    /// for in the wrong place.
+    fn container_dir(root: &Path) -> String {
+        format!("crates/{}", root.file_name().unwrap().to_string_lossy())
+    }
+
+    /// A container on disk: a workspace manifest with a members list, one member per line, and the library
+    /// crate that member names — because the add-operations require it to be there.
     fn container_on_disk(root: &Path) -> PathBuf {
+        let member = container_dir(root);
+        let name = member.trim_start_matches("crates/");
         std::fs::write(
             root.join("Cargo.toml"),
-            "[workspace]\nresolver = \"2\"\n# One crate, and it is host-checkable.\nmembers = [\n    \"crates/spire-embedded\",\n]\n\
-             \n[workspace.metadata.spire]\nstructure = \"embedded\"\n",
+            format!(
+                "[workspace]\nresolver = \"2\"\n# One crate, and it is host-checkable.\nmembers = [\n    \
+                 \"{member}\",\n]\n\n[workspace.metadata.spire]\nstructure = \"embedded\"\n"
+            ),
         )
         .unwrap();
+        create_library(root, &member, name);
         root.join("Cargo.toml")
     }
 
@@ -1585,14 +1627,30 @@ mod tests {
     /// then refused to read the container's own manifest, and nothing in the fixture's shape could have
     /// shown that.
     fn container_on_disk_inline(root: &Path) -> PathBuf {
+        let member = container_dir(root);
+        let name = member.trim_start_matches("crates/");
         std::fs::write(
             root.join("Cargo.toml"),
-            "# A container with its crate set on one line.\n[workspace]\nresolver = \"2\"\n\
-             members = [\"crates/spire-embedded\"]\n\n[workspace.package]\nversion = \"0.1.0\"\n\
-             edition = \"2021\"\n",
+            format!(
+                "# A container with its crate set on one line.\n[workspace]\nresolver = \"2\"\n\
+                 members = [\"{member}\"]\n\n[workspace.package]\nversion = \"0.1.0\"\n\
+                 edition = \"2021\"\n"
+            ),
         )
         .unwrap();
+        create_library(root, &member, name);
         root.join("Cargo.toml")
+    }
+
+    /// The library crate a container's workspace member names.
+    fn create_library(root: &Path, member: &str, name: &str) {
+        let library = root.join(member);
+        std::fs::create_dir_all(library.join("src/drivers")).unwrap();
+        std::fs::write(
+            library.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\n"),
+        )
+        .unwrap();
     }
 
     /// **The routine operation**: a board's BSP, added to an existing container.
@@ -1632,9 +1690,13 @@ mod tests {
         let manifest =
             std::fs::read_to_string(root.path().join("crates/spire-bsp-esp32c3/Cargo.toml"))
                 .expect("the BSP's manifest");
+        // The BSP path-deps the container's own crate — named after the project, not after ours.
+        let member = container_dir(root.path());
+        let container = member.trim_start_matches("crates/");
+        let container_dep = format!("{container} = {{ path = \"../{container}\" }}");
         for expected in [
             "name = \"spire-bsp-esp32c3\"",
-            "spire-embedded = { path = \"../spire-embedded\" }",
+            container_dep.as_str(),
             // The chip **and** `unstable`, not the chip alone: pinning the feature list as it was is what
             // let a BSP that cannot see `esp_hal::delay` pass every host test it had.
             "esp-hal = { version = \"1.2\", features = [\"esp32c3\", \"unstable\"] }",
@@ -1651,7 +1713,7 @@ mod tests {
         assert_eq!(
             workspace_members(&after).expect("the edited manifest still parses"),
             vec![
-                "crates/spire-embedded".to_string(),
+                container_dir(root.path()),
                 "crates/spire-bsp-esp32c3".to_string()
             ],
             "the members stay one list:\n{after}"
@@ -1688,7 +1750,7 @@ mod tests {
         assert_eq!(
             workspace_members(&after).expect("the edited manifest still parses"),
             vec![
-                "crates/spire-embedded".to_string(),
+                container_dir(root.path()),
                 "crates/spire-bsp-esp32c3".to_string()
             ],
             "the member goes into the list, wherever the list is:\n{after}"
@@ -1753,15 +1815,10 @@ mod tests {
 
     /// A container's library, with a driver already in it — the state a second add must respect.
     fn library_on_disk(root: &Path) {
-        let library = root.join("crates").join(EMBEDDED_CRATE);
-        std::fs::create_dir_all(library.join("src/drivers")).unwrap();
+        let member = container_dir(root);
+        create_library(root, &member, member.trim_start_matches("crates/"));
         std::fs::write(
-            library.join("Cargo.toml"),
-            "[package]\nname = \"spire-embedded\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            library.join("src/drivers/mod.rs"),
+            root.join(&member).join("src/drivers/mod.rs"),
             "//! Peripheral drivers, one device per module.\n\npub mod ws2812;\n\npub use ws2812::Ws2812;\n",
         )
         .unwrap();
@@ -1778,11 +1835,10 @@ mod tests {
         assert_eq!(out["device"], "bme280", "the name is normalized");
         assert_eq!(out["bus"], "i2c");
 
-        let module = std::fs::read_to_string(
-            root.path()
-                .join("crates/spire-embedded/src/drivers/bme280.rs"),
-        )
-        .expect("the driver's module");
+        let container = container_dir(root.path());
+        let module =
+            std::fs::read_to_string(root.path().join(&container).join("src/drivers/bme280.rs"))
+                .expect("the driver's module");
         for expected in [
             "use embedded_hal::i2c::I2c;",
             "pub struct Bme280<S, D>",
@@ -1793,18 +1849,16 @@ mod tests {
         }
 
         // The host test exists, is *ignored* rather than failing, and says who un-ignores it.
-        let test =
-            std::fs::read_to_string(root.path().join("crates/spire-embedded/tests/bme280.rs"))
-                .expect("the driver's test");
+        let test = std::fs::read_to_string(root.path().join(&container).join("tests/bme280.rs"))
+            .expect("the driver's test");
         assert!(
             test.contains("#[ignore = \"the bme280 protocol is not written yet"),
             "{test}"
         );
 
         // Registered beside the existing module, modules before re-exports.
-        let list =
-            std::fs::read_to_string(root.path().join("crates/spire-embedded/src/drivers/mod.rs"))
-                .unwrap();
+        let list = std::fs::read_to_string(root.path().join(&container).join("src/drivers/mod.rs"))
+            .unwrap();
         assert!(list.contains("pub mod bme280;"), "{list}");
         assert!(list.contains("pub use bme280::Bme280;"), "{list}");
         assert!(
@@ -1821,11 +1875,15 @@ mod tests {
     /// The two refusals, both before anything is written: no library, and a bus nobody knows.
     #[test]
     fn a_driver_needs_a_library_and_a_known_bus() {
-        // A directory that is not a container: no library crate to add to.
+        // A container-shaped directory whose library crate is missing: nothing to add a driver to.
         let empty = tempfile::tempdir().unwrap();
-        container_on_disk(empty.path());
+        std::fs::write(
+            empty.path().join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = []\n",
+        )
+        .unwrap();
         let err = add_driver(empty.path(), "bme280", "i2c").unwrap_err();
-        assert!(err.contains("no `spire-embedded` library at"), "{err}");
+        assert!(err.contains("no container library at"), "{err}");
 
         // A bus this scaffold does not know: refused by name, and the refusal says what it takes.
         let root = tempfile::tempdir().unwrap();
@@ -1839,7 +1897,8 @@ mod tests {
         assert!(
             !root
                 .path()
-                .join("crates/spire-embedded/src/drivers/bme280.rs")
+                .join(container_dir(root.path()))
+                .join("src/drivers/bme280.rs")
                 .exists(),
             "a refused add must not leave a module behind"
         );
@@ -1875,13 +1934,17 @@ mod tests {
             return;
         };
 
+        // The copy keeps the container's **directory name**, because that name *is* the project name and
+        // the library crate is named after the project. A copy at a random temp path is a container whose
+        // crate is nowhere — which is what the first run of this test reported.
         let work = tempfile::tempdir().unwrap();
-        copy_sources(&source, work.path());
-        add_bsp(work.path(), "esp32c3").expect("a BSP for the pilot board");
+        let root = work.path().join(source.file_name().unwrap());
+        copy_sources(&source, &root);
+        add_bsp(&root, "esp32c3").expect("a BSP for the pilot board");
 
         let toolchain = stable_toolchain();
         let output = cargo_in(
-            work.path(),
+            &root,
             toolchain.as_ref(),
             &[
                 "build",
@@ -1898,9 +1961,8 @@ mod tests {
         );
 
         // Linked, not merely compiled: the `.rlib` is the artifact a dependent crate would get.
-        let artifact = work
-            .path()
-            .join("target/riscv32imc-unknown-none-elf/debug/libspire_bsp_esp32c3.rlib");
+        let artifact =
+            root.join("target/riscv32imc-unknown-none-elf/debug/libspire_bsp_esp32c3.rlib");
         let size = std::fs::metadata(&artifact)
             .map(|meta| meta.len())
             .unwrap_or_default();
@@ -1940,20 +2002,25 @@ mod tests {
             return;
         };
 
+        // The copy keeps the container's directory name — the project name the crate is named after.
         let work = tempfile::tempdir().unwrap();
-        copy_sources(&source, work.path());
-        add_driver(work.path(), "bme280", "i2c").expect("a driver for an i2c device");
+        let root = work.path().join(source.file_name().unwrap());
+        copy_sources(&source, &root);
+        add_driver(&root, "bme280", "i2c").expect("a driver for an i2c device");
+        // The copied container's crate, by the same derivation the add used. It is `spire-embedded` here
+        // because that is *this* container's project name — not because the name is fixed.
+        let container = container_crate(&root).expect("the copied container's crate");
 
         let toolchain = stable_toolchain();
         // The module the emitter registered is a module the compiler actually reads — including the
         // `pub use` line beside it, which names the type it re-exports.
         let chip = cargo_in(
-            work.path(),
+            &root,
             toolchain.as_ref(),
             &[
                 "build",
                 "-p",
-                "spire-embedded",
+                container.as_str(),
                 "--target",
                 "riscv32imc-unknown-none-elf",
             ],
@@ -1966,9 +2033,9 @@ mod tests {
 
         // And the emitted *test* compiles, on the host, where a test can run at all.
         let host = cargo_in(
-            work.path(),
+            &root,
             toolchain.as_ref(),
-            &["test", "-p", "spire-embedded", "--no-run"],
+            &["test", "-p", container.as_str(), "--no-run"],
         );
         assert!(
             host.status.success(),
@@ -1978,9 +2045,10 @@ mod tests {
 
         // Exit status is not evidence: cargo can succeed without building anything, and a test that only
         // checks a status cannot tell that from a real compile. The artifacts can.
-        let rlib = work
-            .path()
-            .join("target/riscv32imc-unknown-none-elf/debug/libspire_embedded.rlib");
+        let rlib = root.join(format!(
+            "target/riscv32imc-unknown-none-elf/debug/lib{}.rlib",
+            container.replace('-', "_")
+        ));
         let size = std::fs::metadata(&rlib)
             .map(|meta| meta.len())
             .unwrap_or_default();
@@ -1991,7 +2059,7 @@ mod tests {
         );
 
         // The driver's test binary: the file `cargo build` never reads, compiled because it is a test.
-        let deps = work.path().join("target/debug/deps");
+        let deps = root.join("target/debug/deps");
         let bme280: Vec<String> = std::fs::read_dir(&deps)
             .map(|entries| {
                 entries
@@ -2016,6 +2084,7 @@ mod tests {
 
     /// Copy a container's sources, skipping what a build regenerates or git owns.
     fn copy_sources(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap().flatten() {
             let name = entry.file_name();
             let text = name.to_string_lossy();
@@ -2044,9 +2113,9 @@ mod tests {
             .unwrap_or_else(|_| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spire-embedded")
             });
-        if !source.join("crates/spire-embedded/Cargo.toml").is_file() {
+        if container_crate(&source).is_err() {
             println!(
-                "no spire-embedded container at {} — set SPIRE_EMBEDDED_ROOT to build this",
+                "no container checkout at {} — set SPIRE_EMBEDDED_ROOT to build this",
                 source.display()
             );
             return None;

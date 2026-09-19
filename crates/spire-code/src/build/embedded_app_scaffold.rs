@@ -35,6 +35,7 @@
 
 use spire_core::build_types::ProjectStructure;
 use std::path::Path;
+use toml_edit::DocumentMut;
 
 /// The app-side facts for one **chip** — the board half of a build.
 ///
@@ -108,21 +109,53 @@ fn marker(embedded_path: &str) -> String {
     )
 }
 
-/// Where `spire-embedded` lives inside its workspace.
-const EMBEDDED_CRATE: &str = "crates/spire-embedded";
-
-/// The crate directory to path-depend on, given a checkout root — or the crate itself.
+/// The container's crate, from a checkout root — or from the crate itself.
 ///
-/// Both are accepted, because both are things a user reasonably points at: the repository they cloned,
-/// or the crate inside it.
-fn embedded_crate_dir(root: &Path) -> Option<String> {
-    if root.join(EMBEDDED_CRATE).join("Cargo.toml").is_file() {
-        return Some(EMBEDDED_CRATE.to_string());
+/// Returns the crate's **name** and the directory to path-depend on *relative to the checkout*, which is
+/// empty when the caller pointed straight at the crate. Both are accepted because both are things a user
+/// reasonably points at: the repository they cloned, or the crate inside it.
+///
+/// The name is **read, not assumed**. The container's library crate is named after its project —
+/// `spire-embedded/` holds `crates/spire-embedded`, and a container called `weather-embedded` holds
+/// `crates/weather-embedded` — so `spire-embedded` is the name of one project rather than a crate id
+/// every container shares. An application that path-deps a crate that is not there builds nowhere.
+fn embedded_crate(root: &Path) -> Result<(String, String), String> {
+    let manifest_path = root.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    let doc: DocumentMut = manifest
+        .parse()
+        .map_err(|e| format!("{} does not parse: {e}", manifest_path.display()))?;
+
+    // A package, not a workspace: the crate itself was pointed at, so its directory name is its name.
+    if doc.get("package").is_some() {
+        let name = doc
+            .get("package")
+            .and_then(|package| package.get("name"))
+            .and_then(|name| name.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "{} has a `[package]` with no `name`",
+                    manifest_path.display()
+                )
+            })?;
+        return Ok((name.to_string(), String::new()));
     }
-    if root.join("Cargo.toml").is_file() && root.join("src/actor.rs").is_file() {
-        return Some(String::new());
+
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("cannot read a project name from {}", root.display()))?;
+    let dir = format!("crates/{name}");
+    if !root.join(&dir).join("Cargo.toml").is_file() {
+        return Err(format!(
+            "no container library at {} — the container's crate is named after its project, so '{dir}' \
+             is the crate this application path-deps (point at the workspace, or at the crate itself)",
+            root.join(&dir).display()
+        ));
     }
-    None
+    Ok((name, dir))
 }
 // CHUNK-2-END
 
@@ -162,15 +195,12 @@ pub(crate) fn embedded_app_scaffold(
         )
     })?;
 
-    // The checkout, read rather than assumed: a wrong directory is cheaper to refuse here than to
+    // The container, read rather than assumed: a wrong directory is cheaper to refuse here than to
     // discover at the first `cargo build`.
-    let crate_dir = embedded_crate_dir(embedded_root).ok_or_else(|| {
-        format!(
-            "no `spire-embedded` checkout at {} — an application path-deps that crate, so this needs \
-             the directory it lives in (the workspace root, or the crate itself)",
-            embedded_root.display()
-        )
-    })?;
+    let (container, crate_dir) = embedded_crate(embedded_root)?;
+    // The crate's *identifier* form, for the `use` paths in `main.rs`: a crate is named with dashes and
+    // referred to with underscores.
+    let container_id = container.replace('-', "_");
 
     // If the platform names a target, it must be the one this scaffold would emit. A platform file
     // carrying esp-idf's triple while the wiring says bare-metal is a conflict rather than a
@@ -192,8 +222,15 @@ pub(crate) fn embedded_app_scaffold(
     };
 
     let bsp_dep = bsp_dep_line(embedded_root, platform_id, embedded_path);
-    let manifest_rs = app_manifest(&name, embedded_path, &embedded_dep, &bsp_dep, &spec);
-    let main_rs = APP_MAIN_RS.to_string();
+    let manifest_rs = app_manifest(
+        &name,
+        embedded_path,
+        &embedded_dep,
+        &bsp_dep,
+        &container,
+        &spec,
+    );
+    let main_rs = APP_MAIN_RS.replace("__CONTAINER_ID__", &container_id);
     let files = vec![
         super::ScaffoldFile {
             path: "Cargo.toml".to_string(),
@@ -209,7 +246,7 @@ pub(crate) fn embedded_app_scaffold(
         },
         super::ScaffoldFile {
             path: "README.md".to_string(),
-            content: readme(&name, &spec),
+            content: readme(&name, &container, &spec),
             structural: true,
             ..Default::default()
         },
@@ -260,16 +297,17 @@ fn bsp_dep_line(container: &Path, platform_id: &str, embedded_path: &str) -> Str
     )
 }
 
-/// The application's manifest: the board's crate set, `spire-embedded`, and the marker.
+/// The application's manifest: the board's crate set, the container's crate, and the marker.
 ///
 /// Two paths, deliberately: `embedded_path` is the *checkout* the user pointed at (what the marker
-/// records, and what a human would move), while `dep_path` is the crate inside it that a manifest has
-/// to name. They differ by `crates/spire-embedded`.
+/// records, and what a human would move), while `dep_path` is the crate inside it that a manifest has to
+/// name. They differ by `crates/<project>` — the container's crate is named after its project.
 fn app_manifest(
     name: &str,
     embedded_path: &str,
     dep_path: &str,
     bsp_dep: &str,
+    container: &str,
     spec: &AppSpec,
 ) -> String {
     APP_MANIFEST
@@ -277,6 +315,7 @@ fn app_manifest(
         .replace("__EMBEDDED__", dep_path)
         .replace("__CHIP__", spec.chip)
         .replace("__BSP_DEP__", bsp_dep)
+        .replace("__CONTAINER__", container)
         .replace("__MARKER__", &marker(embedded_path))
 }
 
@@ -295,19 +334,23 @@ fn cargo_config(spec: &AppSpec) -> String {
 }
 
 /// The application's README: what it depends on, and the one command that puts it on a board.
-fn readme(name: &str, spec: &AppSpec) -> String {
+fn readme(name: &str, container: &str, spec: &AppSpec) -> String {
     README_MD
         .replace("__NAME__", name)
         .replace("__CHIP__", spec.chip)
         .replace("__TARGET__", spec.target)
         .replace("__RUNNER__", spec.runner)
+        // The container by name and by identifier: prose says `weather-embedded`, code says
+        // `weather_embedded`, and the README has to read right in both.
+        .replace("__CONTAINER__", container)
+        .replace("__CONTAINER_ID__", &container.replace('-', "_"))
 }
 
-/// The application's manifest template. `__EMBEDDED__` is where the user's `spire-embedded` is.
+/// The application's manifest template. `__EMBEDDED__` is where the user's container is.
 const APP_MANIFEST: &str = r#"# __NAME__ — an embedded application: one board, one binary.
 #
 # There is no HAL project to depend on. The peripheral traits are `embedded-hal`'s, the HAL is
-# `esp-hal`, and the actor system is `spire-embedded` — so this is an ordinary crate, and what it needs
+# `esp-hal`, and the actor system is `__CONTAINER__` — so this is an ordinary crate, and what it needs
 # from its board is a target, a runner and some pins.
 [package]
 name = "__NAME__"
@@ -316,7 +359,7 @@ edition = "2021"
 
 [dependencies]
 # The actor system, with the embassy runtime wired in.
-spire-embedded = { path = "__EMBEDDED__", features = ["embassy"] }
+__CONTAINER__ = { path = "__EMBEDDED__", features = ["embassy"] }
 
 # The HAL, and the RTOS half of it. `esp-rtos` — not `esp-hal-embassy`, which is no longer maintained
 # — is where the embassy executor for esp-hal lives. Both take the chip feature.
@@ -386,10 +429,10 @@ use esp_hal::delay::Delay;
 use esp_hal::gpio::Output;
 use esp_println::println;
 
-use spire_embedded::actor::{Actor, Mailbox};
-use spire_embedded::embedded_hal::delay::DelayNs;
-use spire_embedded::embedded_hal::digital::OutputPin;
-use spire_embedded::embassy::{run, EmbassyMailbox};
+use __CONTAINER_ID__::actor::{Actor, Mailbox};
+use __CONTAINER_ID__::embedded_hal::delay::DelayNs;
+use __CONTAINER_ID__::embedded_hal::digital::OutputPin;
+use __CONTAINER_ID__::embassy::{run, EmbassyMailbox};
 
 // The ESP-IDF application descriptor, which the image must carry or `espflash` refuses it at flash
 // time. Module level, not inside `main`: the macro emits the static the bootloader reads.
@@ -465,7 +508,7 @@ async fn main(spawner: Spawner) {
     // A board with a plain LED:
     //     Output::new(peripherals.GPIO8, esp_hal::gpio::Level::Low, esp_hal::gpio::OutputConfig::default())
     // A board whose LED is *addressable* needs no output pin at all: it takes an `spi::master::Spi` and
-    // `spire_embedded::drivers::Ws2812`, because a level is not a colour. Either way it is one line,
+    // `__CONTAINER_ID__::drivers::Ws2812`, because a level is not a colour. Either way it is one line,
     // and it is typed so that the rest of this file compiles, links and flashes without it.
     let led: Output<'static> = todo!("this board's LED, from this board's pins");
 
@@ -489,16 +532,16 @@ async fn main(spawner: Spawner) {
 /// The application's README: what it is made of, and the two commands that matter.
 const README_MD: &str = r#"# __NAME__ — an embedded application
 
-One binary for one board (`__CHIP__`), built on `esp-hal` with the `spire-embedded` actor system.
+One binary for one board (`__CHIP__`), built on `esp-hal` with the `__CONTAINER__` actor system.
 
 ```text
 src/main.rs         the actor, and this board's facts — the only file a fill should touch
-Cargo.toml          the board's crates, and `spire-embedded` by path
+Cargo.toml          the board's crates, and `__CONTAINER__` by path
 .cargo/config.toml  the target (`__TARGET__`) and the runner
 ```
 
 There is no HAL project to link against and no BSP to write: the peripheral traits are `embedded-hal`'s,
-the HAL is the vendor's crate, and the actor system is `spire-embedded`. What is left for this project
+the HAL is the vendor's crate, and the actor system is `__CONTAINER__`. What is left for this project
 is its own `main` — and the board's pins, which are in it.
 
 ## Build and run
@@ -529,7 +572,7 @@ so everything around it compiles, links and flashes while it stays unwritten, an
 real check of the wiring rather than a partial one.
 
 One note from the pilot this scaffold was generated from: if the board's LED is **addressable** (an
-WS2812-family part), a GPIO level will not light it — it wants `spire_embedded::drivers::Ws2812` over an
+WS2812-family part), a GPIO level will not light it — it wants `__CONTAINER_ID__::drivers::Ws2812` over an
 `Spi`, because a level is not a colour.
 "#;
 // CHUNK-6-END
@@ -566,12 +609,32 @@ mod tests {
     }
 
     /// A `spire-embedded` checkout on disk: the workspace, with the crate inside it.
+    /// The container's crate, relative to `root`, as the derivation names it: after the project.
+    ///
+    /// A temporary directory's own name here — deliberately **not** `spire-embedded`. That is the name
+    /// of one project, and a fixture that reused it would pass while every other container's crate was
+    /// looked for in the wrong place.
+    fn container_dir(root: &Path) -> String {
+        format!("crates/{}", root.file_name().unwrap().to_string_lossy())
+    }
+
+    /// A container on disk: the workspace manifest, and the library crate inside it.
+    ///
+    /// Both, because a container *is* the workspace — its crate is a member named after the project, and
+    /// the root manifest is what says so.
     fn embedded_on_disk(root: &Path) {
-        let crate_dir = root.join(EMBEDDED_CRATE);
+        let member = container_dir(root);
+        let name = member.trim_start_matches("crates/");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!("[workspace]\nresolver = \"2\"\nmembers = [\"{member}\"]\n"),
+        )
+        .unwrap();
+        let crate_dir = root.join(&member);
         std::fs::create_dir_all(crate_dir.join("src")).unwrap();
         std::fs::write(
             crate_dir.join("Cargo.toml"),
-            "[package]\nname = \"spire-embedded\"\n",
+            format!("[package]\nname = \"{name}\"\n"),
         )
         .unwrap();
         std::fs::write(crate_dir.join("src/actor.rs"), "// the actor system\n").unwrap();
@@ -626,10 +689,18 @@ mod tests {
             .unwrap()
             .content
             .clone();
-        // The one dependency that is ours: by path, and into the *crate* rather than the workspace.
+        // The one dependency that is ours: by path, into the *crate* rather than the workspace, and named
+        // after the container's project rather than after ours.
+        let container = embedded
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert!(
             manifest.contains(&format!(
-                "spire-embedded = {{ path = \"{path}/crates/spire-embedded\""
+                "{container} = {{ path = \"{path}/{}\"",
+                container_dir(embedded.path())
             )),
             "{manifest}"
         );
@@ -731,9 +802,9 @@ mod tests {
         assert!(two.contains("targets **one** board"), "{two}");
     }
 
-    /// A directory that is not a `spire-embedded` checkout is refused here, not at the first build.
+    /// A directory that is not a container is refused here, not at the first build.
     #[test]
-    fn an_app_refuses_a_directory_that_is_not_a_spire_embedded_checkout() {
+    fn an_app_refuses_a_directory_that_is_not_a_container() {
         let _lock = crate::PLATFORM_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -747,7 +818,7 @@ mod tests {
 
         let empty = tempfile::tempdir().unwrap();
         let err = embedded_app_scaffold("App", &["esp32c3".into()], "…", empty.path()).unwrap_err();
-        assert!(err.contains("no `spire-embedded` checkout"), "{err}");
+        assert!(err.contains("Cargo.toml"), "{err}");
 
         // A directory that *is* a project — the HAL workspace this replaced — is refused as well, by
         // the same check rather than by a later, more confusing failure.
@@ -759,7 +830,7 @@ mod tests {
         )
         .unwrap();
         let err = embedded_app_scaffold("App", &["esp32c3".into()], "…", hal.path()).unwrap_err();
-        assert!(err.contains("no `spire-embedded` checkout"), "{err}");
+        assert!(err.contains("no container library at"), "{err}");
     }
 
     /// A chip with no wiring row is refused by name, and the refusal says what *is* known.
@@ -865,15 +936,17 @@ mod tests {
         )]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
-        // The real checkout: beside this repo, or wherever the developer says it is.
+        // The real checkout: beside this repo, or wherever the developer says it is. Its crate is named
+        // after the project — `spire-embedded/crates/spire-embedded` here — so it is read, by the same
+        // derivation the scaffold uses, rather than assumed.
         let root = std::env::var("SPIRE_EMBEDDED_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spire-embedded")
             });
-        if !root.join(EMBEDDED_CRATE).join("Cargo.toml").is_file() {
+        if embedded_crate(&root).is_err() {
             println!(
-                "no spire-embedded checkout at {} — set SPIRE_EMBEDDED_ROOT to build this",
+                "no container checkout at {} — set SPIRE_EMBEDDED_ROOT to build this",
                 root.display()
             );
             return;
