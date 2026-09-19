@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 NatureSense
+
+[package]
+name = "spire-embedded"
+description = "The on-device actor system and a library of peripherals, both written against embedded-hal's traits."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# The executor: `std::thread` plus a bounded queue. Under esp-idf a std thread **is** a FreeRTOS
+# task and `mpsc::sync_channel` is a bounded queue, so "the FreeRTOS executor" is std's with no
+# custom task or queue code to write or trust — and the same executor runs on a Linux host, which
+# is what makes it testable at all.
+#
+# Off by default, deliberately: this is a firmware crate first, and a `no_std` family (RP2040 via
+# embassy) must not have `std` pulled in behind its back. An esp-idf application turns it on.
+std = []
+# The embassy wiring: an actor task loop and a mailbox over an `embassy_sync` channel, for a
+# `no_std` family (ESP32-S3 through `esp-hal`, RP2040 through `embassy-rp`). Brings no executor of
+# its own — the application's `embassy-executor` is the executor; this only joins it to an actor.
+embassy = ["dep:embassy-sync"]
+
+[dependencies]
+# One dependency, and it is the point of the crate: the peripheral traits firmware programs
+# against are the ecosystem's (`OutputPin`, `DelayNs`, `SpiBus`, `I2c`, …). Re-exported rather
+# than left to each crate, so a project names one version of them — two copies are two different
+# `OutputPin` traits, and the error reads like the wrong import.
+#
+# A trait of our own would be a trait no driver crate could be used with, and one more thing to
+# implement per board. There is none.
+embedded-hal = "1.0"
+
+# The channel the embassy mailbox borrows. Not `embassy-executor`: the application owns its
+# executor (and the concrete `#[embassy_executor::task]` functions embassy demands), so depending on
+# it here would be depending on something we do not name.
+embassy-sync = { version = "0.8", optional = true, default-features = false }
+
+[dev-dependencies]
+# An `embassy_sync` channel needs a `RawMutex` implementation; on a host that is this crate's.
+critical-section = { version = "1.1", features = ["std"] }
+
+# The executor's integration test needs the std half; a target that does not ask for `std` is not
+# built with it. (`required-features` beats silently passing: a test that cannot run says so.)
+[[test]]
+name = "executor"
+required-features = ["std"]
+
+[[test]]
+name = "embassy"
+required-features = ["embassy"]
+

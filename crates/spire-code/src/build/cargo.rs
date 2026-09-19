@@ -1329,9 +1329,10 @@ impl CargoBuildModule {
         if structure == spire_core::build_types::ProjectStructure::SpireApp {
             return Ok(super::spire_app_scaffold::spire_app_scaffold(project_name));
         }
-        // Embedded HAL: the contract crate + one backend crate per selected board family. The
-        // platforms are registry ids, so the emitter resolves families (and refuses what it
-        // cannot serve) rather than guessing from the name.
+        // Embedded container: the framework, fixed — the actor system, the two runtimes, an empty
+        // `drivers/` — plus the marker that declares the type. The platform list is echoed back and
+        // used for nothing else: a container is board-agnostic, and its boards are added one BSP at a
+        // time afterwards (`embedded_add_bsp`).
         if structure == spire_core::build_types::ProjectStructure::Embedded {
             return super::embedded_scaffold::embedded_scaffold(project_name, platforms);
         }

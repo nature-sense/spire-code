@@ -1253,7 +1253,7 @@ and NEVER repeat any line or block."
         // parse and a host build gate. An LLM plan here would write into the contract.
         if structure == Some(spire_core::build_types::ProjectStructure::Embedded) {
             return self
-                .embedded_hal_template_plan(goal, root_dir, language, platforms)
+                .embedded_container_template_plan(goal, root_dir, language, platforms)
                 .await;
         }
         // Embedded application: the same deterministic shape as the HAL, for the same reason — the
@@ -1555,17 +1555,18 @@ Project:
         )
     }
 
-    /// Deterministic embedded-HAL plan: scaffold the workspace — the contract crate, the executor
-    /// and one backend crate per board family — then gate it with a parse and a **host** build.
-    /// Never calls the LLM.
+    /// Deterministic embedded-**container** plan: scaffold the workspace — the framework crate, fixed —
+    /// then gate it with a parse and a **host** build. Never calls the LLM.
     ///
-    /// The build gate is the workspace's own `cargo test`, whose `default-members` excludes the
-    /// backends on purpose: the contract and the executor must compile and be testable here, while
-    /// a backend needs a cross toolchain and its vendor SDK. Filling a backend is the fill
-    /// cascade's job (`embedded_hal_fill_plan` / `embedded_hal_fill_apply`), not a step inside a
-    /// creation plan — a backend written from a generic goal would be written against whatever API
-    /// the model guessed, which is the one failure the whole contract exists to prevent.
-    async fn embedded_hal_template_plan(
+    /// The build gate is the workspace's own `cargo test`, and it needs nothing more: the container is
+    /// one library crate with no vendor crate anywhere in its graph, so a host build is the whole check.
+    /// What *does* need a cross toolchain — a board's BSP — arrives later, one board at a time
+    /// (`embedded_add_bsp`), and that operation is where it is verified.
+    ///
+    /// Nothing here is filled, and that is the point: the actor system is ours and identical in every
+    /// container, so a plan that handed it to a model would be asking for a worse copy of it, once per
+    /// project.
+    async fn embedded_container_template_plan(
         &self,
         goal: &str,
         root_dir: &PathBuf,
@@ -2705,15 +2706,16 @@ impl Actor for ProjectCreationActor {
                         .await?;
                     self.active_spec = Some(spec.clone());
                     let plan = match spec.structure {
-                        // The embedded HAL is filled by the **drift cascade**, one backend file at
-                        // a time, from a prompt that carries the platform's own hints — never by a
-                        // generic fill plan: that plan's roots include the contract crate, and a
-                        // model writing there would edit the one thing every backend depends on.
-                        // Its plan is therefore the scaffold's writes plus a gate, and it needs no
-                        // model at all.
+                        // The container is never filled at creation: the framework is fixed, and what a
+                        // model *does* write — a board's facts, a device's protocol — has its own
+                        // operation (`embedded_add_bsp`, `embedded_add_driver`) with its own prompt and
+                        // its own gate. So this plan is the scaffold's writes plus a gate, and it needs
+                        // no model at all.
                         spire_core::build_types::ProjectStructure::Embedded => {
-                            self.embedded_hal_template_plan(&goal, &root_dir, &language, &platforms)
-                                .await
+                            self.embedded_container_template_plan(
+                                &goal, &root_dir, &language, &platforms,
+                            )
+                            .await
                         }
                         _ => self.generate_fill_plan(&goal, &root_dir, &spec).await?,
                     };
