@@ -811,4 +811,121 @@ mod tests {
             "the refusal names both sides: {err}"
         );
     }
+
+    /// The live test: scaffold an application and **build** it for the chip.
+    ///
+    /// This is the check that catches scaffold drift — versions that no longer resolve, an import the
+    /// crate no longer exports, a template that no longer compiles — and nothing else here would
+    /// notice, because the other tests assert *strings*, and a string is not a build.
+    ///
+    /// Ignored by default: it needs the RISC-V target, a `spire-embedded` checkout and a network.
+    ///
+    /// ```sh
+    /// SPIRE_EMBEDDED_ROOT=../spire-embedded cargo test -p spire-code --lib \
+    ///     a_scaffolded_app_builds_for_its_chip -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "live build: needs the target, a spire-embedded checkout and a network"]
+    fn a_scaffolded_app_builds_for_its_chip() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[(
+            "esp32c3",
+            "esp-hal",
+            Some("esp32"),
+            Some("riscv32imc-unknown-none-elf"),
+        )]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        // The real checkout: beside this repo, or wherever the developer says it is.
+        let root = std::env::var("SPIRE_EMBEDDED_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spire-embedded")
+            });
+        if !root.join(EMBEDDED_CRATE).join("Cargo.toml").is_file() {
+            println!(
+                "no spire-embedded checkout at {} — set SPIRE_EMBEDDED_ROOT to build this",
+                root.display()
+            );
+            return;
+        }
+        let path = root.to_string_lossy().to_string();
+        let out = embedded_app_scaffold("Build Check", &["esp32c3".into()], &path, &root)
+            .expect("an esp32c3 application");
+
+        // Write it out the way the project writer does, then build it the way a user would.
+        let work = tempfile::tempdir().unwrap();
+        for file in &out.files {
+            let target = work.path().join(&file.path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, &file.content).unwrap();
+        }
+
+        // The *toolchain*, not just `cargo` from `PATH`: a bare-metal target needs the `core` that
+        // belongs to it, and the `cargo` a machine happens to have first may know nothing about it —
+        // which fails as "can't find crate for `core`" and reads like a missing target.
+        let toolchains = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".rustup/toolchains");
+        let mut stable: Vec<std::path::PathBuf> = std::fs::read_dir(&toolchains)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .map(|n| n.to_string_lossy().starts_with("stable-"))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        stable.sort();
+        let toolchain = stable.pop();
+
+        let mut build = std::process::Command::new(
+            toolchain
+                .as_ref()
+                .map(|t| t.join("bin/cargo"))
+                .unwrap_or_else(|| std::path::PathBuf::from("cargo")),
+        );
+        build.args(["build", "--release"]).current_dir(work.path());
+        if let Some(toolchain) = &toolchain {
+            build
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        toolchain.join("bin").display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                // `rust-lld` may not find `libLLVM.dylib` through its own rpath; the file is in the
+                // toolchain's `lib/`, and this is what reaches it.
+                .env("DYLD_FALLBACK_LIBRARY_PATH", toolchain.join("lib"));
+        }
+
+        let output = build.output().expect("cargo runs");
+        assert!(
+            output.status.success(),
+            "the scaffolded application must build.\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // And it must have produced a *binary*. A green exit with no artifact would be a build that
+        // did nothing — which is the kind of thing a test asserting only a status code would miss.
+        let elf = work
+            .path()
+            .join("target/riscv32imc-unknown-none-elf/release/build-check");
+        let size = std::fs::metadata(&elf)
+            .map(|meta| meta.len())
+            .unwrap_or_default();
+        assert!(
+            size > 0,
+            "no ELF at {} (the scaffolded app built nothing)",
+            elf.display()
+        );
+    }
 }
