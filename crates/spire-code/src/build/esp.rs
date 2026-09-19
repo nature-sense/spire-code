@@ -608,9 +608,10 @@ pub async fn run_esp_build(path: &Path, opts: &BuildOptions) -> Result<BuildOutp
 
 /// The [`BuildSpec`] the **bare-metal** flavour becomes, with the one requirement it has.
 ///
-/// No environment, deliberately: nothing here needs the esp toolchain, `LIBCLANG_PATH` or an IDF
-/// install directory — a stock target builds with the stock toolchain, and injecting that environment
-/// would be this module deciding something the platform never said.
+/// Nothing here needs the esp toolchain, `LIBCLANG_PATH` or an IDF install directory: a stock target
+/// builds with the stock toolchain, and injecting that environment would be this module deciding
+/// something the platform never said. What it does carry is the target check and the host-side linker
+/// fix that comes with it — see `rp2040::spec_for_target`, which is where both live.
 pub(crate) fn bare_metal_spec(
     plan: EspPlan,
     sysroot: Option<&Path>,
@@ -976,6 +977,86 @@ mod tests {
         assert!(
             cap.config_files.is_empty(),
             "routing is by platform, never by file"
+        );
+    }
+
+    /// The live test: **this module's own build path**, against a real scaffolded application.
+    ///
+    /// The unit tests pin the plan and the spec; this drives [`run_esp_build`] itself — the routing
+    /// decision, the plan, the sysroot preflight and the shared process runner — which is the part no
+    /// unit test reaches.
+    ///
+    /// It needs a `spire-embedded` checkout (`$SPIRE_EMBEDDED_ROOT`, else the sibling) and, on a machine
+    /// whose `cargo` is not rustup's, a `PATH` with rustup's toolchain first. That is precisely what the
+    /// preflight refuses without, so running it by hand is the point:
+    ///
+    /// ```sh
+    /// PATH="$HOME/.rustup/toolchains/stable-$(uname -m | sed s/x86_64/x86_64/)/bin:$PATH" \
+    ///   SPIRE_EMBEDDED_ROOT=../spire-embedded \
+    ///   cargo test -p spire-code --lib the_module_builds_a_scaffolded_app -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live build: needs a container checkout, a Rust target and a network"]
+    async fn the_module_builds_a_scaffolded_app() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg = dir.path().join("platforms");
+        std::fs::create_dir_all(&reg).unwrap();
+        std::fs::write(
+            reg.join("esp32c3.yaml"),
+            "id: esp32c3\nname: ESP32-C3\nos: esp-hal\narchitecture:\n  cpu_family: riscv\n  \
+             cpu: esp32c3\n  endian: little\n  target_triple: riscv32imc-unknown-none-elf\n\
+             rust:\n  target: riscv32imc-unknown-none-elf\n  idf_target: esp32c3\n  flash: espflash\n",
+        )
+        .unwrap();
+        let _env = crate::platform::PlatformDirGuard::set(&reg);
+
+        // The container by its *workspace*, not by a crate name: which crate is inside is the
+        // scaffold's business, and it derives it.
+        let source = std::env::var("SPIRE_EMBEDDED_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spire-embedded")
+            });
+        if !source.join("Cargo.toml").is_file() {
+            println!(
+                "no container checkout at {} — set SPIRE_EMBEDDED_ROOT to build this",
+                source.display()
+            );
+            return;
+        }
+
+        let app = crate::build::embedded_app_scaffold::embedded_app_scaffold(
+            "module-build-check",
+            &["esp32c3".to_string()],
+            &source.to_string_lossy(),
+            &source,
+        )
+        .expect("an esp32c3 application");
+
+        let work = tempfile::tempdir().unwrap();
+        let root = work.path().join("module-build-check");
+        for file in &app.files {
+            let target = root.join(&file.path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, &file.content).unwrap();
+        }
+
+        let opts = BuildOptions {
+            platform: Some("esp32c3".to_string()),
+            ..Default::default()
+        };
+        let output = run_esp_build(&root, &opts)
+            .await
+            .expect("the module must build a scaffolded application");
+        assert!(output.success, "{}", output.output);
+        assert!(
+            output.output.contains("Compiling") || output.output.contains("Finished"),
+            "the build must have run: {}",
+            output.output
         );
     }
 

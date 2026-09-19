@@ -350,6 +350,20 @@ pub(crate) fn spec_for_target(
             });
         }
     }
+    let mut env = env;
+
+    // `rust-lld` links dynamically against the toolchain's own `libLLVM`, and on macOS nothing finds it
+    // by default: every link dies with `dyld: Library not loaded: @rpath/libLLVM.dylib`, naming neither
+    // the target nor the build. Measured here, and the reason the live tests set this by hand — a build
+    // module that does not set it links nothing on this host. The toolchain's `lib` is where the
+    // library lives, and the sysroot `rustc --print sysroot` reports *is* the toolchain root.
+    if let Some(sysroot) = sysroot {
+        env.push((
+            "DYLD_FALLBACK_LIBRARY_PATH".to_string(),
+            sysroot.join("lib").to_string_lossy().to_string(),
+        ));
+    }
+
     Ok(BuildSpec {
         command: "cargo".to_string(),
         arguments: args,
@@ -762,7 +776,17 @@ mod tests {
             .expect("the target is installed");
         assert_eq!(spec.command, "cargo");
         assert_eq!(spec.arguments, vec!["build", "--target", RP2040_TARGET]);
-        assert!(spec.env.is_empty(), "{spec:?}");
+        // The one environment a bare-metal build needs on this host: `rust-lld` cannot find the
+        // toolchain's own `libLLVM` without it, and every link then fails with a `dyld` error that names
+        // neither the target nor the build.
+        assert_eq!(
+            spec.env,
+            vec![(
+                "DYLD_FALLBACK_LIBRARY_PATH".to_string(),
+                sysroot.path().join("lib").to_string_lossy().to_string()
+            )],
+            "{spec:?}"
+        );
     }
 
     /// A toolchain that cannot be asked is not a refusal: cargo's own error is better than a guess
