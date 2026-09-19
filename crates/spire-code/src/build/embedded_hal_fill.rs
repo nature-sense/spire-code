@@ -20,7 +20,7 @@
 //! its stub declares every method: the bodies are `unimplemented!()`, which the measure counts as
 //! a placeholder rather than an implementation.
 
-use crate::build::embedded_hal_scaffold::{family_spec, FamilySpec};
+use crate::build::embedded_scaffold::{family_spec, FamilySpec};
 use crate::platform::Platform;
 use serde_json::json;
 use spire_core::subsystems::llm::llm::{LlmMessage, LlmModelRole};

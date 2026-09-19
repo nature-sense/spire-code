@@ -61,7 +61,7 @@ pub use rp2040::Rp2040BuildModule;
 pub mod embedded_app_scaffold;
 pub mod embedded_hal_contract;
 pub mod embedded_hal_fill;
-pub mod embedded_hal_scaffold;
+pub mod embedded_scaffold;
 pub mod hal_migration;
 pub mod hal_rust_contract;
 pub mod spire_app_scaffold;

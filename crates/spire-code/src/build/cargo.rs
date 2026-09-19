@@ -1333,7 +1333,7 @@ impl CargoBuildModule {
         // platforms are registry ids, so the emitter resolves families (and refuses what it
         // cannot serve) rather than guessing from the name.
         if structure == spire_core::build_types::ProjectStructure::Embedded {
-            return super::embedded_hal_scaffold::embedded_hal_scaffold(project_name, platforms);
+            return super::embedded_scaffold::embedded_scaffold(project_name, platforms);
         }
         // Embedded application: emitted by `project_creation`, which is the layer that has the
         // embedded-HAL project's *directory* — the module layer only ever sees names, a goal, a
@@ -2046,7 +2046,7 @@ mod tests {
     /// another, and a rename in either would otherwise show up only as a project the wizard
     /// makes and the app then fails to recognize.
     #[test]
-    fn embedded_hal_scaffold_is_recognized_by_the_analyzer() {
+    fn embedded_scaffold_is_recognized_by_the_analyzer() {
         let _lock = crate::PLATFORM_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2060,11 +2060,9 @@ mod tests {
         .unwrap();
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
-        let out = crate::build::embedded_hal_scaffold::embedded_hal_scaffold(
-            "weather",
-            &["esp32c6".to_string()],
-        )
-        .expect("the scaffold emits");
+        let out =
+            crate::build::embedded_scaffold::embedded_scaffold("weather", &["esp32c6".to_string()])
+                .expect("the scaffold emits");
         let tmp = tempfile::tempdir().unwrap();
         for f in &out.files {
             let p = tmp.path().join(&f.path);

@@ -135,7 +135,7 @@ fn contract_crate(project_name: &str) -> String {
 /// are collapsed to their **families** here, so selecting esp32c6 and esp32s3 produces one
 /// backend crate, not two. An id whose family this scaffold does not know is refused by name:
 /// a backend crate that cannot build is worse than no crate.
-pub(crate) fn embedded_hal_scaffold(
+pub(crate) fn embedded_scaffold(
     project_name: &str,
     platforms: &[String],
 ) -> Result<super::ScaffoldOutput, String> {
@@ -779,7 +779,7 @@ mod tests {
         ]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
-        let out = embedded_hal_scaffold("Weather", &["esp32c6".into(), "esp32s3".into()])
+        let out = embedded_scaffold("Weather", &["esp32c6".into(), "esp32s3".into()])
             .expect("both variants are servable");
         let paths: Vec<&str> = out.files.iter().map(|f| f.path.as_str()).collect();
 
@@ -838,8 +838,7 @@ mod tests {
         ]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
-        let out =
-            embedded_hal_scaffold("weather", &["esp32c6".into(), "rp2040".into()]).expect("both");
+        let out = embedded_scaffold("weather", &["esp32c6".into(), "rp2040".into()]).expect("both");
         let file = |path: &str| {
             out.files
                 .iter()
@@ -925,14 +924,14 @@ mod tests {
         ]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
-        let err = embedded_hal_scaffold("x", &["rpi5".into()]).unwrap_err();
+        let err = embedded_scaffold("x", &["rpi5".into()]).unwrap_err();
         assert!(err.contains("not an embedded platform"), "{err}");
 
-        let err = embedded_hal_scaffold("x", &["nosuch".into()]).unwrap_err();
+        let err = embedded_scaffold("x", &["nosuch".into()]).unwrap_err();
         assert!(err.contains("unknown platform"), "{err}");
 
         // Embedded, but a family no backend is known for: the scaffold must not invent one.
-        let err = embedded_hal_scaffold("x", &["esp32h2".into()]).unwrap_err();
+        let err = embedded_scaffold("x", &["esp32h2".into()]).unwrap_err();
         assert!(
             err.contains("no backend is known for family 'esp32h2'"),
             "{err}"
@@ -962,7 +961,7 @@ mod tests {
         ]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
-        let out = embedded_hal_scaffold("spire-demo", &["esp32c6".into(), "rp2040".into()])
+        let out = embedded_scaffold("spire-demo", &["esp32c6".into(), "rp2040".into()])
             .expect("both families");
         let root = std::env::temp_dir().join("spire-embedded-hal-scaffold");
         let _ = std::fs::remove_dir_all(&root);

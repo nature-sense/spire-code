@@ -16,7 +16,7 @@ use std::path::Path;
 
 use serde_json::json;
 
-use crate::build::embedded_hal_scaffold::{family_spec, FamilySpec};
+use crate::build::embedded_scaffold::{family_spec, FamilySpec};
 use crate::build::hal_rust_contract::{
     extract_impl_methods_rust, required_trait_methods_rust, rust_syntax_check,
 };
@@ -380,7 +380,7 @@ pub(crate) fn add_platform(root: &Path, platform_id: &str) -> Result<serde_json:
         ));
     }
 
-    let files = crate::build::embedded_hal_scaffold::backend_files(&hal, &hal_id, &family, &spec);
+    let files = crate::build::embedded_scaffold::backend_files(&hal, &hal_id, &family, &spec);
     let mut written: Vec<String> = Vec::new();
     for file in &files {
         let target = root.join(&file.path);
@@ -459,7 +459,7 @@ fn extend_readme(root: &Path, hal: &str, family: &str, spec: &FamilySpec) -> Res
     lines.insert(last_bullet + 1, bullet);
 
     // The closing fence of the last ```sh block: insert before it, so the block stays one block.
-    let block = crate::build::embedded_hal_scaffold::readme_family_block(hal, family, spec);
+    let block = crate::build::embedded_scaffold::readme_family_block(hal, family, spec);
     let Some(close) = lines
         .iter()
         .rposition(|l| l.trim() == "```")
@@ -538,11 +538,9 @@ mod tests {
             std::env::set_var("SPIRE_PLATFORM_DIR", registry.path());
 
             // Scaffolded by the real emitter, so the fixture cannot drift from what users get.
-            let out = crate::build::embedded_hal_scaffold::embedded_hal_scaffold(
-                name,
-                &["rp2040".to_string()],
-            )
-            .expect("the scaffold knows rp2040");
+            let out =
+                crate::build::embedded_scaffold::embedded_scaffold(name, &["rp2040".to_string()])
+                    .expect("the scaffold knows rp2040");
             let project = tempfile::tempdir().expect("project dir");
             for file in &out.files {
                 let target = project.path().join(&file.path);
