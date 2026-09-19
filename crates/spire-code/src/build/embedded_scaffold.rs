@@ -1871,58 +1871,30 @@ mod tests {
         let reg = registry(&[("esp32c3", "esp-hal", Some("esp32"))]);
         let _env = crate::platform::PlatformDirGuard::set(reg.path());
 
-        let source = std::env::var("SPIRE_EMBEDDED_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spire-embedded")
-            });
-        if !source.join("crates/spire-embedded/Cargo.toml").is_file() {
-            println!(
-                "no spire-embedded container at {} — set SPIRE_EMBEDDED_ROOT to build this",
-                source.display()
-            );
+        let Some(source) = embedded_container() else {
             return;
-        }
+        };
 
         let work = tempfile::tempdir().unwrap();
         copy_sources(&source, work.path());
         add_bsp(work.path(), "esp32c3").expect("a BSP for the pilot board");
 
         let toolchain = stable_toolchain();
-        let mut build = std::process::Command::new(
-            toolchain
-                .as_ref()
-                .map(|dir| dir.join("bin/cargo"))
-                .unwrap_or_else(|| PathBuf::from("cargo")),
-        );
-        build
-            .args([
+        let output = cargo_in(
+            work.path(),
+            toolchain.as_ref(),
+            &[
                 "build",
                 "-p",
                 "spire-bsp-esp32c3",
                 "--target",
                 "riscv32imc-unknown-none-elf",
-            ])
-            .current_dir(work.path());
-        if let Some(dir) = &toolchain {
-            build
-                .env(
-                    "PATH",
-                    format!(
-                        "{}:{}",
-                        dir.join("bin").display(),
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                )
-                .env("DYLD_FALLBACK_LIBRARY_PATH", dir.join("lib"));
-        }
-
-        let output = build.output().expect("cargo runs");
+            ],
+        );
         assert!(
             output.status.success(),
-            "a generated BSP must build for its chip.\n--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "a generated BSP must build for its chip.\n{}",
+            output_of(&output)
         );
 
         // Linked, not merely compiled: the `.rlib` is the artifact a dependent crate would get.
@@ -1936,6 +1908,109 @@ mod tests {
             size > 0,
             "no rlib at {} (the BSP compiled nothing)",
             artifact.display()
+        );
+    }
+
+    /// The live test for the **other** routine operation: a generated driver, host-compiled *and*
+    /// chip-compiled inside a real container.
+    ///
+    /// Two builds, because two different things can be wrong and each is invisible to the other. The chip
+    /// build catches a driver that quietly assumes `std`: a skeleton is generic over the bus and nothing
+    /// else, so an `alloc` type or a `String` in a driver reads fine on the host and is undeclarable on a
+    /// bare-metal target. The host build reads the **test file** — `cargo build` never looks inside
+    /// `tests/`, so an emitted test that does not compile would sit there unnoticed until someone ran it,
+    /// which for a driver whose test is `#[ignore]`d is nobody.
+    ///
+    /// Ignored by default: it needs the target, a container checkout and a network.
+    ///
+    /// ```sh
+    /// SPIRE_EMBEDDED_ROOT=../spire-embedded cargo test -p spire-code --lib \
+    ///     a_generated_driver_compiles_for_its_chip_and_on_the_host -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "live build: needs the target, a container checkout and a network"]
+    fn a_generated_driver_compiles_for_its_chip_and_on_the_host() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[("esp32c3", "esp-hal", Some("esp32"))]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        let Some(source) = embedded_container() else {
+            return;
+        };
+
+        let work = tempfile::tempdir().unwrap();
+        copy_sources(&source, work.path());
+        add_driver(work.path(), "bme280", "i2c").expect("a driver for an i2c device");
+
+        let toolchain = stable_toolchain();
+        // The module the emitter registered is a module the compiler actually reads — including the
+        // `pub use` line beside it, which names the type it re-exports.
+        let chip = cargo_in(
+            work.path(),
+            toolchain.as_ref(),
+            &[
+                "build",
+                "-p",
+                "spire-embedded",
+                "--target",
+                "riscv32imc-unknown-none-elf",
+            ],
+        );
+        assert!(
+            chip.status.success(),
+            "a generated driver must compile for the chip.\n{}",
+            output_of(&chip)
+        );
+
+        // And the emitted *test* compiles, on the host, where a test can run at all.
+        let host = cargo_in(
+            work.path(),
+            toolchain.as_ref(),
+            &["test", "-p", "spire-embedded", "--no-run"],
+        );
+        assert!(
+            host.status.success(),
+            "the emitted driver test must compile on the host.\n{}",
+            output_of(&host)
+        );
+
+        // Exit status is not evidence: cargo can succeed without building anything, and a test that only
+        // checks a status cannot tell that from a real compile. The artifacts can.
+        let rlib = work
+            .path()
+            .join("target/riscv32imc-unknown-none-elf/debug/libspire_embedded.rlib");
+        let size = std::fs::metadata(&rlib)
+            .map(|meta| meta.len())
+            .unwrap_or_default();
+        assert!(
+            size > 0,
+            "no rlib at {} (the chip build compiled nothing)",
+            rlib.display()
+        );
+
+        // The driver's test binary: the file `cargo build` never reads, compiled because it is a test.
+        let deps = work.path().join("target/debug/deps");
+        let bme280: Vec<String> = std::fs::read_dir(&deps)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .filter(|name| name.starts_with("bme280-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !bme280.is_empty(),
+            "no `bme280-*` test binary in {} — the emitted test was never compiled",
+            deps.display()
+        );
+
+        println!(
+            "driver compiled for the chip ({} bytes) and its host test built ({} binaries)",
+            size,
+            bme280.len()
         );
     }
 
@@ -1956,6 +2031,66 @@ mod tests {
                 std::fs::copy(&source, &target).unwrap();
             }
         }
+    }
+
+    /// The container the live tests build against, if this machine has one.
+    ///
+    /// `SPIRE_EMBEDDED_ROOT` first, then the sibling checkout — and `None`, with a note, rather than a
+    /// panic when neither exists: these tests are also run on machines with no container checkout and no
+    /// bare-metal target, where the honest outcome is a skip.
+    fn embedded_container() -> Option<PathBuf> {
+        let source = std::env::var("SPIRE_EMBEDDED_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spire-embedded")
+            });
+        if !source.join("crates/spire-embedded/Cargo.toml").is_file() {
+            println!(
+                "no spire-embedded container at {} — set SPIRE_EMBEDDED_ROOT to build this",
+                source.display()
+            );
+            return None;
+        }
+        Some(source)
+    }
+
+    /// `cargo`, from a toolchain the caller found, in a container.
+    ///
+    /// The toolchain is passed in rather than looked up here — see [`stable_toolchain`] for why the one a
+    /// machine happens to have first is not good enough. Both live tests need the same environment, so it
+    /// is assembled in one place.
+    fn cargo_in(dir: &Path, toolchain: Option<&PathBuf>, args: &[&str]) -> std::process::Output {
+        let mut command = std::process::Command::new(
+            toolchain
+                .map(|dir| dir.join("bin/cargo"))
+                .unwrap_or_else(|| PathBuf::from("cargo")),
+        );
+        command.args(args).current_dir(dir);
+        if let Some(dir) = toolchain {
+            command
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        dir.join("bin").display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("DYLD_FALLBACK_LIBRARY_PATH", dir.join("lib"));
+        }
+        command.output().expect("cargo runs")
+    }
+
+    /// Both streams of a failed command, for an assertion message.
+    ///
+    /// The success case needs neither; the failure case is unreadable without them, and a live test that
+    /// says only "it failed" costs a rerun to learn anything.
+    fn output_of(output: &std::process::Output) -> String {
+        format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
     }
 
     /// The machine's stable rustup toolchain, if it has one.
