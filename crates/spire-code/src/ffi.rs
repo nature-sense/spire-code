@@ -1363,6 +1363,11 @@ pub(crate) fn serialize_analysis(
                     _ => "Other",
                 },
                 "platformTargets": [],
+                // The **workspace's** structure, inherited. A container's member crates are part of
+                // the container, and a member that reported nothing here decoded as `native` — which
+                // is how the container's growth actions came to appear only when the *workspace* was
+                // selected and vanish the moment its crate was, since the UI gates them on this.
+                "structure": bs.structure,
                 "buildTargets": build_targets,
                 "dependencies": bs.dependencies.iter().map(|d| serde_json::json!({
                     "name": d.name.clone(),
@@ -1987,5 +1992,49 @@ mod serialize_analysis_tests {
             .collect();
         assert!(names.contains(&"core"), "member core missing: {names:?}");
         assert!(names.contains(&"rpi5"), "member rpi5 missing: {names:?}");
+    }
+
+    /// **A container's member crates inherit the workspace's structure.**
+    ///
+    /// They reported nothing here once, so they decoded as `native` — and the UI, which gates a
+    /// container's board/driver actions on this value, showed them for the *workspace* and hid them
+    /// the moment its crate was selected, which is the natural thing to click. Reported by hand as
+    /// "the actions are inconsistent".
+    ///
+    /// Inherited rather than re-derived: the member crates of a container are part of it, and that is
+    /// the fact an action surface has to key on.
+    #[test]
+    fn container_members_inherit_the_workspace_structure() {
+        let analysis = ProjectAnalysis {
+            project_name: "weather-embedded".to_string(),
+            build_systems: vec![meta(
+                "Cargo",
+                Some("weather-embedded"),
+                "",
+                true,
+                vec![WorkspaceMember {
+                    name: "weather-embedded".to_string(),
+                    path: "crates/weather-embedded".to_string(),
+                    version: None,
+                }],
+                ProjectStructure::Embedded,
+            )],
+            ..spire_gis_analysis()
+        };
+
+        let json = serialize_analysis(&analysis);
+        let sp = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        let member = sp
+            .iter()
+            .find(|s| s.get("path").and_then(|v| v.as_str()) == Some("crates/weather-embedded"))
+            .unwrap_or_else(|| panic!("the member crate is a subproject: {sp:?}"));
+        assert_eq!(
+            member.get("structure").and_then(|v| v.as_str()),
+            Some("embedded"),
+            "a container's crate carries the container's structure: {member}"
+        );
     }
 }

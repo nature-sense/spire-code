@@ -146,8 +146,12 @@ struct SubprojectInfo: Codable, Identifiable {
     /// `executable('myapp-rpi', …)`). Empty when the subsystem has no
     /// per-target build selection.
     let buildTargets: [BuildTarget]
-    /// Structural shape: "native" | "single_source" | "hal". Empty when the
-    /// analyzer didn't classify it (treat as native).
+    /// Structural shape: "native" | "single_source" | "hal" | "embedded" | "embedded_app".
+    ///
+    /// A workspace's members **inherit the workspace's structure**, so a container's crates report
+    /// `"embedded"` and an application's crate `"embedded_app"` — which is what lets a per-structure
+    /// action surface (the container's board/driver actions) show for the crate and not only for the
+    /// workspace. Decodes as `"native"` when the analyzer classified nothing.
     let structure: String
     /// Named domains (common / rpi5 / rock3c). Empty when the shape is native.
     let domains: [ProjectDomain]
