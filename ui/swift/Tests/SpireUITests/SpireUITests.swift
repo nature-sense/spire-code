@@ -69,94 +69,6 @@ func platformListingDecodes() throws {
 }
 
 
-/// Which boards the "Add board" menu offers.
-///
-/// The rule the *view* applies, pinned here because the tool refuses what it would offer: a family
-/// that already has a backend crate, a platform that is not a board, and — since one backend serves
-/// every variant of a family — a second variant of a family already present.
-@Test("Add board offers one entry per absent family, and only boards")
-func addableBoardsOffersOneEntryPerAbsentFamily() throws {
-    // Shaped like the real `platforms/list` payload: the model's `architecture`/`toolchain`/`sysroot`
-    // are required keys, so a fixture that omitted them would be testing a payload the core never
-    // sends.
-    let platforms: [Platform] = try MessageSerializer.decode(Data("""
-    [{ "id": "esp32c6", "name": "ESP32-C6", "os": "esp-idf", "family": "esp32", "embedded": true,
-       "library_hints": "RISC-V RV32IMAC via esp-idf-hal.",
-       "architecture": { "cpu_family": "riscv", "cpu": "esp32c6", "endian": "little",
-                         "target_triple": "riscv32imac-esp-espidf" },
-       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
-                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
-                      "needs_exe_wrapper": false },
-       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
-       "rust": { "target": "riscv32imac-esp-espidf", "idf_target": "esp32c6", "flash": "espflash" }
-    }, { "id": "esp32s3", "name": "ESP32-S3", "os": "esp-idf", "family": "esp32", "embedded": true,
-       "architecture": { "cpu_family": "xtensa", "cpu": "esp32s3", "endian": "little",
-                         "target_triple": "xtensa-esp32s3-espidf" },
-       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
-                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
-                      "needs_exe_wrapper": false },
-       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
-       "rust": { "target": "xtensa-esp32s3-espidf", "idf_target": "esp32s3", "flash": "espflash" }
-    }, { "id": "rp2040", "name": "Raspberry Pi Pico", "os": "rp2040", "family": "rp2040", "embedded": true,
-       "architecture": { "cpu_family": "arm", "cpu": "rp2040", "endian": "little",
-                         "target_triple": "thumbv6m-none-eabi" },
-       "toolchain": { "c": "clang", "cpp": "clang++", "ar": "llvm-ar", "strip": "llvm-strip",
-                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
-                      "needs_exe_wrapper": false },
-       "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
-       "rust": { "target": "thumbv6m-none-eabi", "idf_target": "RP2040", "flash": "picotool" }
-    }, { "id": "rpi5", "name": "Raspberry Pi 5", "os": "linux", "embedded": false,
-       "architecture": { "cpu_family": "aarch64", "cpu": "armv8-a", "endian": "little",
-                         "target_triple": "aarch64-linux-gnu" },
-       "toolchain": { "c": "aarch64-linux-gnu-gcc", "cpp": "aarch64-linux-gnu-g++",
-                      "ar": "aarch64-linux-gnu-ar", "strip": "aarch64-linux-gnu-strip",
-                      "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [],
-                      "needs_exe_wrapper": false },
-       "sysroot": { "root": "/usr/aarch64-linux-gnu", "lib_dirs": [], "include_dirs": [],
-                    "pkg_config_libdir": [] }
-    }]
-    """.utf8))
-
-    // A project with an rp2040 backend: the two esp variants are one offer, and rp2040 is not offered
-    // again (the tool would refuse it — a second click must not fork the crate).
-    let addable = EmbeddedHalBackendsSection.addableBoards(
-        platforms: platforms,
-        presentFamilies: ["rp2040"]
-    )
-    #expect(addable.map(\.id) == ["esp32c6"], "one entry per family, boards only: \(addable.map(\.id))")
-
-    // A project with no backends yet: every board family, and still not the Linux host.
-    let fresh = EmbeddedHalBackendsSection.addableBoards(platforms: platforms, presentFamilies: [])
-    #expect(fresh.map(\.id) == ["esp32c6", "rp2040"], "\(fresh.map(\.id))")
-}
-
-/// The validation summary the contract sheet lists.
-///
-/// Pinned against the tool's exact payload: `widget.embedded_hal_validate_contract`'s answer is what
-/// the sheet renders as "this is what the measure will see", so a field that stopped decoding would
-/// show an empty list — and an empty list disables the Write button, which would look like a refusal
-/// rather than a bug.
-@Test("A contract validation summary describes its traits")
-func contractValidationSummaryDescribesTraits() throws {
-    let summary: [String: Any] = [
-        "valid": true,
-        "trait_count": 2,
-        "method_count": 3,
-        "traits": [
-            ["trait": "Sensor", "methods": ["read_deci_celsius"]],
-            ["trait": "Sink", "methods": ["write", "flush"]],
-        ],
-    ]
-    let lines = EmbeddedHalContractSheet.describeTraits(summary: summary)
-    #expect(lines == ["Sensor — read_deci_celsius", "Sink — write, flush"], "\(lines)")
-
-    // A trait with no required methods cannot reach here (the tool refuses it), but the display must
-    // not print a dangling dash if one ever does.
-    let bare = EmbeddedHalContractSheet.describeTraits(summary: ["traits": [["trait": "Marker"]]])
-    #expect(bare == ["Marker"], "\(bare)")
-    #expect(EmbeddedHalContractSheet.describeTraits(summary: [:]).isEmpty)
-}
-
 /// The `device/procs` payload, as the processes panel renders it.
 ///
 /// Pinned against the tool's exact JSON, because this view's failure mode is quiet: a field that
@@ -423,19 +335,19 @@ func wizardTreeDecidesItsOwnSteps() {
     #expect(NewProjectView.path(environment: .embedded, deviceClass: .linuxSbc)
             == [.environment, .deviceClass, .targets, .structure, .details])
 
-    // Controller: HAL vs application comes *before* the board, because the role decides what a board
-    // selection means — a backend to implement, or one to depend on.
+    // Controller: container vs application comes *before* the board, because the role decides what a
+    // board selection means — a BSP to write, or one to depend on.
     let controller = NewProjectView.path(environment: .embedded, deviceClass: .controller)
     #expect(controller == [.environment, .deviceClass, .controllerRole, .targets, .details])
     #expect(controller.firstIndex(of: .controllerRole)! < controller.firstIndex(of: .targets)!)
 
-    // An application is asked one more question than a HAL: which HAL it builds against. Nothing
-    // else in the wizard implies it, and the core refuses an app without it.
+    // An application is asked one more question than a container: which container it builds against.
+    // Nothing else in the wizard implies it, and the core refuses an app without it.
     let application = NewProjectView.path(
         environment: .embedded, deviceClass: .controller, controllerRole: .application
     )
-    #expect(application == [.environment, .deviceClass, .controllerRole, .targets, .halProject, .details])
-    #expect(application.last == .details, "the HAL is chosen before the name, not after")
+    #expect(application == [.environment, .deviceClass, .controllerRole, .targets, .containerProject, .details])
+    #expect(application.last == .details, "the container is chosen before the name, not after")
 }
 
 
@@ -448,7 +360,7 @@ func wizardLeavesBecomeProjectStructures() {
     func key(environment: NewProjectView.ProjectEnvironment,
              nativeKind: NewProjectView.NativeKind = .spireApp,
              deviceClass: NewProjectView.DeviceClass = .linuxSbc,
-             controllerRole: NewProjectView.ControllerRole = .halFrameworks,
+             controllerRole: NewProjectView.ControllerRole = .container,
              useHal: Bool = true) -> String {
         NewProjectView.structureKey(environment: environment, nativeKind: nativeKind,
                                     deviceClass: deviceClass, controllerRole: controllerRole,
@@ -463,18 +375,18 @@ func wizardLeavesBecomeProjectStructures() {
     #expect(key(environment: .embedded, deviceClass: .linuxSbc, useHal: true) == "hal")
     #expect(key(environment: .embedded, deviceClass: .linuxSbc, useHal: false) == "single_source")
 
-    // Controller: the HAL + frameworks — the library the drift cascade fills.
+    // Controller: the container — the framework, the drivers and the BSPs, scaffolded by the core.
     #expect(key(environment: .embedded, deviceClass: .controller,
-                controllerRole: .halFrameworks) == "embedded_hal")
+                controllerRole: .container) == "embedded")
 
-    // Controller: the application. Keyed now, scaffolded by the change that lands the structure — and
-    // until then the wizard must not offer it, which is what `enabled: false` on its card says.
+    // Controller: the application, which path-deps a container rather than containing it.
     #expect(key(environment: .embedded, deviceClass: .controller,
                 controllerRole: .application) == "embedded_app")
 
-    // Nothing in the tree can produce a key the core would not understand. `embedded_app` is the one
-    // the core does not have yet; when it lands, this set is what has to grow with it.
-    let known: Set<String> = ["native", "single_source", "hal", "spire_app", "embedded_hal", "embedded_app"]
+    // Nothing in the tree can produce a key the core would not understand — both embedded keys exist
+    // now (`embedded` for the container, `embedded_app` for the application), so this set is the whole
+    // contract with `ProjectStructure`.
+    let known: Set<String> = ["native", "single_source", "hal", "spire_app", "embedded", "embedded_app"]
     for environment in NewProjectView.ProjectEnvironment.allCases {
         for kind in NewProjectView.NativeKind.allCases {
             for device in NewProjectView.DeviceClass.allCases {
