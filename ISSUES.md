@@ -1641,10 +1641,32 @@ The conversion of the nine entries we have:
 | `rp2040` | a board (`raspberry-pi-pico`) | `chip: rp2040` + its own board facts |
 | `esp32`, `esp32c6`, `esp32p4` | named M5Stack boards | `chip:` + their own board facts |
 
-**The one thing that is a decision, not a mechanic:** which M5Stack boards `esp32`, `esp32c6` and
-`esp32p4` are (and confirmation of `CoreS3` for `esp32s3`, `Pico` for `rp2040`). That is a choice
-about physical hardware, not something derivable from the silicon — inventing them would put into the
-registry the same guess we are removing from the code.
+**The boards (named 2026-09-19).** The list, and the chip each implies **where the name carries it**:
+
+| board | chip | proposed id | basis |
+|---|---|---|---|
+| M5Stack Core S3 | `esp32s3` | `m5stack-core-s3` | the name |
+| M5Stack Atom S3 Lite | `esp32s3` | `m5stack-atom-s3-lite` | the name |
+| Waveshare ESP32-P4-Nano | `esp32p4` | `waveshare-esp32-p4-nano` | the name |
+| M5Stack Core Ink | **?** | `m5stack-core-ink` | *not derivable* |
+| M5Stack Station | **?** | `m5stack-station` | *not derivable* |
+| Raspberry Pi Pico | `rp2040` | `raspberry-pi-pico` | named |
+
+(Ids are proposed, in kebab-case. They are longer than the current `esp32c3`/`rpi5`, which were
+short because they named silicon; a board id has to distinguish *M5Stack Core S3* from a bare
+ESP32-S3, so it cannot be shorter than the board's name.)
+
+Two things are still open, and neither is guessable from the list:
+
+1. **`M5Stack Core Ink` and `M5Stack Station`: which chip?** Neither name carries one. The whole
+   point of this conversion is to stop inventing the chip field, so they stay unassigned until it is
+   known rather than being filed under a plausible-sounding ESP32.
+2. **`esp32c3` and `esp32c6` have no board in the list.** Either a board names each, or those entries
+   go. They must not survive as entries, though: a chip entry kept as a *board* would reintroduce the
+   generic chip name this stage exists to remove.
+
+The three unambiguous boards, the Pico, and the three Linux SBCs are enough to convert the store in
+one pass; Core Ink and Station join it as soon as their chip is named.
 
 **Stage 3 — HAL → a referenced driver library.** Extract ai-traps' `hal/` so `Hal` and `Embedded`
 are the same concept: a project of drivers an application depends on, with a board's BSP as that
