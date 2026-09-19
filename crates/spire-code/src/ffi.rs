@@ -376,6 +376,25 @@ fn init_actor_system() {
         // The esp capability, alongside the module it belongs to.
         module_mcp_servers.push(esp_cap);
 
+        // The **bare-metal** flavour of the same module: the same chip facts and the same flash tool,
+        // but a stock rustup target instead of ESP-IDF — which is what `os: "esp-hal"` routes on, and
+        // what the project scaffold emits. A second instance, so the two capabilities name themselves
+        // apart in the UI rather than both saying "esp-idf".
+        let esp_hal_module_tx = spawn_module(EspBuildModule::for_os("esp-hal"));
+        let _ = registry.register::<BuildModuleMessage>(
+            "build_module_esp_hal",
+            esp_hal_module_tx.clone(),
+        );
+        let esp_hal_cap = describe_module("esp-hal", &esp_hal_module_tx).await;
+        let _ = bm_tx
+            .send(BuildManagerMessage::AddPlatformModule {
+                os: "esp-hal".to_string(),
+                capability: esp_hal_cap.clone(),
+                module_tx: esp_hal_module_tx,
+            })
+            .await;
+        module_mcp_servers.push(esp_hal_cap);
+
         // The rp2040 module registers the same way and for the same reason: its projects are also
         // `Cargo.toml` projects, so what differs is the invocation (a `thumbv6m` target, no
         // vendor SDK, a different flasher) — and that is what `os: "rp2040"` routes on.

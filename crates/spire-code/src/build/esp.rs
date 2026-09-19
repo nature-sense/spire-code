@@ -33,6 +33,31 @@ use spire_core::build_types::BuildSpec;
 /// cannot add to it; it carries `rust-src` (hence `-Zbuild-std`) instead.
 pub const ESP_TOOLCHAIN: &str = "esp";
 
+/// The `os` values this module answers for — **one chip family, two flavours.**
+///
+/// `esp-idf` is the std flavour: `esp-idf-hal` over ESP-IDF, on a target with no prebuilt `core`, so
+/// `-Zbuild-std` and the custom `esp` toolchain. `esp-hal` is the bare-metal one: a **stock** rustup
+/// target, no vendor SDK, no `MCU`, no `sdkconfig` — the flavour the project scaffold emits, and the
+/// one the pilot flew.
+///
+/// One module rather than two, because what the two share is what the routing is *about*: the same
+/// chip, the same platform facts (`rust.target`, `rust.idf_target`, `rust.flash`) and the same flash
+/// tool. What differs is the invocation, and that is a branch inside the plan.
+pub const ESP_OSES: &[&str] = &["esp-idf", "esp-hal"];
+
+/// The **bare-metal** flavour's `os` — the one that builds on stock toolchains.
+pub const ESP_HAL_OS: &str = "esp-hal";
+
+/// True for a platform this module answers for, either flavour.
+pub fn is_esp(platform: &Platform) -> bool {
+    ESP_OSES.contains(&platform.os.as_str())
+}
+
+/// True for the flavour that needs a vendor SDK and `-Zbuild-std`.
+pub fn is_esp_idf(platform: &Platform) -> bool {
+    platform.os != ESP_HAL_OS
+}
+
 /// One esp-idf build: the program to run, its arguments, and the environment it needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EspPlan {
@@ -44,15 +69,20 @@ pub struct EspPlan {
     pub args: Vec<String>,
     /// Environment additions (on top of the inherited environment).
     pub env: Vec<(String, String)>,
+    /// True for the `esp-idf` flavour — the one that needs `MCU`, `LIBCLANG_PATH`, `-Zbuild-std` and
+    /// the custom `esp` toolchain. The bare-metal flavour adds **no** environment at all: a stock
+    /// target builds with the stock toolchain, so forcing the esp one onto it would be wrong.
+    pub esp_idf: bool,
 }
 
-/// The chip a platform targets — `IDF_TARGET`, and the `MCU` environment variable — or `None`
-/// when this is not an esp-idf platform or does not name one.
+/// The chip a platform targets — `IDF_TARGET`, and the `MCU` environment variable — or `None` when
+/// this is not an ESP platform at all.
 ///
-/// One function because three things key off the chip and they must agree: the build (as
-/// `MCU`), the flash tool (as `--chip`), and the triple's directory under `target/`.
+/// One function because three things key off the chip and they must agree: the build (as `MCU`, for
+/// the esp-idf flavour), the flash tool (as `--chip`, for either flavour — `espflash` wants the same
+/// spelling the vendor uses), and the triple's directory under `target/`.
 pub fn esp_chip(platform: &Platform) -> Option<String> {
-    if platform.os != "esp-idf" {
+    if !is_esp(platform) {
         return None;
     }
     let rust = platform.rust.as_ref()?;
@@ -73,15 +103,20 @@ pub fn esp_chip(platform: &Platform) -> Option<String> {
 pub fn esp_plan(platform: &Platform, opts: &BuildOptions) -> Option<EspPlan> {
     let rust = platform.rust.as_ref()?;
     let chip = esp_chip(platform)?;
+    let esp_idf = is_esp_idf(platform);
 
     let mut args = vec![
         "build".to_string(),
         "--target".to_string(),
         rust.target.clone(),
-        // These targets are tier-3 with no prebuilt std: without this the build dies with
-        // "can't find crate for `core`", which reads like a missing toolchain.
-        "-Zbuild-std=std,panic_abort".to_string(),
     ];
+    if esp_idf {
+        // These targets are tier-3 with no prebuilt std: without this the build dies with
+        // "can't find crate for `core`", which reads like a missing toolchain. The bare-metal
+        // flavour's target is a **stock** one, so it needs nothing here — and asking for
+        // `-Zbuild-std` would put a nightly-only flag on a stable build.
+        args.push("-Zbuild-std=std,panic_abort".to_string());
+    }
     if opts.mode.eq_ignore_ascii_case("release") {
         args.push("--release".to_string());
     }
@@ -92,9 +127,17 @@ pub fn esp_plan(platform: &Platform, opts: &BuildOptions) -> Option<EspPlan> {
 
     Some(EspPlan {
         chip: chip.clone(),
+        // `MCU` is a build-time fact only for esp-idf: `esp-idf-sys` reads it, and the crates have no
+        // per-chip cargo feature. In the bare-metal flavour the chip *is* a cargo feature, named in
+        // the project's own manifest, so there is nothing to pass.
+        env: if esp_idf {
+            vec![("MCU".to_string(), chip)]
+        } else {
+            Vec::new()
+        },
+        esp_idf,
         target: rust.target.clone(),
         args,
-        env: vec![("MCU".to_string(), chip)],
     })
 }
 
@@ -397,12 +440,29 @@ pub fn esp_idf_tools_install_dir_in(explicit: Option<&str>) -> String {
 ///
 /// Analysis is deliberately not its job either — a `Cargo.toml` analyses the same way for
 /// either target, so the cargo module keeps that, and only the *invocation* differs here.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EspBuildModule;
+#[derive(Debug, Clone, Copy)]
+pub struct EspBuildModule {
+    /// The flavour this instance answers for — the `os` it was registered under. Carried so the
+    /// capability names what it *is*: two registrations of the same module, one per flavour, must not
+    /// both introduce themselves as "esp-idf".
+    os: &'static str,
+}
+
+impl Default for EspBuildModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl EspBuildModule {
+    /// The **std** flavour — what every existing caller means by "the esp module".
     pub fn new() -> Self {
-        Self
+        Self { os: "esp-idf" }
+    }
+
+    /// The module as it answers for one flavour (see [`ESP_OSES`]).
+    pub fn for_os(os: &'static str) -> Self {
+        Self { os }
     }
 }
 
@@ -414,10 +474,10 @@ impl Actor for EspBuildModule {
         match msg {
             BuildModuleMessage::DescribeCapabilities { reply_to } => {
                 let _ = reply_to.send(ModuleCapability {
-                    name: "esp-idf".to_string(),
+                    name: self.os.to_string(),
                     // Empty on purpose: routing is by platform, not by config file.
                     config_files: Vec::new(),
-                    build_system: "Cargo (esp-idf)".to_string(),
+                    build_system: format!("Cargo ({})", self.os),
                     language: "Rust".to_string(),
                     source_extensions: vec!["rs".to_string()],
                     mcp_servers: Vec::new(),
@@ -499,21 +559,26 @@ impl Actor for EspBuildModule {
 /// The platform and plan a build *or* a flash both need, or the refusal naming what is missing.
 ///
 /// One function so the two paths cannot drift in what they accept — while the message names the
-/// operation, because "an esp-idf build needs a platform" is a confusing thing to read when you
-/// asked for a flash. `esp_plan` is what decides "is this esp-idf": an `os: esp-idf` platform
-/// with no `rust:` block can neither be built nor flashed, so it is refused here rather than
-/// producing a command with an empty triple.
+/// operation, because "an ESP build needs a platform" is a confusing thing to read when you asked for
+/// a flash. `esp_plan` is what decides "is this an ESP platform": a platform with no `rust:` block can
+/// neither be built nor flashed, so it is refused here rather than producing a command with an empty
+/// triple.
 fn esp_platform_plan(op: &str, opts: &BuildOptions) -> Result<(Platform, EspPlan), String> {
     let platform_id = opts
         .platform
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| format!("an esp-idf {op} needs a platform, e.g. \"esp32c6\""))?;
+        .ok_or_else(|| format!("an ESP {op} needs a platform, e.g. \"esp32c3\""))?;
     let platform = Platform::from_registry(platform_id)
         .ok_or_else(|| format!("unknown platform '{platform_id}'"))?;
-    let plan = esp_plan(&platform, opts)
-        .ok_or_else(|| format!("platform '{platform_id}' is not an esp-idf platform"))?;
+    let plan = esp_plan(&platform, opts).ok_or_else(|| {
+        format!(
+            "platform '{platform_id}' is not an ESP platform (os '{}'): this module builds esp-idf \
+             and esp-hal projects",
+            platform.os
+        )
+    })?;
     Ok((platform, plan))
 }
 
@@ -524,7 +589,40 @@ fn esp_platform_plan(op: &str, opts: &BuildOptions) -> Result<(Platform, EspPlan
 /// every other build module.
 pub async fn run_esp_build(path: &Path, opts: &BuildOptions) -> Result<BuildOutput, String> {
     let (_, plan) = esp_platform_plan("build", opts)?;
-    crate::build::generic_helpers::run_build_spec(path, &spec_from_plan(plan)).await
+    let spec = if plan.esp_idf {
+        spec_from_plan(plan)
+    } else {
+        // The bare-metal flavour: a stock target, so there is no SDK and no custom toolchain to force
+        // — but the toolchain about to run must have that target's `core`, and on a machine whose
+        // `cargo` is not rustup's it does not (see `rp2040::spec_from_target`, which measured it).
+        // Checked here rather than left to cargo, whose message names the triple and then suggests a
+        // fix that is already applied.
+        bare_metal_spec(
+            plan,
+            crate::build::rp2040::rustc_sysroot(path).as_deref(),
+            crate::build::rp2040::rustup_installed_targets(path).as_deref(),
+        )?
+    };
+    crate::build::generic_helpers::run_build_spec(path, &spec).await
+}
+
+/// The [`BuildSpec`] the **bare-metal** flavour becomes, with the one requirement it has.
+///
+/// No environment, deliberately: nothing here needs the esp toolchain, `LIBCLANG_PATH` or an IDF
+/// install directory — a stock target builds with the stock toolchain, and injecting that environment
+/// would be this module deciding something the platform never said.
+pub(crate) fn bare_metal_spec(
+    plan: EspPlan,
+    sysroot: Option<&Path>,
+    rustup_targets: Option<&str>,
+) -> Result<BuildSpec, String> {
+    crate::build::rp2040::spec_for_target(
+        plan.args,
+        plan.env,
+        &plan.target,
+        sysroot,
+        rustup_targets,
+    )
 }
 
 /// Flash the artifact for `opts.platform` onto the board, over USB.
@@ -741,6 +839,17 @@ mod tests {
         )
     }
 
+    /// The pilot's board, in the **bare-metal** flavour: a stock rustup target, espflash as the tool.
+    fn c3() -> Platform {
+        platform(
+            "esp32c3",
+            ESP_HAL_OS,
+            "esp32c3",
+            "riscv32imc-unknown-none-elf",
+            Some(("riscv32imc-unknown-none-elf", "esp32c3")),
+        )
+    }
+
     /// A plain Rust project on a normal platform must NOT be claimed by the ESP32 path: it
     /// belongs to `CargoBuildModule`, exactly as before. This is the test that keeps the new
     /// module from hijacking every existing cargo project.
@@ -783,6 +892,90 @@ mod tests {
                 .contains(&"-Zbuild-std=std,panic_abort".to_string()),
             "without build-std these targets fail with `can't find crate for core`: {:?}",
             plan.args
+        );
+    }
+
+    /// The **bare-metal flavour** plans the same chip and triple and none of what an esp-idf build
+    /// needs: no `MCU` (the chip *is* a cargo feature, named in the project's own manifest), and no
+    /// `-Zbuild-std` — its target is a **stock** one, so the flag would be a nightly-only request on a
+    /// stable build.
+    #[test]
+    fn esp_hal_plans_a_stock_target_with_no_idf_environment() {
+        let plan = esp_plan(&c3(), &BuildOptions::default()).expect("an esp-hal platform plans");
+
+        assert_eq!(
+            plan.chip, "esp32c3",
+            "espflash --chip wants the vendor spelling"
+        );
+        assert_eq!(plan.target, "riscv32imc-unknown-none-elf");
+        assert!(!plan.esp_idf);
+        assert!(plan.env.is_empty(), "nothing to pass: {:?}", plan.env);
+        assert_eq!(
+            plan.args,
+            vec!["build", "--target", "riscv32imc-unknown-none-elf"]
+        );
+    }
+
+    /// Its [`BuildSpec`] carries **no** environment: the esp toolchain, `LIBCLANG_PATH` and the shared
+    /// IDF directory belong to the other flavour, and injecting them here would be this module deciding
+    /// something the platform never said.
+    #[test]
+    fn the_bare_metal_spec_adds_no_environment() {
+        let plan = esp_plan(&c3(), &BuildOptions::default()).expect("a plan");
+        let spec =
+            bare_metal_spec(plan, None, None).expect("no sysroot to check, so nothing is refused");
+
+        assert_eq!(spec.command, "cargo");
+        assert!(spec.env.is_empty(), "{:?}", spec.env);
+        assert_eq!(
+            spec.arguments,
+            vec!["build", "--target", "riscv32imc-unknown-none-elf"]
+        );
+    }
+
+    /// The sysroot check applies to this flavour too, and it is the one that matters on a machine whose
+    /// `cargo` is not rustup's: the target is installed, and the toolchain about to run cannot see it.
+    #[test]
+    fn the_bare_metal_spec_refuses_a_target_the_running_toolchain_lacks() {
+        let plan = esp_plan(&c3(), &BuildOptions::default()).expect("a plan");
+        let empty = std::env::temp_dir().join("spire-esp-hal-no-such-sysroot");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let err = bare_metal_spec(plan, Some(&empty), Some("riscv32imc-unknown-none-elf\n"))
+            .expect_err("that directory has no such target");
+        assert!(
+            err.contains("not for the toolchain this build will run"),
+            "{err}"
+        );
+        assert!(
+            err.contains("rustup which cargo"),
+            "the refusal must say what to do: {err}"
+        );
+    }
+
+    /// Two instances of this module are registered — one per flavour — so the capability has to name
+    /// the flavour it answers for. Both introducing themselves as "esp-idf" would be a UI that cannot
+    /// tell them apart, and a route the user cannot reason about.
+    #[tokio::test]
+    async fn the_capability_names_the_flavour() {
+        let mut idf = EspBuildModule::new();
+        let mut hal = EspBuildModule::for_os(ESP_HAL_OS);
+
+        let (t, r) = tokio::sync::oneshot::channel();
+        idf.handle(BuildModuleMessage::DescribeCapabilities { reply_to: t })
+            .await;
+        assert_eq!(r.await.unwrap().name, "esp-idf");
+
+        let (t, r) = tokio::sync::oneshot::channel();
+        hal.handle(BuildModuleMessage::DescribeCapabilities { reply_to: t })
+            .await;
+        let cap = r.await.unwrap();
+        assert_eq!(cap.name, ESP_HAL_OS);
+        assert_eq!(cap.build_system, "Cargo (esp-hal)");
+        assert!(cap.supports_flash, "either flavour flashes with espflash");
+        assert!(
+            cap.config_files.is_empty(),
+            "routing is by platform, never by file"
         );
     }
 
@@ -1163,7 +1356,7 @@ mod tests {
             .expect_err("a flash without a platform must refuse");
         assert!(err.contains("platform"), "{err}");
 
-        // 2. A real platform that is not esp-idf.
+        // 2. A real platform that is not an ESP platform of either flavour.
         let linux = BuildOptions {
             platform: Some("rpi5".to_string()),
             ..Default::default()
@@ -1171,7 +1364,7 @@ mod tests {
         let err = run_esp_flash(root, &linux, None, None)
             .await
             .expect_err("a linux platform has no flash step");
-        assert!(err.contains("not an esp-idf platform"), "{err}");
+        assert!(err.contains("not an ESP platform"), "{err}");
 
         // 3. An esp platform with no flash tool: refused *before* the artifact is looked for,
         //    because no artifact would make it flashable.
@@ -1579,7 +1772,8 @@ mod tests {
             "the error should name the gap: {err}"
         );
 
-        // 2. A real platform that is not esp-idf: refuse rather than build it as if it were.
+        // 2. A real platform that is not an ESP platform of either flavour: refuse rather than build it
+        //    as if it were.
         let linux = BuildOptions {
             platform: Some("rpi5".to_string()),
             ..Default::default()
@@ -1587,7 +1781,7 @@ mod tests {
         let err = run_esp_build(Path::new("/tmp/does-not-matter"), &linux)
             .await
             .expect_err("a linux platform must not be built by this module");
-        assert!(err.contains("not an esp-idf platform"), "{err}");
+        assert!(err.contains("not an ESP platform"), "{err}");
 
         // 3. An id that is not in the registry at all.
         let unknown = BuildOptions {

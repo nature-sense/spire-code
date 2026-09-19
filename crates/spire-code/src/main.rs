@@ -409,6 +409,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         use spire_code::Actor as _;
+        // The **bare-metal** flavour of the same module, registered the same way for the same reason:
+        // the same chip facts and the same flash tool, but a stock rustup target instead of ESP-IDF —
+        // which is what `os: "esp-hal"` routes on. A second instance so the two capabilities name
+        // themselves apart.
+        let (esp_hal_tx, esp_hal_rx) =
+            tokio::sync::mpsc::channel::<spire_code::build::BuildModuleMessage>(8);
+        spire_code::build::EspBuildModule::for_os("esp-hal").spawn(esp_hal_rx);
+        let (t, r) = tokio::sync::oneshot::channel();
+        let _ = esp_hal_tx
+            .send(spire_code::build::BuildModuleMessage::DescribeCapabilities { reply_to: t })
+            .await;
+        if let Ok(cap) = r.await {
+            let _ = bm_tx
+                .send(BuildManagerMessage::AddPlatformModule {
+                    os: "esp-hal".to_string(),
+                    capability: cap,
+                    module_tx: esp_hal_tx,
+                })
+                .await;
+        }
+    }
+    {
+        use spire_code::Actor as _;
         // Registered BY PLATFORM, for the same reason as the esp module above: an rp2040 project
         // is *also* a `Cargo.toml` project, so what differs is the invocation (a `thumbv6m`
         // target, no vendor SDK, a different flasher) — and that is what `os: "rp2040"` routes on.

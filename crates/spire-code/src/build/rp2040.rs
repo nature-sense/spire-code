@@ -243,7 +243,7 @@ fn run_in_project(program: &str, args: &[&str], root: &Path) -> Option<String> {
 }
 
 /// The sysroot of the `rustc` the build will use, or `None` when it cannot be asked.
-fn rustc_sysroot(root: &Path) -> Option<PathBuf> {
+pub(crate) fn rustc_sysroot(root: &Path) -> Option<PathBuf> {
     let sysroot = run_in_project("rustc", &["--print", "sysroot"], root)?;
     let trimmed = sysroot.trim();
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
@@ -253,7 +253,7 @@ fn rustc_sysroot(root: &Path) -> Option<PathBuf> {
 ///
 /// Only used to tell the two missing-target cases apart in the refusal — see
 /// [`spec_from_target`].
-fn rustup_installed_targets(root: &Path) -> Option<String> {
+pub(crate) fn rustup_installed_targets(root: &Path) -> Option<String> {
     run_in_project("rustup", &["target", "list", "--installed"], root)
 }
 
@@ -311,10 +311,25 @@ pub(crate) fn spec_from_target(
     sysroot: Option<&Path>,
     rustup_targets: Option<&str>,
 ) -> Result<BuildSpec, String> {
+    spec_for_target(plan.args, plan.env, &plan.target, sysroot, rustup_targets)
+}
+
+/// The same check for any **bare-metal** plan: an argument list, an environment, and a stock target.
+///
+/// Shared with the esp module's `esp-hal` flavour, whose build has the same shape — a stock rustup
+/// target with no vendor SDK — and whose failure on a machine whose `cargo` is not rustup's is the
+/// same one this was written for.
+pub(crate) fn spec_for_target(
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    target: &str,
+    sysroot: Option<&Path>,
+    rustup_targets: Option<&str>,
+) -> Result<BuildSpec, String> {
     if let Some(sysroot) = sysroot {
-        if !target_available_in_sysroot(sysroot, &plan.target) {
+        if !target_available_in_sysroot(sysroot, target) {
             let known_to_rustup = rustup_targets
-                .map(|targets| target_installed_in(targets, &plan.target))
+                .map(|targets| target_installed_in(targets, target))
                 .unwrap_or(false);
             return Err(if known_to_rustup {
                 format!(
@@ -322,24 +337,24 @@ pub(crate) fn spec_from_target(
                      this build will run (sysroot {}): `cargo` and `rustc` on PATH are not rustup's \
                      — put the directory `rustup which cargo` prints first on PATH, or build \
                      through `rustup run <toolchain> cargo`",
-                    plan.target,
+                    target,
                     sysroot.display()
                 )
             } else {
                 format!(
                     "the target '{}' is not installed for the toolchain at {}: run `rustup target add {}`",
-                    plan.target,
+                    target,
                     sysroot.display(),
-                    plan.target
+                    target
                 )
             });
         }
     }
     Ok(BuildSpec {
         command: "cargo".to_string(),
-        arguments: plan.args,
+        arguments: args,
         working_dir: String::new(),
-        env: plan.env,
+        env,
     })
 }
 
