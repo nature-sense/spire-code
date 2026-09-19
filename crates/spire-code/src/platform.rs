@@ -13,8 +13,11 @@
 //!
 //! The **graph is the canonical store** for platforms (each field stored as an
 //! individual typed property on a Platform node); the YAML files are only the
-//! seed used on startup. The generic MCP client stays in `spire-core` — this
-//! module just builds a [`spire_core::mcp::client::McpServerConfig`] from it.
+//! seed used on startup. The startup phase reads the graph back into
+//! [`set_registry`], and [`Platform::from_registry`] — the build path's lookup —
+//! resolves from that view, so a build cannot disagree with what the graph holds.
+//! The generic MCP client stays in `spire-core` — this module just builds a
+//! [`spire_core::mcp::client::McpServerConfig`] from it.
 //!
 //! These types live here rather than in `spire-core` because the platform
 //! concept is Spire's own: cross-compilation targets, their registry and their
@@ -22,9 +25,38 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// The in-process view of the registry, populated **from the graph** at startup.
+///
+/// [`Platform::from_registry`] is synchronous and is called from deep inside the
+/// build modules — a Cargo target's triple, a Meson cross file, a board's MCP
+/// endpoint — so it cannot query the graph per call. The startup phase seeds this
+/// once per process from the graph's own `Platform` nodes, and the graph is the
+/// source of truth from then on. A process that never seeded it (a test, a bare
+/// tool) falls back to reading the YAML seed directly.
+static REGISTRY: OnceLock<RwLock<Vec<Platform>>> = OnceLock::new();
+
+/// Replace the in-process registry with the platforms read back from the graph.
+pub fn set_registry(platforms: Vec<Platform>) {
+    let lock = REGISTRY.get_or_init(|| RwLock::new(Vec::new()));
+    *lock
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = platforms;
+}
+
+/// The platforms the graph holds, when it has been seeded with any.
+fn graph_registry() -> Option<Vec<Platform>> {
+    let lock = REGISTRY.get()?;
+    let platforms = lock
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    (!platforms.is_empty()).then_some(platforms)
+}
 
 // ============================================================================
 // Platform definitions — cross-compilation targets (rpi5, rock3c, …)
@@ -324,9 +356,26 @@ impl Platform {
         spire_core::config::config_dir().join("platforms")
     }
 
-    /// Load a single platform by id from the registry
-    /// (`$SPIRE_PLATFORM_DIR` or `~/.spire/platforms/*.yaml`).
+    /// Load a single platform by id.
+    ///
+    /// The **graph** is the registry: the startup phase seeds this process from
+    /// the graph's `Platform` nodes and that view wins. The YAML seed
+    /// (`$SPIRE_PLATFORM_DIR` or `~/.spire/<app>/platforms/*.yaml`) is only the
+    /// fallback for a process that has not seeded a graph.
     pub fn from_registry(id: &str) -> Option<Platform> {
+        Self::resolve(id, graph_registry().as_deref())
+    }
+
+    /// [`Self::from_registry`] with the graph-derived view passed in, so the
+    /// selection is testable without a process-global.
+    ///
+    /// An id the graph does *not* hold resolves to `None` rather than being
+    /// looked for in the seed: once the graph exists it is authoritative, and
+    /// silently falling through would hide a platform the graph dropped.
+    fn resolve(id: &str, from_graph: Option<&[Platform]>) -> Option<Platform> {
+        if let Some(platforms) = from_graph {
+            return platforms.iter().find(|p| p.id == id).cloned();
+        }
         let dir = Self::default_platform_dir();
         let platforms = Self::load_directory(&dir).ok()?;
         platforms.into_iter().find(|p| p.id == id)
@@ -627,6 +676,63 @@ mod tests {
         fs::create_dir_all(dir).unwrap();
         let mut f = fs::File::create(dir.join(name)).unwrap();
         f.write_all(content.as_bytes()).unwrap();
+    }
+
+    /// A **complete** platform YAML. `Platform` has required `architecture`,
+    /// `toolchain` and `sysroot`, and `load_directory` skips a file that does not
+    /// parse — so a bare `id`/`name`/`os` fixture loads as *nothing*.
+    fn platform_yaml(id: &str, name: &str) -> String {
+        format!(
+            "id: {id}\nname: {name}\nos: linux\n\
+             architecture:\n  cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
+             target_triple: aarch64-linux-gnu\n\
+             toolchain:\n  c: clang\n  cpp: clang++\n  ar: ar\n  strip: strip\n  ld: ld.lld\n  \
+             pkgconfig: pkg-config\n\
+             sysroot:\n  root: /tmp/sysroot/{id}\n"
+        )
+    }
+
+    /// The graph-held view wins, and an id it does not hold is *not* looked for in
+    /// the seed — once the graph exists it is authoritative.
+    ///
+    /// `resolve` takes the view as an argument rather than reading the
+    /// process-global on purpose: a test that called `set_registry` would leak into
+    /// every other test's `from_registry`, and the runner is parallel.
+    #[test]
+    fn resolve_prefers_the_graph_view_over_the_yaml_seed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "graph-only.yaml",
+            &platform_yaml("graph-only", "From the graph"),
+        );
+        let graph = Platform::load_directory(tmp.path()).unwrap();
+        assert_eq!(graph.len(), 1, "the fixture must load as one platform");
+
+        assert_eq!(
+            Platform::resolve("graph-only", Some(&graph)).map(|p| p.name),
+            Some("From the graph".to_string())
+        );
+        assert!(
+            Platform::resolve("rpi5", Some(&graph)).is_none(),
+            "a graph that exists is authoritative, not a fallback to the seed"
+        );
+    }
+
+    /// Without a graph, the YAML seed is the registry — a bare tool, or a test.
+    #[test]
+    fn resolve_falls_back_to_the_yaml_seed_without_a_graph() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(tmp.path(), "rpi5.yaml", &platform_yaml("rpi5", "Rasp Pi"));
+        let _guard = crate::platform::PlatformDirGuard::set(tmp.path());
+
+        assert_eq!(
+            Platform::resolve("rpi5", None).map(|p| p.name),
+            Some("Rasp Pi".to_string())
+        );
     }
 
     #[test]

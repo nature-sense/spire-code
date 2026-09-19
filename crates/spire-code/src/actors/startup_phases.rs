@@ -598,6 +598,27 @@ impl StartupPhase for PlatformBootstrapPhase {
         match rx.await {
             Ok(Ok(())) => {
                 info!("SystemActor: platform definitions bootstrapped into graph");
+                // Read them back and cache them: the graph is the registry for the
+                // rest of the process — `Platform::from_registry` resolves from this
+                // view, never the YAML seed — and reading it back is what proves the
+                // nodes the writer stored are legible to the reader.
+                let (gtx, grx) = oneshot::channel();
+                if ctx
+                    .memory_graph_tx
+                    .send(MemoryGraphMessage::GetPlatforms { reply_to: gtx })
+                    .await
+                    .is_ok()
+                {
+                    if let Ok(Ok(nodes)) = grx.await {
+                        let cached: Vec<SpirePlatform> = nodes
+                            .iter()
+                            .filter_map(crate::actors::platform_codec::platform_json_to_spire)
+                            .collect();
+                        let count = cached.len();
+                        crate::platform::set_registry(cached);
+                        info!("SystemActor: platform registry cached from graph ({count})");
+                    }
+                }
                 PhaseResult::Complete
             }
             Ok(Err(e)) => {
