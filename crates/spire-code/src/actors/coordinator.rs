@@ -2531,8 +2531,14 @@ impl CoordinatorActor {
                             .iter()
                             .filter_map(crate::actors::platform_codec::platform_json_to_spire)
                             .collect();
+                        // Boards are appended in both branches. They are what a picker
+                        // offers, so a board that declares its chip is how the store
+                        // conversion lands *without* the bare-metal boards vanishing
+                        // from the list the moment their chip entries move out of the
+                        // platform seed.
+                        let boards = crate::platform::Platform::load_boards().unwrap_or_default();
                         if !platforms.is_empty() {
-                            platforms_listing(platforms)
+                            platforms_listing(platforms_with_boards(platforms, boards))
                         } else {
                             // The startup phase chain may not have seeded the
                             // graph yet (or a fresh DB cleared it). The YAML
@@ -2542,7 +2548,7 @@ impl CoordinatorActor {
                             let dir = crate::platform::Platform::default_platform_dir();
                             let from_seed =
                                 crate::platform::Platform::load_directory(&dir).unwrap_or_default();
-                            platforms_listing(from_seed)
+                            platforms_listing(platforms_with_boards(from_seed, boards))
                         }
                     }
                     Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
@@ -5664,6 +5670,19 @@ struct PlatformListing<'a> {
     kind: crate::platform::PlatformKind,
 }
 
+/// The picker's list: what the graph holds, plus the boards the board store declares.
+///
+/// A chip is what a board *is*, not a choice, so boards are what a picker offers — and
+/// appending them is what lets the store conversion land while the chip entries are
+/// still the platform seed, with no bare-metal board falling out of the list.
+fn platforms_with_boards(
+    mut platforms: Vec<crate::platform::Platform>,
+    boards: Vec<crate::platform::Platform>,
+) -> Vec<crate::platform::Platform> {
+    platforms.extend(boards);
+    platforms
+}
+
 fn platforms_listing(platforms: Vec<crate::platform::Platform>) -> serde_json::Value {
     let listing: Vec<PlatformListing> = platforms
         .iter()
@@ -5724,6 +5743,19 @@ mod platform_listing_tests {
 
         assert_eq!(kind_of("esp32c6"), Some("chip".to_string()));
         assert_eq!(kind_of("rpi5"), Some("board".to_string()));
+    }
+
+    /// Boards are appended to whatever the graph holds, so the picker keeps offering a
+    /// bare-metal board after its chip entry has moved out of the platform seed — which
+    /// is the order the store conversion lands in, and why this runs first.
+    #[test]
+    fn the_listing_adds_the_boards_the_board_store_declares() {
+        let graph = vec![platform("esp32c3", "esp-idf")];
+        let boards = vec![platform("m5stack-station", "esp-idf")];
+
+        let out = platforms_with_boards(graph, boards);
+        let ids: Vec<&str> = out.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["esp32c3", "m5stack-station"]);
     }
 
     /// The flag the wizard filters on is in the payload, and the rest of the platform travels with
