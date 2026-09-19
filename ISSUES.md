@@ -1572,3 +1572,73 @@ scaffolded against nothing.
 The same rename dropped the phrase "embedded-HAL project" from the docs: it named a shape that no
 longer exists (a contract crate implementing our own traits). What an application path-deps is the
 container's library crate, `crates/<project>`.
+
+## Rationalising the platform/board/HAL structure
+
+**The trigger.** The Platforms screen listed every registry entry flat, and reading it made the
+underlying mistake visible: the Linux SBC entries (`rpi5`, `rock3c`, `a7s`) are **boards** — the
+Pi 5's arch and sysroot are facts about *that board* — while the bare-metal entries (`esp32c3`,
+`rp2040`, …) are **processors**, and `esp32c3.yaml` is named `"ESP32-C3 (DevKitM-1)"` because the
+board facts had nowhere else to go. Its `library_hints` describe a *DevKitM-1* ("the on-board LED is
+on **GPIO8** and is addressable (WS2812-family)"), not the C3 silicon. So one list held two kinds,
+and one entry held two concepts.
+
+**The model (settled before any code).** Four things, not one:
+
+| concept | what it is | owns |
+|---|---|---|
+| **HAL** | the platform abstraction | *never us* — the Linux kernel, or `embedded-hal` + the vendor HAL |
+| **Chip** | the silicon (`esp32c3`, `rp2040`, `bcm2712`) | its vendor HAL, its compile target (triple, flash tool) |
+| **Board** | the physical thing (`DevKitM-1`, `Pi 5`, `Rock 3C`) | names a chip; its **BSP** (pin facts); optionally a device endpoint |
+| **Driver library** | the reusable project an application depends on | device drivers (Ws2812/IMU · camera/NPU/codec); the actor framework bare-metal-side |
+
+Two consequences worth stating, because both correct an earlier assumption:
+
+- **A BSP is not bare-metal-only.** It is *board facts* (GPIO pinout, LED, active-low). Every board
+  has them; bare-metal needs them **now** (nothing else knows which pin is the LED), while on Linux
+  the kernel already owns the low level, so a BSP there would only name the header mapping — useful,
+  not yet needed. One concept, two timelines.
+- **The two HAL shapes were always the same idea.** ai-traps' `hal/api` + `hal/implementations/<plat>`
+  (camera, NPU, h264) is a *driver library* that has been living **inside** each project; the
+  container is a driver library that already lives beside it. Converging means moving the first out,
+  not inventing a third thing.
+
+**Stage 1 — name the two kinds, and section the screen (done, `683ef22`).** `Platform::kind()`
+returns `PlatformKind::{Board, Chip}`, and `platforms/list` sends it as `"kind"` — **sent**, like
+`embedded` already was, because the rule is `os` and a second copy of it in Swift could only ever
+disagree with the first. The screen sections by it, boards first. The rule is deliberately the
+**inverse of `is_embedded()`** rather than a second predicate: a second taxonomy is free to disagree
+with the one the build keys on. It is derived *today*; the split below turns it into a declared
+field, and only this method changes when it does.
+
+**Stage 2 — the store split (specified, not yet built).** The declared field and the two stores are
+**one change**, not two: adding the field alone changes no behaviour, because the derivation is
+already correct for every current entry. So:
+
+- `kind` becomes a **declared** field (`kind: board` / `kind: chip`), defaulting to today's
+  derivation, so no existing seed has to change to keep working.
+- A board declares the chip it carries (`chip: esp32c3`), which is what makes "one chip, N boards"
+  expressible — and is why `spire-bsp-<chip>` was never the right unit.
+- The load path reads **`boards/` beside `platforms/`**, and `platform_codec` carries both fields so
+  the graph holds the *declaration* rather than re-deriving it (the graph is the source of truth for
+  everything else on `Platform` nodes; these must not be the exception).
+
+The split for the nine entries we have:
+
+| today | becomes | carries |
+|---|---|---|
+| `rpi5`, `rock3c`, `a7s` | **boards** | the SBC's arch + sysroot; its chip (`bcm2712` / RK3566 / A523) |
+| `esp32c3` | **chip** | `esp-hal` 1.2, the stock `riscv32imc-unknown-none-elf`, `espflash` |
+| `esp32c6`, `esp32s3`, `esp32p4`, `rp2040` | **chips** | their triples, vendor HALs, flash tools |
+| *(new)* `devkitm1` | **board** | `chip: esp32c3` + the LED/WS2812 facts moved out of the chip's `library_hints` |
+
+**The one thing that is a decision, not a mechanic:** each of `esp32c6`/`esp32s3`/`esp32p4`/`rp2040`
+needs its **board** named — the devkit its hints actually describe — before its board facts can move
+off the chip entry. `esp32c3` is unambiguous (`DevKitM-1`); the others are not derivable from the
+silicon, and inventing them would put the same guess in the data that we are removing from the code.
+
+**Stage 3 — HAL → a referenced driver library.** Extract ai-traps' `hal/` so `Hal` and `Embedded`
+are the same concept: a project of drivers an application depends on, with a board's BSP as that
+library's per-board piece. **Stage 4 — names last**: rename `Platform`/`Hal`/`Embedded` in the type
+system only after 1–3 hold, since the names are the least of it.
+
