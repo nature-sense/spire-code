@@ -94,6 +94,13 @@ pub struct Platform {
     pub name: String,
     /// Discriminator: "linux" today; "esp-idf", "rp2040", "none", … later.
     pub os: String,
+    /// The target's architecture and triple.
+    ///
+    /// Optional on purpose: a **board** gets these from the `chip:` it declares, and
+    /// restating them per board would be two sources for one fact — the drift this
+    /// stage exists to remove. A chip carries it; a Linux SBC carries it too, being
+    /// both board and target at once.
+    #[serde(default)]
     pub architecture: PlatformArchitecture,
     /// The C cross-toolchain.
     ///
@@ -220,7 +227,10 @@ pub struct PlatformDeploy {
 }
 
 /// CPU architecture of the target platform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` because it is optional on a `Platform`: a board gets its triple from the
+/// chip it declares, so a board entry states none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlatformArchitecture {
     /// Meson cpu_family: arm | aarch64 | x86_64 …
     pub cpu_family: String,
@@ -867,6 +877,28 @@ mod tests {
         assert_eq!(hal.crate_name, "esp-hal");
         assert_eq!(hal.version, "1.2");
         assert_eq!(hal.features, vec!["esp32s3", "unstable"]);
+    }
+
+    /// A board can be authored **without** `architecture`: its chip supplies the
+    /// triple, so restating it per board would be two sources for one fact. This is
+    /// the exact shape the store conversion writes.
+    #[test]
+    fn a_board_entry_need_not_restate_its_chips_architecture() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(
+            tmp.path(),
+            "m5stack-core-s3.yaml",
+            "id: m5stack-core-s3\nname: M5Stack Core S3\nos: esp-hal\nchip: esp32s3\n\
+             library_hints: the board's own facts, not the silicon's\n",
+        );
+
+        let boards = Platform::load_boards_in(tmp.path()).expect("the store reads");
+        assert_eq!(boards.len(), 1, "a board with no architecture still loads");
+        assert_eq!(boards[0].chip_id(), "esp32s3");
+        assert!(
+            boards[0].architecture.target_triple.is_empty(),
+            "the board states no triple; its chip does"
+        );
     }
 
     /// The board store reads boards that declare their chip — which is the whole
