@@ -744,8 +744,240 @@ const OWN_EXECUTOR_STUB: &str = r#"/// A `no_std` family supplies its own execut
 /// TODO: `impl Spawner for StaticSpawner`, the static mailbox, and `run()`.
 pub struct StaticSpawner;"#;
 
+// ---------------------------------------------------------------------------------------------
+// The container's *routine* work: a BSP added as required.
+//
+// The actor framework is fixed and scaffolded once. A BSP is not: it exists because a particular
+// board has no upstream crate, and its whole content is that board's facts — which pin, which bus,
+// which polarity. So this is the operation that runs often, and the one worth getting right.
+// ---------------------------------------------------------------------------------------------
+
+/// The BSP crate for one **board**.
+///
+/// One per board rather than one per family: two boards on one chip are two crates, because the
+/// facts they carry are the boards'. The *vendor* crate they wrap is chosen per chip, which is the
+/// other question — see [`vendor_for`].
+pub(crate) fn bsp_crate(platform_id: &str) -> String {
+    format!("spire-bsp-{platform_id}")
+}
+
+/// The vendor crate a board's BSP wraps, and the version to ask for.
+///
+/// One row per chip, and only for chips proven on a board: `esp32c3` is the pilot. A BSP for a chip
+/// nobody has flashed is a crate whose `todo!()`s might never be fillable.
+fn vendor_for(platform_id: &str) -> Option<(&'static str, &'static str)> {
+    match platform_id {
+        "esp32c3" => Some(("esp-hal", "1.2")),
+        _ => None,
+    }
+}
+
+/// A board's BSP: two files, one of which is the fill's.
+pub(crate) fn bsp_files(
+    platform_id: &str,
+    vendor: &str,
+    vendor_version: &str,
+) -> Vec<super::ScaffoldFile> {
+    let name = bsp_crate(platform_id);
+    let manifest = BSP_MANIFEST
+        .replace("__NAME__", &name)
+        .replace("__CHIP__", platform_id)
+        .replace("__VENDOR__", vendor)
+        .replace("__VENDOR_VERSION__", vendor_version);
+    vec![
+        super::ScaffoldFile {
+            path: format!("crates/{name}/Cargo.toml"),
+            content: manifest,
+            structural: true,
+            ..Default::default()
+        },
+        super::ScaffoldFile {
+            path: format!("crates/{name}/src/lib.rs"),
+            content: bsp_lib(&name, platform_id, vendor),
+            // The fill's file: the board's pins are the one thing no scaffold can know, and they are
+            // the whole reason this crate exists.
+            structural: false,
+            fill_role: Some(spire_core::build_types::SourceRole::HalImplementation),
+        },
+    ]
+}
+
+/// The BSP's source, with the vendor crate's identifier form substituted for its `use` lines.
+fn bsp_lib(name: &str, platform_id: &str, vendor: &str) -> String {
+    BSP_LIB_RS
+        .replace("__NAME__", name)
+        .replace("__CHIP__", platform_id)
+        .replace("__VENDOR__", vendor)
+        .replace("__VENDOR_ID__", &vendor.replace('-', "_"))
+}
+
+/// A BSP's manifest — the vendor HAL, and the crate whose trait names its signatures use.
+const BSP_MANIFEST: &str = r#"# __NAME__ — one board's support package.
+#
+# A BSP is not a HAL. The peripheral traits are `embedded-hal`'s and the HAL is the vendor's crate,
+# so there is nothing of ours to implement here; what lives in this crate is **this board's facts**,
+# which the vendor cannot know and no application should have to carry.
+#
+# The default is an upstream BSP. This crate exists because this board has none.
+[package]
+name = "__NAME__"
+description = "The __CHIP__ board's facts — pins, buses, polarity — over __VENDOR__."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The actor system and the peripherals module, for the trait names this crate's signatures use.
+spire-embedded = { path = "../spire-embedded" }
+# The vendor HAL: the only crate here that knows a chip, and the crate the feature selects.
+__VENDOR__ = { version = "__VENDOR_VERSION__", features = ["__CHIP__"] }
+"#;
+
+/// A BSP's source: the board's constructors, with the pins left to the fill.
+const BSP_LIB_RS: &str = r#"//! The `__NAME__` BSP: **this board's facts**, over `__VENDOR__`.
+//!
+//! Nothing here implements a peripheral trait. `__VENDOR__`'s output driver *is* an `embedded-hal`
+//! `OutputPin` and its delay *is* a `DelayNs`, so a wrapper would be a second implementation of
+//! something the vendor crate already provides — and one that stood between this board and every
+//! driver written against the ecosystem.
+//!
+//! What a BSP adds is knowledge the vendor cannot have: which pin the LED is on, whether it is
+//! active-low, which bus the display is on. Putting it here means no application carries it, and no
+//! two applications can disagree about it.
+//!
+//! The `todo!()`s are the fill's. They are **typed**, so this crate compiles and links before any of
+//! them is written — which is what lets an application that depends on it be built and flashed while
+//! the board's pins are still unknown.
+
+use __VENDOR_ID__::delay::Delay;
+use __VENDOR_ID__::gpio::Output;
+use __VENDOR_ID__::peripherals::Peripherals;
+
+/// This board, and the peripherals its facts are taken from.
+pub struct Board {
+    peripherals: Peripherals,
+}
+
+impl Board {
+    /// Take the peripherals **once**, here, so that every constructor below is a board fact rather
+    /// than an argument each caller has to remember. (`__VENDOR__`'s peripheral singletons are
+    /// `Copy`, so a `&self` can hand one out.)
+    pub fn new(peripherals: Peripherals) -> Self {
+        Self { peripherals }
+    }
+
+    /// The board's LED, as an `embedded-hal` output.
+    ///
+    /// TODO: this board's pin. Polarity belongs here too — an active-low LED is inverted inside this
+    /// function, once, and nothing above the board has to know. A board whose LED is *addressable*
+    /// needs no output at all: it takes a bus and `spire_embedded::drivers::Ws2812`, because a level
+    /// is not a colour.
+    pub fn led(&self) -> Output<'static> {
+        let _ = self.peripherals.GPIO8;
+        todo!("this board's LED pin")
+    }
+
+    /// The board's blocking delay, as an `embedded-hal` `DelayNs`.
+    ///
+    /// `__VENDOR__`'s delay already implements it, so there is nothing to wrap and no error to map.
+    pub fn delay(&self) -> Delay {
+        Delay::new()
+    }
+}
+"#;
+
+/// Add a board's BSP to the container — **the routine operation**.
+///
+/// The container's framework is scaffolded once; a BSP is added *as required*, for a board that has
+/// no upstream crate. So this writes two files and the workspace member that makes them exist, and it
+/// refuses rather than half-does: a manifest that cannot be read, a crate directory that already
+/// exists, or a chip with no known vendor crate all stop before anything is written.
+pub(crate) fn add_bsp(
+    root: &std::path::Path,
+    platform_id: &str,
+) -> Result<serde_json::Value, String> {
+    let platform = crate::platform::Platform::from_registry(platform_id)
+        .ok_or_else(|| format!("unknown platform '{platform_id}' (see ~/.spire/platforms)"))?;
+    if !platform.is_embedded() {
+        return Err(format!(
+            "platform '{platform_id}' is not an embedded platform (os '{}'); a BSP needs a board it \
+             can be built for",
+            platform.os
+        ));
+    }
+    let (vendor, version) = vendor_for(platform_id).ok_or_else(|| {
+        format!(
+            "no BSP wiring is known for '{platform_id}' yet. `esp32c3` is the one row measured on a \
+             board — built, flashed, LED cycling — and another chip is a row here, not a guess"
+        )
+    })?;
+
+    let name = bsp_crate(platform_id);
+    let crate_dir = root.join("crates").join(&name);
+    if crate_dir.exists() {
+        return Err(format!(
+            "board '{platform_id}' already has a BSP ({})",
+            crate_dir.display()
+        ));
+    }
+
+    // The member list is what makes the crate part of the container, so it is read *before* anything
+    // is written: a container whose manifest is unreadable is refused, not half-edited.
+    let manifest_path = root.join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    let member = format!("crates/{name}");
+    if manifest.contains(&format!("\"{member}\"")) {
+        return Err(format!(
+            "`{member}` is already a workspace member — the manifest and the crate directory \
+             disagree, so nothing was written"
+        ));
+    }
+
+    let files = bsp_files(platform_id, vendor, version);
+    let mut written: Vec<String> = Vec::new();
+    for file in &files {
+        let target = root.join(&file.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&target, &file.content)
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+        written.push(file.path.clone());
+    }
+
+    // Beside the other members, so the list stays one list.
+    let mut lines: Vec<String> = manifest.lines().map(str::to_string).collect();
+    let at = lines
+        .iter()
+        .rposition(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with('"') && trimmed.ends_with("\",")
+        })
+        .map(|index| index + 1)
+        .unwrap_or(lines.len());
+    lines.insert(at, format!("    \"{member}\","));
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    std::fs::write(&manifest_path, updated)
+        .map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
+
+    Ok(serde_json::json!({
+        "board": platform_id,
+        "crate": name,
+        "vendor_crate": vendor,
+        "written": written,
+        "workspace_member": member,
+        "note": "the board's facts are typed `todo!()`s in src/lib.rs, so the crate builds and links \
+                 until the fill writes them",
+    }))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
 
     /// A hermetic registry, so the tests can name a family the machine may not have (rp2040) and
@@ -971,5 +1203,126 @@ mod tests {
             std::fs::write(&path, &f.content).unwrap();
         }
         println!("{}", root.display());
+    }
+
+    /// A container on disk: a workspace manifest with a members list, as the framework's own is.
+    fn container_on_disk(root: &Path) -> PathBuf {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\n    \"crates/spire-embedded\",\n]\n\
+             \n[workspace.metadata.spire]\nstructure = \"embedded\"\n",
+        )
+        .unwrap();
+        root.join("Cargo.toml")
+    }
+
+    /// **The routine operation**: a board's BSP, added to an existing container.
+    ///
+    /// The framework is scaffolded once; a BSP is what gets added as required, and its content is the
+    /// board's facts — left as *typed* `todo!()`s so the crate builds and links before the fill writes
+    /// them. That typing is the whole trick: an application depending on this BSP can be built and
+    /// flashed while the pins are still unknown.
+    #[test]
+    fn a_bsp_is_added_to_the_container() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[("esp32c3", "esp-hal", Some("esp32"))]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        let root = tempfile::tempdir().unwrap();
+        let manifest_path = container_on_disk(root.path());
+
+        let out = add_bsp(root.path(), "esp32c3").expect("a BSP for the pilot board");
+        assert_eq!(out["crate"], "spire-bsp-esp32c3");
+        assert_eq!(out["vendor_crate"], "esp-hal");
+
+        let lib = std::fs::read_to_string(root.path().join("crates/spire-bsp-esp32c3/src/lib.rs"))
+            .expect("the BSP's source");
+        for expected in [
+            "pub struct Board",
+            "pub fn led(&self) -> Output<'static>",
+            "todo!(\"this board's LED pin\")",
+            "use esp_hal::gpio::Output;",
+            "use esp_hal::peripherals::Peripherals;",
+        ] {
+            assert!(lib.contains(expected), "missing `{expected}`:\n{lib}");
+        }
+
+        let manifest =
+            std::fs::read_to_string(root.path().join("crates/spire-bsp-esp32c3/Cargo.toml"))
+                .expect("the BSP's manifest");
+        for expected in [
+            "name = \"spire-bsp-esp32c3\"",
+            "spire-embedded = { path = \"../spire-embedded\" }",
+            "esp-hal = { version = \"1.2\", features = [\"esp32c3\"] }",
+        ] {
+            assert!(
+                manifest.contains(expected),
+                "missing `{expected}`:\n{manifest}"
+            );
+        }
+
+        // The workspace member, beside the one that was already there rather than after the bracket.
+        let after = std::fs::read_to_string(&manifest_path).unwrap();
+        let embedded_at = after
+            .find("\"crates/spire-embedded\",")
+            .expect("the first member");
+        let bsp_at = after
+            .find("\"crates/spire-bsp-esp32c3\",")
+            .expect("the new member");
+        assert!(embedded_at < bsp_at, "the members stay one list:\n{after}");
+        assert!(after.contains("structure = \"embedded\""), "{after}");
+    }
+
+    /// Adding the same board twice is refused — before anything is written, not after.
+    #[test]
+    fn adding_a_bsp_twice_is_refused() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[("esp32c3", "esp-hal", Some("esp32"))]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        let root = tempfile::tempdir().unwrap();
+        let manifest_path = container_on_disk(root.path());
+
+        add_bsp(root.path(), "esp32c3").expect("the first");
+        let before = std::fs::read_to_string(&manifest_path).unwrap();
+        let err = add_bsp(root.path(), "esp32c3").unwrap_err();
+        assert!(err.contains("already has a BSP"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            before,
+            "a refused add must not touch the manifest"
+        );
+    }
+
+    /// A BSP needs a board, and a chip whose vendor crate is known — both refusals name the reason.
+    #[test]
+    fn a_bsp_needs_a_board_and_a_known_vendor_crate() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[
+            ("esp32s3", "esp-hal", Some("esp32")),
+            ("x86-64", "linux", None),
+        ]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        let root = tempfile::tempdir().unwrap();
+        container_on_disk(root.path());
+
+        // A chip with no row: refused by name, and the refusal says what *is* known.
+        let err = add_bsp(root.path(), "esp32s3").unwrap_err();
+        assert!(
+            err.contains("no BSP wiring is known for 'esp32s3'"),
+            "{err}"
+        );
+        assert!(err.contains("esp32c3"), "{err}");
+
+        // A host platform is not a board.
+        let err = add_bsp(root.path(), "x86-64").unwrap_err();
+        assert!(err.contains("not an embedded platform"), "{err}");
     }
 }

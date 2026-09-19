@@ -3927,6 +3927,33 @@ executable('{project_name}-{platform}',
                 }
             }
 
+            // Adding a board's BSP to the container: the crate, and the workspace member that makes
+            // it exist. This is the *routine* container operation — the framework is scaffolded once,
+            // a BSP is added as required, for a board with no upstream crate.
+            "embedded_add_bsp" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let board = args
+                    .get("board")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if root.is_empty() || board.is_empty() {
+                    serde_json::json!({
+                        "error": "embedded_add_bsp: 'root' (the container directory) and 'board' (a platform id) are required"
+                    })
+                } else {
+                    match crate::build::embedded_scaffold::add_bsp(
+                        std::path::Path::new(root),
+                        board,
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => serde_json::json!({ "error": e }),
+                    }
+                }
+            }
+
             "hal_diff_contracts" => {
                 let old_summary = args
                     .get("old_summary")
@@ -4479,6 +4506,12 @@ executable('{project_name}-{platform}',
                   "platform": { "type": "string", "description": "Platform registry id (e.g. esp32c6); its `family` decides the crate" }
               }),
               &["root", "platform"]),
+            t("embedded_add_bsp", "Add a board's BSP crate to the spire-embedded container: the board's facts (pins, buses, polarity) as typed `todo!()`s, plus the workspace member that makes the crate exist. The container's framework is scaffolded once; a BSP is added as required, for a board with no upstream BSP.",
+              serde_json::json!({
+                  "root": { "type": "string", "description": "The container directory (the spire-embedded workspace root)" },
+                  "board": { "type": "string", "description": "Platform registry id of the board (e.g. esp32c3)" }
+              }),
+              &["root", "board"]),
             t("hal_diff_contracts", "Diff two HAL contract summaries (added/removed/changed methods).",
               serde_json::json!({ "old_summary": { "type": "object" }, "new_summary": { "type": "object" } }),
               &["old_summary", "new_summary"]),
