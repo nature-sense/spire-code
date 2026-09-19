@@ -309,7 +309,7 @@ async fn an_esp32_backend_builds_where_the_sdk_is_installed() {
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
                 "platforms": ["esp32c6"],
-                "structure": "embedded_hal",
+                "structure": "embedded",
             }),
         )
         .await;
@@ -446,7 +446,7 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
                 "projectName": "blink-workshop",
                 "language": "Rust",
                 "platforms": ["esp32c6", "rp2040"],
-                "structure": "embedded_hal",
+                "structure": "embedded",
             }),
         )
         .await;
@@ -490,7 +490,7 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
                 "platforms": ["esp32c6", "rp2040"],
-                "structure": "embedded_hal",
+                "structure": "embedded",
             }),
         )
         .await;
@@ -498,7 +498,7 @@ async fn the_wizard_creates_an_embedded_hal_project_and_the_loop_closes() {
 
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("a workspace manifest");
     assert!(
-        manifest.contains("structure = \"embedded_hal\""),
+        manifest.contains("structure = \"embedded\""),
         "the declaration the analyzer reads back: {manifest}"
     );
     for path in [
@@ -651,7 +651,7 @@ async fn a_scaffolded_backend_builds_after_one_repair_round() {
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
                 "platforms": ["rp2040"],
-                "structure": "embedded_hal",
+                "structure": "embedded",
             }),
         )
         .await;
@@ -788,7 +788,7 @@ async fn a_second_wrong_answer_still_gets_a_third_round() {
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
                 "platforms": ["rp2040"],
-                "structure": "embedded_hal",
+                "structure": "embedded",
             }),
         )
         .await;
@@ -856,7 +856,7 @@ async fn a_new_contract_and_a_new_board_both_become_fill_work() {
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
                 "platforms": ["rp2040"],
-                "structure": "embedded_hal",
+                "structure": "embedded",
             }),
         )
         .await;
@@ -1018,7 +1018,7 @@ async fn live_fill(platform: &str, project_name: &str) -> Option<serde_json::Val
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
                 "platforms": [platform],
-                "structure": "embedded_hal",
+                "structure": "embedded",
                 // The fill is what this run measures; the scaffold building the same backend would
                 // do the same work twice.
                 "verifyBackends": false,
@@ -1203,7 +1203,7 @@ async fn a_real_model_fills_the_backends_it_is_asked_for() {
                 "rootDir": root.to_string_lossy(),
                 "language": "Rust",
                 "platforms": ["esp32c6", "rp2040"],
-                "structure": "embedded_hal",
+                "structure": "embedded",
             }),
         )
         .await;

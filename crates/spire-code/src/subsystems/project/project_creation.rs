@@ -1251,7 +1251,7 @@ and NEVER repeat any line or block."
         // Embedded-HAL: the same shape of answer as SpireApp, for the same reason — the structure
         // is fixed before the goal is read, so the plan is the scaffold's own file writes plus a
         // parse and a host build gate. An LLM plan here would write into the contract.
-        if structure == Some(spire_core::build_types::ProjectStructure::EmbeddedHal) {
+        if structure == Some(spire_core::build_types::ProjectStructure::Embedded) {
             return self
                 .embedded_hal_template_plan(goal, root_dir, language, platforms)
                 .await;
@@ -1582,7 +1582,7 @@ Project:
                 root_dir,
                 language,
                 platforms,
-                Some(spire_core::build_types::ProjectStructure::EmbeddedHal),
+                Some(spire_core::build_types::ProjectStructure::Embedded),
                 // The HAL *is* the project being scaffolded; it depends on no other.
                 None,
                 true,
@@ -1597,7 +1597,7 @@ Project:
                     platform_targets: platforms.to_vec(),
                     build_system: "Cargo".to_string(),
                     files: vec![],
-                    structure: spire_core::build_types::ProjectStructure::EmbeddedHal,
+                    structure: spire_core::build_types::ProjectStructure::Embedded,
                     embedded: true,
                 }
             });
@@ -2711,7 +2711,7 @@ impl Actor for ProjectCreationActor {
                         // model writing there would edit the one thing every backend depends on.
                         // Its plan is therefore the scaffold's writes plus a gate, and it needs no
                         // model at all.
-                        spire_core::build_types::ProjectStructure::EmbeddedHal => {
+                        spire_core::build_types::ProjectStructure::Embedded => {
                             self.embedded_hal_template_plan(&goal, &root_dir, &language, &platforms)
                                 .await
                         }
@@ -2949,7 +2949,7 @@ mod tests {
                     fill_role: None,
                 },
             ],
-            structure: spire_core::build_types::ProjectStructure::EmbeddedHal,
+            structure: spire_core::build_types::ProjectStructure::Embedded,
             embedded: true,
         };
 

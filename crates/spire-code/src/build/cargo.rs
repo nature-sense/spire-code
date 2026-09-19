@@ -428,9 +428,9 @@ impl CargoBuildModule {
         {
             spire_core::build_types::ProjectStructure::SpireApp
         } else if is_workspace && declares_embedded_hal(&content) {
-            // Declared by the workspace itself — see `ProjectStructure::EmbeddedHal` for why
+            // Declared by the workspace itself — see `ProjectStructure::Embedded` for why
             // this is a marker rather than a guess at the layout.
-            spire_core::build_types::ProjectStructure::EmbeddedHal
+            spire_core::build_types::ProjectStructure::Embedded
         } else {
             spire_core::build_types::ProjectStructure::default()
         };
@@ -754,7 +754,7 @@ impl CargoBuildModule {
 ///
 /// ```toml
 /// [workspace.metadata.spire]
-/// structure = "embedded_hal"
+/// structure = "embedded"
 /// ```
 ///
 /// Read by hand, like the rest of this module's manifest parsing: a TOML dependency for one key
@@ -777,7 +777,7 @@ fn declares_embedded_hal(manifest: &str) -> bool {
                 // The enum's own key, so the marker and `ProjectStructure::as_str` cannot
                 // drift apart.
                 return value.trim().trim_matches('"').eq_ignore_ascii_case(
-                    spire_core::build_types::ProjectStructure::EmbeddedHal.as_str(),
+                    spire_core::build_types::ProjectStructure::Embedded.as_str(),
                 );
             }
         }
@@ -1332,7 +1332,7 @@ impl CargoBuildModule {
         // Embedded HAL: the contract crate + one backend crate per selected board family. The
         // platforms are registry ids, so the emitter resolves families (and refuses what it
         // cannot serve) rather than guessing from the name.
-        if structure == spire_core::build_types::ProjectStructure::EmbeddedHal {
+        if structure == spire_core::build_types::ProjectStructure::Embedded {
             return super::embedded_hal_scaffold::embedded_hal_scaffold(project_name, platforms);
         }
         // Embedded application: emitted by `project_creation`, which is the layer that has the
@@ -2040,7 +2040,7 @@ mod tests {
     }
 
     /// The scaffold and the recognizer must not drift apart: the workspace the embedded-HAL
-    /// scaffold emits is the workspace this analyzer reads as `EmbeddedHal`.
+    /// scaffold emits is the workspace this analyzer reads as `Embedded`.
     ///
     /// This is the pairing that matters — the marker is written in one module and read in
     /// another, and a rename in either would otherwise show up only as a project the wizard
@@ -2075,7 +2075,7 @@ mod tests {
         let meta = CargoBuildModule::new().analyze(tmp.path()).unwrap();
         assert_eq!(
             meta.structure,
-            spire_core::build_types::ProjectStructure::EmbeddedHal,
+            spire_core::build_types::ProjectStructure::Embedded,
             "the emitted marker must be what the analyzer reads"
         );
     }

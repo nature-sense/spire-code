@@ -212,14 +212,14 @@ pub(crate) fn embedded_hal_scaffold(
             .iter()
             .map(|(family, _)| format!("crates/{hal}-{family}/Cargo.toml"))
             .collect(),
-        structure: ProjectStructure::EmbeddedHal,
+        structure: ProjectStructure::Embedded,
         embedded: true,
     })
 }
 
 /// The workspace manifest — and the **marker** that makes this project recognizable.
 ///
-/// `[workspace.metadata.spire] structure = "embedded_hal"` is what `cargo.rs::analyze` reads:
+/// `[workspace.metadata.spire] structure = "embedded"` is what `cargo.rs::analyze` reads:
 /// there is no layout guess, and the value is the enum's own key rather than a prettier spelling,
 /// so the marker and the project type cannot drift apart.
 fn workspace_manifest(display: &str, hal: &str, families: &[(String, FamilySpec)]) -> String {
@@ -259,9 +259,9 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
-# Declares this project's type to Spire. The value is `ProjectStructure::EmbeddedHal`'s own key.
+# Declares this project's type to Spire. The value is `ProjectStructure::Embedded`'s own key.
 [workspace.metadata.spire]
-structure = "embedded_hal"
+structure = "embedded"
 "#
     .replace("__DISPLAY__", display)
     .replace("__BACKENDS__", &backends)
@@ -794,7 +794,7 @@ mod tests {
                 .any(|p| p.contains("esp32c6") || p.contains("esp32s3")),
             "a variant is a platform entry, not a crate: {paths:?}"
         );
-        assert_eq!(out.structure, ProjectStructure::EmbeddedHal);
+        assert_eq!(out.structure, ProjectStructure::Embedded);
         assert!(out.embedded, "the wizard sets embedded for this type");
 
         // The README describes *this* project: the esp32 family's own build command, with the crate
@@ -850,7 +850,7 @@ mod tests {
         // The workspace declares the type, and the backends are not default members: a host
         // `cargo test` must not need a cross toolchain or a vendor SDK.
         let ws = &file("Cargo.toml").content;
-        assert!(ws.contains("structure = \"embedded_hal\""), "{ws}");
+        assert!(ws.contains("structure = \"embedded\""), "{ws}");
         assert!(ws.contains("\"crates/weather-hal-esp32\","), "{ws}");
         assert!(ws.contains("\"crates/weather-hal-rp2040\","), "{ws}");
         assert!(
