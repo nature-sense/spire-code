@@ -235,7 +235,12 @@ impl Platform {
     /// second taxonomy could only disagree with the first. It is what the create-project
     /// wizard filters on to offer embedded platforms for the embedded-HAL project type.
     pub fn is_embedded(&self) -> bool {
-        matches!(self.os.as_str(), "esp-idf" | "rp2040")
+        // The `os` is the *runtime*, which is what the build keys on — and there are three of those
+        // here: ESP-IDF (`std`, one FreeRTOS task per thread), `esp-hal` (bare metal, `no_std`, the
+        // embassy executor), and `rp2040` (bare metal, ARM). The two bare-metal spellings are named
+        // separately because they are different toolchains and different crate sets, which is exactly
+        // what a build routing decision needs to tell apart.
+        matches!(self.os.as_str(), "esp-idf" | "esp-hal" | "rp2040")
     }
 
     /// Load a platform definition from a YAML file.
