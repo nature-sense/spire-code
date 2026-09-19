@@ -31,17 +31,14 @@ struct PlatformViewerView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            List(platforms) { p in
-                Button { selected = p.id } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(p.name).font(.callout.weight(.medium))
-                            .foregroundStyle(selected == p.id ? theme.accent : theme.textPrimary)
-                        Text("\(p.id) · \(p.os)").font(.caption2).foregroundStyle(.secondary)
+            List {
+                ForEach(groups, id: \.kind) { group in
+                    Section(group.title) {
+                        ForEach(group.items) { p in
+                            platformRow(p)
+                        }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .listRowBackground(selected == p.id ? theme.accentBackground : Color.clear)
             }
             .frame(width: 220).scrollContentBackground(.hidden).background(theme.surface)
             Divider()
@@ -54,6 +51,32 @@ struct PlatformViewerView: View {
             }
         }
         .task { loading = true; platforms = await bridge.fetchPlatforms(); if selected == nil { selected = platforms.first?.id }; loading = false }
+    }
+
+    /// Boards, then chips. The registry holds two kinds of entry and they are *not*
+    /// interchangeable — a Linux SBC entry names the board it is built for, a
+    /// bare-metal entry names the processor — so they are sectioned rather than shown
+    /// as one undifferentiated list. `kind` is **sent by the core**; the fallback
+    /// covers only a payload from an older core, which carried `embedded` alone.
+    private var groups: [(kind: String, title: String, items: [Platform])] {
+        [("board", "Boards"), ("chip", "Chips")]
+            .compactMap { kind, title in
+                let items = platforms.filter { ($0.kind ?? ($0.embedded ? "chip" : "board")) == kind }
+                return items.isEmpty ? nil : (kind, title, items)
+            }
+    }
+
+    private func platformRow(_ p: Platform) -> some View {
+        Button { selected = p.id } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(p.name).font(.callout.weight(.medium))
+                    .foregroundStyle(selected == p.id ? theme.accent : theme.textPrimary)
+                Text("\(p.id) · \(p.os)").font(.caption2).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(selected == p.id ? theme.accentBackground : Color.clear)
     }
 
     @State private var loading = true

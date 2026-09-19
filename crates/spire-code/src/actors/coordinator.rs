@@ -5659,6 +5659,9 @@ struct PlatformListing<'a> {
     #[serde(flatten)]
     platform: &'a crate::platform::Platform,
     embedded: bool,
+    /// Board or chip. Sent for the same reason `embedded` is: the rule is `os`, and
+    /// a second copy of it in the client could only ever disagree with this one.
+    kind: crate::platform::PlatformKind,
 }
 
 fn platforms_listing(platforms: Vec<crate::platform::Platform>) -> serde_json::Value {
@@ -5667,6 +5670,7 @@ fn platforms_listing(platforms: Vec<crate::platform::Platform>) -> serde_json::V
         .map(|platform| PlatformListing {
             platform,
             embedded: platform.is_embedded(),
+            kind: platform.kind(),
         })
         .collect();
     serde_json::to_value(listing).unwrap_or(serde_json::json!([]))
@@ -5696,6 +5700,28 @@ mod platform_listing_tests {
             rust: None,
             library_hints: Some("the board's own notes".into()),
         }
+    }
+
+    /// The grouping axis travels with the listing, so the screen can section by it
+    /// instead of re-deriving `os`'s rule in Swift.
+    #[test]
+    fn the_listing_names_boards_and_chips() {
+        let out = platforms_listing(vec![
+            platform("esp32c6", "esp-idf"),
+            platform("rpi5", "linux"),
+        ]);
+        let entries = out.as_array().expect("an array");
+        let kind_of = |id: &str| {
+            entries
+                .iter()
+                .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))
+                .and_then(|p| p.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        assert_eq!(kind_of("esp32c6"), Some("chip".to_string()));
+        assert_eq!(kind_of("rpi5"), Some("board".to_string()));
     }
 
     /// The flag the wizard filters on is in the payload, and the rest of the platform travels with

@@ -29,13 +29,20 @@ struct Platform: Identifiable, Codable, Hashable {
     /// itself keys on, and a second copy of it in Swift could only ever disagree with the first —
     /// the wizard filters its platform list on this flag.
     let embedded: Bool
+    /// `"board"` or `"chip"` — which kind of thing this entry names.
+    ///
+    /// **Sent by `platforms/list`, not derived here**, for the same reason `embedded` is. Board and
+    /// chip are not interchangeable — a Linux SBC entry names the board it is built for, a bare-metal
+    /// entry names the processor — so the platforms screen sections by this instead of showing one
+    /// undifferentiated list. Optional only so a payload from an older core still decodes.
+    let kind: String?
     /// The board this platform can reach, when it declares `device:`. Absent for
     /// the host and for platforms with no board — which is what tells the UI
     /// whether "Run tests on board" / "Deploy binary" can apply.
     let device: PlatformDevice?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, os, architecture, toolchain, sysroot, family, rust, embedded, device
+        case id, name, os, architecture, toolchain, sysroot, family, rust, embedded, device, kind
         case libraryHints = "library_hints"
     }
 }

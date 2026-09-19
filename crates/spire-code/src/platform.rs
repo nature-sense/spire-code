@@ -259,6 +259,20 @@ pub struct PlatformSysroot {
 /// The ${SYSROOT} placeholder substituted with `sysroot.root` in arg lists.
 const SYSROOT_TOKEN: &str = "${SYSROOT}";
 
+/// Whether a registry entry names a **board** or a **chip**.
+///
+/// The two are not interchangeable: a Linux SBC entry names the *board* it is
+/// built for (the Pi 5's arch and sysroot), while a bare-metal entry names the
+/// *processor* (`esp32c3`, `rp2040`) and currently carries that board's facts as
+/// `library_hints`. Showing them as one flat list is what makes the platforms
+/// screen read as a mixture of two different kinds of thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformKind {
+    Board,
+    Chip,
+}
+
 impl Platform {
     /// True for a board a firmware project targets; false for a host or a Linux cross-target.
     ///
@@ -273,6 +287,23 @@ impl Platform {
         // separately because they are different toolchains and different crate sets, which is exactly
         // what a build routing decision needs to tell apart.
         matches!(self.os.as_str(), "esp-idf" | "esp-hal" | "rp2040")
+    }
+
+    /// Which kind of thing this entry names — the axis the platforms list groups by.
+    ///
+    /// The inverse of [`Self::is_embedded`], and deliberately the *only* rule: an
+    /// embedded entry (`esp-idf`/`esp-hal`/`rp2040`) names the **processor**, while
+    /// everything else — a Linux SBC's arch+sysroot, or the host — is a **board**
+    /// entry. A second predicate here would be a second taxonomy, free to disagree
+    /// with the one the build keys on. The store split (`boards/` + `targets/`, a
+    /// board naming its chip) turns this into a declared field, and only this method
+    /// changes when it does.
+    pub fn kind(&self) -> PlatformKind {
+        if self.is_embedded() {
+            PlatformKind::Chip
+        } else {
+            PlatformKind::Board
+        }
     }
 
     /// Load a platform definition from a YAML file.
@@ -690,6 +721,30 @@ mod tests {
              pkgconfig: pkg-config\n\
              sysroot:\n  root: /tmp/sysroot/{id}\n"
         )
+    }
+
+    /// The grouping axis: a Linux SBC entry **is** its board, a bare-metal entry
+    /// names the processor. Kept here rather than re-derived in the client, so the
+    /// screen and the wizard cannot disagree about which is which.
+    #[test]
+    fn kind_separates_linux_boards_from_bare_metal_chips() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_yaml(tmp.path(), "rpi5.yaml", &platform_yaml("rpi5", "Pi 5"));
+        write_yaml(
+            tmp.path(),
+            "esp32c3.yaml",
+            &platform_yaml("esp32c3", "ESP32-C3").replace("os: linux", "os: esp-hal"),
+        );
+        let by_id: std::collections::HashMap<String, Platform> =
+            Platform::load_directory(tmp.path())
+                .unwrap()
+                .into_iter()
+                .map(|p| (p.id.clone(), p))
+                .collect();
+        assert_eq!(by_id.len(), 2, "both fixtures must load");
+
+        assert_eq!(by_id["rpi5"].kind(), PlatformKind::Board);
+        assert_eq!(by_id["esp32c3"].kind(), PlatformKind::Chip);
     }
 
     /// The graph-held view wins, and an id it does not hold is *not* looked for in
