@@ -7,10 +7,14 @@ struct RecentProject: Codable, Identifiable, Equatable {
     var name: String
     var lastOpened: Date
 
-    /// Path to the global recent-projects file (~/.spire/recent-projects.json).
+    /// Path to the recent-projects file, inside the core's config scope
+    /// (`~/.spire/<app>/recent-projects.json`).
+    ///
+    /// The file is the host's, but the directory is the application scope the
+    /// core owns — so it is asked of the core rather than re-derived here.
     static func storageURL() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".spire").appendingPathComponent("recent-projects.json")
+        URL(fileURLWithPath: SpireCorePaths.configDir)
+            .appendingPathComponent("recent-projects.json")
     }
 
     /// Load the list of recent projects (most recent first).

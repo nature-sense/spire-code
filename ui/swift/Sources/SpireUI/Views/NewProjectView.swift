@@ -509,7 +509,7 @@ struct NewProjectView: View {
                 Label(
                     deviceClass == .controller
                         ? "No boards in the registry yet — a board declares a `family`."
-                        : "No Linux SBC targets in the registry yet (check ~/.spire/platforms).",
+                        : "No Linux SBC targets in the registry yet.",
                     systemImage: "tray"
                 )
                 .font(.callout)

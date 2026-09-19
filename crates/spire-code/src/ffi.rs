@@ -195,8 +195,25 @@ fn init_actor_system() {
         return;
     }
 
+    // Name the application before anything resolves a config path — the library
+    // cannot know it, and the config dir is scoped by it — then adopt a
+    // pre-scope `~/.spire/*` layout into that scope, once.
+    //
+    // Both must precede `init_tracing`, which is what first *creates* a
+    // directory under the scope: the adoption moves entries by `rename` and
+    // skips any whose destination already exists.
+    spire_core::config::set_app_name(env!("CARGO_PKG_NAME"));
+    let adopted = spire_core::config::migrate_legacy_layout();
+
     init_tracing();
     tracing::info!("Spire FFI: startup (no project opened yet)");
+    if !adopted.is_empty() {
+        tracing::info!(
+            "Spire FFI: adopted pre-scope config into {}: {:?}",
+            spire_core::config::config_dir().display(),
+            adopted
+        );
+    }
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio");
 
@@ -1807,14 +1824,41 @@ pub unsafe extern "C" fn spire_wait_for_build_event(timeout_ms: u32) -> *mut std
         CString::new(payload).unwrap().into_raw()
     }
 }
+/// The core's resolved per-application config directory, e.g. `~/.spire/spire-code`.
+///
+/// For the host to place its own files beside the core's — the recent-projects
+/// list and the scaffold log — so both sides agree on the scope rather than each
+/// re-deriving it. Does **not** initialise the actor system; it does adopt a
+/// pre-scope `~/.spire/*` layout first (idempotently), because the host asks
+/// this before its first call and expects the answer to already hold its files.
+///
+/// # Safety
+///
+/// Takes no pointers; `unsafe` only as a C ABI entry point. The returned pointer
+/// is a Rust-allocated C string that the caller must release with
+/// [`spire_free_string`].
+#[no_mangle]
+pub unsafe extern "C" fn spire_config_dir() -> *mut std::ffi::c_char {
+    // Name the application here too: this may be the host's very first call,
+    // before `init_actor_system` has run.
+    spire_core::config::set_app_name(env!("CARGO_PKG_NAME"));
+    // Adopt a pre-scope `~/.spire/*` layout before answering, so the directory
+    // handed back already holds the adopted files. Idempotent.
+    spire_core::config::migrate_legacy_layout();
+    let dir = spire_core::config::config_dir();
+    CString::new(dir.to_string_lossy().as_bytes())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// Free a C string previously returned by one of the `spire_*` entry points.
 ///
 /// # Safety
 ///
 /// `ptr` must be either null or a pointer previously returned by
 /// `spire_send_json` / `spire_wait_for_event` / `spire_drain_build_events` /
-/// `spire_wait_for_build_event` and not yet freed. Passing any other pointer, or
-/// freeing the same pointer twice, is undefined behaviour.
+/// `spire_wait_for_build_event` / `spire_config_dir` and not yet freed. Passing
+/// any other pointer, or freeing the same pointer twice, is undefined behaviour.
 #[no_mangle]
 pub unsafe extern "C" fn spire_free_string(ptr: *mut std::ffi::c_char) {
     if !ptr.is_null() {

@@ -310,18 +310,18 @@ impl Platform {
     }
 
     /// Discover the seed platform directory: `$SPIRE_PLATFORM_DIR` (for
-    /// tests/CI/containers) or the default `~/.spire/platforms`, consistent
-    /// with the existing global config location `~/.spire/llm-config.json`.
+    /// tests/CI/containers) or the application-scoped
+    /// `~/.spire/<app>/platforms`.
+    ///
+    /// The scope is the same one `spire-core::config` uses, so one application's
+    /// board catalogue cannot surface in another's.
     pub fn default_platform_dir() -> PathBuf {
         if let Ok(dir) = std::env::var("SPIRE_PLATFORM_DIR") {
             if !dir.trim().is_empty() {
                 return PathBuf::from(dir);
             }
         }
-        let base = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        base.join(".spire").join("platforms")
+        spire_core::config::config_dir().join("platforms")
     }
 
     /// Load a single platform by id from the registry

@@ -157,7 +157,7 @@ fn hal_impl_generation_context(
         .unwrap_or_else(|| interface.to_string());
     // Platform registry record → hardware profile.
     let plat = crate::platform::Platform::from_registry(platform)
-        .ok_or_else(|| format!("platform '{platform}' not in registry (~/.spire/platforms)"))?;
+        .ok_or_else(|| format!("platform '{platform}' not in registry"))?;
     // Module-pair naming: semantic mode REUSES `<iface>_<plat>` when the name
     // is free or only holds a scaffold stub (so Fix replaces stubs instead of
     // piling up `_2` siblings); real implementations are never overwritten.
@@ -3063,7 +3063,7 @@ impl BuildManagerActor {
                     }
                     let Some(platform_rec) = crate::platform::Platform::from_registry(platform)
                     else {
-                        return serde_json::json!({ "error": format!("platform '{platform}' not in registry (~/.spire/platforms)") });
+                        return serde_json::json!({ "error": format!("platform '{platform}' not in registry") });
                     };
 
                     // 2. Contract headers → (stem, summary, class_name).
@@ -3360,7 +3360,7 @@ executable('{project_name}-{platform}',
                         "not generated (platform has no Linux cross file)".to_string();
                     if let Some(cross) = platform_rec.meson_cross_file() {
                         let header = format!(
-                            "# {plat_name} ({platform}) Meson cross file — generated from ~/.spire/platforms/{platform}.yaml\n\n"
+                            "# {plat_name} ({platform}) Meson cross file — generated from the platform registry\n\n"
                         );
                         let cross_path = plat_dir.join(format!("{platform}-cross.txt"));
                         match std::fs::write(&cross_path, format!("{header}{cross}")) {

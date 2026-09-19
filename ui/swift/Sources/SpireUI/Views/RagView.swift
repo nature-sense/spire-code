@@ -219,7 +219,7 @@ struct RagView: View {
 
             if manifests.isEmpty {
                 ContentUnavailableView("No manifests", systemImage: "doc.text.magnifyingglass",
-                    description: Text("Place an ingest.yaml in ~/.spire/knowledge/<corpus>/ or install the bundled docs."))
+                    description: Text("Place an ingest.yaml in the knowledge store's <corpus>/ folder, or install the bundled docs."))
                     .frame(maxHeight: .infinity)
             } else {
                 ScrollView {
@@ -356,7 +356,7 @@ struct RagView: View {
         if await bridge.installSpireDocsManifests() {
             lastIngestMessage = "Installed — press Ingest on each manifest to build the corpus."
         } else {
-            lastIngestMessage = "Install failed — check ~/.spire/logs/spire-scaffold.log."
+            lastIngestMessage = "Install failed — check \(SpireCorePaths.configDir)/logs/spire-scaffold.log."
         }
         await load()
     }

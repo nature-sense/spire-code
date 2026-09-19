@@ -3604,7 +3604,7 @@ impl CoordinatorActor {
 
         let Some(platform) = crate::platform::Platform::from_registry(&platform_id) else {
             return Err(serde_json::json!({
-                "error": format!("platform '{platform_id}' is not in the registry (~/.spire/platforms)")
+                "error": format!("platform '{platform_id}' is not in the registry")
             }));
         };
         let Some(mcp) = platform
@@ -3613,7 +3613,7 @@ impl CoordinatorActor {
             .and_then(|device| device.mcp.as_ref())
         else {
             return Err(serde_json::json!({
-                "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see ~/.spire/platforms/{platform_id}.yaml")
+                "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see the platform registry entry for it")
             }));
         };
 
@@ -3932,7 +3932,7 @@ impl CoordinatorActor {
         }
         let Some(platform) = crate::platform::Platform::from_registry(&platform_id) else {
             return serde_json::json!({
-                "error": format!("platform '{platform_id}' is not in the registry (~/.spire/platforms)")
+                "error": format!("platform '{platform_id}' is not in the registry")
             });
         };
         if platform
@@ -3942,7 +3942,7 @@ impl CoordinatorActor {
             .is_none()
         {
             return serde_json::json!({
-                "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see ~/.spire/platforms/{platform_id}.yaml")
+                "error": format!("platform '{platform_id}' declares no device.mcp endpoint — see the platform registry entry for it")
             });
         }
         let server_name = format!("device-{platform_id}");
@@ -4151,7 +4151,7 @@ impl CoordinatorActor {
         let Some(dest) = dest else {
             return serde_json::json!({
                 "error": format!(
-                    "no deploy destination: pass \"dest\", or set device.deploy.dest for platform '{}' in ~/.spire/platforms",
+                    "no deploy destination: pass \"dest\", or set device.deploy.dest for platform '{}' in the platform registry",
                     staged["platform"].as_str().unwrap_or_default()
                 )
             });

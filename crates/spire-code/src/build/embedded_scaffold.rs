@@ -504,7 +504,7 @@ pub(crate) fn add_bsp(
     platform_id: &str,
 ) -> Result<serde_json::Value, String> {
     let platform = crate::platform::Platform::from_registry(platform_id)
-        .ok_or_else(|| format!("unknown platform '{platform_id}' (see ~/.spire/platforms)"))?;
+        .ok_or_else(|| format!("unknown platform '{platform_id}' (see the platform registry)"))?;
     if !platform.is_embedded() {
         return Err(format!(
             "platform '{platform_id}' is not an embedded platform (os '{}'); a BSP needs a board it \
@@ -920,7 +920,7 @@ mod tests {
     use super::*;
 
     /// A hermetic registry, so the tests can name a family the machine may not have (rp2040) and
-    /// can prove the refusals without touching `~/.spire/platforms`.
+    /// can prove the refusals without touching the user's platform registry.
     fn registry(entries: &[(&str, &str, Option<&str>)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for (id, os, family) in entries {

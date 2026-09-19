@@ -1801,12 +1801,12 @@ final class SpireBridge {
         }
     }
 
-    /// Append a line to ~/.spire/logs/spire-scaffold.log (created on demand).
-    /// Dedicated file so scaffold decode details survive even when the UI
-    /// error surface can't be copy-pasted.
+    /// Append a line to `<core config dir>/logs/spire-scaffold.log` (created on
+    /// demand). Dedicated file so scaffold decode details survive even when the
+    /// UI error surface can't be copy-pasted.
     static func logScaffold(_ line: String) {
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".spire").appendingPathComponent("logs")
+        let url = URL(fileURLWithPath: SpireCorePaths.configDir)
+            .appendingPathComponent("logs")
             .appendingPathComponent("spire-scaffold.log")
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true

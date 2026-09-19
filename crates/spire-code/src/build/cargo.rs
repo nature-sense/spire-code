@@ -1947,6 +1947,32 @@ mod tests {
         assert!(ids.contains(&"ui"));
     }
 
+    /// A hermetic registry with the two Linux cross targets these tests name.
+    ///
+    /// The scaffold's `build.rs` is emitted *from the registry* (a platform's
+    /// `sysroot.lib_dirs`) and `.cargo/config.toml` from its toolchain, so a test
+    /// asserting on either must supply them — depending on the user's
+    /// `~/.spire/platforms` is exactly what made these two fail the moment the
+    /// platform seed moved into the application's own scope.
+    ///
+    /// Returns the temp dir (kept alive) and the `SPIRE_PLATFORM_DIR` guard.
+    fn linux_cross_registry() -> (tempfile::TempDir, crate::platform::PlatformDirGuard) {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, name) in [("rpi5", "Raspberry Pi 5"), ("rock3c", "Rock 3C")] {
+            let yaml = format!(
+                "id: {id}\nname: {name}\nos: linux\n\
+                 architecture:\n  cpu_family: aarch64\n  cpu: armv8-a\n  endian: little\n  \
+                 target_triple: aarch64-linux-gnu\n\
+                 toolchain:\n  c: clang\n  cpp: clang++\n  ar: llvm-ar\n  strip: llvm-strip\n  ld: ld.lld\n\
+                 sysroot:\n  root: /tmp/sysroot/{id}\n  lib_dirs:\n    - ${{SYSROOT}}/usr/lib/aarch64-linux-gnu\n  \
+                 pkg_config_libdir:\n    - ${{SYSROOT}}/usr/lib/aarch64-linux-gnu/pkgconfig\n"
+            );
+            std::fs::write(dir.path().join(format!("{id}.yaml")), yaml).unwrap();
+        }
+        let guard = crate::platform::PlatformDirGuard::set(dir.path());
+        (dir, guard)
+    }
+
     #[test]
     fn scaffold_layout_multi_emits_single_crate_with_per_target_config() {
         // Serialize against `SPIRE_PLATFORM_DIR` mutating tests (build_manager
@@ -1954,6 +1980,7 @@ mod tests {
         let _lock = crate::PLATFORM_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_registry, _env) = linux_cross_registry();
         let out = CargoBuildModule::new()
             .scaffold_layout(
                 "demo",
@@ -2004,6 +2031,9 @@ mod tests {
         let _lock = crate::PLATFORM_DIR_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The analyzer maps `.cargo/config.toml` triples back through the
+        // registry, so supply one here too.
+        let (_registry, _env) = linux_cross_registry();
         // Write the scaffolded files to a temp dir, then verify the analyzer
         // sees ONE crate (not a workspace) with the crate's single lib target.
         let tmp = tempfile::tempdir().unwrap();

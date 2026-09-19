@@ -417,7 +417,7 @@ struct ProjectAnalysisView: View {
             }
 
             if candidatePlatforms.isEmpty {
-                Text("No new platforms available in the registry (~/.spire/platforms).")
+                Text("No new platforms available in the registry.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else {
