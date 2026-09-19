@@ -1648,25 +1648,29 @@ The conversion of the nine entries we have:
 | M5Stack Core S3 | `esp32s3` | `m5stack-core-s3` | the name |
 | M5Stack Atom S3 Lite | `esp32s3` | `m5stack-atom-s3-lite` | the name |
 | Waveshare ESP32-P4-Nano | `esp32p4` | `waveshare-esp32-p4-nano` | the name |
-| M5Stack Core Ink | **?** | `m5stack-core-ink` | *not derivable* |
-| M5Stack Station | **?** | `m5stack-station` | *not derivable* |
+| M5Stack Core Ink | `esp32-pico-d4` | `m5stack-core-ink` | named 2026-09-19 |
+| M5Stack Station | `esp32-d0wdq6-v3` | `m5stack-station` | named 2026-09-19 |
 | Raspberry Pi Pico | `rp2040` | `raspberry-pi-pico` | named |
 
 (Ids are proposed, in kebab-case. They are longer than the current `esp32c3`/`rpi5`, which were
 short because they named silicon; a board id has to distinguish *M5Stack Core S3* from a bare
 ESP32-S3, so it cannot be shorter than the board's name.)
 
-Two things are still open, and neither is guessable from the list:
+**The two classics are distinct chips sharing a family, which is what the lookup must model.**
+`esp32-pico-d4` and `esp32-d0wdq6-v3` are both ESP32 *classic* silicon: they share the family's build
+facts (the `xtensa-esp32-espidf` triple, its toolchain) while being separate chips. So the chip facts
+are keyed **per chip**, with a family grouping for what is genuinely shared — not one `esp32` entry
+standing in for both, which is what the registry has today.
 
-1. **`M5Stack Core Ink` and `M5Stack Station`: which chip?** Neither name carries one. The whole
-   point of this conversion is to stop inventing the chip field, so they stay unassigned until it is
-   known rather than being filed under a plausible-sounding ESP32.
-2. **`esp32c3` and `esp32c6` have no board in the list.** Either a board names each, or those entries
-   go. They must not survive as entries, though: a chip entry kept as a *board* would reintroduce the
-   generic chip name this stage exists to remove.
+One thing is still open:
 
-The three unambiguous boards, the Pico, and the three Linux SBCs are enough to convert the store in
-one pass; Core Ink and Station join it as soon as their chip is named.
+- **`esp32c3` and `esp32c6` have no board.** Either a board names each, or those entries go. They must
+  not survive as entries, though: a chip entry kept as a *board* would reintroduce the generic chip
+  name this stage exists to remove.
+
+Every other entry now has a board — the three Linux SBCs, the two ESP32-S3 boards, the P4-Nano, the
+Pico, and the two classics — so the store conversion can proceed for all of them, with c3/c6 the only
+entries still unresolved.
 
 **Stage 3 — HAL → a referenced driver library.** Extract ai-traps' `hal/` so `Hal` and `Embedded`
 are the same concept: a project of drivers an application depends on, with a board's BSP as that
