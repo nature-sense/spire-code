@@ -439,20 +439,30 @@ impl Platform {
         (true, String::new())
     }
 
-    /// Discover the **board** directory: `$SPIRE_BOARD_DIR` or the application-scoped
-    /// `~/.spire/<app>/boards`.
+    /// Discover the **board** directory: `$SPIRE_BOARD_DIR` or, by default, `boards/`
+    /// **beside the platform store**.
     ///
-    /// The boards a picker offers, in the same shape as a chip entry: a board is a
-    /// `Platform` that declares the `chip:` it carries. Separate from the chips store
-    /// because the two answer different questions — "which board do I have" versus
-    /// "what does its silicon need to build" — and only the first is ever shown.
+    /// The three stores are one catalogue's three answers — what do I have, what does its
+    /// silicon need, what can I pick — so wherever `$SPIRE_PLATFORM_DIR` points them, the
+    /// rest follow. Without that, scoping the platform store in a fixture (or a CI
+    /// container) would scope one and reach into the developer's home directory for the
+    /// other two, which is a green test that means nothing.
     pub fn default_board_dir() -> PathBuf {
         if let Ok(dir) = std::env::var("SPIRE_BOARD_DIR") {
             if !dir.trim().is_empty() {
                 return PathBuf::from(dir);
             }
         }
-        spire_core::config::config_dir().join("boards")
+        Self::store_beside_platform_store("boards")
+    }
+
+    /// `name/`, sitting beside the platform store — the shape `~/.spire/<app>/{platforms,
+    /// chips,boards}` already has.
+    fn store_beside_platform_store(name: &str) -> PathBuf {
+        Self::default_platform_dir()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(name)
     }
 
     /// Every board in the board store.
@@ -470,8 +480,8 @@ impl Platform {
         Self::load_directory(dir)
     }
 
-    /// Discover the **chip-facts** directory: `$SPIRE_CHIP_DIR` or the
-    /// application-scoped `~/.spire/<app>/chips`.
+    /// Discover the **chip-facts** directory: `$SPIRE_CHIP_DIR` or `chips/` beside the
+    /// platform store.
     ///
     /// A board declares `chip:`; this is where that id's build facts live — the stock
     /// triple, the vendor HAL, the flash tool. Separate from the board list because a
@@ -482,7 +492,7 @@ impl Platform {
                 return PathBuf::from(dir);
             }
         }
-        spire_core::config::config_dir().join("chips")
+        Self::store_beside_platform_store("chips")
     }
 
     /// Discover the seed platform directory: `$SPIRE_PLATFORM_DIR` (for
@@ -899,6 +909,20 @@ mod tests {
             boards[0].architecture.target_triple.is_empty(),
             "the board states no triple; its chip does"
         );
+    }
+
+    /// The stores move together: scoping the platform store must scope the chips and
+    /// boards with it, or a fixture scopes one store and reaches into a developer's home
+    /// directory for the others — a green test that would mean nothing.
+    #[test]
+    fn the_other_stores_sit_beside_the_platform_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let platforms = tmp.path().join("platforms");
+        std::fs::create_dir_all(&platforms).unwrap();
+        let _env = crate::platform::PlatformDirGuard::set(&platforms);
+
+        assert_eq!(Platform::default_chip_dir(), tmp.path().join("chips"));
+        assert_eq!(Platform::default_board_dir(), tmp.path().join("boards"));
     }
 
     /// The board store reads boards that declare their chip — which is the whole
