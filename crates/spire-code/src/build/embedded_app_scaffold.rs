@@ -191,7 +191,8 @@ pub(crate) fn embedded_app_scaffold(
         format!("{}/{}", embedded_path.trim_end_matches('/'), crate_dir)
     };
 
-    let manifest_rs = app_manifest(&name, embedded_path, &embedded_dep, &spec);
+    let bsp_dep = bsp_dep_line(embedded_root, platform_id, embedded_path);
+    let manifest_rs = app_manifest(&name, embedded_path, &embedded_dep, &bsp_dep, &spec);
     let main_rs = APP_MAIN_RS.to_string();
     let files = vec![
         super::ScaffoldFile {
@@ -240,16 +241,42 @@ pub(crate) fn embedded_app_scaffold(
 }
 // CHUNK-3-END
 
+/// The BSP dependency line for an application, when the container has a BSP for its board.
+///
+/// A BSP is per board, so its absence is ordinary — an upstream BSP may cover the board, or the board
+/// may need none. What matters is that the application *names* it when it exists: the board's facts
+/// live there, and a `main.rs` that repeats them is a `main.rs` that can drift from them.
+fn bsp_dep_line(container: &Path, platform_id: &str, embedded_path: &str) -> String {
+    let crate_name = format!("spire-bsp-{platform_id}");
+    let dir = format!("crates/{crate_name}");
+    if !container.join(&dir).join("Cargo.toml").is_file() {
+        return String::new();
+    }
+    format!(
+        "# This board's BSP: its facts — which pin the LED is on, whether it is active-low — so that\n\
+         # this file does not repeat them and cannot drift from them.\n\
+         {crate_name} = {{ path = \"{}/{dir}\" }}\n\n",
+        embedded_path.trim_end_matches('/')
+    )
+}
+
 /// The application's manifest: the board's crate set, `spire-embedded`, and the marker.
 ///
 /// Two paths, deliberately: `embedded_path` is the *checkout* the user pointed at (what the marker
 /// records, and what a human would move), while `dep_path` is the crate inside it that a manifest has
 /// to name. They differ by `crates/spire-embedded`.
-fn app_manifest(name: &str, embedded_path: &str, dep_path: &str, spec: &AppSpec) -> String {
+fn app_manifest(
+    name: &str,
+    embedded_path: &str,
+    dep_path: &str,
+    bsp_dep: &str,
+    spec: &AppSpec,
+) -> String {
     APP_MANIFEST
         .replace("__NAME__", name)
         .replace("__EMBEDDED__", dep_path)
         .replace("__CHIP__", spec.chip)
+        .replace("__BSP_DEP__", bsp_dep)
         .replace("__MARKER__", &marker(embedded_path))
 }
 
@@ -313,7 +340,7 @@ esp-backtrace = { version = "0.20", features = ["__CHIP__", "panic-handler", "pr
 # *flash* time — after a clean build, so green build output says nothing about it.
 esp-bootloader-esp-idf = { version = "0.5", features = ["__CHIP__"] }
 
-__MARKER__"#;
+__BSP_DEP____MARKER__"#;
 
 /// The `.cargo/config.toml` template — the board's compile-time facts.
 const APP_CARGO_CONFIG: &str = r#"# What a build for this board needs, declared by the project rather than injected per command line.
@@ -926,6 +953,75 @@ mod tests {
             size > 0,
             "no ELF at {} (the scaffolded app built nothing)",
             elf.display()
+        );
+    }
+
+    /// When the container has a BSP for this board, the application **names it**.
+    ///
+    /// The board's facts live in the BSP, so an application that repeats them in `main.rs` is an
+    /// application that can drift from them. And when there is no BSP — the ordinary case, since an
+    /// upstream one may cover the board — the manifest must not invent a dependency on one.
+    #[test]
+    fn an_app_names_the_containers_bsp_when_there_is_one() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg = registry(&[(
+            "esp32c3",
+            "esp-hal",
+            Some("esp32"),
+            Some("riscv32imc-unknown-none-elf"),
+        )]);
+        let _env = crate::platform::PlatformDirGuard::set(reg.path());
+
+        // A container with a BSP for this board, as `add_bsp` writes one.
+        let with_bsp = tempfile::tempdir().unwrap();
+        embedded_on_disk(with_bsp.path());
+        let bsp = with_bsp.path().join("crates/spire-bsp-esp32c3");
+        std::fs::create_dir_all(&bsp).unwrap();
+        std::fs::write(
+            bsp.join("Cargo.toml"),
+            "[package]\nname = \"spire-bsp-esp32c3\"\n",
+        )
+        .unwrap();
+
+        let path = with_bsp.path().to_string_lossy().to_string();
+        let out =
+            embedded_app_scaffold("Weather Node", &["esp32c3".into()], &path, with_bsp.path())
+                .expect("an esp32c3 application");
+        let manifest = out
+            .files
+            .iter()
+            .find(|f| f.path == "Cargo.toml")
+            .unwrap()
+            .content
+            .clone();
+        assert!(
+            manifest.contains(&format!(
+                "spire-bsp-esp32c3 = {{ path = \"{path}/crates/spire-bsp-esp32c3\" }}"
+            )),
+            "the BSP is named by path:\n{manifest}"
+        );
+        // The vendor crate stays: the application still calls `esp_hal::init` and hands the
+        // peripherals to the BSP.
+        assert!(manifest.contains("esp-hal = "), "{manifest}");
+
+        // A container without one: no such dependency, and nothing invented.
+        let without = tempfile::tempdir().unwrap();
+        embedded_on_disk(without.path());
+        let path = without.path().to_string_lossy().to_string();
+        let out = embedded_app_scaffold("Weather Node", &["esp32c3".into()], &path, without.path())
+            .expect("an esp32c3 application");
+        let manifest = out
+            .files
+            .iter()
+            .find(|f| f.path == "Cargo.toml")
+            .unwrap()
+            .content
+            .clone();
+        assert!(
+            !manifest.contains("spire-bsp-"),
+            "no BSP in the container means no BSP in the manifest:\n{manifest}"
         );
     }
 }
