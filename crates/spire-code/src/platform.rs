@@ -378,6 +378,35 @@ impl Platform {
         self.chip.as_deref().unwrap_or(&self.id)
     }
 
+    /// The facts this entry is **built** with: its own, or the chip's it declares.
+    ///
+    /// A board names its chip and states no triple, sysroot, toolchain or Rust target — those
+    /// are the chip's build facts, and this is what resolves them, the same way `add_bsp`
+    /// resolves the vendor HAL from the same link. The board keeps its identity (`id`, `name`,
+    /// its own hints), so a message about the build still names the board, while the facts a
+    /// compiler needs are the chip's — which is the whole point of naming the chip rather than
+    /// restating it on every board that carries it.
+    ///
+    /// A chip resolves to itself, and so does a Linux SBC that states its own config: neither
+    /// declares a `chip:` to defer to. A board whose chip nobody has described also resolves to
+    /// itself — with the empty facts it states — because inventing a triple is how you build for
+    /// the wrong silicon, and an empty triple fails loudly where a guess would not.
+    pub fn build_facts(&self) -> Platform {
+        if self.chip.is_none() {
+            return self.clone();
+        }
+        let Some(chip) = Self::chip_facts(self.chip_id()) else {
+            return self.clone();
+        };
+        Platform {
+            architecture: chip.architecture,
+            toolchain: chip.toolchain,
+            sysroot: chip.sysroot,
+            rust: chip.rust,
+            ..self.clone()
+        }
+    }
+
     /// Load a platform definition from a YAML file.
     pub fn load(path: impl AsRef<Path>) -> Result<Platform> {
         let path = path.as_ref();
@@ -532,10 +561,22 @@ impl Platform {
     /// looked for in the seed: once the graph exists it is authoritative, and
     /// silently falling through would hide a platform the graph dropped.
     fn resolve(id: &str, from_graph: Option<&[Platform]>) -> Option<Platform> {
+        // Returned **resolved**: whoever asked for an id wants to build with it, and a board's
+        // build facts are its chip's. The listing reads the catalogue raw — that is a different
+        // question ("what is there") from this one ("what do I compile this with").
         if let Some(platforms) = from_graph {
-            return platforms.iter().find(|p| p.id == id).cloned();
+            return platforms
+                .iter()
+                .find(|p| p.id == id)
+                .map(Platform::build_facts);
         }
-        Self::load_registry().ok()?.into_iter().find(|p| p.id == id)
+        Some(
+            Self::load_registry()
+                .ok()?
+                .into_iter()
+                .find(|p| p.id == id)?
+                .build_facts(),
+        )
     }
 
     /// The three stores, in resolution order — the most specific thing an id can name first.
@@ -932,6 +973,80 @@ mod tests {
         assert_eq!(hal.crate_name, "esp-hal");
         assert_eq!(hal.version, "1.2");
         assert_eq!(hal.features, vec!["esp32s3", "unstable"]);
+    }
+
+    /// A board is **built** with its chip's facts — that is what naming the chip buys. It keeps
+    /// its own identity, so a message about a build still names the board; and a chip nobody has
+    /// described is not filled in with a guess.
+    #[test]
+    fn a_board_is_built_with_its_chips_facts() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (platforms, chips, boards) = (
+            tmp.path().join("platforms"),
+            tmp.path().join("chips"),
+            tmp.path().join("boards"),
+        );
+        for dir in [&platforms, &chips, &boards] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let _env = crate::platform::PlatformDirGuard::set(&platforms);
+
+        write_yaml(
+            &chips,
+            "esp32s3.yaml",
+            "id: esp32s3\nname: ESP32-S3\nos: esp-idf\narchitecture:\n  cpu_family: xtensa\n  \
+             cpu: esp32s3\n  endian: little\n  target_triple: xtensa-esp32s3-espidf\n",
+        );
+        write_yaml(
+            &boards,
+            "m5stack-core-s3.yaml",
+            "id: m5stack-core-s3\nname: M5Stack Core S3\nos: esp-idf\nchip: esp32s3\n",
+        );
+
+        let board = Platform::load_boards_in(&boards).unwrap().pop().unwrap();
+        assert!(
+            board.architecture.target_triple.is_empty(),
+            "the board states no triple of its own"
+        );
+
+        let built = board.build_facts();
+        assert_eq!(built.id, "m5stack-core-s3", "the board keeps its name");
+        assert_eq!(
+            built.chip.as_deref(),
+            Some("esp32s3"),
+            "and still says which chip it carries"
+        );
+        assert_eq!(
+            built.architecture.target_triple, "xtensa-esp32s3-espidf",
+            "and is compiled with its chip's triple"
+        );
+
+        // Nothing to defer to: a chip is its own build facts.
+        let chip = Platform::chip_facts_in(&chips, "esp32s3").unwrap();
+        assert_eq!(
+            chip.build_facts().architecture.target_triple,
+            "xtensa-esp32s3-espidf"
+        );
+
+        // A chip nobody has described leaves the board's own (empty) facts alone: loudly empty
+        // beats quietly wrong.
+        write_yaml(
+            &boards,
+            "mystery.yaml",
+            "id: mystery\nname: Mystery\nos: esp-idf\nchip: nobody-described-this\n",
+        );
+        let mystery = Platform::load_boards_in(&boards)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == "mystery")
+            .unwrap();
+        assert!(
+            mystery.build_facts().architecture.target_triple.is_empty(),
+            "an unknown chip is a refusal, not a guessed triple"
+        );
     }
 
     /// A board can be authored **without** `architecture`: its chip supplies the
