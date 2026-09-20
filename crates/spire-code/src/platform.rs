@@ -129,11 +129,12 @@ pub struct Platform {
     /// way rpi5 ≠ rock3c.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
-    /// The **chip** this board carries (`esp32s3`, `rp2040`, `esp32-pico-d4`).
+    /// The **chip** this board carries (`esp32s3`, `rp2040`, `allwinner-a733`).
     ///
-    /// Absent for a Linux SBC, whose entry *is* its board. Present on a bare-metal
-    /// board, where it selects the chip's build facts — the stock triple, the vendor
-    /// HAL, the flash tool. The registry holds **boards**, never generic silicon: this
+    /// Present on every board, bare-metal and Linux alike: naming the silicon is what
+    /// makes an entry a board, and it selects that chip's build facts — the triple, the
+    /// sysroot, the toolchain, the vendor HAL, the flash tool — none of which the board
+    /// restates. The registry holds **boards**, never generic silicon: this
     /// is how a board says which silicon it is, and what `add_bsp` resolves instead of
     /// a chip-name table in Rust.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,11 +304,11 @@ const SYSROOT_TOKEN: &str = "${SYSROOT}";
 
 /// Whether a registry entry names a **board** or a **chip**.
 ///
-/// The two are not interchangeable: a Linux SBC entry names the *board* it is
-/// built for (the Pi 5's arch and sysroot), while a bare-metal entry names the
-/// *processor* (`esp32c3`, `rp2040`) and currently carries that board's facts as
-/// `library_hints`. Showing them as one flat list is what makes the platforms
-/// screen read as a mixture of two different kinds of thing.
+/// The two are not interchangeable, and the discriminator is the `chip:` declaration: a
+/// board names the silicon it carries (`rpi5` → `broadcom-bcm2712`, `m5stack-core-s3` →
+/// `esp32s3`), and a chip is what is left — silicon that names no board, and that no
+/// picker should offer. Showing the two as one flat list is what used to make the
+/// platforms screen read as a mixture of two different kinds of thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformKind {
@@ -594,8 +595,9 @@ impl Platform {
     /// Every entry the catalogue holds — the boards, the Linux SBCs and the chips — as one
     /// list, **deduplicated by id**.
     ///
-    /// One catalogue, three answers: what can I pick (`boards/`), what is its silicon
-    /// (`chips/`), and the entries that predate the split (`platforms/`). Every reader wants
+    /// One catalogue, two answers: what can I pick (`boards/`), and what is its silicon
+    /// (`chips/`) — plus the legacy `platforms/`, normally absent now, which held the
+    /// entries the split distributed. Every reader wants
     /// the same list, so the union lives here rather than in each of them — deduplicated,
     /// because an entry half-moved between two stores must resolve once, not twice, or a
     /// listing shows it twice and a build resolves it ambiguously. Precedence is

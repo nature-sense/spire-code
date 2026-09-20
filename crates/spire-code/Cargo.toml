@@ -61,7 +61,7 @@ sha2 = "0.10"
 # Regex (for parsing XML tool calls from DeepSeek / basic source parsing)
 regex = "1"
 
-# YAML — platform definition files (~/.spire/platforms/*.yaml seed)
+# YAML — platform definition files (~/.spire/<app>/{boards,chips}/*.yaml)
 serde_yaml = "0.9"
 
 # Tree-sitter — AST parsing for source files

@@ -1622,13 +1622,14 @@ That changes two things stage 1 assumed:
   contrast with — so stage 1's sections become "Linux boards" / "bare-metal boards" (what genuinely
   differs is the toolchain world) or disappear entirely. `PlatformKind` survives only as long as the
   mixture does.
-- **There is no `chips/` store.** What a chip *contributes* — the vendor HAL, its feature name, the
-  stock triple, the flash tool — is a **lookup keyed by the chip id**: facts, not an entry, and not
-  something a picker shows. That is also where `vendor_for`'s chip→crate match belongs, beside every
-  other chip fact instead of in a second table in Rust.
+- ~~**There is no `chips/` store.**~~ **Superseded — see "The state it landed in" below.** There *is*
+  a `chips/` store, and what a chip contributes — the vendor HAL, the stock triple, the flash tool,
+  the sysroot and toolchain — is an **entry** in it. That is what let `vendor_for`'s chip→crate match
+  be *deleted* rather than moved into a second table in Rust. *(What was right in the original: a chip
+  is not something a picker offers.)*
 
-Mechanically: a board declares `chip:`; the load path reads **`boards/`** (renaming `platforms/`,
-which was never "platforms" — it was a mixture); and `platform_codec` carries `chip` so the graph
+Mechanically: a board declares `chip:`; the load path reads **`boards/`** and **`chips/`** — the two
+stores the old `platforms/` directory turned out to be a mixture of — and `platform_codec` carries `chip` so the graph
 holds the declaration rather than re-deriving it.
 
 The conversion of the nine entries we have:
@@ -1676,4 +1677,43 @@ entries still unresolved.
 are the same concept: a project of drivers an application depends on, with a board's BSP as that
 library's per-board piece. **Stage 4 — names last**: rename `Platform`/`Hal`/`Embedded` in the type
 system only after 1–3 hold, since the names are the least of it.
+
+## The state it landed in (2026-09-20)
+
+Stages 1 and 2 above are done, and the shape is the one that spec was reaching for. Recorded here
+because two entries it supersedes still sit above, and a reader should meet this first.
+
+- **Two stores, not one.** `~/.spire/<app>/boards/` holds **boards** — 11: the six bare-metal boards,
+  Espressif's `esp32-c3-devkitm-1`, and the four Linux boards (`a7s`, `a7z`, `rock3c`, `rpi5`).
+  `~/.spire/<app>/chips/` holds **chips** — 8: `esp32`, `esp32c3`, `esp32p4`, `esp32s3`, `rp2040`, and
+  the Linux SoCs `allwinner-a733`, `rockchip-rk3566`, `broadcom-bcm2712`. The old `platforms/`
+  directory is gone; `esp32c6` was retired.
+- **Every board declares `chip:`**, and no board states a triple, sysroot or toolchain. `a7s` and
+  `a7z` are the case that proves the model: one SoC, two boards, differing only in I/O.
+- **`kind()` is one test** — *a board declares the chip it carries; a chip is what is left.* The
+  `os`/`is_embedded` rule it replaced is the one the spec above predicted would go, and it went for
+  the reason predicted: a Linux SoC entry is a chip and is **not** bare-metal, which finally retired
+  the `is_embedded` clause. `embedded` survives as the separate axis it always was ("can a firmware
+  project target this").
+- **`Platform::build_facts()`** resolves a board to its chip's architecture, toolchain, sysroot and
+  Rust target while keeping the board's identity — so the link is real at compile time, not only in
+  the data. `resolve()` returns the resolved entry; the listing stays raw, because "what is there"
+  and "what do I compile this with" are different questions.
+- **`vendor_for` is deleted.** The pilot's vendor HAL — esp-hal 1.2 + `unstable`, and *why*
+  `unstable` — is a `hal:` block in `chips/esp32c3.yaml`, and `add_bsp` reads it from there.
+- **The screen shows the link.** `chip` is in the Swift model, a board's row carries it, and the
+  detail panel reads the chip's facts out of the list it already holds rather than showing a board
+  three empty groups.
+- **Where the measured hints are, honestly.** Still on the chips — except the one board-specific fact
+  ever measured, the DevKitM-1's addressable LED on GPIO8, which now lives on the
+  `esp32-c3-devkitm-1` board. Splitting the rest (SDK/constraint notes → chip, I/O notes → board) is
+  unfinished. `a7z` carries no hints because its I/O has not been measured: empty is honest there,
+  a7s's would not be.
+
+Stages 3 and 4 are untouched by this and stand as written above. Two smaller notes worth keeping: a
+hint-length compared across Rust and Python will differ, because Rust counts UTF-8 bytes and Python
+counts characters (22 bytes of em dashes and ellipses in `esp32c3`) and serde_yaml clips a trailing
+newline that Python's parser keeps. And the app's test binary scopes its own `~/.spire/<app>` — the
+app name comes from the process — so an ignored test run without `SPIRE_BOARD_DIR` / `SPIRE_CHIP_DIR`
+reads an *empty* scope rather than the real registry.
 
