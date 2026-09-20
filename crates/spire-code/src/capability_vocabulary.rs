@@ -345,3 +345,112 @@ mod carries_tests {
         );
     }
 }
+
+/// A declared block as **seeder input**: what a graph writer needs, with no tree left in it.
+///
+/// Flattened here, on this side of the message, because it cannot be flattened on the other:
+/// `spire-core` is what this crate depends on, so a seeder there can only be handed names and
+/// properties. What it is handed:
+///
+/// * `capabilities` — every path the entry declares, as node names. A chip's `capabilities:` and a
+///   board's `realized:` are deliberately the same shape, so both contribute here.
+/// * `realizes` — a board's realization edges: the path, and the `via`/`firmware` written under it.
+/// * `carries` — a board's companion edges: the chip, and what is written beside it.
+/// * `pins` — the wiring, passed through untouched. It is board facts for a BSP, not graph edges.
+///
+/// Keys with nothing in them are omitted, so an entry that declares nothing produces nothing — and
+/// a caller can tell that from `null` without inspecting four empty containers.
+pub fn seeder_input(blocks: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let mut names: Vec<String> = Vec::new();
+
+    if let Some(caps) = blocks.get("capabilities") {
+        names.extend(capability_paths(caps));
+    }
+    if let Some(realized) = blocks.get("realized") {
+        let edges = realizations(realized);
+        names.extend(edges.iter().map(|(path, _)| path.clone()));
+        if !edges.is_empty() {
+            out.insert(
+                "realizes".into(),
+                Value::Array(
+                    edges
+                        .into_iter()
+                        .map(|(capability, properties)| {
+                            serde_json::json!({ "capability": capability, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(companions) = blocks.get("companions") {
+        let carried = carries(Some(companions));
+        if !carried.is_empty() {
+            out.insert(
+                "carries".into(),
+                Value::Array(
+                    carried
+                        .into_iter()
+                        .map(|(chip, properties)| {
+                            serde_json::json!({ "chip": chip, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    if let Some(pins) = blocks.get("pins") {
+        out.insert("pins".into(), pins.clone());
+    }
+
+    names.sort();
+    names.dedup();
+    if !names.is_empty() {
+        out.insert("capabilities".into(), serde_json::json!(names));
+    }
+    if out.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(out)
+    }
+}
+
+#[cfg(test)]
+mod seeder_input_tests {
+    use super::*;
+
+    /// A chip contributes names and nothing else; a board contributes names, its realization edges,
+    /// its companion edges — and passes its wiring through, because a BSP needs it and the graph
+    /// does not.
+    #[test]
+    fn a_declared_block_becomes_seeder_input() {
+        let chip = serde_json::json!({
+            "capabilities": { "media": { "video": { "encode": { "codec": "h264" } } } }
+        });
+        assert_eq!(
+            seeder_input(&chip)["capabilities"],
+            serde_json::json!(["media.video.encode"]),
+            "a chip names nodes; it has no edges"
+        );
+        assert!(seeder_input(&chip).get("realizes").is_none());
+
+        let board = serde_json::json!({
+            "realized": { "media": { "camera": { "via": "esp32p4" } } },
+            "companions": [{ "chip": "esp32c6", "role": "radio" }],
+            "pins": { "led": { "pin": "GPIO48" } }
+        });
+        let got = seeder_input(&board);
+        assert_eq!(got["capabilities"], serde_json::json!(["media.camera"]));
+        assert_eq!(got["realizes"][0]["capability"], "media.camera");
+        assert_eq!(got["realizes"][0]["properties"]["via"], "esp32p4");
+        assert_eq!(got["carries"][0]["chip"], "esp32c6");
+        assert_eq!(got["carries"][0]["properties"]["role"], "radio");
+        assert_eq!(got["pins"]["led"]["pin"], "GPIO48", "wiring passes through");
+
+        assert!(
+            seeder_input(&serde_json::json!({})).is_null(),
+            "nothing declared, nothing sent"
+        );
+    }
+}
