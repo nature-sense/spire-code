@@ -1052,9 +1052,15 @@ pub fn hal_platform_library_hints(platform: &str) -> String {
     // Then the raw document. A hand-written YAML that does not describe a *complete* platform
     // (no `architecture`, say) still carries its hint, and refusing it would trade a useful
     // prompt for a schema argument.
-    let dir = crate::platform::Platform::default_platform_dir();
-    let path = dir.join(format!("{platform}.yaml"));
-    if let Ok(text) = std::fs::read_to_string(&path) {
+    // Then the raw document — searched across the stores, because a chip's hints live with
+    // the chip rather than in the board store. A hand-written YAML that does not describe a
+    // *complete* platform (no `architecture`, say) still carries its hint, and refusing it
+    // would trade a useful prompt for a schema argument.
+    let path = crate::platform::Platform::stores()
+        .iter()
+        .map(|dir| dir.join(format!("{platform}.yaml")))
+        .find(|path| path.is_file());
+    if let Some(text) = path.and_then(|path| std::fs::read_to_string(path).ok()) {
         if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
             if let Some(hint) = doc.get("library_hints").and_then(|v| v.as_str()) {
                 let hint = hint.trim();

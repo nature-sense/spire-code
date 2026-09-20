@@ -530,9 +530,49 @@ impl Platform {
         if let Some(platforms) = from_graph {
             return platforms.iter().find(|p| p.id == id).cloned();
         }
-        let dir = Self::default_platform_dir();
-        let platforms = Self::load_directory(&dir).ok()?;
-        platforms.into_iter().find(|p| p.id == id)
+        Self::load_registry().ok()?.into_iter().find(|p| p.id == id)
+    }
+
+    /// The three stores, in resolution order — the most specific thing an id can name first.
+    ///
+    /// A board says what you have, a chip says what its silicon needs, and `platforms/` holds
+    /// the entries that predate the split. Order is precedence: see [`Self::load_registry`].
+    pub fn stores() -> [PathBuf; 3] {
+        [
+            Self::default_board_dir(),
+            Self::default_platform_dir(),
+            Self::default_chip_dir(),
+        ]
+    }
+
+    /// Every entry the catalogue holds — the boards, the Linux SBCs and the chips — as one
+    /// list, **deduplicated by id**.
+    ///
+    /// One catalogue, three answers: what can I pick (`boards/`), what is its silicon
+    /// (`chips/`), and the entries that predate the split (`platforms/`). Every reader wants
+    /// the same list, so the union lives here rather than in each of them — deduplicated,
+    /// because an entry half-moved between two stores must resolve once, not twice, or a
+    /// listing shows it twice and a build resolves it ambiguously. Precedence is
+    /// [`Self::stores`]' order, so the board store's copy of an id wins.
+    ///
+    /// A store that is **absent** contributes nothing — `boards/` and `chips/` only exist once
+    /// there is something in them — while a store that is present and unreadable is an error
+    /// rather than an empty list. That is the distinction [`Self::load_boards`] draws, and it
+    /// matters: "I have no chips" and "I could not read my chips" are different answers.
+    pub fn load_registry() -> Result<Vec<Platform>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for dir in Self::stores() {
+            if !dir.is_dir() {
+                continue;
+            }
+            for platform in Self::load_directory(&dir)? {
+                if seen.insert(platform.id.clone()) {
+                    out.push(platform);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Graph/MCP name of this platform's device server, e.g. `device-rpi5`.
@@ -916,6 +956,9 @@ mod tests {
     /// directory for the others — a green test that would mean nothing.
     #[test]
     fn the_other_stores_sit_beside_the_platform_store() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let platforms = tmp.path().join("platforms");
         std::fs::create_dir_all(&platforms).unwrap();
@@ -923,6 +966,66 @@ mod tests {
 
         assert_eq!(Platform::default_chip_dir(), tmp.path().join("chips"));
         assert_eq!(Platform::default_board_dir(), tmp.path().join("boards"));
+    }
+
+    /// The registry is the **union** of the three stores, deduplicated by id: a chip resolves
+    /// though no board names it, a board resolves though it is not a build target, and an id
+    /// present in two stores — which is what a half-finished move looks like — resolves once.
+    #[test]
+    fn the_registry_is_the_union_of_the_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (platforms, chips, boards) = (
+            tmp.path().join("platforms"),
+            tmp.path().join("chips"),
+            tmp.path().join("boards"),
+        );
+        for dir in [&platforms, &chips, &boards] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = crate::platform::PlatformDirGuard::set(&platforms);
+
+        write_yaml(
+            &platforms,
+            "rpi5.yaml",
+            "id: rpi5\nname: Raspberry Pi 5\nos: linux\n",
+        );
+        write_yaml(
+            &chips,
+            "esp32s3.yaml",
+            "id: esp32s3\nname: ESP32-S3\nos: esp-idf\n",
+        );
+        write_yaml(
+            &boards,
+            "m5stack-core-s3.yaml",
+            "id: m5stack-core-s3\nname: M5Stack Core S3\nos: esp-idf\nchip: esp32s3\n",
+        );
+        // Half-moved: the same id in a later store must not add a second entry, and must not
+        // shadow the earlier one either.
+        write_yaml(
+            &chips,
+            "rpi5.yaml",
+            "id: rpi5\nname: a stale copy\nos: linux\n",
+        );
+
+        let registry = Platform::load_registry().expect("the union reads");
+        let ids: Vec<&str> = registry.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["m5stack-core-s3", "rpi5", "esp32s3"],
+            "boards, then platforms, then chips — each id once"
+        );
+        let rpi5 = registry.iter().find(|p| p.id == "rpi5").expect("rpi5");
+        assert_eq!(rpi5.name, "Raspberry Pi 5", "the earlier store's copy wins");
+
+        let board = Platform::resolve("m5stack-core-s3", None).expect("the board resolves");
+        assert_eq!(
+            board.chip_id(),
+            "esp32s3",
+            "and carries the chip it declares"
+        );
     }
 
     /// The board store reads boards that declare their chip — which is the whole

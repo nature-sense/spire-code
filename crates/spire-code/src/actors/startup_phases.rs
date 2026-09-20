@@ -575,8 +575,10 @@ impl StartupPhase for PlatformBootstrapPhase {
         .await;
         info!("SystemActor: bootstrapping platform definitions into graph");
 
-        let config_dir = SpirePlatform::default_platform_dir();
-        let platforms = SpirePlatform::load_directory(&config_dir).unwrap_or_default();
+        // The **union**: boards, the Linux SBCs, and chips. A chip is a target a build
+        // resolves against even though no picker offers it, so seeding only the board store
+        // would drop the silicon out of the graph — and the graph is what resolution uses.
+        let platforms = SpirePlatform::load_registry().unwrap_or_default();
         let platform_json: Vec<serde_json::Value> = platforms
             .iter()
             .map(crate::actors::platform_codec::platform_to_registry_json)

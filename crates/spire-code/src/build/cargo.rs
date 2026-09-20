@@ -216,10 +216,7 @@ impl CargoBuildModule {
         // BuildTarget per platform) so the UI renders ONE project — never
         // per-platform subprojects with stub sources.
         if is_workspace && !workspace_members.is_empty() {
-            let plat_dir = crate::platform::Platform::default_platform_dir();
-            let registry = crate::platform::Platform::load_directory(&plat_dir)
-                .ok()
-                .unwrap_or_default();
+            let registry = crate::platform::Platform::load_registry().unwrap_or_default();
             let registry_ids: Vec<String> = registry.iter().map(|p| p.id.clone()).collect();
             let platform_members: Vec<spire_core::build_types::WorkspaceMember> = workspace_members
                 .iter()
@@ -356,8 +353,7 @@ impl CargoBuildModule {
         if !is_workspace {
             let config_path = path.join(".cargo").join("config.toml");
             if let Ok(config) = std::fs::read_to_string(&config_path) {
-                let plat_dir = crate::platform::Platform::default_platform_dir();
-                if let Ok(all) = crate::platform::Platform::load_directory(&plat_dir) {
+                if let Ok(all) = crate::platform::Platform::load_registry() {
                     let mut per_platform: Vec<spire_core::build_types::BuildTarget> = Vec::new();
                     for line in config.lines() {
                         let trimmed = line.trim();
