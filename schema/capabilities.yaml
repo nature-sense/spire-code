@@ -32,7 +32,10 @@ categories:
   # `zigbee`/`thread`: it runs over them, which is exactly the nesting a flat list cannot hold.
   radio:
     wifi:        { standard: str, bands: [str] }      # e.g. 802.11ax, [2.4g]
-    bluetooth:   { version: int, le: bool, mesh: bool }
+    # `classic` added when the classic ESP32 turned up: it has Bluetooth Classic *and* LE, while
+    # the C3 and the S3 are LE-only. Omitting it means "none", so the two are distinguishable
+    # without a false - the same absence-is-omission rule the rest of the vocabulary follows.
+    bluetooth:   { version: int, le: bool, classic: bool, mesh: bool }
     ieee802154:
       zigbee:    {}
       thread:    {}
