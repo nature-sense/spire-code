@@ -1783,3 +1783,37 @@ Then: capability nodes and `realizes` / `via` / `carries` edges seeded beside th
 **no `spire-core` change needed**, because `AttrNode.node_type` is a free-form string and
 `RelationshipType` already carries `Custom(String)`.
 
+### Correction (same session): step 2 needs no `Platform` fields at all
+
+Three attempts to add `capabilities` / `realized` / `pins` / `companions` to `Platform` failed on the
+same rock: four new fields break twelve `Platform { … }` literals, and the change is atomic, so it is
+all-or-nothing across eleven fixtures. The attempts above are recorded as a lesson about scripts. They
+are better read as **evidence that the fields were the wrong shape.**
+
+They were. Those fields came from the **blob-prop** design — option (a), data living *on the platform
+node* — and this file already chose **(b): capabilities are nodes and edges.** Under (b) nothing needs
+the blocks on `Platform`:
+
+- the resolved profile (step 4) is a graph **walk** — board → realizes → capability → via → chip;
+- the oracle (step 6) reads the same walk, so it cannot disagree with what the generator was told;
+- the codegen prompt (step 5) is built from that walk.
+
+So the fields were only ever needed to *carry* the data from YAML into the graph through the typed
+`Platform` — and that trip is unnecessary. **The bootstrap can seed capability nodes straight from the
+YAML**, which is how the platform nodes are already seeded.
+
+**Step 2, corrected:**
+
+1. **Read the blocks raw**, the way `generic_helpers` already reads `library_hints` out of a YAML
+   document rather than through the typed `Platform`. That is a precedent in this codebase, not a new
+   trick.
+2. **Seed them as nodes and edges** beside the platform nodes: `(:capability {name:
+   "media.video.encode.h264", …})`, `(board)-[:realizes]->(capability)`,
+   `(capability)-[:via]->(chip)`, `(board)-[:carries]->(chip)`.
+3. **Test it end to end** — a chip YAML with `capabilities:` seeds capability nodes; a board's
+   `realized:` creates the edge to them; and nothing is read from `Platform`.
+
+No `Platform` change, no codec change, no fixtures, and no twelve edits. The lesson generalises:
+**when the source of truth is the graph, do not launder its data through a typed struct that exists
+only to be serialised.**
+
