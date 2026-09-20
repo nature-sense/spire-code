@@ -406,6 +406,23 @@ pub fn seeder_input(blocks: &Value) -> Value {
 
     names.sort();
     names.dedup();
+    // A name the vocabulary does not know is **refused here**, where the names are: a typo (`wiffi`
+    // for `wifi`) must not become a silent absence that reads exactly like a board with no radio.
+    // Refused from the *names* rather than rewritten out of the tree — one place, and the declared
+    // facts stay intact for the diagnostic that has to name them.
+    let mut refused: Vec<String> = Vec::new();
+    for key in ["capabilities", "realized"] {
+        if let Some(block) = blocks.get(key) {
+            refused.extend(unknown_names(block));
+        }
+    }
+    if !refused.is_empty() {
+        names.retain(|name| !refused.contains(name));
+        tracing::warn!(
+            refused = ?refused,
+            "capabilities not in the vocabulary - refused; add them to schema/capabilities.yaml if they are real"
+        );
+    }
     if !names.is_empty() {
         out.insert("capabilities".into(), serde_json::json!(names));
     }
