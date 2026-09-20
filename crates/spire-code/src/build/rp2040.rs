@@ -835,11 +835,10 @@ mod tests {
     /// cargo test -p spire-code --lib dump_registry -- --ignored --nocapture
     /// ```
     #[test]
-    #[ignore = "reads the platform registry from ~/.spire/platforms"]
+    #[ignore = "reads the platform stores from ~/.spire/<app>/{boards,platforms,chips}"]
     fn dump_registry() {
-        let dir = Platform::default_platform_dir();
-        let platforms = Platform::load_directory(&dir).expect("the registry directory loads");
-        println!("{} entries in {}", platforms.len(), dir.display());
+        let platforms = Platform::load_registry().expect("the registry loads");
+        println!("{} entries across the stores", platforms.len());
         for platform in platforms {
             println!(
                 "  {:<10} os={:<8} embedded={:<5} family={:<8} flash={:<9} hints={} chars",
