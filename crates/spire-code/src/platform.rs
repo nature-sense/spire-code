@@ -351,20 +351,20 @@ impl Platform {
 
     /// Which kind of thing this entry names — the axis the platforms list groups by.
     ///
-    /// **The change this doc predicted has happened.** It used to be the inverse of
-    /// [`Self::is_embedded`] "deliberately the *only* rule", and it said the store split — a
-    /// board naming its chip — would turn this into a declared field, with only this method
-    /// changing when it did. That is what happened: a board is now what a picker offers, which
-    /// is a board that declares the `chip:` it carries, or a Linux SBC, where board and target
-    /// are one. And that is why `is_embedded` can no longer stand in for "is silicon": a
-    /// bare-metal board is embedded too. What is left — embedded, naming no board — is a chip.
+    /// **A board declares the chip it carries; a chip is what is left.** That is the whole rule,
+    /// and the store split is what made it exact: every board in the catalogue now names a
+    /// `chip:`, so the rule needs no second clause and `is_embedded` takes no part in it.
+    ///
+    /// It used to *be* the rule — the inverse of [`Self::is_embedded`], "deliberately the only
+    /// one" — and this doc said the split would turn it into a declared field with only this
+    /// method changing. It did, twice: once when the bare-metal boards began naming their
+    /// silicon, and again now the Linux SBCs name their SoCs. A Linux SoC entry is a chip and is
+    /// not bare-metal, which is what finally retired the `is_embedded` clause.
+    ///
+    /// `embedded` remains a separate axis — "can a firmware project target this" — and is no
+    /// longer consulted here.
     pub fn kind(&self) -> PlatformKind {
-        // A board is what a picker offers: a physical thing. It either declares the chip it
-        // carries (`chip:`) or is not bare-metal at all (a Linux SBC is board and target in
-        // one). Embedded-ness alone no longer decides — since boards name their silicon, a
-        // bare-metal *board* is embedded too, and the old rule filed every one of them as a
-        // chip. Silicon is what is left: embedded and naming no board.
-        if self.chip.is_some() || !self.is_embedded() {
+        if self.chip.is_some() {
             PlatformKind::Board
         } else {
             PlatformKind::Chip
@@ -938,7 +938,13 @@ mod tests {
     #[test]
     fn kind_separates_linux_boards_from_bare_metal_chips() {
         let tmp = tempfile::tempdir().unwrap();
-        write_yaml(tmp.path(), "rpi5.yaml", &platform_yaml("rpi5", "Pi 5"));
+        // The Linux entry is a board because it **names its chip**, not because its `os` is
+        // linux — now that the SBCs name their SoCs, `os` no longer decides this at all.
+        write_yaml(
+            tmp.path(),
+            "rpi5.yaml",
+            &format!("{}chip: broadcom-bcm2712\n", platform_yaml("rpi5", "Pi 5")),
+        );
         write_yaml(
             tmp.path(),
             "esp32c3.yaml",

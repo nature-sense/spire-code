@@ -5711,10 +5711,9 @@ mod platform_listing_tests {
     /// instead of re-deriving `os`'s rule in Swift.
     #[test]
     fn the_listing_names_boards_and_chips() {
-        let out = platforms_listing(vec![
-            platform("esp32c6", "esp-idf"),
-            platform("rpi5", "linux"),
-        ]);
+        let mut board = platform("rpi5", "linux");
+        board.chip = Some("broadcom-bcm2712".into());
+        let out = platforms_listing(vec![platform("esp32c6", "esp-idf"), board]);
         let entries = out.as_array().expect("an array");
         let kind_of = |id: &str| {
             entries
@@ -5737,11 +5736,9 @@ mod platform_listing_tests {
         let mut board = platform("m5stack-core-s3", "esp-idf");
         board.chip = Some("esp32s3".into());
 
-        let out = platforms_listing(vec![
-            board,
-            platform("esp32s3", "esp-idf"),
-            platform("rpi5", "linux"),
-        ]);
+        let mut linux = platform("rpi5", "linux");
+        linux.chip = Some("broadcom-bcm2712".into());
+        let out = platforms_listing(vec![board, platform("esp32s3", "esp-idf"), linux]);
         let entries = out.as_array().expect("an array");
         let kind_of = |id: &str| {
             entries
