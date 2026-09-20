@@ -1817,3 +1817,25 @@ No `Platform` change, no codec change, no fixtures, and no twelve edits. The les
 **when the source of truth is the graph, do not launder its data through a typed struct that exists
 only to be serialised.**
 
+
+### Two constraints found before the seeder gets written (2026-09-20)
+
+Both would have been wrong assumptions in the seeder, and both are cheap now.
+
+1. **`spire-core` cannot call `capability_paths` — or anything else in `spire-code`.** The dependency
+   runs one way: `spire-code` depends on `spire-core`, so the seeder (in spire-core's graph subsystem)
+   can only ever be a **dumb writer**. The tree must therefore be **flattened on this side of the
+   message**, in spire-code, and the payload should carry the result — the capability paths, and the
+   edges a realization implies — rather than the raw tree. That also puts the naming rule
+   (`capability_paths`) and its only consumer in the same crate, which is its right home.
+
+2. **`via:` and `firmware:` are not the only things a realization carries, and the vocabulary was
+   wrong to say so.** `schema/capabilities.yaml` states "every capability may carry two realization
+   keys, and nothing else", while the worked example gives `camera: { via: esp32p4, connector: csi0 }`.
+   The example is right and the rule was too strict: a real board says *which* connector, *which* bus,
+   *which* pins.
+
+   Resolved by keeping the two apart cleanly: **`via:` and `firmware:` say what *realizes* a
+   capability; `pins:` says how it is *wired*.** So the connector belongs under `pins:` beside the
+   LED's pin, not inside the capability block — the vocabulary's rule stands as written, and the
+   example in the notes above is the thing that needed correcting.
