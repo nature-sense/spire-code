@@ -1904,3 +1904,13 @@ in that file at all. So the seeder's test needs a graph fixture that does not ex
 that harness is a bigger piece than the seeder itself. The first task is therefore the harness: bring
 up a `MemoryGraph` over a temp store and read a node back. The seeder test, and the delete-first
 assertion that makes it meaningful, follow from it.
+
+**Correction to the gap above: the harness mostly exists.** `create_test_graph() -> GraphDb` is
+already a test helper in `spire-core/src/graph.rs` (around line 670), and
+`tests/spatial_query_tests.rs` and `tests/tile_actor_tests.rs` are integration tests that bring an
+actor up over a test store. So the pattern for "a `MemoryGraph` over a temp store" is written twice
+already, and the seeder's test is a copy of an existing shape rather than new infrastructure. The one
+thing to check first is whether `create_test_graph()` is visible outside `src/graph.rs`'s test module
+(it looks module-scoped), which decides between reusing it and lifting it into a shared test helper -
+a small decision, not a piece of work. Lesson repeated: the gap I named was found by grep, not by
+reading, and grepping one file was one file too few.
