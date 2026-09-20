@@ -1891,3 +1891,16 @@ every startup" it exists for is not happening: a platform removed from the regis
 graph. The seeder's own delete must match the case it writes, and the existing one should be fixed
 in the same commit, because it is precisely the failure the spec above warns about - a stale truth,
 which is worse than no truth.
+
+**The edge API - the last unknown, resolved.** `store_edge_via_gql(..)` writes an edge and
+`delete_edge_via_gql(uuid)` removes one; the GQL label comes from
+`relationship_type_to_gql_label(&RelationshipType)`, and `RelationshipType` carries `Custom(String)`,
+so `realizes` / `via` / `carries` need **no enum change** - they are `Custom`, exactly as the model
+check predicted before any of this was written. So the seeder is entirely: `store_attr_node_via_gql`
+for one node per capability path, `store_edge_via_gql` for the edges, labels from `Custom(..)`.
+
+**And a gap to expect before starting.** `memory_graph.rs` has **no handler tests** - no `#[test]`
+in that file at all. So the seeder's test needs a graph fixture that does not exist yet, and building
+that harness is a bigger piece than the seeder itself. The first task is therefore the harness: bring
+up a `MemoryGraph` over a temp store and read a node back. The seeder test, and the delete-first
+assertion that makes it meaningful, follow from it.
