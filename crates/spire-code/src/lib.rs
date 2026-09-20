@@ -45,3 +45,5 @@ pub use spire_core::actors::{Actor, ToolInfo};
 /// happened when this lock was first shared by three modules' tests.
 #[doc(hidden)]
 pub static PLATFORM_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub mod capability_vocabulary;
