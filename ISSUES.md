@@ -1874,3 +1874,20 @@ which is most entries today. So the writer must treat *absent* as the common cas
 **The test that defines done:** a fixture payload carrying the block above seeds two capability nodes
 and the edges; a *second* bootstrap with the block removed leaves none. The second half is the one
 that catches a missing delete, and it is the half that would otherwise go unwritten.
+
+**What the handler already gives the seeder** (read from it, not assumed): the node write is an
+`AttrNode { id, node_type, name, description, properties, .. }` stored with
+`actor.store_attr_node_via_gql(&attr, None)`, so a capability node is an `AttrNode` with
+`node_type: "Capability"`, `name`/`id` = the path, and the block's properties; the delete is
+`execute_gql_write("MATCH (n:SpireNode) WHERE n.node_type = '..' DETACH DELETE n")`, and node types
+are plain strings, so none of this needs an enum change; and `schedule_snapshot()` runs once after
+the loop. **Edges are not created in this handler**, so the `realizes`/`via`/`carries` writes need
+the edge API read from wherever the `ast_*` relationships are written - that is the one unknown left.
+
+**And a bug found while reading it.** The platform delete matches `node_type = 'platform'` while the
+nodes are created with `node_type: "Platform"`. Cypher compares *values*, and a property value is
+case-sensitive - so that delete matches **nothing**, and the "graph mirrors the registry exactly on
+every startup" it exists for is not happening: a platform removed from the registry stays in the
+graph. The seeder's own delete must match the case it writes, and the existing one should be fixed
+in the same commit, because it is precisely the failure the spec above warns about - a stale truth,
+which is worse than no truth.
