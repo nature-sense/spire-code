@@ -5729,6 +5729,38 @@ mod platform_listing_tests {
         assert_eq!(kind_of("rpi5"), Some("board".to_string()));
     }
 
+    /// A board that declares `chip:` is a board **even though it is embedded**. Before this,
+    /// `is_embedded()` decided, so every bare-metal board was filed under chips — a rule that
+    /// only held while the entries were silicon and their ids named vendors, not boards.
+    #[test]
+    fn a_board_that_declares_its_chip_is_listed_as_a_board() {
+        let mut board = platform("m5stack-core-s3", "esp-idf");
+        board.chip = Some("esp32s3".into());
+
+        let out = platforms_listing(vec![
+            board,
+            platform("esp32s3", "esp-idf"),
+            platform("rpi5", "linux"),
+        ]);
+        let entries = out.as_array().expect("an array");
+        let kind_of = |id: &str| {
+            entries
+                .iter()
+                .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))
+                .and_then(|p| p.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        assert_eq!(kind_of("m5stack-core-s3"), Some("board".to_string()));
+        assert_eq!(
+            kind_of("esp32s3"),
+            Some("chip".to_string()),
+            "silicon stays silicon"
+        );
+        assert_eq!(kind_of("rpi5"), Some("board".to_string()));
+    }
+
     /// The flag the wizard filters on is in the payload, and the rest of the platform travels with
     /// it — the UI reads the rule from here rather than keeping its own copy.
     #[test]

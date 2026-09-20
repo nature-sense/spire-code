@@ -351,18 +351,23 @@ impl Platform {
 
     /// Which kind of thing this entry names — the axis the platforms list groups by.
     ///
-    /// The inverse of [`Self::is_embedded`], and deliberately the *only* rule: an
-    /// embedded entry (`esp-idf`/`esp-hal`/`rp2040`) names the **processor**, while
-    /// everything else — a Linux SBC's arch+sysroot, or the host — is a **board**
-    /// entry. A second predicate here would be a second taxonomy, free to disagree
-    /// with the one the build keys on. The store split (`boards/` + `targets/`, a
-    /// board naming its chip) turns this into a declared field, and only this method
-    /// changes when it does.
+    /// **The change this doc predicted has happened.** It used to be the inverse of
+    /// [`Self::is_embedded`] "deliberately the *only* rule", and it said the store split — a
+    /// board naming its chip — would turn this into a declared field, with only this method
+    /// changing when it did. That is what happened: a board is now what a picker offers, which
+    /// is a board that declares the `chip:` it carries, or a Linux SBC, where board and target
+    /// are one. And that is why `is_embedded` can no longer stand in for "is silicon": a
+    /// bare-metal board is embedded too. What is left — embedded, naming no board — is a chip.
     pub fn kind(&self) -> PlatformKind {
-        if self.is_embedded() {
-            PlatformKind::Chip
-        } else {
+        // A board is what a picker offers: a physical thing. It either declares the chip it
+        // carries (`chip:`) or is not bare-metal at all (a Linux SBC is board and target in
+        // one). Embedded-ness alone no longer decides — since boards name their silicon, a
+        // bare-metal *board* is embedded too, and the old rule filed every one of them as a
+        // chip. Silicon is what is left: embedded and naming no board.
+        if self.chip.is_some() || !self.is_embedded() {
             PlatformKind::Board
+        } else {
+            PlatformKind::Chip
         }
     }
 
