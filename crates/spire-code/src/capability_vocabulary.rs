@@ -240,3 +240,52 @@ mod tests {
         assert!(unknown_names(&serde_json::json!({})).is_empty());
     }
 }
+
+/// The capabilities a block declares, each with the mapping written under it — what a seeder turns
+/// into a node (the path) and an edge (the `via`/`firmware` inside it).
+///
+/// Built on [`capability_paths`] so the naming rule keeps **one** implementation: the paths come
+/// from there, and each one's properties are found by following it back down the tree (`a.b` →
+/// `tree["a"]["b"]`), which needs no second walk and so cannot disagree with the first.
+///
+/// The input is a block, and a block is **category-rooted** — a chip's `capabilities:` and a board's
+/// `realized:` are the same shape, which is the point: a board says it realizes `media.camera`, and a
+/// chip says its silicon *is* `media.camera`.
+pub fn realizations(tree: &Value) -> Vec<(String, Value)> {
+    capability_paths(tree)
+        .into_iter()
+        .map(|path| {
+            let mut node = tree;
+            for part in path.split('.') {
+                node = &node[part];
+            }
+            (path, node.clone())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod realization_tests {
+    use super::*;
+
+    /// The leaf's own mapping comes back with its path — the `via:` a seeder makes an edge from — and
+    /// the path is the *same* path `capability_paths` would give, because it is literally the same
+    /// rule with the properties kept.
+    #[test]
+    fn a_realization_carries_the_properties_written_under_it() {
+        let board = serde_json::json!({
+            "media": { "camera": { "via": "esp32p4", "connector": "csi0" } },
+            "io": { "ethernet": { "via": "esp32p4" } }
+        });
+        let got = realizations(&board);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "io.ethernet", "sorted by path");
+        assert_eq!(got[0].1["via"], "esp32p4");
+        assert_eq!(got[1].0, "media.camera");
+        assert_eq!(got[1].1["connector"], "csi0");
+
+        // The names are the same ones the path rule produces, always.
+        let names: Vec<String> = got.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(names, capability_paths(&board));
+    }
+}
