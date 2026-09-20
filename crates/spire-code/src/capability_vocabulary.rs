@@ -289,3 +289,59 @@ mod realization_tests {
         assert_eq!(names, capability_paths(&board));
     }
 }
+
+/// The silicon a board **carries** beside its host — a board's `companions:` as seeder input: each
+/// companion's chip id, with the rest of its mapping (`role`, `link`, `firmware`) beside it.
+///
+/// A **list**, not a tree, and that is the point: a board carries a *set* of companions, not a
+/// taxonomy of them. `companions:` holds the silicon that *can* be attached — the ESP32-C6 on the
+/// Stamp-P4 — while which ones *are* attached belongs to a project, which is why this produces an
+/// edge per companion rather than a property of the board.
+///
+/// No block, an empty list, or an entry with no `chip:` all mean the same thing: nothing to carry.
+/// And an entry without a chip names no silicon, so it is dropped rather than written as an edge to
+/// nothing — the same refusal as everywhere else, applied to a list instead of a name.
+pub fn carries(companions: Option<&Value>) -> Vec<(String, Value)> {
+    companions
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    let chip = entry.get("chip")?.as_str()?.to_string();
+                    Some((chip, entry.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod carries_tests {
+    use super::*;
+
+    /// The chip id is the edge's target; everything else written beside it (`role`, `link`,
+    /// `firmware`) travels as the edge's properties.
+    #[test]
+    fn a_board_carries_companion_chips() {
+        let companions = serde_json::json!([{
+            "chip": "esp32c6",
+            "role": "radio",
+            "link": { "bus": "uart" },
+            "firmware": "esp-hosted"
+        }]);
+        let got = carries(Some(&companions));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "esp32c6");
+        assert_eq!(got[0].1["role"], "radio");
+        assert_eq!(got[0].1["link"]["bus"], "uart");
+        assert_eq!(got[0].1["firmware"], "esp-hosted");
+
+        // Nothing declared, nothing carried.
+        assert!(carries(None).is_empty());
+        assert!(carries(Some(&serde_json::json!([]))).is_empty());
+        assert!(
+            carries(Some(&serde_json::json!([{ "role": "radio" }]))).is_empty(),
+            "an entry with no chip names no silicon to carry"
+        );
+    }
+}
