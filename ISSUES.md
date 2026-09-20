@@ -1717,3 +1717,69 @@ newline that Python's parser keeps. And the app's test binary scopes its own `~/
 app name comes from the process — so an ignored test run without `SPIRE_BOARD_DIR` / `SPIRE_CHIP_DIR`
 reads an *empty* scope rather than the real registry.
 
+## The capability model (2026-09-20) — design settled, step 2 in progress
+
+The next thing after the board/chip split, and the reason for that split: **the generator defaults
+to software because it does not know hardware exists.** Software is the only *safe* answer when the
+target is unknown — it always compiles, it has no wrong pins — so the model writes a software
+inference path for a board that has an accelerator, and nothing flags it. Everything below exists to
+make the hardware **known and authoritative**, both before generation and after it.
+
+### The shape
+
+- **YAML is the seed; the graph is the source of truth.** Facts are authored in `boards/` and
+  `chips/` because that is easy to create and diff, and seeded into the graph because a graph can
+  hold *relations* — which a per-entry file cannot. Resolution reads the graph; `resolve()` already
+  prefers it, and the startup phase already seeds it.
+- **A capability is not a boolean.** Presence carries its details, and **absence is omission** —
+  which is what keeps "has an NPU" and "has no NPU" from being the same silence.
+- **Two layers of fact, one vocabulary.** A **chip** declares what its silicon *can* do
+  (`capabilities:`); a **board** declares what it *realizes*, and how (`realized:`, `pins:`). The
+  vocabulary (`schema/capabilities.yaml`) is shared, so `media.video.encode.h264` means the same
+  thing on a bare-metal board and on a Linux SBC — only the glue differs.
+- **A board is not one chip.** `companions:` lists silicon a board carries *beside* its host: the
+  Stamp-P4 has no radio and gets WiFi/BT/ZigBee/Thread from an on-board ESP32-C6. What *can* be
+  attached is a board fact; what *is* attached is a configuration, i.e. a graph edge.
+- **Strict on shape, open on vocabulary.** A misshapen capability is refused; a new name under a
+  category is legal, so adding a capability is one line in the vocabulary and never a code change.
+- **The schema carries facts; the drivers carry shape.** The generator gets the resolved profile
+  plus the trait, never a wall of prose.
+- **Pin granularity:** author *function → pin* (`led: GPIO48`), name *function → interface*
+  (`camera: { via: esp32p4, connector: csi0 }`) and let the chip's mux derive the rest. The full
+  pinout is the chip's devicetree and stays out.
+
+### The plan
+
+1. **Vocabulary** — done (`a7b3b57`): `schema/capabilities.yaml`, 7 categories, 20 names. The
+   validator (strict shape / open vocabulary) is still to write.
+2. **Schema + plumbing** — in progress; see below.
+3. **Seed the facts** — chip capabilities, board realization/pins/companions; `esp32c6` returns as
+   companion silicon. Gated on reading the physical boards, and it must not block step 2.
+4. **The resolved profile** — board → chip → capabilities → companions → wiring, as a graph walk.
+5. **Ground the codegen** — the profile into the fill prompt.
+6. **The verification oracle** — flag a software reimplementation where hardware is declared.
+   Inference first: the software path (`tflite`, `ndarray`, hand-rolled loops) is easy to recognise.
+7. **Deterministic fills** — `pins:` → the BSP's `led()` and the Linux impl's line, by template.
+8. **Rename** — HAL → drivers for our side; the vendor HAL stays `hal:` on the chip. Last.
+
+### Step 2, exactly — and its two traps
+
+The four fields (`capabilities`, `realized`, `pins`, `companions` — optional generic trees, because
+the vocabulary is open and a new capability must not be a code change) break **twelve**
+`Platform { … }` literals: `platform.rs` ×6 · `platform_codec.rs` 159, 239, 268 ·
+`coordinator.rs:5688` (the `platform()` test helper, whose callers then follow) · `esp.rs:809` ·
+`rp2040.rs:551`.
+
+- **Trap one — the codec reader.** `platform_codec.rs:159` sits inside `platform_json_to_spire`
+  (line 132), which builds a `Platform` **from graph props**. It must *read* the four props, and
+  `platform_to_registry_json` (line 16; props at 105/110 to model on) must *write* them. Putting
+  `None` there compiles and **silently drops capabilities on every graph round-trip** — so the
+  round-trip test is what defines "done" for this step, not the compile.
+- **Trap two — do it by hand.** A regex/brace-matching script was attempted three times and is the
+  wrong tool: it cannot determine a struct literal's extent, and it produced duplicates (`E0062`)
+  and misses (`E0063`). Twelve hand edits, or an AST pass. Not a script.
+
+Then: capability nodes and `realizes` / `via` / `carries` edges seeded beside the platform nodes —
+**no `spire-core` change needed**, because `AttrNode.node_type` is a free-form string and
+`RelationshipType` already carries `Custom(String)`.
+
