@@ -1930,3 +1930,21 @@ So the seeder is: delete `node_type = 'Capability'`; per payload carrying `capab
 name, then `store_edge_via_gql(board_id, "realizes", path, &[("via", ..)])` and
 `store_edge_via_gql(board_id, "carries", chip_id, ..)` from the block's edge lists - with the case of
 the delete matching the case of the create, which the platform delete currently does not.
+
+**And the last one, so nothing is left to look up.** `GraphDb` has both calls a free function needs:
+`create_node(labels, props) -> id` (line 129) and **`create_edge(label, from, to, props)`** (line 209,
+used in its own tests as `db.create_edge("knows", a, b, vec![])`). So:
+
+    fn seed_capabilities(graph_db: &GraphDb, platforms: &[serde_json::Value]) -> Result<()>
+
+- deletes `node_type = 'Capability'` through `execute_gql_write`;
+- creates one node per path, `labels: ["SpireNode"]`, with `node_type: "Capability"` and
+  `name: <path>` - the label and props the delete's own GQL implies (`MATCH (n:SpireNode) WHERE
+  n.node_type = ...`);
+- `create_edge("realizes", board_id, path, ..)` and `create_edge("carries", board_id, chip_id, ..)`
+  from the block's edge lists.
+
+The handler calls it with its `graph_db`; the test calls it with `GraphDb::new_in_memory()` and reads
+nodes and edges back. **No actor, no message loop, no harness to copy** - the blocker I named two
+entries ago was an artefact of keeping the rule inline in the handler. The rule belongs in a function
+and the handler belongs to the plumbing, which is how every other piece of this work landed.
