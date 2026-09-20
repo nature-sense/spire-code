@@ -85,6 +85,107 @@ pub fn unknown_names(caps: &Value) -> Vec<String> {
     out
 }
 
+/// Every **capability path** in a declared tree, sorted — the names a seeder makes nodes for.
+///
+/// The rule is structural, and it needs no vocabulary lookup: **a key whose value is a mapping is a
+/// capability; a scalar or a list is a property *of* the enclosing capability.** So
+///
+/// ```text
+/// media: { video: { encode: { codec: h264 } }, camera: { interface: mipi-csi } }
+/// ```
+///
+/// yields `media.camera` and `media.video.encode` — *not* `media.video.encode.h264`, because `codec`
+/// is a property and `h264` is its value. That distinction was wrong in an earlier hand-written
+/// example, and this is the function that settles it rather than a convention.
+///
+/// A capability that carries nothing else is emitted as itself (`zigbee: {}` → `radio.ieee802154.
+/// zigbee`), and an intermediate that only holds capabilities (`radio`, `radio.ieee802154`) is a
+/// *path segment*, not a thing a board declares.
+pub fn capability_paths(tree: &Value) -> Vec<String> {
+    fn walk(value: &Value, prefix: &str, out: &mut Vec<String>) {
+        let Some(obj) = value.as_object() else {
+            return;
+        };
+        for (key, child) in obj {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            // A scalar or list is a property, not a capability: it names no node.
+            let Some(child) = child.as_object() else {
+                continue;
+            };
+            // The **top level is the category level** — the vocabulary's own shape — so a category is
+            // always a path segment and never a thing a board declares. That is the whole difference
+            // between an empty `radio: {}` (which names nothing) and an empty `zigbee: {}` (which
+            // names a capability that carries nothing else).
+            if prefix.is_empty() {
+                walk(&Value::Object(child.clone()), &path, out);
+                continue;
+            }
+            if child.values().any(Value::is_object) {
+                walk(&Value::Object(child.clone()), &path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, "", &mut out);
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod capability_path_tests {
+    use super::*;
+
+    /// A capability is a mapping; a property is what its leaves hold. The example that was wrong in
+    /// the notes is the first thing this pins.
+    #[test]
+    fn a_property_is_not_a_capability_path() {
+        let media = serde_json::json!({
+            "media": {
+                "video": { "encode": { "codec": "h264", "max": "1080p30" } },
+                "camera": { "interface": "mipi-csi" }
+            }
+        });
+        assert_eq!(
+            capability_paths(&media),
+            vec!["media.camera", "media.video.encode"],
+            "`codec: h264` is a property of `media.video.encode`, not a capability called `h264`"
+        );
+    }
+
+    /// The nesting the vocabulary was designed around: one radio, three protocol families, and an
+    /// empty block that is still a capability.
+    #[test]
+    fn nesting_and_empty_blocks_are_both_capabilities() {
+        let radio = serde_json::json!({
+            "radio": {
+                "ieee802154": { "zigbee": {}, "thread": {} },
+                "wifi": { "standard": "802.11ax", "bands": ["2.4g"] }
+            }
+        });
+        assert_eq!(
+            capability_paths(&radio),
+            vec![
+                "radio.ieee802154.thread",
+                "radio.ieee802154.zigbee",
+                "radio.wifi",
+            ],
+            "`radio` and `radio.ieee802154` are path segments; the leaves are what a board declares"
+        );
+
+        assert!(capability_paths(&serde_json::json!({})).is_empty());
+        assert!(
+            capability_paths(&serde_json::json!({ "radio": {} })).is_empty(),
+            "a declared-but-empty category names nothing"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
