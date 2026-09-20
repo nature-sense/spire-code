@@ -1,0 +1,80 @@
+# The **vocabulary** of board capabilities — the names and shapes a board's facts must use.
+#
+# Not a board's facts: this is the grammar they are written in. It exists so that
+# `media.video.encode.h264` means the same thing on a bare-metal board and on a Linux SBC, and so
+# the loader can tell a **misspelling** from a **new thing** rather than silently reading a typo
+# as "this board has none".
+#
+# Two rules, and they are the whole discipline:
+#   * **Strict on shape.** A capability that is the wrong shape is refused — a `tops` without a
+#     precision, a bare string where a mapping belongs.
+#   * **Open on vocabulary.** A new name under a category is legal. This file records the ones
+#     that exist so an *unknown* name can be refused; adding a capability is appending a line
+#     here, never a change to the loader.
+#
+# Where a capability is written:
+#   * a **chip** declares what its silicon can do                     (`capabilities:`)
+#   * a **board** declares what it realizes, and how                  (`realized:`, `pins:`)
+#
+# Every capability may carry two realization keys, and nothing else:
+#   via:       the chip that realizes it — the host chip, or a companion. Absent means the host.
+#   firmware:  what must be running on that chip for this to be true.
+# So a capability is never a bare boolean: **presence carries its own details, and absence is
+# omission** — which is what stops "has an NPU" and "has no NPU" from being the same silence.
+#
+# The shapes below are written in a readable shorthand (`str`, `int`, `bool`, `float`, a list, an
+# `enum[...]` of allowed spellings, a nested block). It fixes the *shape*; the validator that
+# enforces it is a separate piece.
+
+categories:
+
+  # One radio, several protocol families — and `matter` is a *layer*, not a sibling of
+  # `zigbee`/`thread`: it runs over them, which is exactly the nesting a flat list cannot hold.
+  radio:
+    wifi:        { standard: str, bands: [str] }      # e.g. 802.11ax, [2.4g]
+    bluetooth:   { version: int, le: bool, mesh: bool }
+    ieee802154:
+      zigbee:    {}
+      thread:    {}
+      matter:    { over: [str] }                      # over: [thread, wifi]
+
+  media:
+    camera:      { interface: "enum[mipi-csi, parallel, usb]" }
+    display:     { interface: "enum[mipi-dsi, rgb, spi, hdmi]" }
+    video:
+      encode:    { codec: "enum[h264, hevc, jpeg]", max: str }
+      decode:    { codec: "enum[h264, hevc, jpeg]", max: str }
+    audio:       { in: bool, out: bool }
+
+  compute:
+    ml:
+      # `tops` belongs to a **dedicated** accelerator, so it is optional — and its absence is
+      # the honest answer for the ESP32-P4, whose "limited AI" is a vector coprocessor with no
+      # TOPS to state. Its keys are precisions, because the same part gives different numbers at
+      # INT8 and FP16, and an INT8-only accelerator cannot run a FP16 model at all.
+      accelerator: { kind: "enum[npu, vector-coprocessor, gpu]", tops: { str: float } }
+      runtime:     "enum[esp-dl, rknn, onnxruntime, tflite-micro, openvino, none]"
+      # The *formats* the converter accepts — distinct from the runtime that executes the
+      # result, and distinct again from the model's *task* (classifier, detector, LLM), which
+      # is what actually decides whether a given model is runnable here.
+      imports:     [ "enum[onnx, tflite, savedmodel, keras, pytorch]" ]
+
+  io:
+    ethernet:    { phy: str, speed: "enum[100m, 1g, 2.5g, 10g]" }
+    usb:         { ports: int, role: "enum[host, device, otg]" }
+    can:         { instances: int }
+    pcie:        { lanes: int }
+    buses:       { instances: { i2c: int, spi: int, uart: int } }
+
+  storage:
+    sd:          { interface: "enum[spi, sdio]" }
+    emmc:        {}
+    nvme:        { lanes: int }
+
+  power:
+    battery:     { charger: bool }
+    poe:         { standard: str }
+
+  sensing:
+    imu:         {}
+    temperature: {}
