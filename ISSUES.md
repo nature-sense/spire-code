@@ -1948,3 +1948,15 @@ The handler calls it with its `graph_db`; the test calls it with `GraphDb::new_i
 nodes and edges back. **No actor, no message loop, no harness to copy** - the blocker I named two
 entries ago was an artefact of keeping the rule inline in the handler. The rule belongs in a function
 and the handler belongs to the plumbing, which is how every other piece of this work landed.
+
+**Correction: the seeder DOES need the actor's store, and the previous entry was wrong.** Reading
+`GraphDb::create_node(labels, props) -> NodeId` and `create_edge(label, subject, object, props)` showed
+both exist, and I concluded the seeder could be a free function over `&GraphDb` with no actor at all.
+That skips something plainly visible in the handler: the platform nodes are written through
+`actor.store_attr_node_via_gql`, which maps an `AttrNode` - labels, `node_type`, timestamps, version -
+onto the graph, while `create_node` takes a raw `Vec<(String, selene Value)>`. Writing capability nodes
+with `create_node` directly would either duplicate that mapping or, worse, produce nodes shaped
+differently from the platform nodes they sit beside. So: the seeder uses the actor's own paths
+(`store_attr_node_via_gql`, `store_edge_via_gql`), and the test **does** need the actor up - which is
+what `tests/spatial_query_tests.rs` already demonstrates. The free-function idea was right about
+extracting the rule and wrong about the harness.
