@@ -471,3 +471,34 @@ mod seeder_input_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    /// The refusal is the whole point: a misspelled capability is dropped from the node names while
+    /// a known one beside it survives — so a typo cannot be read back as "this board has none".
+    #[test]
+    fn a_typod_capability_is_refused_and_a_known_one_survives() {
+        let block = serde_json::json!({
+            "capabilities": {
+                "radio": { "wiffi": {}, "wifi": { "standard": "802.11ax" } }
+            }
+        });
+        let got = seeder_input(&block);
+        assert_eq!(
+            got["capabilities"],
+            serde_json::json!(["radio.wifi"]),
+            "`radio.wiffi` is refused; `radio.wifi` survives"
+        );
+
+        // A block that is entirely misspelled refuses everything and names nothing — which is the
+        // distinction that matters: nothing, not a wrong something.
+        let bad = serde_json::json!({ "capabilities": { "radio": { "wiffi": {} } } });
+        let got = seeder_input(&bad);
+        assert!(
+            got.get("capabilities").is_none(),
+            "all refused, nothing named: {got}"
+        );
+    }
+}
