@@ -1839,3 +1839,38 @@ Both would have been wrong assumptions in the seeder, and both are cheap now.
    capability; `pins:` says how it is *wired*.** So the connector belongs under `pins:` beside the
    LED's pin, not inside the capability block — the vocabulary's rule stands as written, and the
    example in the notes above is the thing that needed correcting.
+
+### The seeder, specified (2026-09-20)
+
+Step 2's last piece, and the only cross-repo one. `spire-code` now hands over the payload; the writer
+lives in `spire-core` and must stay **dumb**, because the dependency runs one way.
+
+**What arrives** — per platform node, under `capability_blocks`, from
+`capability_vocabulary::seeder_input()`:
+
+```yaml
+capabilities: ["media.camera", "media.video.encode"]     # node names
+realizes:     [ { capability: "media.camera", properties: { via: "esp32p4" } } ]
+carries:      [ { chip: "esp32c6", properties: { role: "radio", firmware: "esp-hosted" } } ]
+pins:         { led: { pin: "GPIO48" } }                 # wiring, not an edge - ignored here
+```
+
+A key is absent when it is empty, and the whole block is `null` when the entry declares nothing -
+which is most entries today. So the writer must treat *absent* as the common case, not an error.
+
+**What the writer does**, beside the `BootstrapPlatforms` handler in
+`spire-core/src/subsystems/graph/memory_graph.rs`:
+
+1. **Delete first, like the platform nodes do** - `MATCH (n:SpireNode) WHERE n.node_type =
+   'capability' DETACH DELETE n` - so the graph mirrors the registry on every startup instead of
+   accumulating. Without it an edited board leaves its old capabilities behind, and the oracle would
+   check generated code against a graph that no longer matches the board.
+2. **One node per name** - `node_type: 'capability'`, `name` = the path (`media.video.encode`), with
+   the entry's properties when it has them.
+3. **The edges** - `(board)-[:realizes {properties}]->(capability)`,
+   `(capability)-[:via]->(chip)` where a realization names one, `(board)-[:carries {properties}]->(chip)`.
+   `RelationshipType::Custom` already allows these names, so no enum change is needed.
+
+**The test that defines done:** a fixture payload carrying the block above seeds two capability nodes
+and the edges; a *second* bootstrap with the block removed leaves none. The second half is the one
+that catches a missing delete, and it is the half that would otherwise go unwritten.
