@@ -129,6 +129,83 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
 
 /// Rebuild a `crate::platform::Platform` from the generic registry JSON node the
 /// knowledge crate returns for `Platform` nodes.
+/// The capability blocks an entry declares — `capabilities:`, `realized:`, `pins:`, `companions:` —
+/// read from its **YAML document**, not through the typed `Platform`.
+///
+/// Raw on purpose, and it is the same reading `generic_helpers` already does for `library_hints`.
+/// These are trees: the flat prop map a platform node carries cannot hold one, and the graph — not
+/// the entry, and not a struct that exists only to be serialised — is where they are meant to live.
+/// So they travel as they were written.
+///
+/// `None` when the entry declares none of them, which is the common case: a board with no declared
+/// capabilities is not an error, it is a board with no declared capabilities.
+pub fn capability_blocks(platform: &crate::platform::Platform) -> Option<serde_json::Value> {
+    let name = format!("{}.yaml", platform.id);
+    let path = crate::platform::Platform::stores()
+        .iter()
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())?;
+    let doc: serde_json::Value = serde_yaml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let mut out = serde_json::Map::new();
+    for key in ["capabilities", "realized", "pins", "companions"] {
+        if let Some(block) = doc.get(key) {
+            out.insert(key.to_string(), block.clone());
+        }
+    }
+    (!out.is_empty()).then(|| serde_json::Value::Object(out))
+}
+
+#[cfg(test)]
+mod capability_block_tests {
+    use super::*;
+
+    /// The blocks come back as **written** — a tree, not flattened — and an entry that declares none
+    /// returns `None` rather than an empty object, so "declares nothing" stays distinguishable from
+    /// "declares something empty".
+    #[test]
+    fn capability_blocks_come_back_as_a_tree() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (platforms, chips) = (tmp.path().join("platforms"), tmp.path().join("chips"));
+        std::fs::create_dir_all(&platforms).unwrap();
+        std::fs::create_dir_all(&chips).unwrap();
+        let _env = crate::platform::PlatformDirGuard::set(&platforms);
+
+        std::fs::write(
+            chips.join("esp32p4.yaml"),
+            "id: esp32p4\nname: ESP32-P4\nos: esp-idf\ncapabilities:\n  media:\n    video:\n      \
+             encode: { codec: h264 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            platforms.join("plain.yaml"),
+            "id: plain\nname: Plain\nos: linux\n",
+        )
+        .unwrap();
+
+        let chip = crate::platform::Platform::load_directory(&chips)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let blocks = capability_blocks(&chip).expect("the chip declares capabilities");
+        assert_eq!(
+            blocks["capabilities"]["media"]["video"]["encode"]["codec"], "h264",
+            "the tree survives intact"
+        );
+
+        let plain = crate::platform::Platform::load_directory(&platforms)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            capability_blocks(&plain).is_none(),
+            "nothing declared, nothing sent"
+        );
+    }
+}
+
 pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
     let id = node.get("id")?.as_str()?.to_string();
     let name = node

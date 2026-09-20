@@ -581,7 +581,16 @@ impl StartupPhase for PlatformBootstrapPhase {
         let platforms = SpirePlatform::load_registry().unwrap_or_default();
         let platform_json: Vec<serde_json::Value> = platforms
             .iter()
-            .map(crate::actors::platform_codec::platform_to_registry_json)
+            .map(|p| {
+                let mut node = crate::actors::platform_codec::platform_to_registry_json(p);
+                // The capability blocks travel **raw**, beside the typed props: they are trees, and
+                // the graph — not the entry, and not the flat prop map — is where they belong. The
+                // seeder reads this key; until it does, it is an extra key in an open payload.
+                if let Some(blocks) = crate::actors::platform_codec::capability_blocks(p) {
+                    node["capability_blocks"] = blocks;
+                }
+                node
+            })
             .collect();
 
         let (tx, rx) = oneshot::channel();
