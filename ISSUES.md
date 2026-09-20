@@ -1914,3 +1914,19 @@ thing to check first is whether `create_test_graph()` is visible outside `src/gr
 (it looks module-scoped), which decides between reusing it and lifting it into a shared test helper -
 a small decision, not a piece of work. Lesson repeated: the gap I named was found by grep, not by
 reading, and grepping one file was one file too few.
+
+**The last signatures, so the seeder is a transcription.** `store_edge_via_gql(&self, from_uuid,
+predicate, to_uuid, properties: &[(&str, &str)])` - and `predicate` is a **free string**, so
+`realizes` / `via` / `carries` go straight in with no `RelationshipType` construction at all. Node
+ids **are** the graph uuids (the platform node's id is deliberately the registry id, for exactly that
+reason), so the edges join on ids the seeder already holds. And a test graph is one line:
+`GraphDb::new_in_memory()` - which is all `create_test_graph()` in `src/graph.rs` is, module-scoped,
+so a new test writes the same line rather than needing it lifted. The one remaining shape to copy is
+bringing the `MemoryGraphActor` up over that store, which `tests/spatial_query_tests.rs` already
+demonstrates.
+
+So the seeder is: delete `node_type = 'Capability'`; per payload carrying `capability_blocks`, one
+`AttrNode { node_type: "Capability", id: path, name: path, .. }` through `store_attr_node_via_gql` per
+name, then `store_edge_via_gql(board_id, "realizes", path, &[("via", ..)])` and
+`store_edge_via_gql(board_id, "carries", chip_id, ..)` from the block's edge lists - with the case of
+the delete matching the case of the create, which the platform delete currently does not.
