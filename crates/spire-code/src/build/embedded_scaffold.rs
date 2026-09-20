@@ -308,7 +308,7 @@ const DRIVERS_MOD_RS: &str = r#"// SPDX-License-Identifier: GPL-3.0-or-later
 ///
 /// One per board rather than one per family: two boards on one chip are two crates, because the
 /// facts they carry are the boards'. The *vendor* crate they wrap is chosen per chip, which is the
-/// other question — see [`vendor_for`].
+/// other question — see the `hal:` block the chip store carries.
 pub(crate) fn bsp_crate(platform_id: &str) -> String {
     format!("spire-bsp-{platform_id}")
 }
@@ -337,22 +337,6 @@ fn container_crate(root: &std::path::Path) -> Result<String, String> {
         ));
     }
     Ok(name)
-}
-
-/// The vendor crate a board's BSP wraps, and the version to ask for.
-///
-/// One row per chip, and only for chips proven on a board: `esp32c3` is the pilot. A BSP for a chip
-/// nobody has flashed is a crate whose `todo!()`s might never be fillable.
-fn vendor_for(platform_id: &str) -> Option<(&'static str, &'static str, &'static [&'static str])> {
-    match platform_id {
-        // `unstable` is **measured, not assumed**: `esp_hal::delay` is gated behind it, and the compiler
-        // says so in as many words ("found an item that was configured out … gated behind the `unstable`
-        // feature") when a BSP built without it fails on `use esp_hal::delay::Delay`. A BSP's second job
-        // is a delay for the drivers' `DelayNs`, so that absence is not a nicety — and the version is the
-        // one the pilot application was built, flashed and run with.
-        "esp32c3" => Some(("esp-hal", "1.2", &["unstable"])),
-        _ => None,
-    }
 }
 
 /// A board's BSP: two files, one of which is the fill's.
@@ -512,10 +496,25 @@ pub(crate) fn add_bsp(
             platform.os
         ));
     }
-    let (vendor, version, features) = vendor_for(platform_id).ok_or_else(|| {
+    // The vendor HAL is the **chip's** fact, and it lives with the chip: `esp32c3.yaml` carries
+    // the `hal:` this file used to hold as a match arm, so a version change is a data change and
+    // there is one place it can be wrong. A board states `chip:` and resolves it from the chip
+    // store; a chip entry states its own. Neither is a guess — a chip with no `hal:` is a chip
+    // whose BSP nobody has written, and refusing beats emitting a crate whose `todo!()`s might
+    // never be fillable.
+    let hal = platform.hal.clone().or_else(|| {
+        crate::platform::Platform::chip_facts_in(
+            crate::platform::Platform::default_chip_dir(),
+            platform.chip_id(),
+        )
+        .and_then(|chip| chip.hal)
+    });
+    let hal = hal.ok_or_else(|| {
         format!(
-            "no BSP wiring is known for '{platform_id}' yet. `esp32c3` is the one row measured on a \
-             board — built, flashed, LED cycling — and another chip is a row here, not a guess"
+            "no BSP wiring is known for '{platform_id}' yet: a chip declares the vendor HAL its \
+             BSPs are written against as a `hal:` block (crate, version, features). `esp32c3` is \
+             the one measured on a board — built, flashed, LED cycling — and another chip is a \
+             declaration in the store, not a guess"
         )
     })?;
 
@@ -549,7 +548,14 @@ pub(crate) fn add_bsp(
     }
     let updated = with_workspace_member(&manifest, &member)?;
 
-    let files = bsp_files(&container, platform_id, vendor, version, features);
+    let hal_features: Vec<&str> = hal.features.iter().map(String::as_str).collect();
+    let files = bsp_files(
+        &container,
+        platform_id,
+        &hal.crate_name,
+        &hal.version,
+        &hal_features,
+    );
     let mut written: Vec<String> = Vec::new();
     for file in &files {
         let target = root.join(&file.path);
@@ -568,7 +574,7 @@ pub(crate) fn add_bsp(
     Ok(serde_json::json!({
         "board": platform_id,
         "crate": name,
-        "vendor_crate": vendor,
+        "vendor_crate": &hal.crate_name,
         "written": written,
         "workspace_member": member,
         "note": "the board's facts are typed `todo!()`s in src/lib.rs, so the crate builds and links \
@@ -925,10 +931,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (id, os, family) in entries {
             let family_line = family.map(|f| format!("family: {f}\n")).unwrap_or_default();
+            // The pilot is the one chip whose vendor HAL is measured, and the real store has the
+            // same shape: `esp32c3.yaml` carries the `hal:` and no other entry does. It is what
+            // `add_bsp` reads, and an embedded entry *without* one is still the refusal case.
+            let hal_line = if *id == "esp32c3" {
+                "hal:\n  crate: esp-hal\n  version: \"1.2\"\n  features:\n    - unstable\n"
+            } else {
+                ""
+            };
             std::fs::write(
                 dir.path().join(format!("{id}.yaml")),
                 format!(
-                    "id: {id}\nname: {id}\nos: {os}\n{family_line}architecture:\n  cpu_family: x\n  \
+                    "id: {id}\nname: {id}\nos: {os}\n{family_line}{hal_line}architecture:\n  cpu_family: x\n  \
                      cpu: x\n  endian: little\n  target_triple: x\n"
                 ),
             )
