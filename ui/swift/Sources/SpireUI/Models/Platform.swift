@@ -36,13 +36,20 @@ struct Platform: Identifiable, Codable, Hashable {
     /// entry names the processor — so the platforms screen sections by this instead of showing one
     /// undifferentiated list. Optional only so a payload from an older core still decodes.
     let kind: String?
+    /// The chip this board carries (`chip:` in the registry YAML).
+    ///
+    /// A board declares its silicon and states none of the build facts — the triple, the
+    /// toolchain, the sysroot are the chip's — so this is the link the detail panel follows to
+    /// show what a board is built with, rather than three empty groups. Absent on a chip (it *is*
+    /// the chip) and on a Linux SBC that states its own config.
+    let chip: String?
     /// The board this platform can reach, when it declares `device:`. Absent for
     /// the host and for platforms with no board — which is what tells the UI
     /// whether "Run tests on board" / "Deploy binary" can apply.
     let device: PlatformDevice?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, os, architecture, toolchain, sysroot, family, rust, embedded, device, kind
+        case id, name, os, architecture, toolchain, sysroot, family, rust, embedded, device, kind, chip
         case libraryHints = "library_hints"
     }
 }

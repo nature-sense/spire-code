@@ -71,7 +71,8 @@ struct PlatformViewerView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(p.name).font(.callout.weight(.medium))
                     .foregroundStyle(selected == p.id ? theme.accent : theme.textPrimary)
-                Text("\(p.id) · \(p.os)").font(.caption2).foregroundStyle(.secondary)
+                Text("\(p.id) · \(p.os)" + (p.chip.map { " · chip \($0)" } ?? ""))
+                    .font(.caption2).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
         }
@@ -100,35 +101,49 @@ struct PlatformViewerView: View {
     }
 
     private func detail(_ p: Platform) -> some View {
-        ScrollView {
+        // A board states none of the build facts itself: it names its chip, and the facts are the
+        // chip's. So they are read from the chip entry already in this list — the alternative,
+        // three empty groups, is what every board looked like before it could say what it carries.
+        let facts = p.chip.flatMap { id in platforms.first { $0.id == id } } ?? p
+        return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(p.name).font(.title2.weight(.bold))
+                        if let chip = p.chip {
+                            Text("built with the facts of \(chip)")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
                     Button { Task { _ = p.id; loading = true; platforms = await bridge.fetchPlatforms(); loading = false } } label: {
                         Image(systemName: "arrow.clockwise").foregroundStyle(theme.accent)
                     }.buttonStyle(.plain).help("Reload")
                 }
+                if let chip = p.chip {
+                    group("Chip") {
+                        row("Chip", chip)
+                        row("Name", facts.name)
+                    }
+                }
                 group("Architecture") {
-                    row("CPU family", p.architecture.cpuFamily)
-                    row("CPU", p.architecture.cpu)
-                    row("Endian", p.architecture.endian)
-                    row("Triple", p.architecture.targetTriple)
-                    if let m = p.architecture.march { row("March", m) }
+                    row("CPU family", facts.architecture.cpuFamily)
+                    row("CPU", facts.architecture.cpu)
+                    row("Endian", facts.architecture.endian)
+                    row("Triple", facts.architecture.targetTriple)
+                    if let m = facts.architecture.march { row("March", m) }
                 }
                 group("Toolchain") {
-                    row("C", p.toolchain.c); row("C++", p.toolchain.cpp)
-                    row("ar", p.toolchain.ar); row("strip", p.toolchain.strip)
-                    if let ld = p.toolchain.ld { row("Linker", ld) }
-                    if let pg = p.toolchain.pkgconfig { row("pkgconfig", pg) }
-                    list("C args", p.toolchain.cArgsExtra)
-                    list("C++ args", p.toolchain.cppArgsExtra)
-                    list("Linker args", p.toolchain.linkerArgsExtra)
+                    row("C", facts.toolchain.c); row("C++", facts.toolchain.cpp)
+                    row("ar", facts.toolchain.ar); row("strip", facts.toolchain.strip)
+                    if let ld = facts.toolchain.ld { row("Linker", ld) }
+                    if let pg = facts.toolchain.pkgconfig { row("pkgconfig", pg) }
+                    list("C args", facts.toolchain.cArgsExtra)
+                    list("C++ args", facts.toolchain.cppArgsExtra)
+                    list("Linker args", facts.toolchain.linkerArgsExtra)
                 }
                 group("Sysroot") {
-                    let status = sysrootStatus(p)
+                    let status = sysrootStatus(facts)
                     HStack(alignment: .top, spacing: 6) {
                         Image(systemName: status.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                             .foregroundStyle(status.ok ? Color.green : Color.red)
@@ -156,10 +171,10 @@ struct PlatformViewerView: View {
                             .stroke(status.ok ? Color.green.opacity(0.4) : Color.red.opacity(0.5),
                                     lineWidth: 0.5)
                     )
-                    row("Root", p.sysroot.root)
-                    list("Lib dirs", p.sysroot.libDirs)
-                    list("Include dirs", p.sysroot.includeDirs)
-                    list("pkg-config libdir", p.sysroot.pkgConfigLibdir)
+                    row("Root", facts.sysroot.root)
+                    list("Lib dirs", facts.sysroot.libDirs)
+                    list("Include dirs", facts.sysroot.includeDirs)
+                    list("pkg-config libdir", facts.sysroot.pkgConfigLibdir)
                 }
             }
             .padding(16).frame(maxWidth: .infinity, alignment: .leading)
