@@ -76,6 +76,12 @@ categories:
     can:         { instances: int }
     pcie:        { lanes: int }
     buses:       { instances: { i2c: int, spi: int, uart: int } }
+    # A Linux SBC exposes its SoC's GPIO as a numbered header, not as BSP-named pins - that is a
+    # *realization* (a capability the board has), never a `pins:` wiring map. `pins:` stays
+    # bare-metal-only, because its names are compile-time BSP names the firmware addresses
+    # directly; a header's lines are discovered at runtime on a `gpiochip`. `header` is the
+    # physical form (e.g. 40 for a Raspberry Pi's header); `lines` the usable GPIO count.
+    gpio:        { header: int, lines: int }
 
   storage:
     sd:          { interface: "enum[spi, sdio]" }
