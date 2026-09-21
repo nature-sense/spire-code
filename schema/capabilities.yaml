@@ -50,6 +50,14 @@ categories:
     audio:       { in: bool, out: bool }
 
   compute:
+    # A CPU is a capability like any other: "four cores at 1.8 GHz" is a statement about what the
+    # silicon can do, which is what this category is for. The **ISA is deliberately absent** - the
+    # chip's target triple already carries it, and a second copy is a second thing to keep true.
+    # Added for the Linux SoCs (a733, rk3566, bcm2712), whose cores were until now unstateable.
+    cpu:         { cores: int, clock: str }           # e.g. 4, "1.8GHz"
+    # A GPU for display and render - a *different claim* from `ml.accelerator.kind: gpu`, which
+    # says this GPU does ML. Presence says there is one; `model` says which.
+    gpu:         { model: str }                       # e.g. Mali-G52
     ml:
       # `tops` belongs to a **dedicated** accelerator, so it is optional — and its absence is
       # the honest answer for the ESP32-P4, whose "limited AI" is a vector coprocessor with no
