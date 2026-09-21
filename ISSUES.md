@@ -1960,3 +1960,41 @@ differently from the platform nodes they sit beside. So: the seeder uses the act
 (`store_attr_node_via_gql`, `store_edge_via_gql`), and the test **does** need the actor up - which is
 what `tests/spatial_query_tests.rs` already demonstrates. The free-function idea was right about
 extracting the rule and wrong about the harness.
+
+## The seeder, verified (2026-09-21) — and it had been writing nothing
+
+Phase 1 done: `spire-core` now has the test its spec named (`dc77d7c`), and writing it earned its
+place — **the seeder had never written a single edge**, through three independent failures, none of
+which any existing test could see:
+
+1. **Invalid GQL for empty properties.** `gql_props(&[])` returns the literal `{}`, so
+   `store_edge_via_gql` emitted `INSERT (a)-[e:realizes {}]->(b)`, which SeleneDB's parser rejects
+   (`parse failed: expected prop_ident`). That aborted the **whole bootstrap on the first edge**.
+   The one long-standing caller always passes properties, so the empty case was never exercised.
+2. **No dedup by path.** A path declared by a chip *and* by the board built on it (`media.display`
+   on the P4 and on the P4-Nano) wrote **two nodes** — the store does not dedup by id — leaving
+   every edge to that capability ambiguous. Now collected into a `BTreeSet` before writing.
+3. **No edge metadata.** `parse_edge_from_row` treats `uuid` and `edge_type` as mandatory (`?` on
+   each) while the seeder passed `&[]`, so edges were stored and then **silently dropped by every
+   read**. They now carry what the working caller carries (`store_capability_edge_via_gql`), and
+   `RelationshipType` gained `Realizes` / `Via` / `Carries`, so the predicates read back **named**
+   rather than as `Unknown` — an edge findable only by shape is not one you can query.
+
+This is the lesson this file had already reached two entries above and not yet acted on: a writer
+that never reads back is green while being wrong. The second half of the test is the part that
+matters — re-bootstrap with the blocks removed must leave nothing behind.
+
+**Consequence for the running app: restart it.** Its graph holds platform and capability nodes and
+no capability edges, so every read would answer "nothing provides this".
+
+Two of the test's own assertions were wrong and were corrected, not worked around: a `via` naming
+the board's *chip* is a real edge (the chip is a different node from the board), and the tautology
+the seeder skips is `via == board_id`, not "any `via` that happens to name a chip".
+
+**Vocabulary grew**: `compute.cpu { cores, clock }` and `compute.gpu { model }` (`63cae20`) — the
+three Linux SoCs had no way to state a CPU at all, while every other fact they need (`io.*`,
+`storage.*`, `media.video`, `power.*`, `sensing.*`) was already covered. No loader change was
+required: the vocabulary is embedded with `include_str!`, so the file *is* the source of truth —
+which is what its header always claimed, now confirmed by reading the loader instead of trusting it.
+Worth knowing the consequence: editing that file recompiles all of spire-code.
+
