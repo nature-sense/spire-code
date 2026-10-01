@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 /// Opens the tool overview as a floating window dialog — same pattern as
-/// `PlatformPortal` / `RagPortal` so the Tools button behaves like the other
+/// `ConfigurationPortal` / `RagPortal` so the Tools button behaves like the other
 /// icon-rail items instead of replacing the main workspace.
 enum ToolsPortal {
     private static var windows: [NSWindow] = []

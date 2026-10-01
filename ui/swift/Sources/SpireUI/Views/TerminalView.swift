@@ -32,7 +32,7 @@ struct TerminalView: NSViewRepresentable {
 }
 
 /// Opens an embedded terminal in a floating window (same pattern as
-/// `PlatformPortal`/`RagPortal`). `cwd` defaults to the open project's root.
+/// `ConfigurationPortal`/`RagPortal`). `cwd` defaults to the open project's root.
 enum TerminalPortal {
     private static var windows: [NSWindow] = []
 

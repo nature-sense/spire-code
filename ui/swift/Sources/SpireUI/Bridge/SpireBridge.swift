@@ -240,10 +240,9 @@ final class SpireBridge {
                 self?.showSettings = true
             },
             nc.addObserver(forName: MenuCommand.newProject, object: nil, queue: .main) { [weak self] _ in
-                guard let self else { return }
-                self.closeProject()
-                self.state = .creating(plan: nil, executing: false)
-                self.currentMode = .project
+                // No wizard to open: the welcome screen *is* the new-project flow now — project
+                // type, name, location — so "New project" closes what is open and shows it.
+                self?.closeProject()
             },
         ]
     }
@@ -1260,6 +1259,24 @@ final class SpireBridge {
         }
     }
 
+    /// Fetch every board and chip **as the graph holds it** — the typed entry plus its capability
+    /// blocks (`realizes` / `provides` / `carries` / `pins`), read from the graph's edges.
+    ///
+    /// Distinct from `fetchPlatforms` (`platforms/list`), which sends only the build facts. This is
+    /// the configuration screen's source: the graph is canonical, and the registry YAML is only the
+    /// seed beside it.
+    func fetchPlatformConfigs() async -> [Platform] {
+        do {
+            let body: [String: Any] = ["method": "platforms/config", "params": [:]]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: PlatformConfigReply = try MessageSerializer.decode(reply)
+            return decoded.platforms
+        } catch {
+            return []
+        }
+    }
+
     /// Read a file via the in-process filesystem module (filesystem_read) and return its contents.
     func readFile(at path: String) async -> String? {
         do {
@@ -1358,6 +1375,72 @@ final class SpireBridge {
         } catch {
             return nil
         }
+    }
+
+    /// **Add a component** to an ESP-IDF component library, of the stated **kind**: a `driver` (one
+    /// device on one bus) arrives with its bus seam and a fake bus, a `library` (pure code) with a plain
+    /// unit test and no bus at all. Its code is not written here — that is `idfComponentEdit`.
+    ///
+    /// `bus` is the driver's and is empty for a library, which has none: a bus passed where it means
+    /// nothing would be a contract that lies.
+    func idfAddComponent(
+        root: String,
+        name: String,
+        kind: String,
+        bus: String
+    ) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "idf_add_component",
+            args: ["root": root, "name": name, "kind": kind, "bus": bus]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
+    /// **Remove a component**: its directory. Refuses when another component `REQUIRES` it, naming
+    /// what depends on it — a shared component is not deleted out from under its users.
+    func idfRemoveComponent(root: String, name: String) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "idf_remove_component",
+            args: ["root": root, "name": name]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
+    }
+
+    /// **Write or change a component's protocol.** The model is given the library's `SPIRE.md`, the
+    /// component's header, the bus seam and the invariants; the change is kept only if the component's
+    /// host test still compiles and passes, and rolled back byte-for-byte otherwise.
+    ///
+    /// - Parameter platform: a chip to build for as a *second* gate. Omitted, the host test is the whole
+    ///   check and the result says the chip build did not run.
+    func idfComponentEdit(
+        root: String,
+        name: String,
+        instruction: String,
+        platform: String? = nil
+    ) async -> (result: [String: Any]?, error: String?) {
+        var args: [String: Any] = ["root": root, "name": name, "instruction": instruction]
+        if let platform, !platform.isEmpty {
+            args["platform"] = platform
+        }
+        guard let json = await callBuildTool("idf_component_edit", args: args) else {
+            return (nil, "core unavailable")
+        }
+        // This tool answers in its own shape (`success`/`error`), not with an `error` key only — so the
+        // failure path is a `success == false`, and the message is in `error` when there is one.
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        return (json, nil)
     }
 
     /// Structural C++ syntax check on a header (`cpp_syntax_check`).
@@ -1552,44 +1635,6 @@ final class SpireBridge {
         return (interfaces, placeholders, nil)
     }
 
-    /// Add a board's **BSP** to a container: the board's own facts — which pin its LED is on, whether
-    /// it is active-low, which bus its display is on — emitted as *typed* `todo!()`s, plus the
-    /// workspace member that makes the crate exist. Typed, so the container and every application
-    /// built against it compile and link before the pins are known.
-    ///
-    /// The container's framework is scaffolded once; a BSP is added as required, for a board with no
-    /// upstream BSP. The refusals are the tool's and arrive as `error`: an unknown platform, a
-    /// platform that is not a board, a chip with no vendor-crate row, and a board that already has a
-    /// BSP — that last one is the guard against a second click forking the crate.
-    func embeddedAddBsp(root: String, board: String) async -> (result: [String: Any]?, error: String?) {
-        guard let json = await callBuildTool("embedded_add_bsp", args: ["root": root, "board": board]) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        return (json, nil)
-    }
-
-    /// Add a **device driver** to a container: the bus-generic module and a host test that proves it
-    /// against a fake bus recording. The *protocol* is the fill's; the skeleton is generic over
-    /// `embedded-hal`'s traits, so the same driver runs on any board — and on a host fake.
-    ///
-    /// `bus` is a device fact and the tool validates it: `spi` or `i2c`, because a driver written for
-    /// the wrong one never compiles.
-    func embeddedAddDriver(root: String, device: String, bus: String) async -> (result: [String: Any]?, error: String?) {
-        guard let json = await callBuildTool(
-            "embedded_add_driver",
-            args: ["root": root, "device": device, "bus": bus]
-        ) else {
-            return (nil, "core unavailable")
-        }
-        if let err = json["error"] as? String {
-            return (nil, err)
-        }
-        return (json, nil)
-    }
-
     /// Project-level "add platform": scaffold a FULL new platform target into
     /// an existing HAL project — <plat>/ (meson.build + main.cpp) templated from
     /// an existing platform, per-contract `SPIRE-HAL-STUB` placeholders,
@@ -1746,6 +1791,181 @@ final class SpireBridge {
         )
     }
 
+    /// **The design phase**, over `createProject/DesignApplication`: a board and the design form's
+    /// answers in, a validated decomposition out, for a person to review before any tree exists.
+    ///
+    /// The raw spec JSON is returned beside the decoded one on purpose. The wizard sends *that* value to
+    /// `createProject/Scaffold` and to `idf_apply_design` when the design is approved, so the thing
+    /// scaffolded is the thing that was reviewed — the decoded type is for reading, never for the trip
+    /// back.
+    ///
+    /// `framework` is passed only when the form pinned it; otherwise the model chooses and justifies,
+    /// which is the derived-and-confirmed shape: chosen where it can be informed, confirmed where it can
+    /// be overridden.
+    func designApplication(
+        board: [String: Any],
+        description: String,
+        framework: String? = nil,
+        libraryRoot: String? = nil
+    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, error: String?) {
+        var params: [String: Any] = ["board": board, "description": description]
+        if let framework, !framework.isEmpty { params["framework"] = framework }
+        if let libraryRoot, !libraryRoot.trimmingCharacters(in: .whitespaces).isEmpty {
+            params["libraryRoot"] = libraryRoot
+        }
+        guard let json = await callRawMethod("createProject/DesignApplication", args: params) else {
+            return (nil, nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, nil, error) }
+        guard let spec = json["spec"] as? [String: Any] else {
+            return (nil, nil, "the design came back without a spec")
+        }
+        do {
+            let design = try MessageSerializer.decode(Data(
+                try JSONSerialization.data(withJSONObject: spec)
+            )) as ApplicationDesign
+            Self.logScaffold(
+                "createProject/DesignApplication OK: framework=\(design.framework), \(design.units.count) units"
+            )
+            return (design, spec, nil)
+        } catch {
+            Self.logScaffold("createProject/DesignApplication DECODE FAILED: \(error)")
+            return (nil, spec, "the design did not decode: \(error)")
+        }
+    }
+
+    /// **The design phase's other door**, over `createProject/ParseComposition`: the contents of a
+    /// `composition.spire` in, the same validated spec `designApplication` answers with out.
+    ///
+    /// A person holding a composition — the file the scaffold writes and a project is edited through —
+    /// should not have to answer the six questions again and hope a model reproduces what they already
+    /// have. The Rust side parses it with the same parser and the same six rules it reads a project's
+    /// own file with, so what is reviewed here is held to exactly what a file on a tree is.
+    ///
+    /// The return shape is deliberately `designApplication`'s, down to the raw `spec` that goes back
+    /// untouched to `createProject/Scaffold`: the wizard handles one thing whichever door the design
+    /// came through. `name` is the file's own name, so a refusal names the file to open rather than the
+    /// step that read it.
+    func parseComposition(
+        text: String,
+        name: String? = nil
+    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, error: String?) {
+        var params: [String: Any] = ["text": text]
+        if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty { params["name"] = name }
+        guard let json = await callRawMethod("createProject/ParseComposition", args: params) else {
+            return (nil, nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, nil, error) }
+        guard let spec = json["spec"] as? [String: Any] else {
+            return (nil, nil, "the composition came back without a spec")
+        }
+        do {
+            let design = try MessageSerializer.decode(Data(
+                try JSONSerialization.data(withJSONObject: spec)
+            )) as ApplicationDesign
+            Self.logScaffold(
+                "createProject/ParseComposition OK: framework=\(design.framework), "
+                    + "\(design.units.count) units"
+            )
+            return (design, spec, nil)
+        } catch {
+            Self.logScaffold("createProject/ParseComposition DECODE FAILED: \(error)")
+            return (nil, spec, "the composition did not decode: \(error)")
+        }
+    }
+
+    /// **Apply a reviewed design** to the component library: `idf_apply_design` writes a typed stub for
+    /// every component the design says has to be written, and reports what it found and what it did.
+    ///
+    /// It is a separate step from the scaffold, and it happens *before* it: a component the application's
+    /// composition includes has to exist — with its manifest, so a `REQUIRES` resolves — by the time the
+    /// application's tree is written.
+    func applyDesignedComponents(
+        libraryRoot: String,
+        application: [String: Any]
+    ) async -> (result: [String: Any]?, error: String?) {
+        guard let json = await callBuildTool(
+            "idf_apply_design",
+            args: ["root": libraryRoot, "application": application]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, error) }
+        // **A component the design says is already here and is not.** `apply` reports this in
+        // `problems`, not `error`, because the library directory is still written: what breaks is the
+        // *build*, when the application's `REQUIRES` names a component nobody has — a raw CMake line
+        // that never mentions the design. The problems are the actionable half ("the design says the
+        // library already has `moving_average` and it does not"), and the log is where a person reads
+        // them when the sheet stops on them.
+        let problems = (json["problems"] as? [String]) ?? []
+        Self.logScaffold(
+            "idf_apply_design OK: added=\((json["added"] as? [Any])?.count ?? 0)"
+                + (problems.isEmpty
+                    ? ""
+                    : "\n\(problems.count) problem(s):\n"
+                        + problems.map { "  • \($0)" }.joined(separator: "\n"))
+        )
+        return (json, nil)
+    }
+
+    /// **Did the composition land?** The design's framework and components against the sources the fill
+    /// actually wrote, over `createProject/VerifyApplication`.
+    ///
+    /// A *structural* check, and it exists because a fill that ignores the design still **compiles**: a
+    /// live run was handed the reviewed decomposition and answered with one flat FreeRTOS poll loop
+    /// instead, and nothing else would have noticed. Empty `gaps` means "not obviously absent" — never
+    /// "correct"; the build and a reader are what say that.
+    func verifyComposition(
+        root: String,
+        application: [String: Any]
+    ) async -> (gaps: [String], error: String?) {
+        guard let json = await callRawMethod(
+            "createProject/VerifyApplication",
+            args: ["rootDir": root, "application": application]
+        ) else {
+            return ([], "core unavailable")
+        }
+        if let error = json["error"] as? String { return ([], error) }
+        let gaps = (json["gaps"] as? [String]) ?? []
+        // The gaps themselves, in the log: when the sheet stops on them, the log is the one place a
+        // person can read why without the message having to be copied out of the UI.
+        Self.logScaffold(
+            "createProject/VerifyApplication: \(gaps.count) gap(s)"
+                + (gaps.isEmpty ? "" : "\n" + gaps.map { "  • \($0)" }.joined(separator: "\n"))
+        )
+        return (gaps, nil)
+    }
+
+    /// **What the composition actually needs.** Rewrite `main/idf_component.yml` from the sources the
+    /// fill wrote, over `createProject/FinalizeManifest`.
+    ///
+    /// The scaffold states the design's dependencies before the composition exists — the board's BSP
+    /// unconditionally, because a design that named a board intends to use it. The fill is what decides
+    /// whether it *did*: a sensor-only app whose display and touch are still stubs would otherwise pin
+    /// the board's whole peripheral stack, download and compile it, and dead-strip every byte — which is
+    /// the first build's minutes rather than its seconds. Run once the tree is written and before the
+    /// build; the returned list is what the manifest now declares (empty when nothing needs one).
+    func finalizeApplicationManifest(
+        root: String,
+        application: [String: Any]
+    ) async -> (dependencies: [String], error: String?) {
+        guard let json = await callRawMethod(
+            "createProject/FinalizeManifest",
+            args: ["rootDir": root, "application": application]
+        ) else {
+            return ([], "core unavailable")
+        }
+        if let error = json["error"] as? String { return ([], error) }
+        let dependencies = (json["dependencies"] as? [String]) ?? []
+        Self.logScaffold(
+            "createProject/FinalizeManifest: \(dependencies.count) managed dependency(ies)"
+                + (dependencies.isEmpty
+                    ? " — none: the composition reaches for no board support"
+                    : "\n" + dependencies.map { "  • \($0)" }.joined(separator: "\n"))
+        )
+        return (dependencies, nil)
+    }
+
     /// Phase 1: scaffold a new project offline via `createProject/Scaffold`.
     /// The Rust core resolves the build module's scaffold_layout, writes all
     /// structural + source-stub files to `root`, runs AnalyzeProject, and
@@ -1757,7 +1977,8 @@ final class SpireBridge {
     /// other request is byte-for-byte what it was.
     func scaffoldProject(buildSystem: String, projectName: String, root: String,
                          platforms: [String] = [], structure: String = "native",
-                         embedded: Bool = false, embeddedRoot: String? = nil) async -> String? {
+                         embedded: Bool = false, embeddedRoot: String? = nil,
+                         application: [String: Any]? = nil) async -> String? {
         do {
             var params: [String: Any] = [
                 "projectName": projectName,
@@ -1770,6 +1991,15 @@ final class SpireBridge {
             if let embeddedRoot, !embeddedRoot.trimmingCharacters(in: .whitespaces).isEmpty {
                 params["embeddedRoot"] = embeddedRoot
             }
+            // The **reviewed design**, when there is one. It is the spec the design phase returned,
+            // handed back untouched: the scaffold states the framework, carries the decomposition as
+            // `SPIRE.application.json`, names the design's components in the application's own
+            // `REQUIRES`, and hands the fill phase the units, the wiring and the board facts. An
+            // application scaffolded without one is the older shape — a blank `app_main` and no
+            // stated framework — which is why the parameter is optional and omitted, not empty.
+            if let application {
+                params["application"] = application
+            }
             let body: [String: Any] = [
                 "method": "createProject/Scaffold",
                 "params": params
@@ -1779,17 +2009,25 @@ final class SpireBridge {
             let rawText = String(data: reply, encoding: .utf8) ?? "nil"
             let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any]
             if let err = json?["error"] as? String { return err }
-            // Decode the spec and expose it via the state machine. On failure,
-            // log the FULL raw reply + the underlying DecodingError so the
-            // JSON/Rust mismatch is visible in ~/.spire/logs/spire-scaffold.log.
+            // Decode the spec and expose it on the bridge. On failure, log the FULL raw reply + the
+            // underlying DecodingError so the JSON/Rust mismatch is visible in
+            // ~/.spire/logs/spire-scaffold.log.
             do {
                 let spec: ScaffoldSpec = try MessageSerializer.decode(reply)
                 Self.logScaffold("createProject/Scaffold OK: \(spec.files.count) files, platforms=\(spec.platformTargets)")
-                self.scaffoldSpec = spec
-                // The observable state must be mutated on the main actor —
-                // Observation does not reliably invalidate views for off-main writes.
+                // **Only the spec is exposed — the state deliberately does not move.** Scaffolding is
+                // one phase of the sheet's own creation pipeline, and the sheet *is* the surface for
+                // it: the modal stays up from design to build, streaming the phases into its log.
+                // Moving the state to `.scaffolding` here swapped the workspace pane away from the
+                // view that hosts that sheet (`ContentView` shows `WelcomeView` only while the state
+                // is `.unconnected`), so the sheet was torn down about a second in and every phase
+                // after it — fill, verify, finalize, build — ran with nothing on screen. The state
+                // moves once, at the end, when `openProject` opens what was built.
+                //
+                // The observable is written on the main actor: Observation does not reliably
+                // invalidate views for off-main writes.
                 await MainActor.run {
-                    self.state = .scaffolding(spec: spec)
+                    self.scaffoldSpec = spec
                 }
                 return nil
             } catch {
@@ -1821,32 +2059,114 @@ final class SpireBridge {
         }
     }
 
+    /// The `ScaffoldSpec` as the Rust side reads it.
+    ///
+    /// Hand-built rather than `JSONEncoder`-ed, because the wire shape is not the Swift shape: Rust's
+    /// `ScaffoldSpec` uses snake_case keys and requires a `content` on **every** file — without it the
+    /// guard would deserialize an all-empty spec and lose the structural contract the fill (and a
+    /// repair) has to respect.
+    ///
+    /// **`structure` is not optional decoration, and leaving it out was a whole live run.** The core gates
+    /// the framework block, the reviewed composition, the composition rules and the library's own headers
+    /// on `structure == idf_application`; a spec that arrives without it deserializes as `native` (the
+    /// field's `#[serde(default)]`), so a fill asked for `actors` was handed generic rules and a goal and
+    /// nothing else — and wrote a bare FreeRTOS poll loop with its own sensor classes. It round-trips
+    /// verbatim: the value is the core's own key, decoded from the scaffold response.
+    private func scaffoldSpecJSON(_ spec: ScaffoldSpec) -> [String: Any] {
+        var json: [String: Any] = [
+            "structural_files": spec.structuralFiles,
+            "fill_roots": spec.fillRoots,
+            "dependency_sections": spec.dependencySections,
+            "platform_targets": spec.platformTargets,
+            "build_system": spec.buildSystem,
+            "structure": spec.structure,
+            "embedded": spec.embedded,
+            "files": spec.files.map {
+                ["path": $0.path, "content": $0.content, "structural": $0.structural]
+            }
+        ]
+        // **The core's report, handed back exactly as it came** — when there was one. It is optional
+        // on the wire in both directions (Rust's `Option` with `skip_serializing_if`, this model's
+        // `decodeIfPresent`), so it is *omitted* rather than sent as null: a spec without a warning
+        // produces the same request it did before the field existed, and a fill or a repair that
+        // hands it back cannot turn "nothing to say" into "the report is nil".
+        if let warning = spec.designWarning {
+            json["design_warning"] = warning
+        }
+        return json
+    }
+
+    /// **Repair a build that failed**, over `createProject/RepairFromBuild`: the compiler's own output
+    /// in, whole-file rewrites out, as steps for `executeCreationPlan`.
+    ///
+    /// The build is the caller's — it owns the toolchain and knows how this machine builds — and this is
+    /// the other half: which file each error belongs to, and which of those the scaffold left open. The
+    /// diagnostics are passed **verbatim**, notes and include chains included, because the note that says
+    /// what the compiler expected is usually the whole repair.
+    func repairProject(
+        root: String,
+        diagnostics: String,
+        spec: ScaffoldSpec
+    ) async -> (repair: ApplicationRepair?, error: String?) {
+        do {
+            let body: [String: Any] = [
+                "method": "createProject/RepairFromBuild",
+                "params": [
+                    "rootDir": root,
+                    "diagnostics": diagnostics,
+                    "spec": scaffoldSpecJSON(spec)
+                ]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            if let json = try JSONSerialization.jsonObject(with: reply) as? [String: Any],
+               let error = json["error"] as? String {
+                return (nil, error)
+            }
+            let repair: ApplicationRepair = try MessageSerializer.decode(reply)
+            Self.logScaffold("createProject/RepairFromBuild OK: \(repair.summary)")
+            return (repair, nil)
+        } catch {
+            Self.logScaffold("createProject/RepairFromBuild FAILED: \(error)")
+            return (nil, "the repair could not be read: \(error)")
+        }
+    }
+
     /// Phase 2: ask the LLM to fill the materialized scaffold inside its fill
     /// roots (`createProject/Fill`). Returns a constrained plan, nil on error.
-    func fillProject(goal: String, root: String, spec: ScaffoldSpec) async -> PlanGenerationResult? {
-        Self.logScaffold("createProject/Fill CALLED (goal='\(goal)' root=\(root))")
+    ///
+    /// `libraryRoot` is the library an ESP-IDF application is built against, and it is **not decoration**:
+    /// the fill prompt is where the model is shown the library's own headers — the framework's
+    /// (`actor.hpp`, which carries a worked `spire::Actor`/`spire::Scheduler` example) and the
+    /// components the design names — plus the library's `SPIRE.md`. Without it those sections are simply
+    /// absent, which is what a live run found: a fill handed the reviewed composition and the prose idiom
+    /// but **no API** wrote the only embedded code it knew — a bare FreeRTOS poll loop and its own sensor
+    /// classes — instead of `spire::Actor` on a `spire::Scheduler`. The scaffold was already told the
+    /// library; the fill was not.
+    func fillProject(
+        goal: String,
+        root: String,
+        spec: ScaffoldSpec,
+        libraryRoot: String? = nil
+    ) async -> PlanGenerationResult? {
+        Self.logScaffold(
+            "createProject/Fill CALLED (goal='\(goal)' root=\(root) library=\(libraryRoot ?? "none"))"
+        )
         do {
-            // Rust expects snake_case (ScaffoldSpec CodingKeys) and a required
-            // `content` on each file — otherwise the guard would deserialize an
-            // all-empty spec and lose the structural contract for the fill step.
-            let specData = try JSONSerialization.data(withJSONObject: [
-                "structural_files": spec.structuralFiles,
-                "fill_roots": spec.fillRoots,
-                "dependency_sections": spec.dependencySections,
-                "platform_targets": spec.platformTargets,
-                "build_system": spec.buildSystem,
-                "files": spec.files.map {
-                    ["path": $0.path, "content": $0.content, "structural": $0.structural]
-                }
-            ])
-            let specDict = try JSONSerialization.jsonObject(with: specData) as? [String: Any] ?? [:]
+            let specDict = scaffoldSpecJSON(spec)
+            var params: [String: Any] = [
+                "goal": goal,
+                "rootDir": root,
+                "spec": specDict,
+            ]
+            if let libraryRoot, !libraryRoot.isEmpty {
+                // The same field `createProject/Scaffold` takes: the core reads it as the library whose
+                // headers and `SPIRE.md` the fill prompt is written from.
+                params["embeddedRoot"] = libraryRoot
+            }
             let body: [String: Any] = [
                 "method": "createProject/Fill",
-                "params": [
-                    "goal": goal,
-                    "rootDir": root,
-                    "spec": specDict
-                ]
+                "params": params,
             ]
             let data = try JSONSerialization.data(withJSONObject: body)
             let reply = try await backend.send(data)

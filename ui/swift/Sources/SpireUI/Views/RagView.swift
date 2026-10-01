@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-/// Opens the RAG panel as a floating window (same pattern as `PlatformPortal`).
+/// Opens the RAG panel as a floating window (same pattern as `ConfigurationPortal`).
 enum RagPortal {
     private static var windows: [NSWindow] = []
     @MainActor static func open(bridge: SpireBridge, theme: AppTheme) {

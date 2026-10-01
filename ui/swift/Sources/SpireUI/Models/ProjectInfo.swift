@@ -128,7 +128,16 @@ struct SourceUnit: Codable, Hashable {
 }
 
 struct SubprojectInfo: Codable, Identifiable {
-    var id: String { name }
+    /// **Identity is the path, not the name.**
+    ///
+    /// Two directories in different places can share a leaf name — `components/ramen/test` and
+    /// `components/actors/test` are both `test` — and an id that collides is two rows SwiftUI cannot
+    /// tell apart: `ForEach` gets a duplicate id (a row it may drop), and every selection comparison
+    /// in the UI is by this, so one click highlights *both*. The analyzer no longer reports nested
+    /// files as subprojects, which is the real fix; this is the other half of it — identity that
+    /// cannot collide, whatever the tree looks like. The root subproject's path is empty, and it is
+    /// the only one, so it is identity enough.
+    var id: String { path }
     let name: String
     let kind: SubprojectKind
     let buildSystem: String
@@ -155,9 +164,28 @@ struct SubprojectInfo: Codable, Identifiable {
     let structure: String
     /// Named domains (common / rpi5 / rock3c). Empty when the shape is native.
     let domains: [ProjectDomain]
+    /// What an ESP-IDF **component** says it is — `"driver"` (one device on one bus) or `"library"`
+    /// (pure code: an algorithm, a filter, a codec).
+    ///
+    /// **Sent by the analyzer, not derived here**: the component states the kind in its own
+    /// `CMakeLists.txt`, and a second copy of that reading in Swift could only ever disagree with the
+    /// first. `nil` for a subproject that is not a component, and for a component that states no kind
+    /// (one written by hand) — which the UI shows as no kind at all rather than guessing one.
+    let componentKind: String?
+
+    /// The **framework** component this is, when it is one — `"toolkit"`, `"ramen"` or `"actors"` —
+    /// and `nil` for everything else.
+    ///
+    /// **Sent by the analyzer**, because the list of shipped components is the *tool's* (it is what
+    /// `FRAMEWORK_FILES` emits and what the edit and remove paths refuse), and a second copy here
+    /// could only drift from it. A framework component is not a stub: it arrives complete, nothing
+    /// writes it, and nothing removes it — which is what `nil`/not-`nil` decides in the row.
+    let componentFramework: String?
 
     enum CodingKeys: String, CodingKey {
-        case name, kind, buildSystem = "buildSystem",
+        case name, kind, componentKind = "componentKind",
+             componentFramework = "componentFramework",
+             buildSystem = "buildSystem",
              path, language, files, dependencies, buildStatus = "buildStatus",
              descriptionKey = "description", platformTargets = "platformTargets",
              buildTargets = "buildTargets", structure = "structure",
@@ -179,13 +207,16 @@ struct SubprojectInfo: Codable, Identifiable {
         buildTargets = try c.decodeIfPresent([BuildTarget].self, forKey: .buildTargets) ?? []
         structure = try c.decodeIfPresent(String.self, forKey: .structure) ?? "native"
         domains = try c.decodeIfPresent([ProjectDomain].self, forKey: .domains) ?? []
+        componentKind = try c.decodeIfPresent(String.self, forKey: .componentKind)
+        componentFramework = try c.decodeIfPresent(String.self, forKey: .componentFramework)
     }
 
     init(name: String, kind: SubprojectKind, buildSystem: String, path: String,
          language: String, description: String = "", files: [FileEntry]? = nil,
          dependencies: [Dependency]? = nil, buildStatus: BuildStatus? = nil,
          platformTargets: [String] = [], buildTargets: [BuildTarget] = [],
-         structure: String = "native", domains: [ProjectDomain] = []) {
+         structure: String = "native", domains: [ProjectDomain] = [],
+         componentKind: String? = nil, componentFramework: String? = nil) {
         self.name = name
         self.kind = kind
         self.buildSystem = buildSystem
@@ -199,6 +230,8 @@ struct SubprojectInfo: Codable, Identifiable {
         self.buildTargets = buildTargets
         self.structure = structure
         self.domains = domains
+        self.componentKind = componentKind
+        self.componentFramework = componentFramework
     }
 
     func encode(to encoder: Encoder) throws {
@@ -216,6 +249,8 @@ struct SubprojectInfo: Codable, Identifiable {
         try c.encode(buildTargets, forKey: .buildTargets)
         try c.encode(structure, forKey: .structure)
         try c.encode(domains, forKey: .domains)
+        try c.encodeIfPresent(componentKind, forKey: .componentKind)
+        try c.encodeIfPresent(componentFramework, forKey: .componentFramework)
     }
 }
 
@@ -289,6 +324,13 @@ enum SubprojectKind: String, Codable {
     case cdylib    // dynamic library
     case framework // macOS framework
     case directory // non-subproject top-level directory
+    /// A **component** of an ESP-IDF component library: a directory under `components/`. It is the
+    /// library's product, and the one thing in the tree a user adds, edits and removes.
+    ///
+    /// Declared here rather than left to fall back to `unknown`, because a `String`-backed enum
+    /// *throws* on a raw value it does not know — one unrecognized kind would take the whole
+    /// `ProjectInfo` decode with it, and the project would fail to open rather than show a row.
+    case component
     case unknown
 }
 

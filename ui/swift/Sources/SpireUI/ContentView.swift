@@ -42,23 +42,32 @@ struct ContentView: View {
                     iconSidebar
                     Divider().overlay(theme.divider)
 
-                    // ── Left pane: project details / workspace (state-driven) ──
-                    workspacePane
-                        .frame(width: leftW)
-                        .frame(maxHeight: .infinity)
+                    if case .unconnected = bridge.state {
+                        // The welcome screen is **one pane**. Nothing on it is about a project, so
+                        // there is no workspace to split and no project actions to offer beside it —
+                        // Open and New are both right there, side by side. The icon bar stays: it is
+                        // the application's own navigation, and it is not going anywhere.
+                        WelcomeView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        // ── Left pane: project details / workspace (state-driven) ──
+                        workspacePane
+                            .frame(width: leftW)
+                            .frame(maxHeight: .infinity)
 
-                    // Draggable vertical divider.
-                    divider
-                        .frame(width: dividerWidth)
-                        .gesture(dragDivider(totalW: totalW))
+                        // Draggable vertical divider.
+                        divider
+                            .frame(width: dividerWidth)
+                            .gesture(dragDivider(totalW: totalW))
 
-                    // ── Right pane: contextual actions (state-driven) ──
-                    ContextActionPane(
-                        selectedSubproject: bridge.selectedSubproject,
-                        selectedBuildTarget: bridge.selectedBuildTarget
-                    )
-                        .frame(width: rightW)
-                        .frame(maxHeight: .infinity)
+                        // ── Right pane: contextual actions (state-driven) ──
+                        ContextActionPane(
+                            selectedSubproject: bridge.selectedSubproject,
+                            selectedBuildTarget: bridge.selectedBuildTarget
+                        )
+                            .frame(width: rightW)
+                            .frame(maxHeight: .infinity)
+                    }
                 }
             }
 
@@ -125,8 +134,10 @@ struct ContentView: View {
     private var workspacePane: some View {
         switch bridge.state {
         case .unconnected:
-            RecentProjectsPane()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Unreachable: `body` shows `WelcomeView` full-width in this state, beside the icon bar
+            // and without the pane split. Kept as an explicit case rather than a `default`, so a new
+            // state has to be answered here rather than silently inheriting this one.
+            EmptyView()
         case .opening:
             progressPane("Opening project…")
         case .creating, .scaffolding, .filling:
@@ -212,8 +223,8 @@ struct ContentView: View {
     /// Narrow left-edge icon rail: Platforms / Tools / RAG / LLM Settings / Appearance.
     private var iconSidebar: some View {
         VStack(spacing: 6) {
-            sidebarButton(icon: "shippingbox", title: "Platforms") {
-                PlatformPortal.open(bridge: bridge, theme: theme)
+            sidebarButton(icon: "cpu", title: "Configuration") {
+                ConfigurationPortal.open(bridge: bridge, theme: theme)
             }
             sidebarButton(icon: "wrench.and.screwdriver", title: "Tools") {
                 ToolsPortal.open(bridge: bridge, theme: theme)

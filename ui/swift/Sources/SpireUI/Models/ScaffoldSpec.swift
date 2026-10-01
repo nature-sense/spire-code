@@ -17,7 +17,8 @@ struct ScaffoldFile: Codable, Identifiable, Hashable {
 ///
 /// Rust serializes this with snake_case keys; the CodingKeys map them to the
 /// camelCase properties used by the UI. `structure`/`embedded`/`fillRole` are
-/// newer fields whose presence is optional for backward compatibility.
+/// newer fields whose presence is optional for backward compatibility, as is
+/// `designWarning`.
 struct ScaffoldSpec: Codable {
     let structuralFiles: [String]
     let fillRoots: [String]
@@ -32,6 +33,14 @@ struct ScaffoldSpec: Codable {
     /// True when the project is an embedded cross-compile (targets only, no
     /// host build). Defaults to false (host/native project).
     let embedded: Bool
+    /// **The core's own report, when this scaffold did not use the design it was handed.**
+    ///
+    /// `Some` when the tree already stated its design in `composition.spire`: the tree's decides —
+    /// a design changes by editing that file — so the decomposition the wizard reviewed was dropped,
+    /// and this is the sentence saying so. The core owns the rule, so it owns the wording; the sheet
+    /// shows it verbatim rather than composing its own. Optional, and absent from the wire when there
+    /// is nothing to say, which is the ordinary case.
+    let designWarning: String?
 
     enum CodingKeys: String, CodingKey {
         case structuralFiles = "structural_files"
@@ -42,6 +51,7 @@ struct ScaffoldSpec: Codable {
         case files
         case structure
         case embedded
+        case designWarning = "design_warning"
     }
 
     init(from decoder: Decoder) throws {
@@ -54,6 +64,7 @@ struct ScaffoldSpec: Codable {
         files = try c.decodeIfPresent([ScaffoldFile].self, forKey: .files) ?? []
         structure = try c.decodeIfPresent(String.self, forKey: .structure) ?? "native"
         embedded = try c.decodeIfPresent(Bool.self, forKey: .embedded) ?? false
+        designWarning = try c.decodeIfPresent(String.self, forKey: .designWarning)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -66,5 +77,6 @@ struct ScaffoldSpec: Codable {
         try c.encode(files, forKey: .files)
         try c.encode(structure, forKey: .structure)
         try c.encode(embedded, forKey: .embedded)
+        try c.encodeIfPresent(designWarning, forKey: .designWarning)
     }
 }

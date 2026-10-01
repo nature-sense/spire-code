@@ -363,30 +363,29 @@ struct ProjectDashboardView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// New-project setup pane for an empty directory. The full-screen plan/
-    /// execution view is rendered by ContentView (.creating state), NOT here —
-    /// this view only ever shows the empty-project setup form.
+    /// New-project setup pane for an empty directory.
+    ///
+    /// The project types come from the same list the welcome screen shows, with this directory as
+    /// the location already answered — there is no wizard to render the plan in any more, and the
+    /// plan/execution view ContentView used to switch to is gone with it.
     private var setupProjectPane: some View {
         VStack(spacing: 16) {
-            Image(systemName: "hammer.badge.plus")
-                .font(.system(size: 42))
-                .foregroundStyle(.orange)
-            Text("Set Up Project")
-                .font(.title.weight(.semibold))
-            Text("Choose Embedded or Native, then pick your structure (HAL for embedded Meson projects).")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button {
-                bridge.state = .creating(plan: nil, executing: false)
-            } label: {
-                Label("Structure Project…", systemImage: "wand.and.stars")
-                    .font(.headline)
-                    .padding(.horizontal, 8)
+            VStack(spacing: 8) {
+                Image(systemName: "hammer.badge.plus")
+                    .font(.system(size: 42))
+                    .foregroundStyle(.orange)
+                Text("Set Up Project")
+                    .font(.title.weight(.semibold))
+                Text("This folder has no project in it. Choose what it should be.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
-            .buttonStyle(.borderedProminent)
+            ProjectTypePicker(fixedLocation: bridge.projectRoot)
+                .frame(maxWidth: 460)
         }
         .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var emptyView: some View {

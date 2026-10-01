@@ -730,6 +730,8 @@ struct ActionPanelView: View {
     /// Free-text `modify/code` request: the sheet, and what the user typed.
     @State private var showModify: Bool = false
     @State private var modifyPrompt: String = ""
+    /// The project-type list, for a folder that has no project in it yet.
+    @State private var showingStructurePicker: Bool = false
     /// Text for the chat prompt input box.
     @State private var chatInput: String = ""
 
@@ -1032,13 +1034,12 @@ struct ActionPanelView: View {
             }
 
             // ── Action cards ──
-            // Empty project (only .spire metadata): show the scaffolding
-            // wizard so the user can create the initial build structure.
+            // Empty project (only .spire metadata): offer the project types, with this folder as the
+            // location. There is no wizard any more — the list is the whole decision, and the sheet
+            // it opens asks only for a name.
             if project.isEmpty {
-                // Empty project → open the step-wise wizard (Embedded/Native
-                // + HAL) instead of the legacy single-form.
                 Button {
-                    bridge.state = .creating(plan: nil, executing: false)
+                    showingStructurePicker = true
                 } label: {
                     Label("Structure Project…", systemImage: "wand.and.stars")
                         .font(.headline)
@@ -1047,6 +1048,12 @@ struct ActionPanelView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .padding(8)
+                .sheet(isPresented: $showingStructurePicker) {
+                    ProjectTypePicker(fixedLocation: project.root)
+                        .padding(20)
+                        .frame(width: 460)
+                        .background(theme.background)
+                }
             } else if selectedSubproject != nil && isBuildableSelection {
                 // Build/Test/Lint are shown only for a BUILDABLE selection: a
                 // build target, a HAL platform domain, or a non-HAL subproject.
