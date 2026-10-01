@@ -1267,6 +1267,15 @@ pub(crate) fn serialize_analysis(
         .build_systems
         .iter()
         .any(|bs| bs.structure == spire_core::build_types::ProjectStructure::IdfLibrary);
+    // Either ESP-IDF type has the SAME `components/<name>/` layout, so "is this a component?" is asked
+    // of both. `idf_library` stays for the one place the two differ — the library's `main/` harness.
+    let idf_project = analysis.build_systems.iter().any(|bs| {
+        matches!(
+            bs.structure,
+            spire_core::build_types::ProjectStructure::IdfLibrary
+                | spire_core::build_types::ProjectStructure::IdfApplication
+        )
+    });
 
     // Build subproject list from build systems
     let mut subprojects: Vec<serde_json::Value> = analysis
@@ -1296,14 +1305,15 @@ pub(crate) fn serialize_analysis(
             // so two components that each have a `test/` produce two subprojects called `test` — one
             // id, two rows, and a click that selects both.
             let under_components = rel_path0.strip_prefix("components/");
-            if idf_library && under_components.is_some_and(|name| name.contains('/')) {
+            if idf_project && under_components.is_some_and(|name| name.contains('/')) {
                 return None;
             }
-            // A **component** of a component library: a directory directly under `components/`. It is
-            // the library's product, and the one thing in the tree a user adds, edits and removes, so
-            // it says what it is rather than the generic "library", and it is named by its own
+            // A **component** of a component library or an application: a directory directly under
+            // `components/`. For a library it is the product, and the one thing in the tree a user
+            // adds, edits and removes; for an application it is the composition's own units. Either
+            // way it says what it is rather than the generic "library", and it is named by its own
             // directory rather than by the wrapper it sits in (`components`).
-            let is_component = idf_library && under_components.is_some();
+            let is_component = idf_project && under_components.is_some();
             // A SpireApp root workspace is the project itself (its single
             // member crate is the app the root describes), so it stays as a
             // first-class subproject. Only the LEGACY multi-platform workspace
@@ -2578,6 +2588,79 @@ mod serialize_analysis_tests {
             subproject_paths(&json).contains(&"main".to_string()),
             "an application's main is its product, not a harness: {json}"
         );
+    }
+
+    /// An **application's** `components/<name>/` directories are components too — named by their own
+    /// directory rather than by the `components/` wrapper.
+    ///
+    /// The library was the first to grow component rows, and the check that produced them asked the
+    /// library's structure alone. An application shares the layout but not that flag, so every one of
+    /// its components fell through to the generic branch and took its name from the first path segment
+    /// — `components/air_quality` read as `components`, and the whole composition was one repeated row
+    /// in the left pane. The unit is the directory, whichever ESP-IDF project it sits in.
+    #[test]
+    fn an_applications_components_are_named_by_their_directory() {
+        let analysis = ProjectAnalysis {
+            project_root: "/tmp/pm25-meter".to_string(),
+            project_name: "pm25-meter".to_string(),
+            build_systems: vec![
+                meta(
+                    "CMake",
+                    None,
+                    "",
+                    false,
+                    vec![],
+                    ProjectStructure::IdfApplication,
+                ),
+                meta(
+                    "CMake",
+                    Some("air_quality"),
+                    "components/air_quality",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+                meta(
+                    "CMake",
+                    Some("messages"),
+                    "components/messages",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+            ],
+            ..spire_gis_analysis()
+        };
+
+        let json = serialize_analysis(&analysis);
+        let sp = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .expect("subprojects");
+        let named = |path: &str| {
+            sp.iter()
+                .find(|s| s.get("path").and_then(|v| v.as_str()) == Some(path))
+                .map(|s| {
+                    (
+                        s.get("name").and_then(|v| v.as_str()).map(str::to_string),
+                        s.get("kind").and_then(|v| v.as_str()).map(str::to_string),
+                    )
+                })
+        };
+        for name in ["air_quality", "messages"] {
+            let path = format!("components/{name}");
+            assert_eq!(
+                named(&path),
+                Some((Some(name.to_string()), Some("component".to_string()))),
+                "an application's component is named by its directory: {json}"
+            );
+        }
+        // The symptom, stated directly: nothing in the tree is called `components`.
+        let names: Vec<&str> = sp
+            .iter()
+            .filter_map(|s| s.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(!names.contains(&"components"), "{names:?}");
     }
 
     fn subproject_paths(json: &serde_json::Value) -> Vec<String> {
