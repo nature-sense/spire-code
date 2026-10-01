@@ -54,14 +54,19 @@ pub mod modify_code;
 pub mod modify_contract;
 pub mod targeted_edit;
 pub use meson::MesonBuildModule;
-pub mod esp;
-pub use esp::EspBuildModule;
-pub mod rp2040;
-pub use rp2040::Rp2040BuildModule;
-pub mod embedded_app_scaffold;
-pub mod embedded_scaffold;
+pub mod idf;
+pub use idf::IdfBuildModule;
+pub mod application_spec;
+/// `idf_component_edit`'s history: the instruction and the gate verdict, as queryable graph nodes.
+pub mod edit_history;
 pub mod hal_migration;
 pub mod hal_rust_contract;
+/// The ESP-IDF environment this machine has: found, tested (`doctor_idf_environment`) and repaired
+/// (`repair_idf_environment`) — so an install that is present but broken is the app's problem to
+/// diagnose, not a person's.
+pub mod idf_env;
+pub mod idf_projects;
+pub mod registry;
 pub mod spire_app_scaffold;
 pub mod verify_spine;
 
@@ -203,6 +208,20 @@ pub enum BuildModuleMessage {
         /// Modules may use it to exclude a host build target or unlock
         /// per-platform HAL scaffolding.
         embedded: bool,
+        /// The **component library** an ESP-IDF application is built against — a directory,
+        /// relative to the new project's root or absolute. `None` for every other structure, and
+        /// for a library, which is built against nothing.
+        ///
+        /// Carried in the message rather than derived from a convention, because only the caller
+        /// knows which library this product belongs to, and a guess here is a project that cannot
+        /// find its own components.
+        library: Option<String>,
+        /// The **decomposition** an ESP-IDF application was designed from — the reviewed spec, whose
+        /// framework the scaffold states in the application's `CMakeLists.txt` and which it writes
+        /// beside it as `SPIRE.application.json`, so the fill phase writes the composition that was
+        /// reviewed rather than one it invents. `None` for every other structure, and for an
+        /// application whose design has not run.
+        application: Option<crate::build::application_spec::ApplicationSpec>,
         reply_to: oneshot::Sender<Result<ScaffoldOutput, String>>,
     },
 }

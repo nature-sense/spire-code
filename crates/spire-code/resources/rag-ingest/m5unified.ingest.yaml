@@ -1,0 +1,82 @@
+# Board-HAL corpus: **M5Unified** (m5stack/M5Unified) — M5Stack's own "Unified
+# library for the M5Stack series": one API that drives every M5 board's display,
+# touch, IMU, RTC, power, microphone and speaker, so an application written
+# against it runs on whichever M5 board is in hand.
+#
+# Why it is here *alongside* esp-bsp, rather than instead of it. The two are not
+# layers of each other and they do not overlap in code: esp-bsp's M5Stack boards
+# depend on **Espressif's** components (`esp_lcd_ili9341`, `bmi270`,
+# `esp_io_expander_aw9523`…) and drive the hardware through them, while M5Unified
+# is M5Stack's own stack — a different implementation of the same job. What
+# differs is the **altitude**:
+#
+#   * esp-bsp says *what the board is* — pin tables, buses, which drivers are
+#     present, the bring-up order. That is the layer a component must never hold,
+#     and the layer a design phase reads first.
+#   * M5Unified says *how to write against it* — `M5.begin()`, `M5.Display`,
+#     `M5.Imu`, `M5.Power`, `M5.update()` — which is what most M5 code in the
+#     world actually calls.
+#
+# So a question about pins wants esp-bsp and a question about driving the thing
+# wants this, and the retrieval is better for having both.
+#
+# Scoped to the API and the examples, and checked against the real tree (167
+# files, of which this claims 68 — the API, the examples and the README):
+#
+#   * `src/*.h` and `src/**/*.hpp` — the unified API: `M5Unified.hpp` and the
+#     classes it composes (`src/utility/Button_Class.hpp`, `IMU_Class`,
+#     `Power_Class`, `Speaker_Class`, `Display_Class`…). The doc comments here
+#     *are* the reference. Both depths are listed because the API sits at both.
+#   * `examples/**/*.ino` and `*.cpp` — how it is actually driven, one example
+#     per face of the board (Displays, Imu, Button, Microphone, Rtc, Axp2101…).
+#     This is the half that answers "what does the code look like".
+#   * `README.md` — what the library is, which boards it covers, and how it is
+#     pulled into an ESP-IDF or Arduino project.
+#
+# What is *not* here: `docs/` (pinout **SVG** diagrams — a corpus of pixels, and
+# the same pins in table form are in esp-bsp) and the `.inl` files (implementation
+# behind the `.hpp` that declares the same API).
+version: "1.0"
+pipeline:
+  name: M5Unified — M5Stack's unified board HAL
+  corpus: m5unified
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: m5unified
+      patterns:
+        - "**/*.h"
+        - "**/*.hpp"
+        - "**/*.ino"
+        - "**/*.cpp"
+        - "**/*.md"
+  sources:
+    - id: m5unified
+      type: github_repo
+      enabled: true
+      url: https://github.com/m5stack/M5Unified.git
+      processing:
+        parser: code
+        languages:
+          - "C++"
+        # Absolute-path matching, so every pattern carries `**/`, and each
+        # directory is listed at both depths: `**/src/**/*.hpp` cannot match
+        # `src/M5Unified.hpp` (its `**` needs a directory), and `**/src/*.hpp`
+        # cannot match `src/utility/IMU_Class.hpp`. One pattern per depth — the
+        # esp-idf-hal manifest is where that trap was first measured.
+        include_paths:
+          - "**/src/*.h"
+          - "**/src/*.hpp"
+          - "**/src/**/*.h"
+          - "**/src/**/*.hpp"
+          - "**/examples/*.ino"
+          - "**/examples/**/*.ino"
+          - "**/examples/*.cpp"
+          - "**/examples/**/*.cpp"
+          - "**/README.md"
+        exclude_paths:
+          - "**/docs/**"
+          - "**/*.svg"
+          - "LICENSE"

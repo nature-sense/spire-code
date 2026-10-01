@@ -222,13 +222,18 @@ fn step_description(step_type: &CreationStepType, params: &serde_json::Value) ->
 
 fn step_from_value(index: usize, v: &serde_json::Value) -> Option<CreationStep> {
     // Resolve the step-type string from ANY alias the model has emitted —
-    // verified across live runs: `step`, `action`, `step_type`, `stepType`.
-    // Parameters likewise from `arguments` or `parameters`.
+    // verified across live runs: `step`, `action`, `step_type`, `stepType`, and `type` — the
+    // last one added after a live run of the application-creation loop, where the model wrote
+    // `{"type": "write_source_file", "path": …, "content": …}` for all eight of its steps and
+    // every one of them was discarded: an entire plan rejected for its key's *name*.
+    // Parameters likewise from `arguments` or `parameters`, or — for that flat shape — from the
+    // step object itself, which is where a model that writes `type` puts them.
     let type_key = v
         .get("step")
         .or_else(|| v.get("action"))
         .or_else(|| v.get("step_type"))
         .or_else(|| v.get("stepType"))
+        .or_else(|| v.get("type"))
         .and_then(|x| x.as_str())
         .map(str::to_string);
     if let Some(s) = type_key {
@@ -237,7 +242,7 @@ fn step_from_value(index: usize, v: &serde_json::Value) -> Option<CreationStep> 
                 .get("arguments")
                 .or_else(|| v.get("parameters"))
                 .cloned()
-                .unwrap_or(serde_json::json!({}));
+                .unwrap_or_else(|| v.clone());
             let params = backfill_step_params(&step_type, raw);
             let description = v
                 .get("description")
@@ -547,6 +552,10 @@ pub enum ProjectCreationMessage {
         embedded_root: Option<PathBuf>,
         /// True for embedded projects (cross-compiled targets only — no host).
         embedded: bool,
+        /// The **framework** the application was designed in, when the design phase ran: it is
+        /// written into the application's `CMakeLists.txt`, so the fill phase, a person and another
+        /// tool all read the same choice back instead of inferring one.
+        application: Option<crate::build::application_spec::ApplicationSpec>,
         reply_to: oneshot::Sender<Result<crate::subsystems::build::build_manager::ScaffoldSpec>>,
     },
     /// Phase 2 of the two-phase creation flow (LLM, constrained): fill the
@@ -558,6 +567,10 @@ pub enum ProjectCreationMessage {
         goal: String,
         root_dir: PathBuf,
         spec: crate::subsystems::build::build_manager::ScaffoldSpec,
+        /// The library this project is built against, when the caller named one — read for its
+        /// `SPIRE.md`, the same way `ScaffoldProject` reads it for the plan. `None` for a project
+        /// whose caller has not said.
+        library_root: Option<PathBuf>,
         reply_to: oneshot::Sender<Result<PlanGenerationResult>>,
     },
     /// AppSpec requirements pass (SpireApp, LLM): derive a VALIDATED AppSpec
@@ -598,6 +611,10 @@ pub enum ProjectCreationMessage {
         embedded_root: Option<PathBuf>,
         /// True for embedded projects (cross-compiled targets only — no host).
         embedded: bool,
+        /// The **framework** an application was designed in — see `ScaffoldProject`. The plan is
+        /// asked for *before* anything is written, so this is the only place it can come from: a
+        /// tree that does not exist yet cannot state it.
+        application: Option<crate::build::application_spec::ApplicationSpec>,
         reply_to: oneshot::Sender<Result<PlanScaffoldResult>>,
     },
     /// Execute the entire plan sequentially.
@@ -662,11 +679,45 @@ impl ProjectCreationActor {
         goal: &str,
         root_dir: &Path,
         spec: &crate::subsystems::build::build_manager::ScaffoldSpec,
+        // The **library** an ESP-IDF application is built against, when the caller named one. Its
+        // `SPIRE.md` is the project's architecture, and this prompt is the only place a model can
+        // read it.
+        library_root: Option<&Path>,
+        // The **framework** an ESP-IDF application was designed in, when the caller knows it. `None`
+        // is the ordinary case here — the caller is planning, so the tree does not exist yet — and it
+        // is then read back from the application's own `CMakeLists.txt`, which is where the choice
+        // lives once the tree does.
+        application: Option<crate::build::application_spec::ApplicationSpec>,
     ) -> Result<PlanGenerationResult, String> {
         let project_name = root_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "my_project".to_string());
+
+        // **The tree says what it is.** Every application-specific block below — the framework, the
+        // reviewed composition, the composition rules, the library's own headers — is gated on
+        // `structure == IdfApplication`, and `structure` is a field a caller can drop: a spec built by
+        // hand without it deserializes as `native`, because the field carries `#[serde(default)]`.
+        //
+        // That is not hypothetical, and it cost two live runs: the wizard's `scaffoldSpecJSON` omitted it,
+        // so a fill asked for `actors` was handed the goal and the generic rules and **nothing else** — no
+        // framework, no composition, no API — and wrote a bare FreeRTOS poll loop with its own sensor
+        // classes. Both the composition and its JSON record are written *by* the application scaffold, so
+        // a tree carrying either **is** an application whatever the field says: the file is the fact, the
+        // field the claim.
+        let planned_structure = match spec.structure {
+            spire_core::build_types::ProjectStructure::IdfApplication => spec.structure,
+            _ if root_dir
+                .join(crate::build::idf_projects::COMPOSITION_FILE)
+                .is_file()
+                || root_dir
+                    .join(crate::build::idf_projects::APPLICATION_FILE)
+                    .is_file() =>
+            {
+                spire_core::build_types::ProjectStructure::IdfApplication
+            }
+            other => other,
+        };
 
         // ATOMIC: the LLM planning step is REQUIRED. No configured LLM →
         // fatal error; nothing may ever be scaffolded without a real plan.
@@ -706,16 +757,154 @@ impl ProjectCreationActor {
             } else {
                 String::new()
             };
+        // The **library's** hints, and the whole reason `SPIRE.md` is written down.
+        //
+        // An architecture is not in the code — it is in the file the library's author filled in — so
+        // a plan written without it is a plan that invents one. Each type reads exactly one file:
+        // an **application** reads the library it named, and a **library** reads its own, which is
+        // there only when it is being filled after it was created. A brand-new library has written
+        // down nothing yet, and that is not a gap to paper over — it is the truth about it.
+        //
+        // Read from disk rather than from the scaffolded tree, because at plan time the tree does
+        // not exist: the plan is asked for *before* anything is written.
+        let hints_root = match planned_structure {
+            spire_core::build_types::ProjectStructure::IdfLibrary => Some(root_dir),
+            spire_core::build_types::ProjectStructure::IdfApplication => library_root,
+            _ => None,
+        };
+        let library_hints = hints_root
+            .and_then(crate::build::idf_projects::library_hints)
+            .map(|hints| {
+                format!(
+                    "LIBRARY HINTS — how the library this project builds on says it is meant to be\n\
+                     used. Its author wrote this down, it is the architecture, and it is not in the\n\
+                     code. Follow it.\n\n{hints}\n"
+                )
+            })
+            .unwrap_or_default();
+        // The **decomposition** the design phase produced, which is what stops the model choosing a
+        // framework again *and* inventing a composition. It matters only for an application: a library
+        // builds against nothing and states neither, which is exactly what the library scaffold
+        // asserts.
+        //
+        // The decomposition handed in arrives **already resolved against the tree**: the caller asks
+        // `idf_projects::design_for_scaffold`, which owns the rule that a tree carrying a design decides
+        // and a copy a caller still holds does not override it. So the only question left here is the
+        // arm below — the leg with nothing handed in at all.
+        //
+        // A tree that states a framework this does not know, or whose composition does not parse, is
+        // *refused* rather than planned around: a composition written under a guess is a wasted round
+        // trip at best.
+        let designed = match planned_structure {
+            spire_core::build_types::ProjectStructure::IdfApplication => match application {
+                Some(application) => Some(application),
+                // Nothing handed in: read the one the application carries, which is where the design
+                // lives once the tree exists — the fill leg after a scaffold, with no caller needing
+                // to remember it. **`composition.spire` is what is read**, and the JSON record is
+                // brought back into agreement with it on the way (see
+                // `read_application_and_sync_record`): the file a person edits decides, and the record
+                // never goes on describing a design that was replaced.
+                //
+                // This leg is about to write the tree, so settling the record here is a write it was
+                // going to do anyway — which is why it is the *settling* reader and not the plain one.
+                //
+                // A composition that is there and does not parse is **refused** here rather than
+                // planned around, which is the rule the framework check above already follows. Falling
+                // back to the JSON record in its place would plan the round trip from a design the
+                // file no longer states, and nothing downstream would say so.
+                None => crate::build::idf_projects::read_application_and_sync_record(root_dir)?,
+            },
+            _ => None,
+        };
+        // The framework: from the decomposition when there is one, and otherwise from the line the
+        // application states — so an application made before the design phase runs is still told what
+        // it says about itself.
+        let framework = match designed.as_ref().map(|application| application.framework) {
+            Some(framework) => Some(framework),
+            None if planned_structure
+                == spire_core::build_types::ProjectStructure::IdfApplication =>
+            {
+                match std::fs::read_to_string(root_dir.join("CMakeLists.txt")) {
+                    Ok(contents) => crate::build::application_spec::declared_framework(&contents)?,
+                    // No tree yet, or no file to read: nothing is stated, and the library's rule for
+                    // choosing applies.
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
+        let framework_block = match planned_structure {
+            spire_core::build_types::ProjectStructure::IdfApplication => {
+                crate::build::idf_projects::framework_prompt_block(framework)
+            }
+            _ => String::new(),
+        };
+        // The composition itself: the components, the units, the wiring and the board facts that were
+        // reviewed. Without it the model writes a *different* application from the one that was
+        // agreed, and nothing in the round trip says so.
+        let composition_block = match &designed {
+            Some(application)
+                if planned_structure
+                    == spire_core::build_types::ProjectStructure::IdfApplication =>
+            {
+                crate::build::idf_projects::composition_block(application)
+            }
+            _ => String::new(),
+        };
+        // The interfaces the composition has to call. A design says which components exist; only the
+        // headers say what to call on them, and a live run wrote a plausible API that did not exist.
+        let component_apis = match (&designed, library_root) {
+            (Some(application), Some(root))
+                if planned_structure
+                    == spire_core::build_types::ProjectStructure::IdfApplication =>
+            {
+                crate::build::idf_projects::component_apis(root, application)
+            }
+            _ => String::new(),
+        };
+        // The composition is the **architecture, not advice**, and this is the failure it guards
+        // against: a live run was handed the reviewed `actors` decomposition, the framework's idiom and
+        // the library's own headers, and answered with one flat FreeRTOS poll loop plus its own
+        // `Sps30`/`Sht20` classes. So the two things it did are named as prohibitions. Only an
+        // application has a composition, so this is empty for everything else.
+        let composition_rules = if composition_block.is_empty() {
+            String::new()
+        } else {
+            "THE COMPOSITION IS THE ARCHITECTURE — implement it, do not approximate it:\n\
+             - Write every unit above with the **framework's own idiom** (see FRAMEWORK). For `actors` \
+             that is `spire::Actor<Message>` with `on_message`, spawned on a `spire::Scheduler` — \
+             **not** a bare FreeRTOS `while (true)` task, and **not** an `xTaskCreate` per unit.\n\
+             - The design's components belong to the **library**: include them and use them — a \
+             component named `name` publishes `#include <name.hpp>`. Do **not** declare your own class \
+             in `main/` for a component the design names: a second copy of the same driver is free to \
+             disagree with the first.\n\
+             - **Use only the methods the headers declare.** A component whose header offers only what a stub offers — `probe()`, `run()` — has **no read API yet**: write the `TODO` where the call belongs, exactly as the bus opening is left open, and **do not invent** `read(...)`, `push(...)` or any other method. A call the library does not declare is a file that does not compile, and the headers above are the whole API.\n"
+                .to_string()
+        };
         let prompt = format!(
             r#"You are filling an already-scaffolded {bs} project. The structure is LOCKED.
-Write a JSON object of the form {{"steps": [...]}} where each step is
-(write_source_file / create_directory / declare_dependencies / build / test / parse_and_validate / tool_call)
+Write a JSON object of the form {{"steps": [...]}} where each step is one of
+(write_source_file / create_directory / declare_dependencies / build / test / parse_and_validate / tool_call).
+A step is {{"type": "<one of those>", ...its own fields}} — a `write_source_file` carries "path" and
+"content", a `create_directory` carries "path". For example:
+
+  {{"steps": [
+    {{"type": "write_source_file", "path": "{source_dir}/main.cpp", "content": "// the composition goes here\n"}},
+    {{"type": "build"}}
+  ]}}
+
+The step's fields sit BESIDE "type", not wrapped in another object.
 to implement the goal INSIDE the existing skeleton.
 
 STRUCTURE CONTRACT:
 {structure}
 
+{framework_block}
+{composition_block}
+{composition_rules}
+{component_apis}
 {framework_hints}
+{library_hints}
 
 RULES:
 - You may write/modify files ONLY under the fill roots and create subdirectories beneath them.
@@ -732,7 +921,17 @@ Project: name={project_name}, root={root}, goal={goal}
             bs = spec.build_system,
             bs_lower = spec.build_system.to_lowercase(),
             root = root_dir.display(),
+            framework_block = framework_block,
+            composition_block = composition_block,
+            composition_rules = composition_rules,
+            component_apis = component_apis,
             framework_hints = framework_hints,
+            library_hints = library_hints,
+            source_dir = spec
+                .fill_roots
+                .first()
+                .map(String::as_str)
+                .unwrap_or("main"),
         );
         info!(
             "[ProjectCreation] Fill: requesting LLM fill plan for {} (spec bs={}, platforms={:?})",
@@ -892,6 +1091,67 @@ and NEVER repeat any line or block."
         }
     }
 
+    /// The build-system label a scaffold reports: the **structure** decides first, because a project
+    /// type can say what a language cannot — an ESP-IDF library and an ESP-IDF application are both
+    /// "ESP-IDF", and neither is "C++" — and the language is the fallback.
+    fn build_system_for(
+        structure: spire_core::build_types::ProjectStructure,
+        language: &str,
+    ) -> &'static str {
+        use spire_core::build_types::ProjectStructure;
+        match structure {
+            ProjectStructure::IdfLibrary | ProjectStructure::IdfApplication => "ESP-IDF",
+            _ => Self::build_system_for_language(language),
+        }
+    }
+
+    /// The four facts a scaffold request cannot be answered without, resolved from the request
+    /// itself: **which config file** the build module is found by, the **library** an application is
+    /// built against, the **build-system label** the spec reports, and whether the project is
+    /// **embedded**.
+    ///
+    /// One function because this was two. The in-memory spec and the scaffold each mapped a *language*
+    /// to a build file, and adding the ESP-IDF project types to only one of them is how a project
+    /// ends up with `structure: "idf_library"` and `build_system: "Meson"` — which is exactly what
+    /// happened, and how this was found. The next shape to be added now has one place to go.
+    ///
+    /// The ESP-IDF types are chosen by **structure**, not by language: their config file is
+    /// `sdkconfig.defaults`, the one file in an IDF tree that is IDF's alone. `language: "cpp"` would
+    /// otherwise route them to the Meson module, which has never heard of them.
+    fn scaffold_routing(
+        language: &str,
+        structure: Option<spire_core::build_types::ProjectStructure>,
+        embedded_root: Option<&Path>,
+        embedded: bool,
+    ) -> (&'static str, Option<String>, &'static str, bool) {
+        use spire_core::build_types::ProjectStructure;
+        match structure {
+            // A component library is built against nothing, and is cross-compiled by definition.
+            Some(ProjectStructure::IdfLibrary) => ("sdkconfig.defaults", None, "ESP-IDF", true),
+            Some(ProjectStructure::IdfApplication) => (
+                "sdkconfig.defaults",
+                // "The project this one depends on" is the same fact the build module calls the
+                // `library`, under the name the wizard already had for it.
+                embedded_root.map(|root| root.to_string_lossy().to_string()),
+                "ESP-IDF",
+                true,
+            ),
+            _ => (
+                match language.to_lowercase().as_str() {
+                    "swift" => "Package.swift",
+                    "python" => "pyproject.toml",
+                    "javascript" | "typescript" | "node" => "package.json",
+                    "go" => "go.mod",
+                    "c++" | "cpp" | "c" | "meson" => "meson.build",
+                    _ => "Cargo.toml",
+                },
+                None,
+                Self::build_system_for_language(language),
+                embedded,
+            ),
+        }
+    }
+
     /// Return the `.gitignore` body for a build system. Every scaffolded
     /// project also ignores `.spire/` (project-local graph DB + logs) so it is
     /// never committed. Keyed on the build system (not a coarse language
@@ -967,11 +1227,6 @@ and NEVER repeat any line or block."
         Ok("git initialized; scaffold baseline committed".to_string())
     }
 
-    /// Compute the in-memory structural contract (ScaffoldSpec) for a new
-    /// project WITHOUT writing anything to disk. Requests the build module's
-    /// scaffold layout via BuildManager and maps it into a ScaffoldSpec with
-    /// structural (locked) vs fillable files. Used by `PlanScaffold` so the
-    /// LLM plans against the real structure before it exists on disk.
     /// Resolve the structural spec for a new project without writing anything.
     // The arguments are the creation request's own fields plus the two the wizard adds: splitting
     // them into a struct would move the same list one line up, and every caller already has them.
@@ -979,48 +1234,31 @@ and NEVER repeat any line or block."
     async fn scaffold_spec_in_memory(
         &self,
         project_name: &str,
-        _root_dir: &PathBuf,
         language: &str,
         platforms: &[String],
         structure: Option<spire_core::build_types::ProjectStructure>,
-        // Where the container an **application** depends on lives.
+        // Where the library an **application** is built against lives.
         //
         // `None` for every other structure, and for an application whose caller has not named one —
-        // which is refused below rather than guessed at: an app that invents its own dependency is a
-        // build failure several steps later, in a place that names neither the app nor the HAL.
+        // which is a legitimate start ("No library named" is written into its build file) rather
+        // than something to guess at: an app that invents its own dependency is a build failure
+        // several steps later, in a place that names neither the app nor the library.
         embedded_root: Option<&Path>,
         embedded: bool,
-    ) -> Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> {
-        // Embedded **application**: a firmware binary that path-deps a HAL project.
+        // The **design** this spec is resolved from, already decided by the caller — the framework the
+        // design phase chose and the composition that goes with it, which is what the application's own
+        // `CMakeLists.txt` states and the fill phase reads back.
         //
-        // Emitted here rather than through the build module, because it is not a per-language
-        // layout: it is one fixed emission whose *input* is another project's directory — something
-        // the module layer never sees (it gets a name, a goal, platforms and a structure, and no
-        // paths at all). The module layer stays the owner of "how does a language lay itself out";
-        // this needs a file to read.
-        if structure == Some(spire_core::build_types::ProjectStructure::EmbeddedApp) {
-            let embedded_root = embedded_root.ok_or_else(|| {
-                "an embedded application needs the container it depends on: pass \
-                 `embedded_root` — the directory of the container this app builds against"
-                    .to_string()
-            })?;
-            let out = crate::build::embedded_app_scaffold::embedded_app_scaffold(
-                project_name,
-                platforms,
-                &embedded_root.to_string_lossy(),
-                embedded_root,
-            )?;
-            return Ok(spec_from_scaffold_output(out, language));
-        }
-
-        let build_file = match language.to_lowercase().as_str() {
-            "swift" => "Package.swift",
-            "python" => "pyproject.toml",
-            "javascript" | "typescript" | "node" => "package.json",
-            "go" => "go.mod",
-            "c++" | "cpp" | "c" | "meson" => "meson.build",
-            _ => "Cargo.toml",
-        };
+        // Resolved by the caller rather than here, and through the one resolver,
+        // [`idf_projects::design_for_scaffold`](crate::build::idf_projects::design_for_scaffold): the
+        // design a **plan** is built against and the design a **scaffold** writes have to be one design,
+        // and they are asked for separately — so the rule that decides it lives in one place and both
+        // legs call it. Nothing here reads the tree, which is what this function's promise is: the plan
+        // phase has to be able to run before the tree exists.
+        application: Option<crate::build::application_spec::ApplicationSpec>,
+    ) -> Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> {
+        let (build_file, library, _build_system, embedded) =
+            Self::scaffold_routing(language, structure, embedded_root, embedded);
         let (t, r) = oneshot::channel();
         self.build_manager_tx
             .send(BuildManagerMessage::ScaffoldBuildConfig {
@@ -1030,6 +1268,8 @@ and NEVER repeat any line or block."
                 platforms: platforms.to_vec(),
                 structure,
                 embedded,
+                library,
+                application,
                 reply_to: t,
             })
             .await
@@ -1232,13 +1472,12 @@ and NEVER repeat any line or block."
     async fn generate_plan_async(
         &self,
         goal: &str,
-        root_dir: &PathBuf,
+        // A path rather than a `PathBuf`: it is read, and passed on to the planners, which take a
+        // directory to plan against.
+        root_dir: &Path,
         language: &str,
         platforms: &[String],
         structure: Option<spire_core::build_types::ProjectStructure>,
-        // The HAL directory an application depends on. See `embedded_app_template_plan`: the plan is
-        // the scaffold, so a plan that cannot read the HAL cannot be run either.
-        embedded_root: Option<&std::path::Path>,
     ) -> PlanGenerationResult {
         // SpireApp: deterministic monorepo scaffold — the structure itself is
         // fixed (Cargo workspace + SwiftUI), so the plan is the scaffold's own
@@ -1246,22 +1485,6 @@ and NEVER repeat any line or block."
         if structure == Some(spire_core::build_types::ProjectStructure::SpireApp) {
             return self
                 .spire_app_template_plan(goal, root_dir, language, platforms)
-                .await;
-        }
-        // Embedded-HAL: the same shape of answer as SpireApp, for the same reason — the structure
-        // is fixed before the goal is read, so the plan is the scaffold's own file writes plus a
-        // parse and a host build gate. An LLM plan here would write into the contract.
-        if structure == Some(spire_core::build_types::ProjectStructure::Embedded) {
-            return self
-                .embedded_container_template_plan(goal, root_dir, language, platforms)
-                .await;
-        }
-        // Embedded application: the same deterministic shape as the HAL, for the same reason — the
-        // structure is fixed before the goal is read — and here the plan *is* the scaffold: its steps
-        // are what write the project (see `PlanView`).
-        if structure == Some(spire_core::build_types::ProjectStructure::EmbeddedApp) {
-            return self
-                .embedded_app_template_plan(goal, root_dir, language, platforms, embedded_root)
                 .await;
         }
         if let Some(llm_tx) = &self.llm_tx {
@@ -1512,7 +1735,9 @@ Project:
     async fn spire_app_template_plan(
         &self,
         goal: &str,
-        root_dir: &PathBuf,
+        // A path rather than a `PathBuf`: it is only ever read — for the project's name, and by the
+        // plan that is built from the spec below.
+        root_dir: &Path,
         language: &str,
         platforms: &[String],
     ) -> PlanGenerationResult {
@@ -1523,13 +1748,14 @@ Project:
         let spec = self
             .scaffold_spec_in_memory(
                 &project_name,
-                root_dir,
                 language,
                 platforms,
                 Some(spire_core::build_types::ProjectStructure::SpireApp),
                 // A Spire app is host-only: it depends on no HAL project.
                 None,
                 false,
+                // Nor is it an ESP-IDF application, so it states no framework.
+                None,
             )
             .await
             .unwrap_or_else(|e| {
@@ -1543,6 +1769,8 @@ Project:
                     files: vec![],
                     structure: spire_core::build_types::ProjectStructure::SpireApp,
                     embedded: false,
+                    // A Spire app states no design and scaffolds nothing over one.
+                    design_warning: None,
                 }
             });
 
@@ -1553,137 +1781,6 @@ Project:
             spec,
             "SpireApp structure — deterministic monorepo scaffold",
         )
-    }
-
-    /// Deterministic embedded-**container** plan: scaffold the workspace — the framework crate, fixed —
-    /// then gate it with a parse and a **host** build. Never calls the LLM.
-    ///
-    /// The build gate is the workspace's own `cargo test`, and it needs nothing more: the container is
-    /// one library crate with no vendor crate anywhere in its graph, so a host build is the whole check.
-    /// What *does* need a cross toolchain — a board's BSP — arrives later, one board at a time
-    /// (`embedded_add_bsp`), and that operation is where it is verified.
-    ///
-    /// Nothing here is filled, and that is the point: the actor system is ours and identical in every
-    /// container, so a plan that handed it to a model would be asking for a worse copy of it, once per
-    /// project.
-    async fn embedded_container_template_plan(
-        &self,
-        goal: &str,
-        root_dir: &PathBuf,
-        language: &str,
-        platforms: &[String],
-    ) -> PlanGenerationResult {
-        let project_name = root_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "embedded-hal".to_string());
-        let spec = self
-            .scaffold_spec_in_memory(
-                &project_name,
-                root_dir,
-                language,
-                platforms,
-                Some(spire_core::build_types::ProjectStructure::Embedded),
-                // The HAL *is* the project being scaffolded; it depends on no other.
-                None,
-                true,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                warn!("[ProjectCreation] embedded-HAL scaffold spec failed: {e}");
-                crate::subsystems::build::build_manager::ScaffoldSpec {
-                    structural_files: vec!["Cargo.toml".to_string()],
-                    fill_roots: vec!["crates".to_string()],
-                    dependency_sections: vec!["Cargo.toml".to_string()],
-                    platform_targets: platforms.to_vec(),
-                    build_system: "Cargo".to_string(),
-                    files: vec![],
-                    structure: spire_core::build_types::ProjectStructure::Embedded,
-                    embedded: true,
-                }
-            });
-        scaffold_plan_from_spec(
-            goal,
-            root_dir,
-            language,
-            spec,
-            "embedded-HAL structure — deterministic workspace scaffold",
-        )
-    }
-
-    /// Deterministic embedded-**application** plan: scaffold the binary — the manifest that path-deps
-    /// the HAL, the board's build wiring, and the actor — then gate it with a parse and a cross-build.
-    /// Never calls the LLM.
-    ///
-    /// The plan *is* the scaffold here: `PlanView` materializes a project by executing the plan's
-    /// steps, so a structure without a template plan falls through to the LLM path and writes nothing
-    /// of this shape. The app's one model-written file is `src/main.rs` (the board's LED constructor),
-    /// which the scaffold already emits as a compiling `todo!()` — the same split the HAL uses: the
-    /// structure is fixed before the goal is read, and the goal only shapes the code inside it.
-    ///
-    /// `embedded_root` is required: an application's entire dependency graph is read from that HAL project,
-    /// so a plan for one without it fails here, by name, rather than emitting a crate that cannot
-    /// resolve a single dependency.
-    async fn embedded_app_template_plan(
-        &self,
-        goal: &str,
-        root_dir: &PathBuf,
-        language: &str,
-        platforms: &[String],
-        embedded_root: Option<&std::path::Path>,
-    ) -> PlanGenerationResult {
-        let project_name = root_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "embedded-app".to_string());
-        let spec = match embedded_root {
-            Some(embedded_root) => self
-                .scaffold_spec_in_memory(
-                    &project_name,
-                    root_dir,
-                    language,
-                    platforms,
-                    Some(spire_core::build_types::ProjectStructure::EmbeddedApp),
-                    Some(embedded_root),
-                    true,
-                )
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("[ProjectCreation] embedded-app scaffold spec failed: {e}");
-                    Self::embedded_app_fallback_spec(platforms)
-                }),
-            None => {
-                warn!(
-                    "[ProjectCreation] embedded app for '{project_name}' has no HAL directory: the \
-                     wizard's picker supplies `embeddedRoot`"
-                );
-                Self::embedded_app_fallback_spec(platforms)
-            }
-        };
-        scaffold_plan_from_spec(
-            goal,
-            root_dir,
-            language,
-            spec,
-            "embedded-app structure — deterministic firmware scaffold",
-        )
-    }
-
-    /// The spec a failed (or HAL-less) application scaffold falls back to: enough for the plan to say
-    /// what is missing, and no invented dependency paths.
-    fn embedded_app_fallback_spec(
-        platforms: &[String],
-    ) -> crate::subsystems::build::build_manager::ScaffoldSpec {
-        crate::subsystems::build::build_manager::ScaffoldSpec {
-            structural_files: vec!["Cargo.toml".to_string()],
-            fill_roots: vec!["src".to_string()],
-            dependency_sections: vec!["Cargo.toml".to_string()],
-            platform_targets: platforms.to_vec(),
-            build_system: "Cargo".to_string(),
-            files: vec![],
-            structure: spire_core::build_types::ProjectStructure::EmbeddedApp,
-            embedded: true,
-        }
     }
 
     /// Generate a plan for a new project. In v1 this is a deterministic
@@ -2509,7 +2606,11 @@ impl Actor for ProjectCreationActor {
                 language,
                 platforms,
                 structure,
-                embedded_root,
+                // Both are read by the *scaffold-based* plan (`PlanScaffold`), which is the one that
+                // fills a real project: this generator writes a generic skeleton from a goal and has
+                // nowhere to put either — an ESP-IDF project's library is substituted into its
+                // `CMakeLists.txt` by the scaffold, and its hints are read by `generate_fill_plan`.
+                embedded_root: _embedded_root,
                 embedded: _embedded,
                 reply_to,
             } => {
@@ -2520,14 +2621,7 @@ impl Actor for ProjectCreationActor {
                     platforms
                 };
                 let plan = self
-                    .generate_plan_async(
-                        &goal,
-                        &root_dir,
-                        &language,
-                        &platforms,
-                        structure,
-                        embedded_root.as_deref(),
-                    )
+                    .generate_plan_async(&goal, &root_dir, &language, &platforms, structure)
                     .await;
                 info!(
                     "[ProjectCreation] PLAN GENERATED: language={}, root_dir={}, steps={}",
@@ -2552,6 +2646,7 @@ impl Actor for ProjectCreationActor {
                 structure,
                 embedded_root,
                 embedded,
+                application,
                 reply_to,
             } => {
                 let platforms = if platforms.is_empty() {
@@ -2561,53 +2656,57 @@ impl Actor for ProjectCreationActor {
                 };
                 let result: Result<crate::subsystems::build::build_manager::ScaffoldSpec, String> =
                     async {
-                        // An embedded application is emitted outside the build module: its input is
-                        // another project's *directory*, which the module layer never sees. The write
-                        // loop below is shared, so both producers land on disk the same way.
-                        let out = if structure
-                            == Some(spire_core::build_types::ProjectStructure::EmbeddedApp)
-                        {
-                            let embedded_root = embedded_root.ok_or_else(|| {
-                                "an embedded application needs the container it depends \
-                                 on: pass `embeddedRoot` — the directory of the container it builds against"
-                                    .to_string()
-                            })?;
-                            crate::build::embedded_app_scaffold::embedded_app_scaffold(
-                                &project_name,
-                                &platforms,
-                                &embedded_root.to_string_lossy(),
-                                &embedded_root,
-                            )?
-                        } else {
-                            let build_file = match language.to_lowercase().as_str() {
-                                "swift" => "Package.swift",
-                                "python" => "pyproject.toml",
-                                "javascript" | "typescript" | "node" => "package.json",
-                                "go" => "go.mod",
-                                "c++" | "cpp" | "c" | "meson" => "meson.build",
-                                _ => "Cargo.toml",
-                            };
-                            let (t, r) = oneshot::channel();
-                            self.build_manager_tx
-                                .send(BuildManagerMessage::ScaffoldBuildConfig {
-                                    project_name: project_name.clone(),
-                                    goal: String::new(),
-                                    build_file: build_file.to_string(),
-                                    platforms: platforms.clone(),
-                                    structure,
-                                    embedded,
-                                    reply_to: t,
-                                })
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            r.await
-                                .map_err(|e| e.to_string())?
-                                .map_err(|e| e.to_string())?
-                        };
+                        let (build_file, library, _build_system, embedded) =
+                            ProjectCreationActor::scaffold_routing(
+                                &language,
+                                structure,
+                                embedded_root.as_deref(),
+                                embedded,
+                            );
+                        // **The design this tree is written from**, resolved the same way the plan was:
+                        // the tree's when it already carries one — it is the file a person edits, and the
+                        // application's `REQUIRES` and its record are stated from it — and the caller's
+                        // only when the tree has none. See `idf_projects::design_for_scaffold`; the one
+                        // resolver, so what was planned and what is written cannot disagree.
+                        //
+                        // This leg is about to write, so the read is the plain one and nothing is settled
+                        // here: the scaffold writes the record itself, from this same design, through
+                        // `application_scaffold`.
+                        let design = crate::build::idf_projects::design_for_scaffold(
+                            &root_dir,
+                            structure,
+                            application,
+                        )?;
+                        // The design, and — when the tree already stated one — the sentence the
+                        // wizard shows. Every statement below (`REQUIRES`, the record, the
+                        // composition) is written from `design.spec`, so a caller whose copy was
+                        // dropped is told here rather than left to discover it in the tree.
+                        let application = design.spec;
+                        let (t, r) = oneshot::channel();
+                        self.build_manager_tx
+                            .send(BuildManagerMessage::ScaffoldBuildConfig {
+                                project_name: project_name.clone(),
+                                goal: String::new(),
+                                build_file: build_file.to_string(),
+                                platforms: platforms.clone(),
+                                structure,
+                                embedded,
+                                library,
+                                application,
+                                reply_to: t,
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let out = r
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .map_err(|e| e.to_string())?;
 
                         let root = root_dir.clone();
+                        // The structure decides where the language cannot: an ESP-IDF library and
+                        // an ESP-IDF application are both "ESP-IDF", and neither of them is "C++".
                         let build_system =
-                            ProjectCreationActor::build_system_for_language(&language);
+                            ProjectCreationActor::build_system_for(out.structure, &language);
                         let mut spec = crate::subsystems::build::build_manager::ScaffoldSpec {
                             structural_files: Vec::new(),
                             fill_roots: out.fill_roots.clone(),
@@ -2617,18 +2716,12 @@ impl Actor for ProjectCreationActor {
                             files: out.files.clone(),
                             structure: out.structure,
                             embedded: out.embedded,
+                            // When the tree already stated a design, this is the sentence the
+                            // wizard shows: the design just reviewed was not the one used.
+                            design_warning: design.dropped,
                         };
                         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-                        for f in &out.files {
-                            let p = root.join(&f.path);
-                            if let Some(parent) = p.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                            }
-                            std::fs::write(&p, &f.content).map_err(|e| e.to_string())?;
-                            if f.structural {
-                                spec.structural_files.push(f.path.clone());
-                            }
-                        }
+                        materialize_scaffold_files(&root, &out.files, &mut spec)?;
                         // Legacy single-file scaffold fallback.
                         if out.files.is_empty() {
                             let p = root.join(&out.build_file);
@@ -2682,6 +2775,7 @@ impl Actor for ProjectCreationActor {
                 structure,
                 embedded_root,
                 embedded,
+                application,
                 reply_to,
             } => {
                 let platforms = if platforms.is_empty() {
@@ -2690,11 +2784,22 @@ impl Actor for ProjectCreationActor {
                     platforms
                 };
                 let result: Result<PlanScaffoldResult, String> = async {
+                    // **The design this creation works from**, resolved once for both legs: the tree's
+                    // when it already carries one and the caller's otherwise — see
+                    // `design_for_scaffold`, which owns that rule so that what the plan is built against
+                    // and what the scaffold writes are one design and not two.
+                    //
+                    // Read **without writing**: this is the planning phase, and nothing goes on disk
+                    // until the caller confirms.
+                    let design = crate::build::idf_projects::design_for_scaffold(
+                        &root_dir,
+                        structure,
+                        application,
+                    )?;
                     // In-memory contract only — NO disk writes until confirm.
-                    let spec = self
+                    let mut spec = self
                         .scaffold_spec_in_memory(
                             &project_name,
-                            &root_dir,
                             &language,
                             &platforms,
                             structure,
@@ -2702,23 +2807,23 @@ impl Actor for ProjectCreationActor {
                             // is read from it, so a plan for one without it is refused by name.
                             embedded_root.as_deref(),
                             embedded,
+                            design.spec.clone(),
                         )
                         .await?;
+                    // A plan is a scaffold in waiting, so it carries the same report the write does:
+                    // a person told at the plan what will not be applied cannot be surprised by the
+                    // tree — and the plan is what the sheet's log reads first.
+                    spec.design_warning = design.dropped;
                     self.active_spec = Some(spec.clone());
-                    let plan = match spec.structure {
-                        // The container is never filled at creation: the framework is fixed, and what a
-                        // model *does* write — a board's facts, a device's protocol — has its own
-                        // operation (`embedded_add_bsp`, `embedded_add_driver`) with its own prompt and
-                        // its own gate. So this plan is the scaffold's writes plus a gate, and it needs
-                        // no model at all.
-                        spire_core::build_types::ProjectStructure::Embedded => {
-                            self.embedded_container_template_plan(
-                                &goal, &root_dir, &language, &platforms,
-                            )
-                            .await
-                        }
-                        _ => self.generate_fill_plan(&goal, &root_dir, &spec).await?,
-                    };
+                    let plan = self
+                        .generate_fill_plan(
+                            &goal,
+                            &root_dir,
+                            &spec,
+                            embedded_root.as_deref(),
+                            design.spec,
+                        )
+                        .await?;
                     Ok(PlanScaffoldResult { plan, spec })
                 }
                 .await;
@@ -2729,10 +2834,15 @@ impl Actor for ProjectCreationActor {
                 goal,
                 root_dir,
                 spec,
+                library_root,
                 reply_to,
             } => {
                 self.active_spec = Some(spec.clone());
-                let plan = self.generate_fill_plan(&goal, &root_dir, &spec).await;
+                // The framework is not asked of the caller here: the application states it in its own
+                // `CMakeLists.txt` by now, and `generate_fill_plan` reads it back from there.
+                let plan = self
+                    .generate_fill_plan(&goal, &root_dir, &spec, library_root.as_deref(), None)
+                    .await;
                 let _ = reply_to.send(plan.map_err(anyhow::Error::msg));
             }
 
@@ -2824,7 +2934,7 @@ fn spec_from_scaffold_output(
     out: crate::build::ScaffoldOutput,
     language: &str,
 ) -> crate::subsystems::build::build_manager::ScaffoldSpec {
-    let build_system = ProjectCreationActor::build_system_for_language(language);
+    let build_system = ProjectCreationActor::build_system_for(out.structure, language);
     let mut spec = crate::subsystems::build::build_manager::ScaffoldSpec {
         structural_files: Vec::new(),
         fill_roots: out.fill_roots.clone(),
@@ -2834,6 +2944,8 @@ fn spec_from_scaffold_output(
         files: out.files.clone(),
         structure: out.structure,
         embedded: out.embedded,
+        // Nothing was resolved here: this is the shape of a scaffold, not a resolved design.
+        design_warning: None,
     };
     for f in &out.files {
         if f.structural {
@@ -2906,6 +3018,40 @@ fn scaffold_plan_from_spec(
     }
 }
 
+/// Materialize a scaffold's files under `root`, **leaving a composition that is already there alone**.
+///
+/// Everything the scaffold emits is the tool's to write: the build files, the record, the stub the fill
+/// phase replaces. [`COMPOSITION_FILE`](crate::build::idf_projects::COMPOSITION_FILE) is the exception,
+/// and it is a file of a different kind: it is the one a person edits, the one that can carry comments,
+/// and — since the design was resolved *from it* (`idf_projects::design_for_scaffold`) — rendering it
+/// again could only lose something. So a composition that is already there is kept exactly as it is,
+/// byte for byte, and the record beside it is written from the design that was read out of it, which is
+/// what keeps the two stating the same thing.
+///
+/// Every structural path is recorded whether or not it was written: locked is a fact about the file, not
+/// about what this loop happened to do to it just now — and a path that is on disk and not recorded is a
+/// file the fill phase would then be free to overwrite.
+fn materialize_scaffold_files(
+    root: &Path,
+    files: &[crate::build::ScaffoldFile],
+    spec: &mut crate::subsystems::build::build_manager::ScaffoldSpec,
+) -> Result<(), String> {
+    for file in files {
+        let path = root.join(&file.path);
+        if file.structural {
+            spec.structural_files.push(file.path.clone());
+        }
+        if file.path == crate::build::idf_projects::COMPOSITION_FILE && path.is_file() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, &file.content).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2953,6 +3099,7 @@ mod tests {
             ],
             structure: spire_core::build_types::ProjectStructure::Embedded,
             embedded: true,
+            design_warning: None,
         };
 
         let plan = scaffold_plan_from_spec(
@@ -2990,6 +3137,333 @@ mod tests {
             serde_json::json!(["crates/demo-hal/src/lib.rs"]),
             "the parse gate checks the Rust the scaffold wrote: {:?}",
             plan.steps[2].parameters
+        );
+    }
+
+    /// The library's `SPIRE.md` reaches the model — and so do the **decomposition** the design phase
+    /// produced and the framework inside it.
+    ///
+    /// The first is the whole reason the file is written down, and both of its failure modes are
+    /// silent: hints that never arrive are an architecture nobody follows, and hints taken from the
+    /// wrong project are someone else's architecture — which is worse. The others are the same failure
+    /// one level up: the hints describe *both* frameworks and how to choose, so without the decision
+    /// the model chooses again and invents a different composition, differently, per run.
+    #[test]
+    fn the_librarys_hints_and_the_design_reach_the_fill_prompt() {
+        use crate::build::application_spec::{examples, ApplicationFramework, ApplicationSpec};
+        use crate::build::idf_projects::{APPLICATION_FILE, HINTS_FILE};
+        use crate::subsystems::build::build_manager::ScaffoldSpec;
+        use std::sync::{Arc, Mutex};
+
+        /// Ask for one plan and hand back the prompt it was asked with, under a root of the caller's
+        /// choosing — so the read-back of a design the tree carries can be exercised rather than
+        /// assumed. The reply is a plan the caller can parse, so a failure here is about the prompt
+        /// and not the response.
+        fn prompt_for(
+            spec: &ScaffoldSpec,
+            library_root: Option<&std::path::Path>,
+            application: Option<ApplicationSpec>,
+            root: &std::path::Path,
+        ) -> String {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let (llm_tx, mut llm_rx) = mpsc::channel::<LlmMessage>(4);
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured = seen.clone();
+            rt.spawn(async move {
+                while let Some(msg) = llm_rx.recv().await {
+                    if let LlmMessage::Complete {
+                        prompt, reply_to, ..
+                    } = msg
+                    {
+                        captured.lock().unwrap().push(prompt);
+                        let _ = reply_to.send(Ok(
+                            r#"[{ "write_source_file": { "path": "main/sensor.cpp", "content": "// read" } }]"#
+                                .to_string(),
+                        ));
+                    }
+                }
+            });
+
+            let mut actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
+            actor.set_llm(llm_tx);
+            rt.block_on(actor.generate_fill_plan(
+                "read a PM2.5 sensor",
+                root,
+                spec,
+                library_root,
+                application,
+            ))
+            .expect("a parseable plan comes back");
+
+            let prompts = seen.lock().unwrap();
+            assert_eq!(prompts.len(), 1, "one planning round trip");
+            prompts[0].clone()
+        }
+
+        // The library the application is built against, and what it said about itself.
+        let library = tempfile::tempdir().unwrap();
+        let said =
+            "# sensors\n\n## How to use it\n\nCall `sensors::begin()` once, before any read.\n";
+        std::fs::write(library.path().join(HINTS_FILE), said).unwrap();
+        // Its **headers**, written by hand: what a composition has to call is the library's own API, and
+        // this is the half of the prompt a model cannot invent. `component_names` counts a component
+        // directory only when it has a manifest, which is the rule IDF applies too.
+        for (path, body) in [
+            (
+                "components/sps30/CMakeLists.txt",
+                "idf_component_register(INCLUDE_DIRS include)\n",
+            ),
+            (
+                "components/sps30/include/sps30.hpp",
+                "namespace sps30 {\nclass Sps30 {\npublic:\n    explicit Sps30(BusHandle device);\n};\n}\n",
+            ),
+            (
+                "components/actors/include/actor.hpp",
+                "namespace spire {\ntemplate <typename Message>\nclass Actor {\nprotected:\n    void on_message(const Message& message);\n};\n}\n",
+            ),
+        ] {
+            let file = library.path().join(path);
+            std::fs::create_dir_all(file.parent().expect("a parent")).unwrap();
+            std::fs::write(&file, body).unwrap();
+        }
+
+        let spec = ScaffoldSpec {
+            structural_files: vec!["CMakeLists.txt".to_string()],
+            fill_roots: vec!["main".to_string()],
+            dependency_sections: Vec::new(),
+            platform_targets: vec!["esp32s3".to_string()],
+            build_system: "ESP-IDF".to_string(),
+            files: Vec::new(),
+            structure: spire_core::build_types::ProjectStructure::IdfApplication,
+            embedded: true,
+            design_warning: None,
+        };
+        // A root with no tree in it yet: planning happens before anything is written.
+        let unborn = tempfile::tempdir().unwrap();
+
+        let named = prompt_for(&spec, Some(library.path()), None, unborn.path());
+        assert!(
+            named.contains("Call `sensors::begin()` once, before any read."),
+            "the library's hints are in the prompt:\n{named}"
+        );
+        assert!(named.contains("LIBRARY HINTS"), "{named}");
+
+        // An application that named no library is told nothing — not the hints of whatever happens
+        // to sit at its own root, which is not a library.
+        let unnamed = prompt_for(&spec, None, None, unborn.path());
+        assert!(
+            !unnamed.contains("LIBRARY HINTS"),
+            "no library named, so no hints:\n{unnamed}"
+        );
+
+        // The decomposition the design phase produced, which is what stops the model choosing a
+        // framework again *and* inventing a composition.
+        let app_one = crate::build::application_spec::parse_spec(examples::PM25_METER)
+            .expect("the worked example parses");
+        let actors = prompt_for(&spec, None, Some(app_one.clone()), unborn.path());
+        assert!(actors.contains("FRAMEWORK: `actors`"), "{actors}");
+        assert!(actors.contains("not choose again"), "{actors}");
+        assert!(
+            actors.contains("spire::Scheduler"),
+            "and what the choice means, in the idiom that matters:\n{actors}"
+        );
+        // **What an edge carries.** The compiler, not a test, is what found this: the model wrote an
+        // actor holding `ActorRef<TouchEvent>` because `TouchEvent` was its own message, and spawned it
+        // with a ref to an actor that takes `Reading`. `a -> b` carries `b`'s message — stated here
+        // because it is the difference between a composition that compiles and one that does not.
+        assert!(
+            actors.contains("edge carries the receiver's message, not the sender's")
+                && actors.contains("`spire::ActorRef<b::Message>`"),
+            "{actors}"
+        );
+        // And *where a component lives*, which the next build asked for: a driver's handle does not exist
+        // until `init()` opens the bus, and a non-copyable component cannot be kept as a plain member or
+        // assigned — `sps30_ = sps30::Sps30(handle);` was the error.
+        assert!(
+            actors.contains("driver's argument usually does not exist until `init()`")
+                && actors.contains("std::optional<sps30::Sps30>")
+                && actors.contains("non-copyable"),
+            "{actors}"
+        );
+        // The composition itself: the units, what they use, how they are wired and where the devices
+        // are. Without this the model writes a different application from the reviewed one.
+        for expected in [
+            "THE DESIGN — reviewed and approved",
+            "`sps30` — driver on i2c: PM1/2.5/4/10 readings (to be written in the library)",
+            "`moving_average` — library: a rolling window (already in the library)",
+            "`sampler` — actor on `Tick`",
+            "uses sps30, sht20",
+            "sends to air_quality",
+            "Wiring: sampler -> air_quality; air_quality -> view",
+            "`sps30` on i2c at 0x69",
+        ] {
+            assert!(
+                actors.contains(expected),
+                "the composition block is missing {expected:?}:
+{actors}"
+            );
+        }
+
+        // And the two prohibitions the composition rules carry — the two things a live run did without
+        // them: it wrote one flat FreeRTOS poll loop, and its own `class Sps30` in `main/`.
+        assert!(
+            actors.contains("not** a bare FreeRTOS `while (true)` task")
+                && actors.contains("not** an `xTaskCreate` per unit"),
+            "the composition is implemented with the framework, not approximated by a loop:\n{actors}"
+        );
+        assert!(
+            actors.contains("Do **not** declare your own class")
+                && actors.contains("`#include <name.hpp>`"),
+            "the library's components are include-only, never re-declared:\n{actors}"
+        );
+        // **And what a stub can be called.** A component whose header offers `probe()` and nothing else
+        // has no read API; a fill that invented `read(...)` produced `sampler.cpp` that could not compile,
+        // and the header it was shown was the whole API. The rule names the move — leave the `TODO` —
+        // rather than only forbidding the invention.
+        assert!(
+            actors.contains("Use only the methods the headers declare")
+                && actors.contains("**do not invent**")
+                && actors.contains("no read API yet"),
+            "a stub component has nothing to call, and the composition must leave it open:\n{actors}"
+        );
+
+        // **And the API the composition has to call.** Telling a model which components exist is not
+        // telling it what to call on them, and it cannot write an API it has never seen: a live run was
+        // handed the reviewed composition and the prose idiom with **no headers at all**, and answered
+        // with a bare FreeRTOS `while (true)` loop and its own sensor classes rather than `spire::Actor`
+        // on a `spire::Scheduler`. The headers arrive only when a design *and* a library are both
+        // present — which is why the fill is given the library as `embeddedRoot` — so it is pinned here
+        // rather than left to a caller to remember.
+        let with_library = prompt_for(
+            &spec,
+            Some(library.path()),
+            Some(app_one.clone()),
+            unborn.path(),
+        );
+        assert!(
+            with_library.contains("#include <actor.hpp>") && with_library.contains("spire"),
+            "the framework's own headers are in the prompt:\n{with_library}"
+        );
+        assert!(
+            with_library.contains("#include <sps30.hpp>")
+                && with_library.contains("explicit Sps30(BusHandle device)"),
+            "and the components the design names, by the path they are included by:\n{with_library}"
+        );
+        assert!(
+            !actors.contains("#include <actor.hpp>"),
+            "with no library named there is nothing to read, and nothing is invented:\n{actors}"
+        );
+
+        // A ramen application gets its own idiom and its own units.
+        let trap = prompt_for(
+            &spec,
+            None,
+            Some(crate::build::application_spec::parse_spec(examples::INSECT_TRAP).unwrap()),
+            unborn.path(),
+        );
+        assert!(trap.contains("FRAMEWORK: `ramen`"), "{trap}");
+        assert!(
+            trap.contains("synchronous and inline") && trap.contains("never a cycle"),
+            "the ramen idiom, including the DAG rule:
+{trap}"
+        );
+        assert!(
+            trap.contains("`capture` — stage: pulls nothing")
+                && trap.contains("`classifier` — stage: pulls detections, pushes verdicts"),
+            "the stages, as they were reviewed:
+{trap}"
+        );
+
+        // Nothing named and nothing stated: the library's rule applies, and the prompt says where the
+        // answer belongs rather than leaving the model to invent a record of it.
+        let none = prompt_for(&spec, None, None, unborn.path());
+        assert!(none.contains("this application states none"), "{none}");
+        assert!(
+            !none.contains("THE DESIGN"),
+            "with no design there is nothing to follow, and nothing is invented:\n{none}"
+        );
+        assert!(
+            !none.contains("THE COMPOSITION IS THE ARCHITECTURE"),
+            "and with nothing to compose there is no composition to insist on:\n{none}"
+        );
+
+        // Once the tree exists, what it carries is read back — the caller does not have to remember
+        // the design, which is what makes the fill leg after a scaffold work unattended.
+        let built = tempfile::tempdir().unwrap();
+        std::fs::write(
+            built.path().join(APPLICATION_FILE),
+            format!("{}\n", serde_json::to_string_pretty(&app_one).unwrap()),
+        )
+        .unwrap();
+        let from_disk = prompt_for(&spec, None, None, built.path());
+        assert!(
+            from_disk.contains("FRAMEWORK: `actors`")
+                && from_disk.contains("`sps30` on i2c at 0x69"),
+            "the application's own file is the source once it exists:
+{from_disk}"
+        );
+
+        // **And the field a caller can drop.** `structure` arrives from the caller, and a spec built
+        // without it deserializes as `native` — which is exactly what the wizard's hand-built spec did.
+        // Every application block above is gated on that one word, so a fill asked for `actors` was handed
+        // the goal and the generic rules and nothing else, and wrote a flat FreeRTOS loop with its own
+        // sensor classes. The tree's own `SPIRE.application.json` is written *by* the application scaffold,
+        // so it decides: the file is the fact, the field the claim.
+        let mut dropped = spec.clone();
+        dropped.structure = spire_core::build_types::ProjectStructure::Native;
+        let from_a_dropped_field = prompt_for(&dropped, Some(library.path()), None, built.path());
+        assert!(
+            from_a_dropped_field.contains("FRAMEWORK: `actors`")
+                && from_a_dropped_field.contains("THE DESIGN — reviewed and approved")
+                && from_a_dropped_field.contains("THE COMPOSITION IS THE ARCHITECTURE")
+                && from_a_dropped_field.contains("#include <actor.hpp>"),
+            "a tree carrying a design is an application whatever the spec's field says:\n\
+             {from_a_dropped_field}"
+        );
+        // With no tree to say it, the field is all there is: a native project stays native and is not
+        // handed a composition it does not have.
+        let native_with_nothing = prompt_for(&dropped, None, None, unborn.path());
+        assert!(
+            !native_with_nothing.contains("THE DESIGN")
+                && !native_with_nothing.contains("THE COMPOSITION IS THE ARCHITECTURE"),
+            "nothing in the tree and `native` in the field is still not an application:\n\
+             {native_with_nothing}"
+        );
+
+        // An application made before the design phase exists states no decomposition — only the
+        // framework line — and that alone is still followed.
+        let stated = tempfile::tempdir().unwrap();
+        std::fs::write(
+            stated.path().join("CMakeLists.txt"),
+            format!(
+                "project(pm25-meter)\n{}\n",
+                ApplicationFramework::Ramen.marker_line()
+            ),
+        )
+        .unwrap();
+        let from_line = prompt_for(&spec, None, None, stated.path());
+        assert!(
+            from_line.contains("FRAMEWORK: `ramen`"),
+            "the stated framework is read back even with no decomposition:
+{from_line}"
+        );
+        assert!(
+            !from_line.contains("THE DESIGN"),
+            "and no design is invented for it:
+{from_line}"
+        );
+
+        // A **library** is told nothing about frameworks: it is built against nothing, states none of
+        // its own, and a prompt that offered it one would be inventing a decision it never makes.
+        let library_spec = ScaffoldSpec {
+            structure: spire_core::build_types::ProjectStructure::IdfLibrary,
+            ..spec
+        };
+        let library_prompt = prompt_for(&library_spec, None, Some(app_one), unborn.path());
+        assert!(
+            !library_prompt.contains("FRAMEWORK:") && !library_prompt.contains("THE DESIGN"),
+            "a library is offered no framework and no application's design:
+{library_prompt}"
         );
     }
 
@@ -3420,6 +3894,35 @@ mod tests {
         assert_eq!(steps[4].step_type, CreationStepType::ParseAndValidate);
     }
 
+    /// The shape a **live** run of the application-creation loop produced (2026-09-26): `type` as the
+    /// step-type key, with the step's own fields *beside* it rather than wrapped. Every one of that
+    /// plan's eight steps was discarded — an entire plan rejected for its key's **name** — which is the
+    /// failure mode this family of tests exists for, and the reason a live run is worth more than any
+    /// number of scripted ones.
+    #[test]
+    fn parse_fill_steps_handles_the_flat_type_shape() {
+        let text = r##"{"steps": [
+            {"type": "create_directory", "path": "main/components"},
+            {"type": "write_source_file", "path": "main/main.cpp",
+             "content": "#include <cstdio>\nint main() { return 0; }\n"},
+            {"type": "build"}
+        ]}"##;
+        let steps = parse_fill_steps(text).expect("the shape a live run produced parses");
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        assert_eq!(steps[0].step_type, CreationStepType::CreateDirectory);
+        assert_eq!(steps[0].parameters["path"], "main/components");
+        assert_eq!(steps[1].step_type, CreationStepType::WriteSourceFile);
+        assert_eq!(steps[1].parameters["path"], "main/main.cpp");
+        assert!(
+            steps[1].parameters["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("int main")),
+            "the source beside `type` is the step's content: {:?}",
+            steps[1].parameters
+        );
+        assert_eq!(steps[2].step_type, CreationStepType::Build);
+    }
+
     /// Regression test from the SECOND live deterministic-json response
     /// (captured 2026-08-18): the model used `"step"` as the step-type key
     /// (previous run used `"action"`) with `"arguments"` for params, and a
@@ -3628,6 +4131,7 @@ public:
             files: vec![],
             structure: spire_core::build_types::ProjectStructure::default(),
             embedded: false,
+            design_warning: None,
         });
         let step = CreationStep {
             id: "fill-1".to_string(),
@@ -3671,5 +4175,153 @@ public:
         assert!(config.contains("// swift-tools-version"));
         assert!(config.contains("PackageDescription"));
         assert!(config.contains("name: \"my_app\""));
+    }
+
+    /// **A scaffold does not render over a composition that is already there**, and everything it does
+    /// write is stated from the design that file carries.
+    ///
+    /// This is the write half of the resolution rule (see `idf_projects::design_for_scaffold`), and both
+    /// failures it closes are silent: a scaffold that wrote `REQUIRES` from nothing left an application
+    /// whose own `CMakeLists.txt` did not name the components its composition includes — a build error at
+    /// the `#include`, naming neither file; and one that wrote `composition.spire` from the design its
+    /// caller still held discarded the comments a person had left in it, which is the one thing a file has
+    /// that a record cannot.
+    #[test]
+    fn a_scaffold_leaves_an_authored_composition_alone_and_states_the_record_from_it() {
+        use crate::build::application_spec::{examples, parse_spec};
+        use crate::build::idf_projects::{
+            application_scaffold, design_for_scaffold, render_composition, APPLICATION_FILE,
+            COMPOSITION_FILE,
+        };
+
+        let authored = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let stale = parse_spec(examples::INSECT_TRAP).expect("the other worked example parses");
+        let root = tempfile::tempdir().unwrap();
+
+        // The file a person edited: the reviewed composition, plus a comment that is theirs and can only
+        // live in the file.
+        let on_disk = format!(
+            "{}\n# `moving_average` is a library we already have; the two drivers are stubs to fill.\n",
+            render_composition(&authored).unwrap()
+        );
+        std::fs::write(root.path().join(COMPOSITION_FILE), &on_disk).unwrap();
+
+        // A caller that still holds the design it used to — it resolves to the tree's, which is the point.
+        let resolved = design_for_scaffold(
+            root.path(),
+            Some(spire_core::build_types::ProjectStructure::IdfApplication),
+            Some(stale),
+        )
+        .expect("the tree's design resolves");
+        assert_eq!(resolved.spec.as_ref(), Some(&authored));
+
+        let out = application_scaffold(
+            "pm25-meter",
+            &[],
+            "../sensor-library",
+            resolved.spec.as_ref(),
+        )
+        .expect("the application scaffolds");
+        // As `ScaffoldProject` starts it: nothing recorded, so what is locked is what this write decided.
+        let mut spec = spec_from_scaffold_output(out.clone(), "C++");
+        // …and the report the leg threads onto it, from the same resolution — so the wizard's banner
+        // has something to show on exactly this run, the one where the reviewed design was dropped.
+        spec.design_warning = resolved.dropped;
+        spec.structural_files.clear();
+        materialize_scaffold_files(root.path(), &out.files, &mut spec)
+            .expect("the scaffold is written");
+
+        // The composition is the person's, byte for byte — comment and all.
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(COMPOSITION_FILE)).unwrap(),
+            on_disk,
+            "a scaffold does not render over the file it read the design from"
+        );
+        assert!(
+            spec.structural_files.iter().any(|p| p == COMPOSITION_FILE),
+            "and it is still locked, whether or not this run wrote it: {:?}",
+            spec.structural_files
+        );
+
+        // The record, by contrast, is the tool's: written, and stating the composition the file holds
+        // rather than the design the caller had.
+        assert_eq!(
+            parse_spec(&std::fs::read_to_string(root.path().join(APPLICATION_FILE)).unwrap())
+                .expect("the record parses"),
+            authored,
+            "the record follows the file it was read from"
+        );
+
+        // And the application's own `CMakeLists.txt` names the components the composition names — the
+        // build failure this whole resolution exists to prevent. The framework first, then the
+        // composition's own (`messages` and one component per actor), then the library's.
+        let cmake = std::fs::read_to_string(root.path().join("main/CMakeLists.txt")).unwrap();
+        assert!(
+            cmake.contains(
+                "REQUIRES actors toolkit messages sampler air_quality view touch power sps30 sht20 moving_average"
+            ),
+            "the requirements are stated from the design the tree carries: {cmake}"
+        );
+
+        // And the **report**: this run dropped the caller's design, so the spec the wizard reads
+        // carries the sentence for it. Silence here is the failure the report exists to prevent — a
+        // sheet that reviewed one decomposition and a tree built from another, saying nothing.
+        let told = spec
+            .design_warning
+            .expect("the drop is reported on the spec the wizard reads");
+        assert!(
+            told.contains(COMPOSITION_FILE),
+            "and the report names the file that decides, so it is actionable: {told}"
+        );
+    }
+
+    /// A tree with **no** composition gets one written: the file's first writing, not a rewrite over
+    /// something — which is what keeps the scaffold's `REQUIRES`, its record and its composition one
+    /// design rather than three statements about it.
+    #[test]
+    fn a_scaffold_writes_the_composition_it_was_designed_from_when_there_is_none() {
+        use crate::build::application_spec::{examples, parse_composition, parse_spec};
+        use crate::build::idf_projects::{
+            application_scaffold, design_for_scaffold, COMPOSITION_FILE,
+        };
+
+        let design = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let root = tempfile::tempdir().unwrap();
+        let resolved = design_for_scaffold(
+            root.path(),
+            Some(spire_core::build_types::ProjectStructure::IdfApplication),
+            Some(design.clone()),
+        )
+        .expect("the caller's design resolves");
+        assert_eq!(
+            resolved.spec.as_ref(),
+            Some(&design),
+            "there is no file to prefer"
+        );
+        assert_eq!(
+            resolved.dropped, None,
+            "and the ordinary case reports nothing: this is a project being created for the first time"
+        );
+
+        let out = application_scaffold(
+            "pm25-meter",
+            &[],
+            "../sensor-library",
+            resolved.spec.as_ref(),
+        )
+        .expect("the application scaffolds");
+        let mut spec = spec_from_scaffold_output(out.clone(), "C++");
+        spec.structural_files.clear();
+        materialize_scaffold_files(root.path(), &out.files, &mut spec)
+            .expect("the scaffold is written");
+
+        assert_eq!(
+            parse_composition(
+                &std::fs::read_to_string(root.path().join(COMPOSITION_FILE)).unwrap()
+            )
+            .expect("the file it wrote is readable by the reader it is for"),
+            design,
+            "the composition is written when there is none, and it is the reviewed design"
+        );
     }
 }

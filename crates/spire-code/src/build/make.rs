@@ -162,6 +162,8 @@ impl Actor for MakeBuildModule {
                 platforms: _platforms,
                 structure: _structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let bc = r#"$(CC) -std=c++17 src/main.cpp -o __P__

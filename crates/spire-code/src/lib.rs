@@ -16,10 +16,10 @@ pub mod actors;
 pub mod build;
 pub use build::{
     AstEdgeData, AstNodeData, AstParseResult, BuildModuleMessage, BuildOptions, BuildOutput,
-    CargoBuildModule, CmakeBuildModule, EspBuildModule, GoBuildModule, GradleBuildModule,
+    CargoBuildModule, CmakeBuildModule, GoBuildModule, GradleBuildModule, IdfBuildModule,
     LanguageConfig, MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability,
-    NodeBuildModule, ParseSummary, PythonBuildModule, Rp2040BuildModule, RubyBuildModule,
-    SwiftBuildModule, TestOptions,
+    NodeBuildModule, ParseSummary, PythonBuildModule, RubyBuildModule, SwiftBuildModule,
+    TestOptions,
 };
 pub mod device;
 pub mod ffi;
@@ -46,4 +46,5 @@ pub use spire_core::actors::{Actor, ToolInfo};
 #[doc(hidden)]
 pub static PLATFORM_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub mod capabilities;
 pub mod capability_vocabulary;

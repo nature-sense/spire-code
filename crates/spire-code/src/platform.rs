@@ -143,6 +143,15 @@ pub struct Platform {
     /// BSP has been proven on a board.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hal: Option<PlatformHal>,
+    /// The board's BSP, as the platform's SDK names it (`bsp: m5stack_core_s3` in the board YAML).
+    ///
+    /// **Board-scoped**, where [`PlatformHal`] is chip-scoped: one chip serves several boards, while
+    /// the BSP brings up *this* board's display, touch and power. Under ESP-IDF that is a managed
+    /// component name (`espressif/m5stack_core_s3`), not a Rust crate. Absent means the board is
+    /// served by Spire's own generated backend, which keeps "we generate it" distinguishable from
+    /// "someone else's".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bsp: Option<String>,
     /// Rust toolchain, for targets whose build is not a C cross-compile (`os: "esp-idf"`).
     ///
     /// Absent for the C platforms, whose toolchain is [`PlatformToolchain`]. Kept separate
@@ -1548,6 +1557,7 @@ sysroot:
             family: None,
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1683,6 +1693,7 @@ rust:
             family: None,
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1715,6 +1726,7 @@ rust:
             family: None,
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1747,6 +1759,7 @@ rust:
             family: None,
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1771,6 +1784,7 @@ rust:
             family: None,
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             device: None,
             library_hints: None,
@@ -1925,6 +1939,7 @@ sysroot:
             family: None,
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             device: None,
             library_hints: None,

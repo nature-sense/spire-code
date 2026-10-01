@@ -19,7 +19,11 @@ use spire_code::actors::{
     CoordinatorMessage, FfiSharedState, LlmActor, LlmConfig, McpClientActor, ProjectAnalyzerActor,
     ProjectAnalyzerMessage, ProjectQueryMessage, SystemActor, ToolRouterActor, ToolsActor,
 };
-use spire_code::build::{BuildModuleMessage, MesonBuildModule};
+use spire_code::build::{BuildModuleMessage, IdfBuildModule, MesonBuildModule};
+use spire_code::subsystems::project::project_creation::{
+    ProjectCreationActor, ProjectCreationMessage,
+};
+use spire_core::modules::{FilesystemMessage, FilesystemModule};
 use spire_core::subsystems::graph::memory_graph::{MemoryGraphActor, MemoryGraphMessage};
 use tokio::sync::mpsc;
 
@@ -100,9 +104,11 @@ async fn system(llm_url: &str) -> System {
 }
 
 /// The same system, with whatever `LlmConfig` the caller supplies — including the REAL one
-/// from `~/.spire/llm-config.json`. That is how the live-model test reaches DeepSeek without
-/// a key ever appearing in this file: `load_global_llm_config()` is the same loader the app
-/// calls at startup (startup_phases.rs:1087), so the test sees exactly what the app sees.
+/// from the app's own config (`~/.spire/<app>/llm-config.json`; `SPIRE_APP_NAME=spire-code`
+/// when running a *test* binary, which is not named `spire-code`). That is how the live-model
+/// tests reach DeepSeek without a key ever appearing in this file:
+/// `load_global_llm_config()` is the same loader the app calls at startup
+/// (startup_phases.rs:1087), so the test sees exactly what the app sees.
 async fn system_with_llm(llm_config: LlmConfig) -> System {
     let system = ActorSystem::new();
 
@@ -113,8 +119,12 @@ async fn system_with_llm(llm_config: LlmConfig) -> System {
 
     let (chat_tx, _) = system.spawn(ChatActor::new());
     let (mcp_tx, _) = system.spawn(McpClientActor::new());
+    // Read before the config moves into the LLM actor, and kept for the creation actor below.
+    let has_llm_key = !llm_config.api_key.is_empty();
     let (llm_tx, _) = system.spawn(LlmActor::new(llm_config));
     let (system_tx, _) = system.spawn(SystemActor::new());
+    let creation_mcp_tx = mcp_tx.clone();
+    let creation_llm_tx = llm_tx.clone();
 
     // The build manager needs the LLM too: `hal_generate_impl` answers "LLM unavailable —
     // the build manager is not connected to the LLM service" without it (ffi.rs:315).
@@ -176,6 +186,22 @@ async fn system_with_llm(llm_config: LlmConfig) -> System {
     let _ = registry.register::<MemoryGraphMessage>("memory_graph", memory_graph_tx.clone());
     let _ = registry.register::<MemoryGraphMessage>("knowledge_graph", memory_graph_tx.clone());
     let _ = registry.register::<ProjectQueryMessage>("project.query", project_query_tx);
+    // The **creation actor** and the filesystem it writes through. Without these, every
+    // `createProject/*` request answers "lost: channel closed" — the registry has nothing under
+    // `project_creation`, the dummy sender swallows the request and the reply channel drops. That is
+    // what a creation run discovers and unit tests cannot: the flows are the flows, and the *wiring*
+    // is what makes them reachable.
+    let fs_tx = spawn_module(FilesystemModule::new());
+    let _ = registry.register::<FilesystemMessage>("filesystem", fs_tx.clone());
+    let mut project_creation =
+        ProjectCreationActor::new(fs_tx.clone(), bm_tx.clone(), creation_mcp_tx);
+    if has_llm_key {
+        project_creation.set_llm(creation_llm_tx);
+    }
+    project_creation.set_memory_graph(memory_graph_tx.clone());
+    let (project_creation_tx, _) = system.spawn(project_creation);
+    let _ = registry
+        .register::<ProjectCreationMessage>("project_creation", project_creation_tx.clone());
     // The language modules. The manager starts with an EMPTY router, so a project's build
     // system is recognised only once its module is registered — the step that made
     // `build_analyze` answer "No known build config". Meson is what this fixture needs; the
@@ -183,6 +209,12 @@ async fn system_with_llm(llm_config: LlmConfig) -> System {
     let meson_tx = spawn_module(MesonBuildModule::new());
     let _ = registry.register::<BuildModuleMessage>("build_module_meson", meson_tx.clone());
     register_build_module("meson", meson_tx, &bm_tx).await;
+    // ESP-IDF, for the application-creation run: a scaffold is routed by the **config file** a module
+    // claims, so without this the manager answers "no build module owns config file
+    // 'sdkconfig.defaults'" and neither ESP-IDF project type can be created at all.
+    let idf_tx = spawn_module(IdfBuildModule::new());
+    let _ = registry.register::<BuildModuleMessage>("build_module_idf", idf_tx.clone());
+    register_build_module("esp-idf", idf_tx, &bm_tx).await;
     let _ = coord_tx
         .send(CoordinatorMessage::SetFfiDeps {
             registry,
@@ -605,7 +637,11 @@ async fn a_real_model_fixes_a_real_defect() {
     // ── The gate ──
     let llm_config = spire_core::config::load_global_llm_config();
     if llm_config.api_key.is_empty() {
-        eprintln!("skipped: no deepseek.api_key in ~/.spire/llm-config.json");
+        eprintln!(
+            "skipped: no deepseek.api_key in {}\n             A test binary is not named `spire-code`, so `SPIRE_APP_NAME=spire-code` is what
+             points this at the app's own config dir.",
+            spire_core::config::llm_config_path().display()
+        );
         return;
     }
     eprintln!(
@@ -692,4 +728,541 @@ async fn a_real_model_fixes_a_real_defect() {
         serde_json::json!(true),
         "what the model wrote does not build: {rebuilt}"
     );
+}
+// ─────────────────────────────────────────────────────────────────────────────────────
+// The **application-creation loop**, end to end, with a real model.
+//
+// Gated the same way the live fix run is: `#[ignore]` so a plain `cargo test` never spends money or
+// network, and a runtime check so that even `--ignored` skips cleanly with no key configured. Two more
+// gates, because this one needs a library to design against and a place to put a product:
+//
+//   SPIRE_LIVE_LIBRARY=<an ESP-IDF component library>   the library the application is built against
+//   SPIRE_LIVE_WORKSPACE=<a directory to create in>     where the product is scaffolded
+//   SPIRE_APP_NAME=spire-code                           so the loader finds the app's own config
+//
+//     SPIRE_APP_NAME=spire-code SPIRE_LIVE_LIBRARY=~/spire-idf SPIRE_LIVE_WORKSPACE=/tmp/app-one \
+//       cargo test -p spire-code --test system_flow_tests -- --ignored --nocapture
+//
+// **The library is copied, never written to.** The copy is what the design reads its facts from and what
+// the design is applied to, so a run leaves the original untouched and can be repeated.
+// ─────────────────────────────────────────────────────────────────────────────────────
+#[ignore = "live model: spends real DeepSeek calls — run explicitly with `--ignored`"]
+#[tokio::test]
+async fn a_real_model_designs_builds_and_fills_an_application() {
+    use spire_code::build::application_spec::{validate, ApplicationSpec, UnitKind, UnitSource};
+
+    // ── The gates ──
+    let llm_config = spire_core::config::load_global_llm_config();
+    if llm_config.api_key.is_empty() {
+        eprintln!(
+            "skipped: no deepseek.api_key in {}\n             A test binary is not named `spire-code`, so `SPIRE_APP_NAME=spire-code` is what
+             points this at the app's own config dir.",
+            spire_core::config::llm_config_path().display()
+        );
+        return;
+    }
+    let Ok(library_source) = std::env::var("SPIRE_LIVE_LIBRARY") else {
+        eprintln!("skipped: set SPIRE_LIVE_LIBRARY to a component library to design against");
+        return;
+    };
+    let Ok(workspace) = std::env::var("SPIRE_LIVE_WORKSPACE") else {
+        eprintln!("skipped: set SPIRE_LIVE_WORKSPACE to a directory to create the product in");
+        return;
+    };
+    let workspace = std::path::PathBuf::from(workspace);
+    std::fs::create_dir_all(&workspace).expect("create the workspace");
+
+    // The library is copied: a run reads its facts and writes the design's components into the *copy*,
+    // so the original is never touched and the run can be repeated.
+    let library = workspace.join("library");
+    let _ = std::fs::remove_dir_all(&library);
+    copy_tree(std::path::Path::new(&library_source), &library);
+    let manifest = std::fs::read_to_string(library.join("CMakeLists.txt")).expect("its manifest");
+    assert!(
+        spire_code::build::idf_projects::declares_library(&manifest),
+        "{library_source} is not a component library"
+    );
+    eprintln!(
+        "live: {} against {}, library {library_source} ({} components)",
+        llm_config.planning_model,
+        llm_config.api_url,
+        spire_code::build::idf_projects::component_names(&library).len()
+    );
+
+    let sys = system_with_llm(llm_config).await;
+
+    // ── 1. Design ──
+    // The design form's six answers, in the words a person would use, and the real library: the
+    // components it names as `existing` are the ones this library actually has.
+    let description = "A desktop air-quality meter on an M5Stack Core S3. It reads particulates \
+                       (PM1/2.5/4/10) from an SPS30 and temperature/humidity from an SHT20, both on \
+                       the internal I2C bus. It shows the current reading and a rolling average on the \
+                       built-in screen, and lets me recalibrate from the touch screen. It samples about \
+                       once a second and keeps working, with a warning, if one sensor is missing.";
+    let designed = sys
+        .call(
+            "createProject/DesignApplication",
+            serde_json::json!({
+                "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3", "hal": "m5unified" },
+                "description": description,
+                "libraryRoot": library.to_string_lossy(),
+            }),
+        )
+        .await;
+    let spec: ApplicationSpec = serde_json::from_value(designed["spec"].clone())
+        .unwrap_or_else(|e| panic!("the design did not come back as a spec: {e}\n{designed}"));
+    validate(&spec).expect("the design phase only returns a spec that passed the checks");
+    eprintln!(
+        "\n══ THE DESIGN (for review) ══\n{}\n",
+        serde_json::to_string_pretty(&spec).unwrap_or_default()
+    );
+
+    // Structure, not judgement: a person reviews the composition above; this pins what the loop
+    // depends on — the board that was asked for, and a design with something in it.
+    assert_eq!(spec.board.chip, "esp32s3");
+    assert_eq!(spec.board.bsp, "m5stack_core_s3");
+    assert!(
+        !spec.units.is_empty(),
+        "a design with no units is not a design"
+    );
+
+    // ── 2. Apply the design: the library gains the components it asked to be written ──
+    let applied = sys
+        .tool(
+            "idf_apply_design",
+            serde_json::json!({
+                "root": library.to_string_lossy(),
+                "application": spec,
+            }),
+        )
+        .await;
+    eprintln!(
+        "apply: {}",
+        serde_json::to_string_pretty(&applied).unwrap_or_default()
+    );
+    let after = spire_code::build::idf_projects::component_names(&library);
+    for unit in spec.units.iter().filter(|unit| {
+        // A **published** component is a managed dependency: `main/idf_component.yml` resolves it, so
+        // the library is not expected to have it.
+        unit.kind == UnitKind::Component
+            && !matches!(
+                unit.source,
+                Some(UnitSource::Existing) | Some(UnitSource::Published)
+            )
+    }) {
+        let ident = unit.id.replace('-', "_");
+        assert!(
+            after.contains(&ident),
+            "the design asked for `{ident}` and the library does not have it: {after:?}"
+        );
+        eprintln!(
+            "  {ident}: {:?}",
+            spire_code::build::idf_projects::component_kind(&library, &ident)
+        );
+    }
+
+    // ── 3. Scaffold the application, from the same spec ──
+    let app_root = workspace.join("pm25-meter");
+    let _ = std::fs::remove_dir_all(&app_root);
+    let scaffolded = sys
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "pm25-meter",
+                "rootDir": app_root.to_string_lossy(),
+                "language": "C++",
+                "structure": "idf_application",
+                "embedded": true,
+                "embeddedRoot": library.to_string_lossy(),
+                "application": spec,
+                // The loop, not the toolchain: a board build here would be about this machine.
+                "verifyBackends": false,
+            }),
+        )
+        .await;
+    assert!(
+        scaffolded.get("error").is_none(),
+        "the application did not scaffold: {scaffolded}"
+    );
+    let cmake = std::fs::read_to_string(app_root.join("CMakeLists.txt")).expect("its manifest");
+    let stated = spire_code::build::application_spec::declared_framework(&cmake);
+    eprintln!("app: framework stated = {stated:?}");
+    assert_eq!(
+        stated,
+        Ok(Some(spec.framework)),
+        "the application states the framework it was designed in:\n{cmake}"
+    );
+    assert!(
+        app_root
+            .join(spire_code::build::idf_projects::APPLICATION_FILE)
+            .is_file(),
+        "and carries the decomposition the fill phase reads"
+    );
+
+    // ── 4. Fill: the model writes `main/` from the design it was given ──
+    // The scaffold's answer *is* the contract the fill respects, so it is passed straight through
+    // rather than reconstructed here.
+    let filled = sys
+        .call(
+            "createProject/Fill",
+            serde_json::json!({
+                "goal": description,
+                "rootDir": app_root.to_string_lossy(),
+                "spec": scaffolded,
+                "embeddedRoot": library.to_string_lossy(),
+            }),
+        )
+        .await;
+    assert!(
+        filled.get("error").is_none(),
+        "the fill leg failed: {filled}"
+    );
+    let plan = filled.get("plan").unwrap_or(&filled);
+    let steps = plan
+        .get("steps")
+        .and_then(|steps| steps.as_array())
+        .unwrap_or_else(|| panic!("the fill returned no plan: {filled}"));
+    eprintln!("fill: {} steps", steps.len());
+    let writes: Vec<serde_json::Value> = steps
+        .iter()
+        .filter(|step| {
+            // The plan is serialized for the wire, so the step's type arrives as `stepType`.
+            step.get("stepType").and_then(|t| t.as_str()) == Some("write_source_file")
+                || step.get("step_type").and_then(|t| t.as_str()) == Some("write_source_file")
+        })
+        .cloned()
+        .collect();
+    assert!(
+        !writes.is_empty(),
+        "a fill that writes nothing is not a fill: {filled}"
+    );
+    assert!(
+        writes.iter().any(|step| step["parameters"]["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("main/"))),
+        "the composition belongs in `main/`: {writes:?}"
+    );
+
+    // ── 5. Write what it planned, and say what it did not ──
+    // The write steps only: the plan's parse and build gates are the app's to run (they need the ESP-IDF
+    // toolchain and a chip target, and a build failure here would be about this machine, not the loop).
+    let written = sys
+        .call(
+            "createProject/ExecutePlan",
+            serde_json::json!({
+                "rootDir": app_root.to_string_lossy(),
+                "steps": writes,
+            }),
+        )
+        .await;
+    eprintln!(
+        "executed: {}",
+        serde_json::to_string_pretty(&written).unwrap_or_default()
+    );
+    let main_cpp = app_root.join("main/main.cpp");
+    assert!(
+        main_cpp.is_file(),
+        "the plan said it would write `main/` and did not"
+    );
+    let body = std::fs::read_to_string(&main_cpp).unwrap_or_default();
+    eprintln!(
+        "\n══ main/main.cpp ({} bytes) ══\n{}\n",
+        body.len(),
+        body.chars().take(4000).collect::<String>()
+    );
+
+    // The design's units and board facts have to be *in* what was written, not merely in the prompt:
+    // what was filled is the application that was reviewed. Names are compared with separators stripped
+    // and case folded — the design says `rolling_average` and C++ writes `RollingAverage`, and a test
+    // that insisted on one of them would be testing the model's spelling rather than the loop.
+    let mut composed = String::new();
+    for entry in std::fs::read_dir(app_root.join("main")).expect("the source tree exists") {
+        let path = entry.expect("an entry").path();
+        if path.is_file() {
+            composed.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        }
+    }
+    assert!(
+        !composed.trim().is_empty(),
+        "the fill wrote nothing into main/"
+    );
+    let folded = composed.to_lowercase().replace(['_', '-'], "");
+    for unit in &spec.units {
+        let designed_name = unit.id.to_lowercase().replace(['_', '-'], "");
+        assert!(
+            folded.contains(&designed_name),
+            "`{}` was designed and `main/` does not name it",
+            unit.id
+        );
+    }
+    // **A stub is a boundary, not an API.** A component the design marked `stub` has a header that is a
+    // shape and a `TODO` — nothing callable — so the composition has to leave its calls open rather than
+    // invent them. The first live build failed on exactly that: `RollingAverage::push`, an initializer
+    // the stub does not take, and a `uint8_t` address passed where a `BusHandle` is wanted. A `TODO`
+    // where the call belongs is the shape that compiles, and the shape a person finishes after writing
+    // the protocol.
+    if spec.units.iter().any(|unit| {
+        unit.kind == spire_code::build::application_spec::UnitKind::Component
+            && !matches!(
+                unit.source,
+                Some(spire_code::build::application_spec::UnitSource::Existing)
+                    | Some(spire_code::build::application_spec::UnitSource::Published)
+            )
+    }) {
+        assert!(
+            composed.contains("TODO"),
+            "every component in this design is a stub, and `main/` invented their calls instead of \
+             leaving them open — which is a composition that cannot compile"
+        );
+    }
+    // A board fact is the *application's* — the rule the whole component library rests on — so it is in
+    // `main/`, which is where a reviewer looks for it.
+    for fact in &spec.board_facts {
+        if !fact.address.trim().is_empty() {
+            assert!(
+                composed.contains(&fact.address),
+                "the design's board fact for `{}` (at {}) did not reach the application",
+                fact.device,
+                fact.address
+            );
+        }
+    }
+
+    // ── 5. Is it the composition that was reviewed? ─────────────────────────────────────────────────
+    //
+    // Every assertion above passes for a `main/` that names each component and then writes **its own**:
+    // a live run did exactly that — one flat FreeRTOS poll loop, `xTaskCreate`, and `class Sps30` /
+    // `class Sht20` in `main/sensors.h` — and every name the design used was present. Naming a
+    // component is not using it. The gate is what tells the two apart, so the loop ends on it rather
+    // than on the file having been written.
+    let verified = sys
+        .call(
+            "createProject/VerifyApplication",
+            serde_json::json!({
+                "rootDir": app_root.to_string_lossy(),
+                "application": &spec,
+            }),
+        )
+        .await;
+    let gaps = verified["gaps"].as_array().cloned().unwrap_or_default();
+    eprintln!(
+        "verify: {} — {}",
+        if gaps.is_empty() {
+            "composed"
+        } else {
+            "NOT composed"
+        },
+        serde_json::to_string_pretty(&gaps).unwrap_or_default()
+    );
+    assert!(
+        gaps.is_empty(),
+        "the fill was handed the reviewed composition and did not write it:\n{}",
+        serde_json::to_string_pretty(&gaps).unwrap_or_default()
+    );
+
+    // ── 5. And it is **built**, where this machine can ──────────────────────────────────────────────
+    //
+    // The scaffold's contract is a file **cmake reads**, and an assertion about a substring is not a
+    // reader: four defects of this scaffold were invisible to every test in the suite — a leftover
+    // `__FRAMEWORK_BLOCK__` line, an absolute library path concatenated onto the application's own, a
+    // `SRCS` glob IDF takes literally, and no `REQUIRES` at all — and a real build found each one. What
+    // this step does is put that reader *inside* the loop, so the model's composition is compiled by the
+    // compiler and not by the person who opens the project.
+    //
+    // `SPIRE_LIVE_BUILD_COMMAND` is the whole environment contract: a shell command run **in the
+    // application's directory** that builds it. Shelling out to a command rather than calling `idf.py`
+    // is deliberate — this machine's `export.sh` is broken (an unsupported system ninja and a venv
+    // activation error), so the command is a person's own working invocation. The gate says where it
+    // looked when it cannot run, because a gate that skips silently looks exactly like a gate that
+    // passed.
+    match std::env::var("SPIRE_LIVE_BUILD_COMMAND") {
+        Ok(command) => {
+            // The **break**: the repair turn is the one part of this loop that only runs when something
+            // is wrong, so the only deterministic way to test it is to make something wrong on purpose.
+            // A failing `static_assert` appended to `main.cpp` is an error a whole-file rewrite removes —
+            // and it is in the one directory the scaffold leaves open.
+            let broke = std::env::var("SPIRE_LIVE_BREAK_BUILD").is_ok();
+            if broke {
+                let broken = app_root.join("main/main.cpp");
+                let mut content = std::fs::read_to_string(&broken).unwrap_or_default();
+                content.push_str(
+                    "\n// Deliberate: this gate proves the repair turn runs.\n\
+                     static_assert(sizeof(int) == 0, \"deliberate break\");\n",
+                );
+                std::fs::write(&broken, content).expect("the break is written");
+                eprintln!("break: appended a failing static_assert to main/main.cpp");
+            }
+
+            let mut log = build(&app_root, &command);
+            let mut errors = compiler_errors(&log);
+            eprintln!(
+                "\n══ THE BUILD — {} ══",
+                if errors.is_empty() {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            );
+            report_errors(&errors);
+
+            // A build that failed is not an answer, so the loop repairs and rebuilds — **twice at
+            // most**, because errors cascade: a syntax error hides every type error in the file it
+            // broke, so the first pass fixes what the compiler could see and the second fixes what it
+            // could see after that. The diagnostics are handed over *verbatim* — the compiler's own
+            // lines, notes included, because the note that says what the compiler expected is usually
+            // the whole repair — and the repair returns steps the caller executes through the same path
+            // the fill's steps take, which is where the structural guard lives.
+            for pass in 1..=2 {
+                if errors.is_empty() {
+                    break;
+                }
+                let repaired = sys
+                    .call(
+                        "createProject/RepairFromBuild",
+                        serde_json::json!({
+                            "rootDir": app_root.to_string_lossy(),
+                            "diagnostics": log,
+                            "spec": scaffolded,
+                        }),
+                    )
+                    .await;
+                let steps = repaired
+                    .get("steps")
+                    .and_then(|steps| steps.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                eprintln!(
+                    "\n══ THE REPAIR (pass {pass}) ══\n  {} step(s); {} refused; {} outside what a repair \
+                     may touch",
+                    steps.len(),
+                    repaired
+                        .get("refused")
+                        .and_then(|v| v.as_array())
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    repaired
+                        .get("unrepaired")
+                        .and_then(|v| v.as_array())
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                );
+                for entry in repaired
+                    .get("unrepaired")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    eprintln!("  not ours to fix: {}", entry.as_str().unwrap_or_default());
+                }
+                assert!(
+                    repaired.get("error").is_none(),
+                    "the repair leg failed: {repaired}"
+                );
+                // Nothing to rewrite means nothing will change on a rebuild, and re-asking the same
+                // question about the same log is a loop with no exit.
+                if steps.is_empty() {
+                    break;
+                }
+                let applied = sys
+                    .call(
+                        "createProject/ExecutePlan",
+                        serde_json::json!({
+                            "rootDir": app_root.to_string_lossy(),
+                            "steps": steps,
+                        }),
+                    )
+                    .await;
+                eprintln!(
+                    "  applied: {}",
+                    serde_json::to_string(&applied).unwrap_or_default()
+                );
+                log = build(&app_root, &command);
+                errors = compiler_errors(&log);
+                eprintln!(
+                    "\n══ THE BUILD AFTER REPAIR {pass} — {} ══",
+                    if errors.is_empty() { "passed" } else { "failed" }
+                );
+                report_errors(&errors);
+            }
+            // The one thing asserted about the *scaffold*: the application's **own** component reached
+            // the compiler. That is its contract — a manifest that collects the sources, names the
+            // framework's and the design's components and resolves the library — and it is exactly what
+            // was broken while every other assertion in this suite passed.
+            assert!(
+                log.contains("esp-idf/main/CMakeFiles/__idf_main")
+                    || log.contains("Project build complete"),
+                "the application's own component never reached the compiler, so cmake did not accept \
+                 what the scaffold wrote:\n{}",
+                log.lines().rev().take(30).collect::<Vec<_>>().join("\n")
+            );
+            // And the one thing asserted about the **loop**: it ends with a build that passes. With the
+            // deliberate break in place that is the repair's verdict and nothing else — the second build
+            // cannot pass unless the rewrite removed the break. Without it, the compiler is judging the
+            // model's composition, which is what the loop exists to have judged.
+            assert!(
+                errors.is_empty(),
+                "the application did not build{}: the repair turn {} it. The compiler said:\n{}",
+                if broke { " after a deliberate break" } else { "" },
+                if broke { "did not fix" } else { "was not needed by" },
+                errors.join("\n  ")
+            );
+        }
+        Err(_) => eprintln!(
+            "\nbuild: skipped — SPIRE_LIVE_BUILD_COMMAND was not set, so nothing built {}. It is the \
+             command that builds in the application's directory (e.g. `. ~/esp/esp-idf/export.sh; idf.py \
+             build`).",
+            app_root.display()
+        ),
+    }
+
+    eprintln!(
+        "\n✓ the loop ran: designed → applied → scaffolded → filled → built, at {}",
+        workspace.display()
+    );
+}
+
+/// Run the build command in the application's directory, in the environment it inherits.
+fn build(root: &std::path::Path, command: &str) -> String {
+    let output = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .output()
+        .expect("the build command runs");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The compiler's own error lines, which is what a repair turn is given.
+fn compiler_errors(log: &str) -> Vec<String> {
+    log.lines()
+        .filter(|line| line.contains("error:"))
+        .map(|line| line.trim().to_string())
+        .collect()
+}
+
+fn report_errors(errors: &[String]) {
+    if errors.is_empty() {
+        eprintln!("  no compiler errors");
+    }
+    for error in errors {
+        eprintln!("  {error}");
+    }
+}
+
+/// Copy a directory tree — the library is copied rather than written to, so a live run is repeatable.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create the copy");
+    for entry in std::fs::read_dir(from).expect("read the source") {
+        let entry = entry.expect("an entry");
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a file");
+        }
+    }
 }

@@ -5,6 +5,10 @@
 #   make swift     — build the Swift UI executable
 #   make app       — build everything + assemble build/Spire.app (double-clickable)
 #   make run       — assemble + launch the app
+#   make run-idf   — assemble + launch it **with an exported ESP-IDF environment** — the app resolves one
+#                    itself when it has none, so this is for *choosing* one
+#                    (`build/run-with-idf.sh --check` proves the environment;
+#                    `build/run-with-idf.sh -- <command>` runs a command in it)
 #   make test      — run Rust + Swift tests (formatting is checked first)
 #   make fmt       — format the Rust crates (this one + the spire-core sibling)
 #   make fmt-check — fail if anything is unformatted
@@ -14,7 +18,7 @@
 # fmt targets can reach it. Keeping both formatted stops the drift that made an
 # earlier `cargo fmt` run reformat 43 files at once.
 
-.PHONY: rust swift app run test fmt fmt-check clean
+.PHONY: rust swift app run run-idf test fmt fmt-check clean
 
 rust:
 	cargo build --release -p spire-code
@@ -27,6 +31,12 @@ app:
 
 run: app
 	@open ./build/Spire.app
+
+# The same app, launched with an ESP-IDF environment resolved *first*, so that a chip build inside it runs
+# in an environment a person chose rather than the one the app resolves for itself when it has none. This
+# execs the binary instead of `open`, so the app inherits the environment.
+run-idf: app
+	@./build/run-with-idf.sh
 
 fmt:
 	cargo fmt

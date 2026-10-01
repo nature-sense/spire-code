@@ -1,0 +1,79 @@
+# Device wisdom corpus: **esp-idf-lib** (UncleRus/esp-idf-lib) — ninety-odd device
+# drivers for ESP-IDF, one per `components/<name>/`, from air-quality sensors and
+# ADCs to displays and rotary encoders. It is the highest-value *third-party*
+# corpus for a generated component, because it answers the question a driver task
+# actually starts with: **has somebody already written this device, and how is it
+# driven?**
+#
+# Scoped deliberately, and every pattern below was checked against the real tree
+# (94 components) rather than assumed — a pattern that matches nothing ingests
+# nothing, and the failure looks like bad retrieval rather than like a typo.
+#
+#   * `components/*/*.h` — the public API of every driver. The doc comments in
+#     these headers *are* the reference (docs.rs-style: the same source renders
+#     them). A component may carry more than one header — `color/rgb.h` and
+#     `color/hsv.h`, `framebuffer/fbanimation.h` — which is why this takes every
+#     header at the component root rather than `<name>.h` alone. The layout is
+#     **flat**: no component nests a public header, so one depth is the honest
+#     form here and a `**/` variant would only invite a second copy of each.
+#   * `components/*/.eil.yml` — the **catalogue**: each driver states its name,
+#     description, group, bus and dependencies in this file. That is the
+#     structured half of "what exists", and the cheapest way for a plan to
+#     discover that a driver for a device is already here and which bus it wants.
+#   * `examples/*/default/main/*.c` — how each driver is **actually driven**. A
+#     call shape is usually visible here and nowhere else.
+#   * `README.md`, `FAQ.md`, `Metadata.md`, `Porting.md` — the library's own
+#     prose: how it is installed, what the `.eil.yml` fields mean, how a driver
+#     is composed into an application, and the mistakes people make.
+#
+# What is *not* here: `components/*/*.c`. For retrieval the implementations are a
+# much larger and much less useful neighbour of the header that declares the same
+# API, and a chunk of somebody's bit-twiddling is exactly the near-miss that makes
+# a driver question return the wrong device. The `docs/` tree is left out for the
+# same reason — it is Doxygen output derived from these headers.
+version: "1.0"
+pipeline:
+  name: esp-idf-lib — the third-party device-driver library
+  corpus: esp-idf-lib
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: esp-idf-lib
+      patterns:
+        - "**/*.h"
+        - "**/*.c"
+        - "**/*.yml"
+        - "**/*.md"
+  sources:
+    - id: esp-idf-lib
+      type: github_repo
+      enabled: true
+      url: https://github.com/UncleRus/esp-idf-lib.git
+      processing:
+        parser: code
+        languages:
+          - "C"
+        # Include patterns are matched against the **absolute** path inside the
+        # clone, so every one of them carries its `**/` prefix (see the
+        # spire-core manifest). Each directory is listed at both depths where a
+        # file can sit at either — `**/examples/*/main/*.c` cannot match
+        # `examples/x/main/a/b.c`, and the nested form cannot match the flat one.
+        include_paths:
+          - "**/components/*/*.h"
+          - "**/components/*/.eil.yml"
+          - "**/examples/*/default/main/*.c"
+          - "**/examples/*/default/README.md"
+          - "**/README.md"
+          - "**/FAQ.md"
+          - "**/Metadata.md"
+          - "**/Porting.md"
+        # The includes are explicit, so this is a small list of things that would
+        # otherwise arrive with them: the drivers' licences (one per component,
+        # and a licence is not documentation), and the vendored dev tooling.
+        exclude_paths:
+          - "**/devtools/**"
+          - "LICENSE"
+          - "CHANGELOG.md"
+          - "CONTRIBUTING.md"

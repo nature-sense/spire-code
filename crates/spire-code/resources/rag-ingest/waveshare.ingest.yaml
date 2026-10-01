@@ -1,0 +1,100 @@
+# Board wisdom corpus: **Waveshare ESP32 components** (waveshareteam/Waveshare-ESP32-components)
+# — Waveshare's **own** board support packages and display drivers, the source
+# behind the `waveshare` namespace on the ESP Component Registry.
+#
+# This is the canonical source for a Waveshare board, and it is better than the
+# community alternative (`esp-cpp/espp`, which also carries Waveshare BSPs)
+# because it is the vendor's: the `bsp/` directory names match the product names,
+# the board facts come from the people who designed the board, and the display
+# drivers beside them are Waveshare's own rather than a re-implementation.
+#
+# The two boards this was gathered for, and where they live:
+#
+#   * **ESP32-S3-Touch-LCD-2.8B** (SKU 30103) → `bsp/esp32_s3_touch_lcd_2_8d`.
+#     The "B" and "D" are board revisions, not different hardware: both are a
+#     2.8-inch 480×480 panel on an **ST7701** display controller with a **GT911**
+#     touch controller, so the shipped BSP's pin map and bring-up apply as they
+#     are. (The revision suffix in a Waveshare BSP name — `4b`, `4_3c`, `2_8d` —
+#     is the board revision, and it is worth checking against the wiki when a
+#     board's *hardware* differs between them.)
+#   * **ESP32-P4-NANO** → `bsp/esp32_p4_nano`, a MIPI-DSI board built on
+#     Waveshare's own `esp_lcd_dsi` plus an `esp_lcd_hx8394`/`jd9365`/`ili9881c`
+#     panel driver.
+#
+# What it carries, and what it deliberately does not:
+#
+#   * `bsp/*/README.md` — the board's page: the **pin table**, the buses, what is
+#     fitted, and the bring-up. The single most valuable file per board, and the
+#     layer a generated component is forbidden to hold (a driver takes a bus
+#     handle and knows no pins).
+#   * `bsp/*/idf_component.yml` — the board's **dependency set**: which panel,
+#     touch, codec and expander it needs. It is the reproducible answer to "what
+#     has to be present", and it is where an application's `idf_component.yml`
+#     comes from.
+#   * `bsp/*/include/**/*.h` — the BSP API and its pin macros (`include/bsp/*.h`).
+#   * `display/**/README.md` and `display/**/include/**/*.h` — the LCD/DSI/touch
+#     driver components Waveshare publishes (`esp_lcd_dsi`, `hx8394`, `jd9365`,
+#     `ili9881c`, `st7703`, `st7735`, `ota7290b`, `sh8601`, `jd9165`, …), each
+#     with the API its panel is driven through.
+#   * `sensor/**/README.md` and headers — `qmi8658` (IMU) and `pcf85063a` (RTC),
+#     which are on these boards.
+#   * the repository's own `README.md`.
+#
+# What is *not* here: the implementations (`*.c`), the private headers
+# (`priv_include/`), the per-component `license.txt`, and **`lora/`** — the LR1121
+# components are a separate product line these applications do not use, and
+# leaving them out is one line to reverse if that changes.
+#
+# One honest gap, worth knowing when a panel question comes back thin: the panel
+# controller for the 2.8B is `espressif/esp_lcd_st7701` and its touch controller
+# `espressif/esp_lcd_touch_gt911` — **Espressif** components, not Waveshare ones —
+# so this corpus carries the board facts and the *Waveshare* drivers, and the
+# generic panel drivers come from the registry (or the `esp-bsp` corpus when the
+# same driver is published there).
+version: "1.0"
+pipeline:
+  name: Waveshare ESP32 components — BSPs and display drivers
+  corpus: waveshare
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: waveshare
+      patterns:
+        - "**/*.h"
+        - "**/*.md"
+        - "**/*.yml"
+  sources:
+    - id: waveshare
+      type: github_repo
+      enabled: true
+      url: https://github.com/waveshareteam/Waveshare-ESP32-components.git
+      processing:
+        parser: code
+        languages:
+          - "C"
+        # Absolute-path matching, so every pattern carries `**/`, and each
+        # directory that can hold a file at either depth lists both forms.
+        #
+        # `**/README.md` is the broad one, and it is deliberate: with `lora/`
+        # excluded it is exactly the repository README, the board pages, the
+        # driver pages and the sensor pages — measured on the real tree (719
+        # files, of which this claims 238), not assumed.
+        include_paths:
+          - "**/bsp/*/idf_component.yml"
+          - "**/bsp/*/include/*.h"
+          - "**/bsp/*/include/**/*.h"
+          - "**/display/**/include/*.h"
+          - "**/display/**/include/**/*.h"
+          - "**/sensor/**/include/*.h"
+          - "**/sensor/**/include/**/*.h"
+          - "**/README.md"
+        exclude_paths:
+          - "**/lora/**"
+          - "**/priv_include/**"
+          - "**/test_app/**"
+          - "**/*.c"
+          - "**/*.txt"
+          - "LICENSE"
+          - "**/.github/**"

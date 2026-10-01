@@ -520,6 +520,75 @@ async fn test_coordinator_ping() {
     assert_eq!(result, serde_json::json!({"pong": true}));
 }
 
+/// A build that produced **only warnings** is not a broken build — and the answer still has to be a
+/// *repair*.
+///
+/// The caller decodes `steps`/`diagnostics`/`refused`/`unrepaired`/`next`, and this reply once omitted
+/// the two lists it had no use for here: the far end, which requires them, turned a clean-ish build into
+/// "the repair could not run: Key 'refused' not found" and took the whole verify down with it.
+#[tokio::test]
+async fn test_coordinator_repair_from_a_warning_only_build_answers_with_a_whole_repair() {
+    let system = ActorSystem::new();
+    let (chat_tx, _) = system.spawn(ChatActor::new());
+    let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
+    let (mcp_tx, _) = system.spawn(McpClientActor::new());
+    let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig::default()));
+    let (system_tx, _) = system.spawn(SystemActor::new());
+
+    let (coord_tx, _handle) = system.spawn(CoordinatorActor::new(
+        chat_tx,
+        tools_tx,
+        mcp_tx,
+        llm_tx,
+        system_tx,
+        mock_memory_graph(),
+        mock_sender(),
+        mock_sender(),
+        mock_sender(),
+        mock_sender(),
+        mock_sender(),
+    ));
+
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    coord_tx
+        .send(CoordinatorMessage::HandleRequest {
+            method: "createProject/RepairFromBuild".to_string(),
+            params: serde_json::json!({
+                "rootDir": "/tmp/nowhere",
+                "diagnostics": "main/main.cpp:12:9: warning: unused variable 'x' [-Wunused-variable]\n",
+                "spec": {
+                    "structural_files": ["main/CMakeLists.txt"],
+                    "fill_roots": ["main"],
+                    "dependency_sections": ["main/idf_component.yml"],
+                    "platform_targets": ["esp32s3"],
+                    "build_system": "ESP-IDF",
+                },
+            }),
+            response_tx: resp_tx,
+        })
+        .await
+        .unwrap();
+    let reply = resp_rx.await.unwrap();
+
+    for key in ["steps", "diagnostics", "refused", "unrepaired", "next"] {
+        assert!(
+            reply.get(key).is_some(),
+            "the repair reply omits {key:?}, which is one of the keys the caller decodes: {reply}"
+        );
+    }
+    assert_eq!(reply["steps"], serde_json::json!([]));
+    assert_eq!(reply["diagnostics"], serde_json::json!(0));
+    assert_eq!(reply["refused"], serde_json::json!([]));
+    assert_eq!(reply["unrepaired"], serde_json::json!([]));
+    assert!(
+        reply["next"]
+            .as_str()
+            .expect("next")
+            .contains("no `error:` line"),
+        "and it says why there was nothing to do: {reply}"
+    );
+}
+
 #[tokio::test]
 async fn test_coordinator_chat_get_active_end_to_end() {
     let system = ActorSystem::new();
@@ -3112,6 +3181,11 @@ async fn test_build_default_registry_registers_project_meta_tools() {
         "project/test",
         "project/lint",
         "project/install",
+        // The **ESP Component Registry**, which a design reaches before it designs a driver: a tool that
+        // registers but is not advertised is a tool the model never sees, which is the failure this test
+        // family exists for.
+        "registry/search",
+        "registry/component",
     ] {
         assert!(
             names.iter().any(|n| n == tool),

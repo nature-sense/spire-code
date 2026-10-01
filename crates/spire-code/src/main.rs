@@ -384,17 +384,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     {
         use spire_code::Actor as _;
-        // Registered BY PLATFORM, not by config file. An esp-idf project is *also* a
-        // `Cargo.toml` project, so claiming that file would replace the cargo module above
-        // and send every Rust project down the ESP32 path.
-        let (esp_tx, esp_rx) =
+        // Registered BY PLATFORM, not by config file. An ESP-IDF project is *also* a CMake
+        // project, so claiming `CMakeLists.txt` would replace the cmake module above and send
+        // every CMake project down the ESP-IDF path.
+        let (idf_tx, idf_rx) =
             tokio::sync::mpsc::channel::<spire_code::build::BuildModuleMessage>(8);
-        spire_code::build::EspBuildModule::new().spawn(esp_rx);
+        spire_code::build::IdfBuildModule::new().spawn(idf_rx);
         // The capability is queried first because the registration carries it: the manager
         // gates `build_flash` on `supports_flash`, and a platform module whose capability was
         // never asked for would have to be given one the manager cannot trust.
         let (t, r) = tokio::sync::oneshot::channel();
-        let _ = esp_tx
+        let _ = idf_tx
             .send(spire_code::build::BuildModuleMessage::DescribeCapabilities { reply_to: t })
             .await;
         if let Ok(cap) = r.await {
@@ -402,52 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .send(BuildManagerMessage::AddPlatformModule {
                     os: "esp-idf".to_string(),
                     capability: cap,
-                    module_tx: esp_tx,
-                })
-                .await;
-        }
-    }
-    {
-        use spire_code::Actor as _;
-        // The **bare-metal** flavour of the same module, registered the same way for the same reason:
-        // the same chip facts and the same flash tool, but a stock rustup target instead of ESP-IDF —
-        // which is what `os: "esp-hal"` routes on. A second instance so the two capabilities name
-        // themselves apart.
-        let (esp_hal_tx, esp_hal_rx) =
-            tokio::sync::mpsc::channel::<spire_code::build::BuildModuleMessage>(8);
-        spire_code::build::EspBuildModule::for_os("esp-hal").spawn(esp_hal_rx);
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = esp_hal_tx
-            .send(spire_code::build::BuildModuleMessage::DescribeCapabilities { reply_to: t })
-            .await;
-        if let Ok(cap) = r.await {
-            let _ = bm_tx
-                .send(BuildManagerMessage::AddPlatformModule {
-                    os: "esp-hal".to_string(),
-                    capability: cap,
-                    module_tx: esp_hal_tx,
-                })
-                .await;
-        }
-    }
-    {
-        use spire_code::Actor as _;
-        // Registered BY PLATFORM, for the same reason as the esp module above: an rp2040 project
-        // is *also* a `Cargo.toml` project, so what differs is the invocation (a `thumbv6m`
-        // target, no vendor SDK, a different flasher) — and that is what `os: "rp2040"` routes on.
-        let (rp2040_tx, rp2040_rx) =
-            tokio::sync::mpsc::channel::<spire_code::build::BuildModuleMessage>(8);
-        spire_code::build::Rp2040BuildModule::new().spawn(rp2040_rx);
-        let (t, r) = tokio::sync::oneshot::channel();
-        let _ = rp2040_tx
-            .send(spire_code::build::BuildModuleMessage::DescribeCapabilities { reply_to: t })
-            .await;
-        if let Ok(cap) = r.await {
-            let _ = bm_tx
-                .send(BuildManagerMessage::AddPlatformModule {
-                    os: "rp2040".to_string(),
-                    capability: cap,
-                    module_tx: rp2040_tx,
+                    module_tx: idf_tx,
                 })
                 .await;
         }

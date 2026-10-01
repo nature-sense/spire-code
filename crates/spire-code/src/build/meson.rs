@@ -2267,6 +2267,8 @@ impl Actor for MesonBuildModule {
                 platforms,
                 structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let result = self.scaffold_layout(&project_name, &goal, &platforms, structure);

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 NatureSense
+#
+# ESP-IDF applies this on top of its own defaults the first time a project is configured, and
+# `sdkconfig` is what it writes as a result.
+#
+# **Only a symbol the project itself decides belongs here.** A board's facts belong to that board's
+# component, and a *framework's* requirements belong with that framework — which is to say, in the
+# hints of the component library that carries it, not in the shell every project starts from. That
+# is why this file is nearly empty: the tool does not know what will be added to it.
+
+# The main task starts the application and then, usually, waits. It is the one setting that is about
+# the shell rather than about anything in it.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

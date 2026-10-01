@@ -9,6 +9,8 @@ ui/swift/.swiftpm/
 /build/*.app/
 /build/*.framework/
 /build/*.dylib/
+# Written by build/run-with-idf.sh when this machine's `idf.py` does not run under its own interpreter.
+/build/idf-bin/
 
 # Local runtime data (graph snapshots per project) — anywhere in the tree
 **/.spire/

@@ -105,6 +105,8 @@ async fn ui_build_actions_are_routable_through_tools_call() {
         "build_lint",
         "build_format",
         "build_fix",
+        "idf_env_check",
+        "idf_env_fix",
     ] {
         assert!(
             registered.iter().any(|n| n == name),

@@ -25,6 +25,19 @@ impl CmakeBuildModule {
         let mut metadata = parse_key_value(path, "CMakeLists.txt", "")?;
         metadata.build_system = "CMake".to_string();
         metadata.project_type = "CMake_project".to_string();
+        // An **ESP-IDF** project states its own type in its root `CMakeLists.txt`, and this is where
+        // that is read. Analysis of one belongs to this module — its `CMakeLists.txt` *is* a CMake
+        // project (see `IdfBuildModule`, which owns only the invocation) — so the marker is read
+        // here rather than by a module of its own.
+        //
+        // Only a root carries the marker, so a component under it stays what it is: a component.
+        // `structure_from` returns `None` for every other CMake project, which is what keeps this
+        // from claiming the whole of Spire.
+        if let Ok(content) = std::fs::read_to_string(path.join("CMakeLists.txt")) {
+            if let Some(structure) = crate::build::idf_projects::structure_from(&content) {
+                metadata.structure = structure;
+            }
+        }
         Ok(metadata)
     }
 
@@ -163,6 +176,8 @@ impl Actor for CmakeBuildModule {
                 platforms: _platforms,
                 structure: _structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let bc = r#"cmake_minimum_required(VERSION 3.16)

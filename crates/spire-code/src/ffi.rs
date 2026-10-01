@@ -23,9 +23,9 @@ use crate::subsystems::project::project_install::{ProjectInstallActor, ProjectIn
 use crate::subsystems::project::project_lint::{ProjectLintActor, ProjectLintMessage};
 use crate::subsystems::project::project_test::{ProjectTestActor, ProjectTestMessage};
 use crate::{
-    BuildModuleMessage, CargoBuildModule, CmakeBuildModule, EspBuildModule, GoBuildModule,
-    GradleBuildModule, MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability,
-    NodeBuildModule, PythonBuildModule, Rp2040BuildModule, RubyBuildModule, SwiftBuildModule,
+    BuildModuleMessage, CargoBuildModule, CmakeBuildModule, GoBuildModule, GradleBuildModule,
+    IdfBuildModule, MakeBuildModule, MavenBuildModule, MesonBuildModule, ModuleCapability,
+    NodeBuildModule, PythonBuildModule, RubyBuildModule, SwiftBuildModule,
 };
 use spire_core::actors::rag::{RagActor, RagMessage};
 use spire_core::actors::tool_providers::ToolRouterActor;
@@ -34,6 +34,7 @@ use spire_core::actors::{
     McpClientMessage, MemoryGraphActor, MemoryGraphMessage, ProgressActor, ProgressMessage,
     SystemPromptActor, SystemPromptMessage, ToolsActor,
 };
+use spire_core::build_types::ProjectStructure;
 use spire_core::models::embedding::Embedder;
 use spire_core::modules::{
     FilesystemMessage, FilesystemModule, GitMessage, GitModule, ProcessMessage, ProcessModule,
@@ -288,6 +289,61 @@ fn init_actor_system() {
                 .await;
             let _ = r.await;
         }
+
+        // ── Seed the platform + capability graph ──
+        // The registry (boards + chips) is user-level, so it belongs in the shared knowledge store
+        // rather than a project graph. The CLI runs this through `PlatformBootstrapPhase`; the FFI
+        // never sends `SystemMessage::Initialize` (the phase chain waits for `project/open`), so
+        // without this step the app would never write the platform or capability nodes and edges —
+        // and the capability seeder would be invisible here. `platform_seed_payload` flattens each
+        // entry's capability blocks into the shape `spire-core`'s seeder consumes.
+        {
+            use spire_core::actors::MemoryGraphMessage as MgMsg;
+
+            let platforms: Vec<serde_json::Value> = crate::platform::Platform::load_registry()
+                .unwrap_or_default()
+                .iter()
+                .map(crate::actors::platform_codec::platform_seed_payload)
+                .collect();
+            let count = platforms.len();
+            let (t, r) = tokio::sync::oneshot::channel();
+            let _ = knowledge_graph_tx
+                .send(MgMsg::BootstrapPlatforms {
+                    platforms,
+                    reply_to: t,
+                })
+                .await;
+            match r.await {
+                Ok(Ok(())) => tracing::info!(
+                    "KnowledgeStore: platform + capability graph seeded ({count} entries)"
+                ),
+                Ok(Err(e)) => tracing::warn!("KnowledgeStore: platform seed failed: {e}"),
+                Err(e) => tracing::warn!("KnowledgeStore: platform seed response error: {e}"),
+            }
+
+            // Read it back and cache it in-process, the way `PlatformBootstrapPhase` does: the graph
+            // is the registry for the rest of the process, and reading it back is what proves the
+            // nodes the writer stored are legible to the reader.
+            let (t, r) = tokio::sync::oneshot::channel();
+            if knowledge_graph_tx
+                .send(MgMsg::GetPlatforms { reply_to: t })
+                .await
+                .is_ok()
+            {
+                if let Ok(Ok(nodes)) = r.await {
+                    let cached: Vec<crate::platform::Platform> = nodes
+                        .iter()
+                        .filter_map(crate::actors::platform_codec::platform_json_to_spire)
+                        .collect();
+                    let cached_count = cached.len();
+                    crate::platform::set_registry(cached);
+                    tracing::info!(
+                        "KnowledgeStore: platform registry cached from graph ({cached_count})"
+                    );
+                }
+            }
+        }
+
         let _ = registry.register::<MemoryGraphMessage>("knowledge_graph", knowledge_graph_tx.clone());
         // RagActor data plane → KnowledgeStore; project store kept for provenance.
         let (rag_tx, _) = system.spawn(RagActor::from_registry(
@@ -383,61 +439,25 @@ fn init_actor_system() {
         // the esp block instead (which pushed cargo's servers twice and the platform module's not
         // at all) — the ordering hid it, because the two registrations are adjacent.
         module_mcp_servers.push(cap);
-        // The ESP32 module registers BY PLATFORM, not by config file. An esp-idf project is
-        // *also* a `Cargo.toml` project, so claiming that file would replace the cargo module
-        // in the router and send every Rust project in Spire down the ESP32 path. Declaring
-        // `os: "esp-idf"` routes on what actually differs — the invocation.
-        let esp_module_tx = spawn_module(EspBuildModule::new());
-        let _ = registry.register::<BuildModuleMessage>("build_module_esp", esp_module_tx.clone());
+        // The ESP-IDF module registers BY PLATFORM, not by config file. An ESP-IDF project is
+        // *also* a CMake project, so claiming `CMakeLists.txt` would replace the cmake module in the
+        // router and send every CMake project in Spire down the ESP-IDF path. Declaring
+        // `os: "esp-idf"` routes on what actually differs — the invocation, `idf.py`.
+        let idf_module_tx = spawn_module(IdfBuildModule::new());
+        let _ = registry.register::<BuildModuleMessage>("build_module_idf", idf_module_tx.clone());
         // Its capability travels with the registration: it is what tells the manager whether a
         // `build_flash` request may be routed here at all.
-        let esp_cap = describe_module("esp-idf", &esp_module_tx).await;
+        let idf_cap = describe_module("esp-idf", &idf_module_tx).await;
         let _ = bm_tx
             .send(BuildManagerMessage::AddPlatformModule {
                 os: "esp-idf".to_string(),
-                capability: esp_cap.clone(),
-                module_tx: esp_module_tx,
+                capability: idf_cap.clone(),
+                module_tx: idf_module_tx,
             })
             .await;
         // The esp capability, alongside the module it belongs to.
-        module_mcp_servers.push(esp_cap);
+        module_mcp_servers.push(idf_cap);
 
-        // The **bare-metal** flavour of the same module: the same chip facts and the same flash tool,
-        // but a stock rustup target instead of ESP-IDF — which is what `os: "esp-hal"` routes on, and
-        // what the project scaffold emits. A second instance, so the two capabilities name themselves
-        // apart in the UI rather than both saying "esp-idf".
-        let esp_hal_module_tx = spawn_module(EspBuildModule::for_os("esp-hal"));
-        let _ = registry.register::<BuildModuleMessage>(
-            "build_module_esp_hal",
-            esp_hal_module_tx.clone(),
-        );
-        let esp_hal_cap = describe_module("esp-hal", &esp_hal_module_tx).await;
-        let _ = bm_tx
-            .send(BuildManagerMessage::AddPlatformModule {
-                os: "esp-hal".to_string(),
-                capability: esp_hal_cap.clone(),
-                module_tx: esp_hal_module_tx,
-            })
-            .await;
-        module_mcp_servers.push(esp_hal_cap);
-
-        // The rp2040 module registers the same way and for the same reason: its projects are also
-        // `Cargo.toml` projects, so what differs is the invocation (a `thumbv6m` target, no
-        // vendor SDK, a different flasher) — and that is what `os: "rp2040"` routes on.
-        let rp2040_module_tx = spawn_module(Rp2040BuildModule::new());
-        let _ = registry.register::<BuildModuleMessage>(
-            "build_module_rp2040",
-            rp2040_module_tx.clone(),
-        );
-        let rp2040_cap = describe_module("rp2040", &rp2040_module_tx).await;
-        let _ = bm_tx
-            .send(BuildManagerMessage::AddPlatformModule {
-                os: "rp2040".to_string(),
-                capability: rp2040_cap.clone(),
-                module_tx: rp2040_module_tx,
-            })
-            .await;
-        module_mcp_servers.push(rp2040_cap);
 
         let node_module_tx = spawn_module(NodeBuildModule::new());
         let _ = registry.register::<BuildModuleMessage>("build_module_node", node_module_tx.clone());
@@ -1090,24 +1110,53 @@ pub(crate) async fn populate_target_graph(
     Ok(())
 }
 
+/// The files that say "this directory **is** the project root, not a wrapper around one".
+///
+/// Mirrors what the build modules register as their own `config_files`, because "is this directory
+/// a project?" and "which module claims it?" should not be two different answers. `Cargo.toml`
+/// alone was the original answer, and it is what made an ESP-IDF project open as `main/`: a
+/// component library's root holds one non-hidden subdirectory — `main/`, the build harness — and
+/// a check that only knew `Cargo.toml` descended straight into it.
+const PROJECT_ROOT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "CMakeLists.txt",
+    "sdkconfig.defaults",
+    "meson.build",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "Makefile",
+    "pom.xml",
+    "build.gradle",
+    "Gemfile",
+    "Package.swift",
+];
+
 /// Resolve the real project root when the user opens a WRAPPER folder.
 ///
-/// When the chosen directory has no `Cargo.toml` of its own but contains
+/// When the chosen directory has no build file of its own but contains
 /// exactly one non-hidden subdirectory that does, Spire resolves to that
 /// nested project root. This is the classic double-nesting artifact from
 /// scaffolding `<name>` into a folder already named `<name>` (e.g.
 /// `ai-traps-mcp/ai-traps-mcp`) and made every relative file path resolve to
 /// a non-existent file ("Unable to read file").
+///
+/// A **wrapper** is a directory with no build file and one subdirectory. A directory with a build
+/// file is a project, whatever the build system is — see [`PROJECT_ROOT_MARKERS`].
 pub(crate) fn resolve_project_root(root: &std::path::Path) -> std::path::PathBuf {
     let mut candidate = root.to_path_buf();
     loop {
-        // If the candidate already contains a Cargo.toml at its own root,
+        // If the candidate already contains a build file at its own root,
         // it IS the project — stop descending.
         let has_own_build = std::fs::read_dir(&candidate)
             .ok()
             .map(|rd| {
-                rd.flatten()
-                    .any(|e| e.path().is_file() && e.file_name().to_string_lossy() == "Cargo.toml")
+                rd.flatten().any(|e| {
+                    e.path().is_file()
+                        && PROJECT_ROOT_MARKERS
+                            .iter()
+                            .any(|m| e.file_name().to_string_lossy() == *m)
+                })
             })
             .unwrap_or(false);
         if has_own_build {
@@ -1175,19 +1224,50 @@ pub(crate) fn collect_tree_files(
     }
 }
 
+/// A label for a build config that has no name of its own, from the build system that found it.
+///
+/// The label is the tool a reader would recognise, lowercased — which is not always just
+/// `to_lowercase()`: SwiftPM is `swift`, because nobody calls it "swiftpm" out loud.
+fn build_system_label(build_system: &str) -> String {
+    match build_system {
+        "Cargo" => "cargo".to_string(),
+        "SwiftPM" | "Xcode" => "swift".to_string(),
+        "Make" => "make".to_string(),
+        other => other.to_lowercase(),
+    }
+}
+
 pub(crate) fn serialize_analysis(
     analysis: &crate::subsystems::project::project_analyzer::ProjectAnalysis,
 ) -> serde_json::Value {
-    let build_systems: Vec<String> = analysis
-        .build_systems
-        .iter()
-        .map(|bs| bs.build_system.clone())
-        .collect();
+    // The *systems*, in the order the analysis found them — not the build files. An ESP-IDF project
+    // has two `CMakeLists.txt` (its own, and a component's), so the raw list reads `CMake · CMake`;
+    // and this array is used as a `ForEach` id in the UI, where a duplicate is a dropped row.
+    let mut build_systems: Vec<String> = Vec::new();
+    for bs in &analysis.build_systems {
+        if !build_systems.contains(&bs.build_system) {
+            build_systems.push(bs.build_system.clone());
+        }
+    }
     let languages_json: serde_json::Value = analysis
         .languages
         .iter()
         .map(|l| (l.language.clone(), serde_json::json!(l.file_count)))
         .collect();
+    // A **component library**'s `main/` is the build harness, not a subproject.
+    //
+    // It exists so that `idf.py build` compiles the components above it, and it starts nothing,
+    // wires nothing and names no device — a library that grows an application in there is a library
+    // nobody can use twice. Listing it makes a fresh library look like it already has one, which is
+    // the boundary the type exists to hold.
+    //
+    // An *application*'s `main/` is the opposite: it is the product, and it stays. Decided by the
+    // root's own declared structure, so a directory called `main` in any other project is untouched.
+    let idf_library = analysis
+        .build_systems
+        .iter()
+        .any(|bs| bs.structure == spire_core::build_types::ProjectStructure::IdfLibrary);
+
     // Build subproject list from build systems
     let mut subprojects: Vec<serde_json::Value> = analysis
         .build_systems
@@ -1205,6 +1285,25 @@ pub(crate) fn serialize_analysis(
                 .unwrap_or("")
                 .trim_matches('/')
                 .to_string();
+            // The library's build harness — see `idf_library` above.
+            if idf_library && rel_path0 == "main" {
+                return None;
+            }
+            // A file **inside** a component — its `test/CMakeLists.txt`, most often — is part of that
+            // component rather than a project of its own: ESP-IDF's unit is the component directory,
+            // and what a harness does is the component's business. Skipped for the same reason the
+            // library's `main/` is, with a second one of its own: a nested file is named by its leaf,
+            // so two components that each have a `test/` produce two subprojects called `test` — one
+            // id, two rows, and a click that selects both.
+            let under_components = rel_path0.strip_prefix("components/");
+            if idf_library && under_components.is_some_and(|name| name.contains('/')) {
+                return None;
+            }
+            // A **component** of a component library: a directory directly under `components/`. It is
+            // the library's product, and the one thing in the tree a user adds, edits and removes, so
+            // it says what it is rather than the generic "library", and it is named by its own
+            // directory rather than by the wrapper it sits in (`components`).
+            let is_component = idf_library && under_components.is_some();
             // A SpireApp root workspace is the project itself (its single
             // member crate is the app the root describes), so it stays as a
             // first-class subproject. Only the LEGACY multi-platform workspace
@@ -1222,10 +1321,31 @@ pub(crate) fn serialize_analysis(
             // configs (e.g. `rpi/hal/meson.build`) the top-level directory
             // name ("rpi") is the subproject's identity — not the leaf
             // ("hal") — so it matches what the user sees in the graph.
-            let name = if is_spire_app && rel_path0.is_empty() {
-                // The SpireApp subproject is the project: name it after it.
+            //
+            // The root config of a project that *is* its root — a SpireApp monorepo, or either
+            // ESP-IDF type — is named after the project. The generic fallback below exists for the
+            // opposite case: a root config sitting beside the real project (a bare Makefile next to
+            // a Cargo workspace), where the build system is the only label there is. A library whose
+            // only subproject is called "cmake" reads as a project with something else in it.
+            let root_is_the_project = rel_path0.is_empty()
+                && matches!(
+                    bs.structure,
+                    ProjectStructure::SpireApp
+                        | ProjectStructure::IdfLibrary
+                        | ProjectStructure::IdfApplication
+                );
+            let name = if is_component {
+                // A component is called by its own directory: `components/sps30` is `sps30`, not
+                // `components`.
+                rel_path0
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(rel_path0.as_str())
+                    .to_string()
+            } else if root_is_the_project {
+                // The root subproject is the project: name it after it.
                 if analysis.project_name.is_empty() {
-                    "cargo".to_string()
+                    build_system_label(&bs.build_system)
                 } else {
                     analysis.project_name.clone()
                 }
@@ -1251,12 +1371,7 @@ pub(crate) fn serialize_analysis(
                         // Root configs without a name (e.g. a bare Makefile
                         // wrapper next to a Cargo workspace) get a label from
                         // their build system instead of the opaque "unknown".
-                        match bs.build_system.as_str() {
-                            "Cargo" => "cargo".to_string(),
-                            "SwiftPM" | "Xcode" => "swift".to_string(),
-                            "Make" => "make".to_string(),
-                            other => other.to_lowercase(),
-                        }
+                        build_system_label(&bs.build_system)
                     })
             };
             let lang = match bs.build_system.as_str() {
@@ -1276,7 +1391,40 @@ pub(crate) fn serialize_analysis(
                 .trim_matches('/')
                 .to_string();
             let is_root = rel_path.is_empty();
-            let kind = if is_root { "project" } else { "library" };
+            let kind = if is_root {
+                "project"
+            } else if is_component {
+                "component"
+            } else {
+                "library"
+            };
+            // **What the component is.** Read from the component's own `CMakeLists.txt`, where it is
+            // stated, and read here rather than in Swift because it is a fact about the component and a
+            // second reading could only disagree with the first. `null` for an entry that is not a
+            // component, and for one that states nothing (written by hand) — the UI then shows no kind
+            // at all, which is what it is.
+            //
+            // Beside it, **whose** component it is: a framework component is shipped with every
+            // library and cannot be written or removed, which is a different thing from a generated
+            // stub however alike the two look. The tool knows the three names (`FRAMEWORK_COMPONENTS`),
+            // so the UI does not have to keep a second list that could drift from it.
+            let (component_kind, component_framework) = if is_component {
+                let component = rel_path0.rsplit('/').next();
+                let kind = component
+                    .and_then(|name| {
+                        crate::build::idf_projects::component_kind(
+                            std::path::Path::new(&analysis.project_root),
+                            name,
+                        )
+                    })
+                    .map(|kind| kind.as_str());
+                let framework = component
+                    .filter(|name| crate::build::idf_projects::is_framework_component(name))
+                    .map(|name| name.to_string());
+                (kind, framework)
+            } else {
+                (None, None)
+            };
             let files_json: Vec<serde_json::Value> = {
                 let sp_path = bs.project_path.as_deref().unwrap_or("");
                 let mut files = Vec::new();
@@ -1304,6 +1452,9 @@ pub(crate) fn serialize_analysis(
             Some(serde_json::json!({
                 "name": name,
                 "kind": kind,
+                "componentKind": component_kind,
+                // Which framework component this is, when it is one — `null` for everything else.
+                "componentFramework": component_framework,
                 "buildSystem": bs.build_system,
                 "description": bs.description.clone().unwrap_or_else(|| "".to_string()),
                 "path": rel_path,
@@ -2098,5 +2249,396 @@ mod serialize_analysis_tests {
             Some("embedded"),
             "a container's crate carries the container's structure: {member}"
         );
+    }
+
+    /// A component library's `main/` is the build harness, and it is not a subproject.
+    ///
+    /// Pinned because the harness exists only so `idf.py build` has something to compile, and
+    /// listing it makes a fresh library look like it already contains an application — the one thing
+    /// the library type is for.
+    #[test]
+    fn a_librarys_build_harness_is_not_a_subproject() {
+        let analysis = ProjectAnalysis {
+            project_root: "/tmp/spire-idf".to_string(),
+            project_name: "spire-idf".to_string(),
+            build_systems: vec![
+                meta(
+                    "CMake",
+                    None,
+                    "",
+                    false,
+                    vec![],
+                    ProjectStructure::IdfLibrary,
+                ),
+                // The harness, analysed like any other `CMakeLists.txt` under the root — which is
+                // how it ends up in the list at all.
+                meta(
+                    "CMake",
+                    Some("main"),
+                    "main",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+            ],
+            ..spire_gis_analysis()
+        };
+
+        let json = serialize_analysis(&analysis);
+        let paths = subproject_paths(&json);
+        assert!(
+            !paths.contains(&"main".to_string()),
+            "the harness is not a subproject: {paths:?}"
+        );
+        assert!(
+            paths.contains(&String::new()),
+            "the project itself still is: {paths:?}"
+        );
+        // …and it is called by its name, not by the name of its build system.
+        let root_name = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|sp| {
+                sp.iter()
+                    .find(|s| s.get("path").and_then(|v| v.as_str()) == Some(""))
+                    .and_then(|s| s.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            });
+        assert_eq!(root_name.as_deref(), Some("spire-idf"), "{json}");
+    }
+
+    /// A **component's kind** — and whether it is one of the shipped **framework** components — reaches
+    /// the UI on the keys the UI reads.
+    ///
+    /// `componentKind` and `componentFramework` are joins between two languages: `serialize_analysis`
+    /// writes them here and `SubprojectInfo` reads those exact spellings there, where a miss decodes as
+    /// `nil` — and `nil` is a *meaningful* value on the Swift side ("this component states no kind";
+    /// "this component is the library's own work"). So a drift would present as a component spire-code
+    /// itself created being shown as one written by hand, or as the framework being offered a Write
+    /// button it cannot honour, rather than as an error anywhere.
+    ///
+    /// The pair is the point of the test: `actors` and `moving_average` state the **same kind**
+    /// (`library`), so the kind alone cannot tell a shipped framework component from a generated stub —
+    /// which is exactly the mistake this key exists to prevent. The kind is read from the component's
+    /// own `CMakeLists.txt`, so this test writes those files the way the emitter writes them.
+    #[test]
+    fn a_components_kind_travels_on_the_key_the_ui_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (name, kind) in [
+            ("sps30", "driver"),
+            ("moving_average", "library"),
+            // Deliberately the same kind as `moving_average`: a framework component is a library, and
+            // only `componentFramework` says which of the two it is.
+            ("actors", "library"),
+        ] {
+            let component = root.join("components").join(name);
+            std::fs::create_dir_all(&component).unwrap();
+            std::fs::write(
+                component.join("CMakeLists.txt"),
+                format!(
+                    "set(SPIRE_COMPONENT_KIND {kind})\n\
+                     idf_component_register(SRCS \"src/{name}.cpp\" INCLUDE_DIRS \"include\")\n"
+                ),
+            )
+            .unwrap();
+        }
+        // …and one that states no kind, which is what a hand-written component looks like.
+        let handwritten = root.join("components/handwritten");
+        std::fs::create_dir_all(&handwritten).unwrap();
+        std::fs::write(
+            handwritten.join("CMakeLists.txt"),
+            "idf_component_register(SRCS \"src/x.cpp\" INCLUDE_DIRS \"include\")\n",
+        )
+        .unwrap();
+        let analysis = ProjectAnalysis {
+            project_root: root.display().to_string(),
+            project_name: "sensors".to_string(),
+            build_systems: vec![
+                meta(
+                    "CMake",
+                    None,
+                    "",
+                    false,
+                    vec![],
+                    ProjectStructure::IdfLibrary,
+                ),
+                meta(
+                    "CMake",
+                    Some("sps30"),
+                    "components/sps30",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+                meta(
+                    "CMake",
+                    Some("moving_average"),
+                    "components/moving_average",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+                meta(
+                    "CMake",
+                    Some("handwritten"),
+                    "components/handwritten",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+                meta(
+                    "CMake",
+                    Some("actors"),
+                    "components/actors",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+            ],
+            ..spire_gis_analysis()
+        };
+
+        let json = serialize_analysis(&analysis);
+        let sp = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        let key_of = |path: &str, key: &str| {
+            sp.iter()
+                .find(|s| s.get("path").and_then(|v| v.as_str()) == Some(path))
+                .and_then(|s| s.get(key))
+                .cloned()
+        };
+        let kind_of = |path: &str| key_of(path, "componentKind");
+        let framework_of = |path: &str| key_of(path, "componentFramework");
+
+        assert_eq!(
+            kind_of("components/sps30"),
+            Some(serde_json::json!("driver")),
+            "{json}"
+        );
+        assert_eq!(
+            kind_of("components/moving_average"),
+            Some(serde_json::json!("library")),
+            "{json}"
+        );
+        // A component that states nothing is `null`, not a default: the sheet shows no kind at all.
+        assert_eq!(
+            kind_of("components/handwritten"),
+            Some(serde_json::Value::Null),
+            "{json}"
+        );
+        // The key is always present — `null` for an entry that is not a component and for one that
+        // states nothing — so the Swift side has one shape to decode rather than two absences.
+        assert_eq!(kind_of(""), Some(serde_json::Value::Null), "{json}");
+
+        // **And whose component it is.** `actors` is a framework component; the others are the
+        // library's own work. The two halves matter equally: a false positive would lock a component
+        // the user added out of its own Write button.
+        assert_eq!(
+            framework_of("components/actors"),
+            Some(serde_json::json!("actors")),
+            "{json}"
+        );
+        assert_eq!(
+            kind_of("components/actors"),
+            Some(serde_json::json!("library")),
+            "a framework component is still a library — which is why the kind alone cannot say this"
+        );
+        for path in [
+            "components/sps30",
+            "components/moving_average",
+            "components/handwritten",
+        ] {
+            assert_eq!(
+                framework_of(path),
+                Some(serde_json::Value::Null),
+                "{path} is the library's own work, not the framework: {json}"
+            );
+        }
+        assert_eq!(framework_of(""), Some(serde_json::Value::Null), "{json}");
+    }
+    /// A component's own `test/` harness is **not** a subproject.
+    ///
+    /// Every component ships one (`components/<name>/test/CMakeLists.txt`), and a nested file is named
+    /// by its leaf — so two components that each have a harness were two subprojects called `test`, and
+    /// because the UI identifies its rows by that name they were **one row** to anyone clicking them:
+    /// selecting one highlighted both. The unit is the component directory; what lives inside it is the
+    /// component's business. (`ramen` and `actors` both ship a harness, which is why a fresh library
+    /// showed exactly this pair.)
+    #[test]
+    fn a_components_test_harness_is_not_a_subproject() {
+        let analysis = ProjectAnalysis {
+            project_root: "/tmp/sensors".to_string(),
+            project_name: "sensors".to_string(),
+            build_systems: vec![
+                meta(
+                    "CMake",
+                    None,
+                    "",
+                    false,
+                    vec![],
+                    ProjectStructure::IdfLibrary,
+                ),
+                meta(
+                    "CMake",
+                    Some("ramen"),
+                    "components/ramen",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+                meta(
+                    "CMake",
+                    Some("ramen"),
+                    "components/ramen/test",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+                meta(
+                    "CMake",
+                    Some("actors"),
+                    "components/actors",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+                meta(
+                    "CMake",
+                    Some("actors"),
+                    "components/actors/test",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+            ],
+            ..spire_gis_analysis()
+        };
+
+        let json = serialize_analysis(&analysis);
+        let subprojects = json
+            .get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .expect("subprojects");
+        let paths: Vec<&str> = subprojects
+            .iter()
+            .filter_map(|s| s.get("path").and_then(|v| v.as_str()))
+            .collect();
+        let names: Vec<&str> = subprojects
+            .iter()
+            .filter_map(|s| s.get("name").and_then(|v| v.as_str()))
+            .collect();
+
+        // The components are there…
+        assert!(paths.contains(&"components/ramen"), "{paths:?}");
+        assert!(paths.contains(&"components/actors"), "{paths:?}");
+        // …and nothing inside one is a project of its own.
+        assert!(
+            !paths.iter().any(|p| p.matches('/').count() > 1),
+            "a component's own files are not subprojects: {paths:?}"
+        );
+        // The symptom, stated directly: no row called `test` at all — and so nothing for the UI to
+        // give one id to.
+        assert!(!names.contains(&"test"), "{names:?}");
+    }
+
+    /// An application's `main/` is its product. Same directory, opposite meaning — and the
+    /// difference is the root's own declared structure, not the name of the directory.
+    #[test]
+    fn an_applications_main_stays_a_subproject() {
+        let analysis = ProjectAnalysis {
+            project_root: "/tmp/pm25-meter".to_string(),
+            project_name: "pm25-meter".to_string(),
+            build_systems: vec![
+                meta(
+                    "CMake",
+                    None,
+                    "",
+                    false,
+                    vec![],
+                    ProjectStructure::IdfApplication,
+                ),
+                meta(
+                    "CMake",
+                    Some("main"),
+                    "main",
+                    false,
+                    vec![],
+                    ProjectStructure::Native,
+                ),
+            ],
+            ..spire_gis_analysis()
+        };
+
+        let json = serialize_analysis(&analysis);
+        assert!(
+            subproject_paths(&json).contains(&"main".to_string()),
+            "an application's main is its product, not a harness: {json}"
+        );
+    }
+
+    fn subproject_paths(json: &serde_json::Value) -> Vec<String> {
+        json.get("subprojects")
+            .and_then(serde_json::Value::as_array)
+            .map(|sp| {
+                sp.iter()
+                    .filter_map(|s| s.get("path").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The descent decides what the project *is*: it becomes `ProjectAnalysis.project_root`, the project
+/// name is that directory's own name, and every relative file path is resolved against it. Descend
+/// one level too far and the tree, the name and the paths are all wrong together.
+#[cfg(test)]
+mod resolve_project_root_tests {
+    use super::resolve_project_root;
+
+    /// A directory with a build file of its own is the project — **whatever** the build system is.
+    ///
+    /// Pinned because an ESP-IDF component library's root holds exactly one non-hidden
+    /// subdirectory, `main/`, which is its build harness. A check that only knew `Cargo.toml`
+    /// descended straight into it, and `spire-idf` opened as a project called `main` whose only
+    /// `CMakeLists.txt` registered a harness.
+    #[test]
+    fn a_project_with_one_component_does_not_descend_into_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("spire-idf");
+        std::fs::create_dir_all(root.join("main")).unwrap();
+        std::fs::write(root.join("CMakeLists.txt"), "project(spire-idf)\n").unwrap();
+        std::fs::write(root.join("sdkconfig.defaults"), "").unwrap();
+        std::fs::write(root.join("main").join("CMakeLists.txt"), "").unwrap();
+
+        assert_eq!(resolve_project_root(&root), root);
+    }
+
+    /// The case the check was written for, still working: a Cargo project resolves to itself.
+    #[test]
+    fn a_cargo_project_resolves_to_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("spire-gis");
+        std::fs::create_dir_all(root.join("crates")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        assert_eq!(resolve_project_root(&root), root);
+    }
+
+    /// …and a **wrapper** — no build file of its own, one subdirectory — still descends into the
+    /// project inside it. This is the double-nesting artifact the descent exists for.
+    #[test]
+    fn a_wrapper_still_descends_to_the_project_inside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("ai-traps-mcp");
+        let inner = outer.join("ai-traps-mcp");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("Cargo.toml"), "[package]\n").unwrap();
+
+        assert_eq!(resolve_project_root(&outer), inner);
     }
 }

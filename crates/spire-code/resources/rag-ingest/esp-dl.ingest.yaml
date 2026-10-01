@@ -1,0 +1,97 @@
+# Device wisdom corpus: **esp-dl** (espressif/esp-dl) — the on-device inference
+# runtime, and the one corpus an application that runs a *model* cannot do
+# without. A detector on this platform is a fixed shape: a camera, an image
+# preprocessor, a `.espdl` model, and a postprocessor that turns tensors into
+# boxes. Every part of that shape is written down in this tree and nowhere else —
+# not in a datasheet, not in the BSP.
+#
+# Scoped deliberately, and every pattern below was checked against the real tree
+# (master, and the sibling repository the exporters live in) rather than assumed —
+# a pattern that matches nothing ingests nothing, and the failure looks like bad
+# retrieval rather than like a typo.
+#
+#   * `esp-dl/**/*.hpp` — the **API**. This component has **no `include/`**: its
+#     headers sit beside the implementations, so the header *is* what a caller
+#     includes and the `.cpp` beside it is the one neighbour not worth retrieving.
+#     `esp-dl/dl/` is the tensor and layer runtime (`dl_base_*.hpp`,
+#     `dl_layer_*.hpp`), `esp-dl/vision/` is the pipeline an application calls —
+#     `detect`, `classification`, `recognition`, `image` — and `esp-dl/fbs_loader/`
+#     is how a model file is opened.
+#   * `examples/*/main/*.cpp` — **how it is driven**. The `app_main.cpp` of an
+#     example is the only place the call shape is written down: load a model,
+#     configure the detector, run it on a frame, read the boxes. Its `README.md`
+#     says which model and which chip it is for.
+#   * `models/README.md` and the `*.md` under it — the **catalogue**: which
+#     prebuilt models exist, what each one detects, and what it costs on which
+#     chip. That is the structured half of "is there a model for this?", which is
+#     the question a detector task starts with. The models themselves are binary
+#     and are not ingested: a chunk of quantised weights is not documentation.
+#   * `operator_support_state.md` — which operators the runtime implements, per
+#     chip and per data type. It is the constraint that decides whether a model can
+#     run at all, and nothing else in the tree states it.
+#
+# The **training** side is a second repository, `espressif/esp-detection`: it is
+# where a model that does not exist yet would come from (train, then export to
+# `.espdl`). Its README and its `cfg/` are ingested — what a model needs and how
+# the class names are declared, which is what a person mapping detections to
+# labels reaches for — and its Python is not: the application is C++, and the
+# exporter is a tool a person runs rather than code a design phase composes.
+version: "1.0"
+pipeline:
+  name: esp-dl — the on-device inference runtime, its models and its examples
+  corpus: esp-dl
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: esp-dl
+      patterns:
+        - "**/*.hpp"
+        - "**/*.h"
+        - "**/*.md"
+        - "**/*.yaml"
+  sources:
+    - id: esp-dl
+      type: github_repo
+      enabled: true
+      url: https://github.com/espressif/esp-dl.git
+      processing:
+        parser: code
+        languages:
+          - "C++"
+        # include_paths are matched against the **absolute** path inside the clone,
+        # so every directory pattern carries its `**/` prefix (see the spire-core
+        # manifest). `esp-dl/*.hpp` is listed beside `esp-dl/**/*.hpp` because the
+        # two are different depths and neither can match the other.
+        include_paths:
+          - "**/esp-dl/*.hpp"
+          - "**/esp-dl/**/*.hpp"
+          - "**/esp-dl/**/*.h"
+          - "**/examples/*/main/*.cpp"
+          - "**/examples/*/main/*.hpp"
+          - "**/examples/*/README.md"
+          - "**/models/README.md"
+          - "**/models/**/*.md"
+          - "**/README.md"
+          - "**/operator_support_state.md"
+        # A build directory, a downloaded component and a generated config are what
+        # an example *produces*; the example is the source, the `README` and the
+        # `sdkconfig.defaults.*` beside it say what it needs.
+        exclude_paths:
+          - "**/examples/**/build/**"
+          - "**/examples/**/managed_components/**"
+          - "**/examples/**/sdkconfig"
+          - "**/examples/**/partitions.csv"
+    - id: esp-detection
+      type: github_repo
+      enabled: true
+      url: https://github.com/espressif/esp-detection.git
+      processing:
+        parser: text
+        include_paths:
+          - "**/README.md"
+          - "**/cfg/*.yaml"
+          - "**/cfg/**/*.yaml"
+        exclude_paths:
+          - "**/LICENSE"

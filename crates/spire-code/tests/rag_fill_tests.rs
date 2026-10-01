@@ -4,8 +4,9 @@
 //! The **live fill**: install the bundled corpora and ingest them into the KnowledgeStore.
 //!
 //! This is the step that turns a manifest into retrievable knowledge, and it is the one that has to
-//! touch the network (three corpora clone from GitHub) and a real embedder, so it is `#[ignore]`d and
-//! run deliberately:
+//! touch the network — nearly every corpus clones from GitHub (`rust` and `device-facts` are the
+//! local sources, and the device/board libraries are the largest clones) — and a real embedder, so
+//! it is `#[ignore]`d and run deliberately:
 //!
 //! ```sh
 //! # every corpus, into ~/.spire/knowledge
@@ -61,6 +62,31 @@ async fn init_graph(tx: &tokio::sync::mpsc::Sender<MgMsg>, dir: &std::path::Path
     r.await.expect("Initialize reply").expect("Initialize");
 }
 
+/// The real embedder, or `None` with a line saying why — in which case the caller must **return**,
+/// not substitute `NoopEmbedder`.
+///
+/// `NoopEmbedder` is not a slower embedder: it fails every call on purpose, so that RAG surfaces a
+/// missing model instead of degrading to zero vectors. A store therefore cannot even be *ingested*
+/// without one — the ingest embeds each chunk — which is why there is no lexical-only fallback to
+/// fall back to and a machine without the model gets a skip rather than an assertion about a store
+/// that was never filled.
+///
+/// Built **inside** the runtime deliberately: the model is cached on this machine, so no Hugging Face
+/// round trip happens and hf-hub's blocking client is never reached. (`ffi.rs` builds it *outside* the
+/// runtime because a first-ever download would panic otherwise; if this ever panics with "Cannot start
+/// a runtime from within a runtime", that is what changed.)
+fn real_embedder() -> Option<Arc<dyn Embedder>> {
+    match spire_core::embedder::CandleEmbedder::new() {
+        Ok(embedder) => Some(Arc::new(embedder)),
+        Err(e) => {
+            eprintln!(
+                "no Candle embedder ({e}) — nothing can be ingested without one, so this is skipped"
+            );
+            None
+        }
+    }
+}
+
 #[ignore = "live fill: clones from GitHub (or reads the local SDK) and embeds — minutes"]
 #[tokio::test]
 async fn the_bundled_corpora_ingest_into_the_knowledge_store() {
@@ -81,16 +107,9 @@ async fn the_bundled_corpora_ingest_into_the_knowledge_store() {
     init_graph(&memory_graph_tx, project_data.path()).await;
     init_graph(&knowledge_tx, &store).await;
 
-    // Built inside the runtime on purpose: the model is cached on this machine, so no Hugging Face
-    // round trip happens and hf-hub's blocking client is never reached. (ffi.rs builds it *outside*
-    // the runtime because a first-ever download would panic otherwise; if this test ever panics with
-    // "Cannot start a runtime from within a runtime", that is what changed.)
-    let embedder: Arc<dyn Embedder> = match spire_core::embedder::CandleEmbedder::new() {
-        Ok(e) => Arc::new(e),
-        Err(e) => {
-            eprintln!("no Candle embedder ({e}) — the corpus would be lexical-only");
-            Arc::new(spire_core::embedder::NoopEmbedder)
-        }
+    // The real embedder, built inside the runtime — see [`real_embedder`].
+    let Some(embedder) = real_embedder() else {
+        return;
     };
     let registry = Arc::new(ServiceRegistry::new());
     let _ = registry.register_service("embedder", Arc::new(EmbedderService(embedder.clone())));
@@ -223,6 +242,140 @@ async fn the_bundled_corpora_ingest_into_the_knowledge_store() {
         assert!(
             !hits.is_empty(),
             "{corpus} answered a query with nothing, so its chunks are not retrievable"
+        );
+    }
+}
+
+/// The `device-facts` corpus' premise, on its own: a **part number** answers with that part.
+///
+/// That corpus is asked by *key* — one document per part, named for it — and the documents that ship
+/// are deliberately close (`sht20.md` and `sht30.md`: one family, both measuring without clock
+/// stretching, the same CRC polynomial, and a different address, command set, framing and CRC seed).
+/// So this is the property the corpus exists for, and the one a similarity search can fail: asking
+/// for one part must return *that* part's document and not its neighbour's.
+///
+/// Unlike the live fill it is **not** `#[ignore]`d: the corpus is a `local` source, so nothing here
+/// touches the network. The embedder, though, has to be the real one — `NoopEmbedder` **fails every
+/// call** rather than degrading to zero vectors, so a store cannot even be *ingested* without the
+/// model; when it is not on this machine the test says so and returns. That is what makes the
+/// assertion below a claim about the corpus as the app will search it.
+///
+/// **The margin is small, and that is the finding worth knowing.** The two documents are ~90%
+/// identical text, so for `sht20` the scores came out 0.049 / 0.047 against 0.093 / 0.051 for
+/// `sht30`: the right document wins both times, by a hair in one case. Nothing about that is
+/// random — the same model and the same text give the same answer every run — but it does mean a
+/// change to either document must be **re-measured** rather than assumed to have kept the order, and
+/// it is why the seam labels every chunk with its source path (`#### …/sht20.md`) instead of letting
+/// the model infer which of two near-identical protocols is this part's. The scores are printed on
+/// every run so the margin is visible rather than inferred from a pass.
+#[tokio::test]
+async fn a_device_facts_query_answers_with_that_part_and_not_its_neighbour() {
+    let Some(embedder) = real_embedder() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let store = tmp.path().join("knowledge");
+    std::fs::create_dir_all(&store).expect("create store");
+    // The installer is what puts each document where the manifest's relative `path` resolves to.
+    rag_bundle::install_into(&store).expect("install the bundle");
+
+    let system = ActorSystem::new();
+    let (memory_graph_tx, _) = system.spawn(MemoryGraphActor::new());
+    let (knowledge_tx, _) = system.spawn(MemoryGraphActor::new());
+    let project_data = tmp.path().join("project");
+    std::fs::create_dir_all(&project_data).expect("create project data dir");
+    init_graph(&memory_graph_tx, &project_data).await;
+    init_graph(&knowledge_tx, &store).await;
+
+    // Deliberately the real embedder: see the doc comment — retrieval is a vector search, and a
+    // store cannot be filled without the model at all.
+    {
+        let (t, r) = tokio::sync::oneshot::channel();
+        knowledge_tx
+            .send(MgMsg::InitializeEmbedder {
+                model_path: None,
+                embedder: Some(embedder.clone()),
+                reply_to: t,
+            })
+            .await
+            .expect("send InitializeEmbedder");
+        let _ = r.await;
+    }
+    let registry = Arc::new(ServiceRegistry::new());
+    let _ = registry.register_service("embedder", Arc::new(EmbedderService(embedder)));
+    let _ = registry.register::<MgMsg>("knowledge_graph", knowledge_tx.clone());
+    let _ = registry.register::<MgMsg>("memory_graph", memory_graph_tx.clone());
+    let (rag_tx, _) = system.spawn(RagActor::from_registry(
+        knowledge_tx,
+        memory_graph_tx,
+        registry.clone(),
+    ));
+
+    let (t, r) = tokio::sync::oneshot::channel();
+    rag_tx
+        .send(RagMessage::IngestGraphConfig {
+            manifest_path: store
+                .join(rag_bundle::DEVICE_FACTS_CORPUS)
+                .join("ingest.yaml"),
+            project_root: None,
+            reply_to: t,
+        })
+        .await
+        .expect("send IngestGraphConfig");
+    let report = r.await.expect("reply").expect("ingest");
+    assert_eq!(
+        report.chunks as usize,
+        rag_bundle::FACTS_DOCS.len(),
+        "one document is one chunk — a split document is half a protocol, which is what the corpus' \
+         chunk_size exists to prevent"
+    );
+
+    // Each part, and the neighbour that must not answer for it. The byte is what a *retrieved* chunk
+    // has to carry to be usable: the command table, not just the framing it shares with the neighbour.
+    for (part, neighbour, fact) in [
+        ("sht20", "sht30.md", "0xF3"),
+        ("sht30", "sht20.md", "0x2400"),
+    ] {
+        let (t, r) = tokio::sync::oneshot::channel();
+        rag_tx
+            .send(RagMessage::Query {
+                domain: rag_bundle::DEVICE_FACTS_CORPUS.to_string(),
+                query: part.to_string(),
+                top_k: 3,
+                reply_to: t,
+            })
+            .await
+            .expect("send Query");
+        let hits = r.await.expect("reply").expect("query");
+        let top = hits
+            .first()
+            .unwrap_or_else(|| panic!("'{part}' answered with nothing"));
+
+        println!(
+            "{part}: {} hits — {:#?}",
+            hits.len(),
+            hits.iter()
+                .map(|h| (h.source_path.as_str(), h.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            top.source_path.ends_with(&format!("{part}.md")),
+            "the key did not select the document: '{part}' was answered by {}",
+            top.source_path
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|h| h.source_path.ends_with(neighbour) && h.score >= top.score),
+            "'{part}' ranked its neighbour ({neighbour}) at least as high: {:#?}",
+            hits.iter()
+                .map(|h| (h.source_path.clone(), h.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            top.text.contains(fact),
+            "the chunk retrieved for '{part}' does not carry its own command word ({fact}), so it is \
+             not the whole document"
         );
     }
 }

@@ -579,18 +579,15 @@ impl StartupPhase for PlatformBootstrapPhase {
         // resolves against even though no picker offers it, so seeding only the board store
         // would drop the silicon out of the graph — and the graph is what resolution uses.
         let platforms = SpirePlatform::load_registry().unwrap_or_default();
+        // `platform_seed_payload` attaches each entry's capability blocks **flattened** — the shape
+        // `spire-core`'s seeder consumes (`capabilities` as names, `realizes`/`carries` as edges).
+        // Attaching them raw (what `capability_blocks(p)` returns) seeds platform nodes and *no*
+        // capability nodes or edges: the seeder iterates `capabilities` as an array of names and
+        // finds an object, and looks for `realizes`/`carries` where the raw tree has
+        // `realized`/`companions`. It compiles and looks right, and writes nothing that reads back.
         let platform_json: Vec<serde_json::Value> = platforms
             .iter()
-            .map(|p| {
-                let mut node = crate::actors::platform_codec::platform_to_registry_json(p);
-                // The capability blocks travel **raw**, beside the typed props: they are trees, and
-                // the graph — not the entry, and not the flat prop map — is where they belong. The
-                // seeder reads this key; until it does, it is an extra key in an open payload.
-                if let Some(blocks) = crate::actors::platform_codec::capability_blocks(p) {
-                    node["capability_blocks"] = blocks;
-                }
-                node
-            })
+            .map(crate::actors::platform_codec::platform_seed_payload)
             .collect();
 
         let (tx, rx) = oneshot::channel();

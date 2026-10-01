@@ -1,0 +1,72 @@
+# Device wisdom corpus: **device facts** — the protocol of a part, keyed by part number.
+#
+# The gap this closes is not "somebody has already written this device" (that is `esp-idf-lib`) but
+# "what are the command words, the framing and the checksum for *this* part". Nothing else in the
+# bundle can answer it, and two things make it unanswerable from the library corpora:
+#
+#   * **Coverage.** A device that is not in a library is not in a library: `esp-idf-lib` carries
+#     `sht3x` and `sht4x` and no `sht20`, so a `sht20` query returns a *different device* whose
+#     command set differs (`0x2400` to measure and `0xE000` to fetch, against SHT2x's `0xF3`/`0xF5`
+#     and its bare read). That is a plausible-but-wrong driver, which is worse than no answer.
+#   * **Depth.** Even for a device the library *does* carry, the protocol bytes live in
+#     `components/*/*.c` — which the `esp-idf-lib` manifest excludes on purpose, and rightly: it
+#     would put one driver's bit-twiddling beside another's as the near-miss the model has to
+#     rank. The header that is ingested gives the API shape and the family, never the bytes.
+#
+# So this corpus is **documents about parts**, not code: one file per part number, named for it
+# (`sht20.md`), and asked for by it. The seam below asks this corpus for the bytes and `esp-idf-lib`
+# for the shape, and labels which section is which.
+#
+# Two documents, and deliberately close: `sht20.md` and `sht30.md` are the same family, both measuring
+# without clock stretching, with the same CRC polynomial — and they disagree about the address, the
+# command words, the framing and the checksum's initial value. That closeness is the point. A corpus
+# of unrelated documents would be found by similarity by accident, so it would prove nothing about
+# the key; a **near-miss pair** is what the key has to separate, and `tests/rag_fill_tests.rs` pins
+# that a query for one part answers with that part's document and not its neighbour's.
+#
+# Each document states its own **provenance** and says which parts of it are derived rather than
+# authoritative — a fact with a source can be checked, and a fact without one is indistinguishable
+# from a guess, which is the one thing a protocol cannot be built on.
+#
+# The corpus directory holds **only** those documents and the format is documented here rather than
+# in a `README.md` beside them, because everything matching the patterns below is ingested and would
+# be retrievable as if it were a part — a format note is not a device.
+version: "1.0"
+pipeline:
+  name: Device facts — a part's protocol, keyed by part number
+  corpus: device-facts
+  settings:
+    # **A whole protocol, or none of it.** A part's facts are retrieved to be written from, and a
+    # fragment of them is worse than nothing: a model handed only the "what a bad reply looks like"
+    # chunk would write a driver with a checksum check and no command words, and would have no way to
+    # tell that it had been given half an answer. So the chunk here is deliberately sized to hold a
+    # whole document — this is the budget, not a target, and
+    # `tests/rag_bundle_manifests.rs` fails if a document outgrows it rather than letting one split
+    # silently into two retrievable halves. Details (citations, provenance) are what fill it; a
+    # document that needs more than this is stating more than a protocol's facts.
+    chunk_size: 3000
+    chunk_overlap: 0
+    embedding_model: ""
+  domains:
+    - name: device-facts
+      patterns:
+        - "**/*.md"
+  sources:
+    - id: device-facts
+      # `local` because the corpus ships with the binary: `rag_bundle::install_into` copies each
+      # document beside this manifest, so it is version-controlled and reviewed in the source tree
+      # rather than fetched. The path is **relative on purpose** — it resolves against this
+      # manifest's own directory (`<store>/device-facts/`), which is what makes the install
+      # relocatable to any user's store.
+      type: local
+      enabled: true
+      path: docs
+      processing:
+        parser: markdown
+        # Absolute installed paths are matched, so the pattern carries its `**/` prefix — the rule
+        # every manifest here documents, and `tests/rag_bundle_manifests.rs` enforces. A glob rather
+        # than a file list because the *installer* is what decides which documents ship
+        # (`rag_bundle::FACTS_DOCS`, an explicit list), so a file added to the source directory
+        # without an entry there never reaches this one.
+        include_paths:
+          - "**/*.md"

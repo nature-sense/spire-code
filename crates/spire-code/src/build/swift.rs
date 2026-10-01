@@ -932,6 +932,8 @@ impl Actor for SwiftBuildModule {
                 platforms: _platforms,
                 structure: _structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let bc = r#"// swift-tools-version: 5.10

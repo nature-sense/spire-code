@@ -3148,21 +3148,290 @@ pub fn hal_doc_fix_prompt_whole(path: &str, content: &str, issues: &[HalDocLintI
 /// riskier than returning the complete file. The prompt explicitly forbids
 /// reformatting/reordering — an earlier "fix" that ran clang-format over the
 /// tree rewrote 28k lines without fixing a single diagnostic.
-pub fn compile_fix_prompt(path: &str, content: &str, errors: &[String]) -> String {
+///
+/// `related` carries the **other files the compiler named**, read-only, so a mismatch that spans two
+/// files can be fixed in one pass: told to make `power.hpp`'s constructor match a spawn call while
+/// seeing neither the call nor the note that says what it passed, a model can only guess. Empty for
+/// the single-file dashboard flow, where there is nothing extra to show.
+pub fn compile_fix_prompt(
+    path: &str,
+    content: &str,
+    errors: &[String],
+    related: &[(String, String)],
+) -> String {
     let mut out = String::new();
     out.push_str("Fix the COMPILER diagnostics in this C/C++ file by rewriting the WHOLE file.\n");
     out.push_str(&format!("File: {path}\n\nDiagnostics:\n"));
     for (i, e) in errors.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, e));
     }
-    out.push_str(&format!("\nCurrent content:\n```cpp\n{content}\n```\n\n"));
+    out.push_str(&format!("\nCurrent content:\n```cpp\n{content}\n```\n"));
+    // A mismatch spread across two files is fixed by lining them up, and the model can only do that
+    // if it sees both. Read-only: the repair still rewrites exactly one file.
+    if !related.is_empty() {
+        out.push_str(
+            "\nOther files the compiler named, shown only so you can see the types that must line \
+             up. Do NOT rewrite these:\n",
+        );
+        for (rel_path, rel_content) in related {
+            out.push_str(&format!("\n// {rel_path}\n```cpp\n{rel_content}\n```\n"));
+        }
+    }
     out.push_str(
-        "Return ONLY the complete corrected file inside a single ```cpp block.\n\
+        "\nReturn ONLY the complete corrected file inside a single ```cpp block.\n\
          Change ONLY what is required to resolve the reported diagnostics. Keep every \
          other line, signature, include and behaviour byte-identical: do NOT reformat, \
          do NOT reorder includes, do NOT rename anything, and add no commentary outside \
          the code block.",
     );
+    out
+}
+
+/// One thing a compiler complained about, with everything it printed around it.
+///
+/// The three parts are all load-bearing for a repair pass, and the first one is why this is a struct
+/// rather than a `Vec<String>`:
+///
+///  * **`related`** is the `In file included from …` chain and the files the `note:` lines name. The
+///    fix usually lives in one of *these*, not in `file`. A live build of a generated application
+///    reported `no matching function for call to 'app::Sampler::Sampler(…)'` inside the **library's**
+///    `scheduler.hpp` — a header the application may not change — while the mistake was the
+///    spawn call in `main.cpp`; a repair that read only the blamed file would look at the wrong file
+///    and give up;
+///  * **`lines`** carries the `note:` lines, which say what the compiler expected
+///    (`no known conversion for argument 2 from 'ActorRef<Reading>' to 'ActorRef<Offsets>'` is the
+///    whole repair, and passing it on costs nothing);
+///  * **`file`** is the blamed file, kept as printed: it is what a diagnostics list keys by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildDiagnostic {
+    /// The file the compiler blamed, exactly as it printed it.
+    pub file: String,
+    /// Every other file named around this diagnostic, innermost first: the include chain above it and
+    /// the files its `note:` lines point at.
+    pub related: Vec<String>,
+    /// The `error:` line and the `note:` lines under it, verbatim, in the order they were printed.
+    pub lines: Vec<String>,
+}
+
+impl BuildDiagnostic {
+    /// The files a repair pass could act on, in the order it should try them: the file the compiler
+    /// **blamed** first, then the files around it.
+    ///
+    /// The blamed file wins whenever a repair may touch it, because *the compiler blamed this file* is
+    /// the strongest signal there is — a syntax error is in *that* file and nowhere else. The chain and
+    /// the notes are the fallback that makes the interesting case work: a mismatch reported inside the
+    /// library's `scheduler.hpp` is a call in the `main.cpp` that included it, and a repair that never
+    /// looked past the blamed file would look at a header it must not change.
+    ///
+    /// The order was the other way round first, and a live run found the cost: a syntax error in
+    /// `main/touch.hpp` arrived under an `In file included from …/main/main.cpp:8:` chain, so the repair
+    /// rewrote `main.cpp` and left the broken file exactly as broken.
+    pub fn candidates(&self) -> Vec<&str> {
+        std::iter::once(self.file.as_str())
+            .chain(self.related.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// Whether this is an overload-resolution failure — the one error shape whose fix is genuinely
+    /// ambiguous between the two files it names.
+    ///
+    /// `no matching function for call to 'app::Power::Power(…)'` over a `candidate:` note that says
+    /// `no known conversion for argument 1 from 'ActorRef<app::Report>' to 'ActorRef<app::Battery>'`
+    /// is a shape a live build produced: the spawn site passed `ActorRef<Report>` and the constructor
+    /// wanted `ActorRef<Battery>`, and **either** could be the mistake. A repair that fixed only the
+    /// first fillable candidate — the call site, which the include chain reaches before the note —
+    /// looped forever, because `main.cpp` cannot be made to match a declaration that is itself wrong.
+    pub fn is_overload_mismatch(&self) -> bool {
+        self.lines.iter().any(|line| {
+            line.contains("no matching function for call")
+                || line.contains("no known conversion for argument")
+        })
+    }
+}
+
+/// Read a compiler's output into the diagnostics a repair pass acts on.
+///
+/// Compilers print `path:line:col: error: …`, the `note:` lines that explain it, and — when the error
+/// sits inside a header — an `In file included from …` chain above it. A line that is none of those is a
+/// continuation (the source line, a caret diagram) and belongs to nothing. Warnings are **ignored**: a
+/// warning is not a broken build, and a pass that rewrote files because of one would be a pass nobody
+/// asked for.
+///
+/// GCC prints a chain as `In file included from A:N:` followed by `from B:N:` continuations, and IDF
+/// prints one chain per diagnostic. Both forms are read here, because which one a compiler uses is the
+/// compiler's business and not the caller's.
+pub fn group_diagnostics(text: &str) -> Vec<BuildDiagnostic> {
+    let mut found: Vec<BuildDiagnostic> = Vec::new();
+    let mut chain: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("In file included from ") {
+            chain = vec![location_file(rest)];
+            continue;
+        }
+        if let Some(rest) = line.trim_start().strip_prefix("from ") {
+            if !chain.is_empty() {
+                chain.push(location_file(rest));
+            }
+            continue;
+        }
+        let Some((file, severity)) = diagnostic_head(line) else {
+            continue;
+        };
+        match severity {
+            Severity::Error => found.push(BuildDiagnostic {
+                file: file.clone(),
+                related: std::mem::take(&mut chain),
+                lines: vec![line.trim_end().to_string()],
+            }),
+            // A note explains the error above it, even when it names a *different* file — which is
+            // exactly the case worth catching, because that other file is where the fix goes.
+            Severity::Note => {
+                if let Some(last) = found.last_mut() {
+                    // Deduplicated: an include chain and a note often name the same file, and a
+                    // candidate list that repeats itself makes a prompt that repeats itself.
+                    if !last.related.contains(&file) {
+                        last.related.push(file);
+                    }
+                    last.lines.push(line.trim_end().to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+enum Severity {
+    Error,
+    Note,
+}
+
+/// The file and severity a compiler diagnostic line states, or `None` when the line is not one.
+///
+/// `fatal error:` is tried before `error:` because the former contains the latter. The path is
+/// everything before the marker with its `:line:col` stripped, and it must contain no space — a
+/// compiler prints `path:line:col: error: message`, and a looser match would turn a *message* that
+/// quotes a diagnostic into a filename.
+fn diagnostic_head(line: &str) -> Option<(String, Severity)> {
+    for (marker, severity) in [
+        ("fatal error: ", Severity::Error),
+        ("error: ", Severity::Error),
+        ("note: ", Severity::Note),
+    ] {
+        if let Some(at) = line.find(marker) {
+            let before = line[..at].trim_end_matches(':').trim();
+            if before.is_empty() || before.contains(' ') {
+                return None;
+            }
+            return Some((location_file(before), severity));
+        }
+    }
+    None
+}
+
+/// `path:line:col` — or `path:line`, or `path` — to `path`.
+fn location_file(location: &str) -> String {
+    let trimmed = location.trim_end_matches(':');
+    // The column and the line are the last two colon-separated fields, and only when they are numbers:
+    // a path may contain a colon, a version number may look like a line.
+    match trimmed.rsplit_once(':') {
+        Some((head, tail)) if tail.chars().all(|c| c.is_ascii_digit()) => {
+            match head.rsplit_once(':') {
+                Some((path, line)) if line.chars().all(|c| c.is_ascii_digit()) => path.to_string(),
+                _ => head.to_string(),
+            }
+        }
+        _ => trimmed.to_string(),
+    }
+}
+
+/// The **fillable** files a set of diagnostics points at, each with the diagnostics that named it.
+///
+/// `fill_roots` is the scaffold's own rule — the directories a model may write into — and it is the
+/// whole reason this exists: a repair that could rewrite anything would be a repair that could break the
+/// scaffold it was reading. A diagnostic whose every candidate lies outside those roots is left out, and
+/// the caller reports it: the mistake is then in a file the **library** owns, and the fix is a person's.
+///
+/// Candidates are tried in the order [`BuildDiagnostic::candidates`] gives, so a call site beats the
+/// header it called into — which is the case a real build produced, where the error was reported inside
+/// `scheduler.hpp` and belonged to `main.cpp`. Paths outside `root` are never ours, and a path
+/// that is not a file is not repaired either, whatever the compiler said about it.
+///
+/// The one exception is an overload-resolution failure ([`BuildDiagnostic::is_overload_mismatch`]),
+/// whose fix can sit at the call site **or** in the declaration the compiler offered as a `candidate:`.
+/// There every fillable candidate gets a repair step, so the pass reaches the header the error was
+/// really about instead of rewriting the call site into the same wrong shape forever.
+pub fn repairable_sources(
+    root: &std::path::Path,
+    fill_roots: &[String],
+    diagnostics: &[BuildDiagnostic],
+) -> Vec<(std::path::PathBuf, Vec<BuildDiagnostic>)> {
+    let prefix = format!("{}/", root.to_string_lossy());
+    let mut by_file: Vec<(std::path::PathBuf, Vec<BuildDiagnostic>)> = Vec::new();
+    for diagnostic in diagnostics {
+        // Every other error has one home — the first fillable candidate — and stopping there keeps a
+        // repair from sprawling into a file the compiler only named in passing. An overload-resolution
+        // failure is the exception: it names a call site *and* the declaration it could not match, and
+        // either could carry the fix, so both are repaired.
+        let every_fillable_candidate = diagnostic.is_overload_mismatch();
+        for candidate in diagnostic.candidates() {
+            let relative = candidate.strip_prefix(&prefix).unwrap_or(candidate);
+            let path = root.join(relative);
+            let inside = fill_roots
+                .iter()
+                .any(|fill_root| path.starts_with(root.join(fill_root)));
+            if !inside || !path.is_file() {
+                continue;
+            }
+            match by_file.iter_mut().find(|(known, _)| known == &path) {
+                Some((_, list)) => list.push(diagnostic.clone()),
+                None => by_file.push((path, vec![diagnostic.clone()])),
+            }
+            if !every_fillable_candidate {
+                break;
+            }
+        }
+    }
+    by_file
+}
+
+/// The **other** fillable files the compiler named around a diagnostic, with their current content,
+/// for a repair prompt that has to line two files up.
+///
+/// [`repairable_sources`] decides what the repair may rewrite; this decides what it may *read*. The
+/// file already being repaired is left out, as is anything outside the fill roots — the same rule, for
+/// the same reason: a repair must not read the library into its own fix. It is read-only context, never
+/// a second write, and it is what turns `no known conversion for argument 1 …` from a note the model
+/// sees into the second file it needs to reconcile.
+pub fn related_sources(
+    root: &std::path::Path,
+    fill_roots: &[String],
+    diagnostics: &[BuildDiagnostic],
+    repaired: &std::path::Path,
+) -> Vec<(String, String)> {
+    let prefix = format!("{}/", root.to_string_lossy());
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    for diagnostic in diagnostics {
+        for candidate in diagnostic.candidates() {
+            let relative = candidate.strip_prefix(&prefix).unwrap_or(candidate);
+            let path = root.join(relative);
+            let inside = fill_roots
+                .iter()
+                .any(|fill_root| path.starts_with(root.join(fill_root)));
+            if !inside || !path.is_file() || path == repaired || seen.contains(&path) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let relative = path
+                    .strip_prefix(root)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                seen.push(path);
+                out.push((relative, content));
+            }
+        }
+    }
     out
 }
 
@@ -5376,5 +5645,242 @@ struct ICameraHAL : hal::HalModule {
         assert!(hints.contains("spire_send_json"), "hints: {hints}");
         assert!(hints.contains("CandleEmbedder"), "hints: {hints}");
         assert!(hints.contains("declare_dependencies"), "hints: {hints}");
+    }
+
+    /// The diagnostics of a **real failing build** of a generated application, verbatim.
+    ///
+    /// Every part of the shape is here because it was here in the log: the error is reported inside the
+    /// **library's** `scheduler.hpp` while the mistake is the spawn call in `main.cpp`, the notes name
+    /// the file that carries the fix and say what the compiler expected, and an include chain sits above
+    /// each of them. A parser that read only `error:` lines would send a repair at a header the
+    /// application may not change.
+    const A_REAL_FAILING_BUILD: &str = "\
+[1062/1087] Building CXX object esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj
+FAILED: esp-idf/main/CMakeFiles/__idf_main.dir/main.cpp.obj
+In file included from /tmp/app/main/main.cpp:2:
+/tmp/app/library/components/actors/include/scheduler.hpp:63:23: error: no matching function for call to 'app::Sampler::Sampler(spire::ActorRef<app::Reading>&, spire::ActorRef<app::Reading>&)'
+In file included from /tmp/app/main/main.cpp:8:
+/tmp/app/main/sampler.hpp:23:5: note: candidate: 'app::Sampler::Sampler(spire::ActorRef<app::Reading>, spire::ActorRef<app::Offsets>)'
+   23 |     Sampler(spire::ActorRef<app::Reading> air, spire::ActorRef<app::Offsets> offsets)
+      |     ^~~~~~~
+/tmp/app/main/sampler.hpp:23:72: note:   no known conversion for argument 2 from 'ActorRef<app::Reading>' to 'ActorRef<app::Offsets>'
+warning: unused variable 'x' [-Wunused-variable]
+ninja: build stopped: subcommand failed.";
+
+    /// A compiler's output, read for the repair pass: errors grouped with their notes, warnings left
+    /// alone, and the include chain kept — because the chain is where the fix usually goes.
+    #[test]
+    fn a_build_s_output_is_read_into_diagnostics_a_repair_can_act_on() {
+        let found = group_diagnostics(A_REAL_FAILING_BUILD);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        let diagnostic = &found[0];
+        assert_eq!(
+            diagnostic.file, "/tmp/app/library/components/actors/include/scheduler.hpp",
+            "the file the compiler blamed, as it printed it"
+        );
+        assert_eq!(
+            diagnostic.related,
+            vec![
+                "/tmp/app/main/main.cpp".to_string(),
+                "/tmp/app/main/sampler.hpp".to_string(),
+            ],
+            "the include chain and the note's file — the two places the fix could go:\n{diagnostic:#?}"
+        );
+        assert!(
+            diagnostic
+                .lines
+                .iter()
+                .any(|line| line.contains("no known conversion for argument 2")),
+            "the note that says what the compiler expected is the repair:\n{diagnostic:#?}"
+        );
+        assert_eq!(
+            diagnostic.lines.len(),
+            3,
+            "the error and both `note:` lines under it — the notes are the compiler saying what it \
+             expected, which is the repair"
+        );
+        assert!(
+            !diagnostic
+                .lines
+                .iter()
+                .any(|line| line.contains("unused variable")),
+            "a warning is not a broken build, and a repair for one is a repair nobody asked for"
+        );
+        assert!(
+            diagnostic
+                .lines
+                .iter()
+                .all(|line| !line.contains("^~~~~~~")),
+            "a caret diagram is a continuation, not a diagnostic:\n{diagnostic:#?}"
+        );
+        // **The blamed file first, the call site second.** A syntax error is in the file the compiler
+        // named and nowhere else; the chain only decides it when the blamed file is one a repair may not
+        // touch — which is what the guard test below is about.
+        assert_eq!(
+            diagnostic.candidates()[0],
+            "/tmp/app/library/components/actors/include/scheduler.hpp"
+        );
+        assert_eq!(diagnostic.candidates()[1], "/tmp/app/main/main.cpp");
+    }
+
+    /// Which of those files a repair may touch: the scaffold's **fill roots**, and nothing else.
+    ///
+    /// The same rule the fill writes under, and what keeps a repair from rewriting the manifest that
+    /// defines the build — or the library the application only consumes. A diagnostic whose every
+    /// candidate is outside is dropped here, and that is a report to a person, not a repair.
+    #[test]
+    fn a_repair_may_only_touch_the_files_the_scaffold_left_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("main")).unwrap();
+        std::fs::write(root.join("main/main.cpp"), "// the composition\n").unwrap();
+        std::fs::write(root.join("main/sampler.hpp"), "// an actor\n").unwrap();
+        std::fs::write(root.join("CMakeLists.txt"), "project(x)\n").unwrap();
+
+        let fill_roots = vec!["main".to_string()];
+        let found = group_diagnostics(&format!(
+            "{}/main/main.cpp:4:9: error: 'Foo' was not declared in this scope\n\
+             {}/CMakeLists.txt:2:1: error: Parse error. Expected \"(\"\n\
+             {}/library/components/sps30/include/sps30.hpp:9:2: error: no such file\n",
+            root.display(),
+            root.display(),
+            root.display(),
+        ));
+        let repairable = repairable_sources(root, &fill_roots, &found);
+        assert_eq!(repairable.len(), 1, "{repairable:#?}");
+        assert_eq!(repairable[0].0, root.join("main/main.cpp"));
+        assert!(
+            repairable[0].1[0].lines[0].contains("was not declared"),
+            "{repairable:#?}"
+        );
+
+        // A diagnostic the compiler *blamed* on a locked file, whose include chain reaches a fillable
+        // one: the call site is repaired, and the locked file is not touched.
+        let found = group_diagnostics(&format!(
+            "In file included from {}/main/sampler.hpp:3:\n\
+             {}/library/components/actors/include/scheduler.hpp:63:23: error: no matching function\n",
+            root.display(),
+            root.display(),
+        ));
+        let repairable = repairable_sources(root, &fill_roots, &found);
+        assert_eq!(
+            repairable.len(),
+            1,
+            "the chain carries it back into `main/`:\n{repairable:#?}"
+        );
+        assert_eq!(repairable[0].0, root.join("main/sampler.hpp"));
+
+        // Nothing in `main/` to blame: the library owns the mistake, and a person decides.
+        let found = group_diagnostics(&format!(
+            "{}/library/components/actors/include/actor.hpp:9:2: error: no such file\n",
+            root.display()
+        ));
+        assert!(repairable_sources(root, &fill_roots, &found).is_empty());
+    }
+
+    /// The `pm25-reader` repair loop, in one test: an overload-resolution failure whose two files both
+    /// live in `main/`.
+    ///
+    /// A real generated application produced exactly this — `main.cpp` spawned `Power` with a `view`
+    /// that is an `ActorRef<Report>`, while `Power`'s constructor wanted `ActorRef<Battery>` — and the
+    /// repair rewrote `main.cpp` on every pass, because `repairable_sources` stopped at the first
+    /// fillable candidate (the call site, which the include chain reaches before the note). The call
+    /// site cannot be made to match a declaration that is itself wrong, so those passes never
+    /// converged: 6 compiler lines, then 3, then the same 3 again.
+    const PM25_READER_OVERLOAD_MISMATCH: &str = "\
+In file included from /tmp/app/main/main.cpp:2:
+/tmp/app/library/components/actors/include/scheduler.hpp: In instantiation of 'app::Power* spire::Scheduler::spawn<app::Tick, app::Power>(...)':
+/tmp/app/main/main.cpp:31:46:   required from here
+/tmp/app/library/components/actors/include/scheduler.hpp:74:23: error: no matching function for call to 'app::Power::Power(spire::ActorRef<app::Report>&)'
+In file included from /tmp/app/main/main.cpp:8:
+/tmp/app/main/power.hpp:14:14: note: candidate: 'app::Power::Power(spire::ActorRef<app::Battery>)'
+/tmp/app/main/power.hpp:14:45: note:   no known conversion for argument 1 from 'ActorRef<app::Report>' to 'ActorRef<app::Battery>'
+ninja: build stopped: subcommand failed.";
+
+    #[test]
+    fn an_overload_mismatch_repairs_the_call_site_and_the_declaration_both() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("main")).unwrap();
+        std::fs::write(root.join("main/main.cpp"), "// the composition\n").unwrap();
+        std::fs::write(root.join("main/power.hpp"), "// an actor\n").unwrap();
+
+        let fill_roots = vec!["main".to_string()];
+        let found = group_diagnostics(
+            &PM25_READER_OVERLOAD_MISMATCH.replace("/tmp/app", &root.display().to_string()),
+        );
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].is_overload_mismatch(),
+            "the shape is what makes this repair reach past the call site:\n{found:#?}"
+        );
+
+        let repairable = repairable_sources(root, &fill_roots, &found);
+        let paths: Vec<_> = repairable.iter().map(|(path, _)| path.clone()).collect();
+        assert!(
+            paths.contains(&root.join("main/main.cpp")),
+            "the call site is repaired:\n{repairable:#?}"
+        );
+        assert!(
+            paths.contains(&root.join("main/power.hpp")),
+            "and so is the declaration the compiler offered — the file the loop never reached:\n{repairable:#?}"
+        );
+        assert_eq!(
+            paths.len(),
+            2,
+            "and the locked scheduler.hpp does not sneak in:\n{repairable:#?}"
+        );
+    }
+
+    /// The repair prompt carries the *other* file the compiler named, read-only, so a mismatch that
+    /// spans two files can be lined up in one pass.
+    #[test]
+    fn a_repair_reads_the_other_fillable_file_it_has_to_line_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("main")).unwrap();
+        std::fs::write(root.join("main/main.cpp"), "// the composition\n").unwrap();
+        std::fs::write(root.join("main/power.hpp"), "// an actor\n").unwrap();
+
+        let fill_roots = vec!["main".to_string()];
+        let found = group_diagnostics(
+            &PM25_READER_OVERLOAD_MISMATCH.replace("/tmp/app", &root.display().to_string()),
+        );
+
+        // Repairing `power.hpp` shows `main.cpp`; repairing `main.cpp` shows `power.hpp`. Never the
+        // locked `scheduler.hpp`, which is not fillable at all.
+        let for_power = related_sources(root, &fill_roots, &found, &root.join("main/power.hpp"));
+        assert_eq!(for_power.len(), 1, "{for_power:#?}");
+        assert_eq!(for_power[0].0, "main/main.cpp");
+        assert_eq!(for_power[0].1, "// the composition\n");
+
+        let for_main = related_sources(root, &fill_roots, &found, &root.join("main/main.cpp"));
+        assert_eq!(for_main.len(), 1, "{for_main:#?}");
+        assert_eq!(for_main[0].0, "main/power.hpp");
+    }
+
+    #[test]
+    fn the_repair_prompt_carries_related_files_as_read_only_context() {
+        let prompt = compile_fix_prompt(
+            "/tmp/app/main/power.hpp",
+            "// an actor\n",
+            &["power.hpp:14:14: note:   no known conversion for argument 1".to_string()],
+            &[(
+                "main/main.cpp".to_string(),
+                "// the composition\n".to_string(),
+            )],
+        );
+        assert!(prompt.contains("main/main.cpp"), "{prompt}");
+        assert!(prompt.contains("// the composition"), "{prompt}");
+        assert!(prompt.contains("Do NOT rewrite these"), "{prompt}");
+        // The corrected file is still the only thing asked for.
+        assert!(
+            prompt.contains("Return ONLY the complete corrected file"),
+            "{prompt}"
+        );
+
+        // With no related files the prompt is exactly the single-file shape the dashboard flow uses.
+        let bare = compile_fix_prompt("/tmp/app/main/power.hpp", "// an actor\n", &[], &[]);
+        assert!(!bare.contains("Do NOT rewrite these"), "{bare}");
     }
 }

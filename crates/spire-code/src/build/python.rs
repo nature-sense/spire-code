@@ -300,6 +300,8 @@ impl Actor for PythonBuildModule {
                 platforms: _platforms,
                 structure: _structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let bc = r#"[project]

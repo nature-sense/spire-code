@@ -61,8 +61,12 @@ pub enum Verified {
 /// compiler, a board, or a model.
 #[async_trait::async_trait]
 pub trait CodeModifyBackend: Send + Sync {
-    /// Ask the model for the rewrites. `None`, or an empty list, means it proposed
-    /// nothing usable — which is a failure to show the user, not a silent no-op.
+    /// Ask the model for the rewrites.
+    ///
+    /// `None` means it proposed nothing usable — a failure to show the user. An **empty list** is
+    /// different: the model rewrote the file(s) and every rewrite matched what was already on disk,
+    /// so the request is already in effect. That is a no-op ([`ModifyCodeReport::up_to_date`]), not
+    /// a failure, which is what a re-run against finished files must report.
     async fn plan(&self, prompt: &str, scope: &[PathBuf]) -> Option<Vec<PlannedChange>>;
 
     /// Compile, and return the errors the build reports, grouped by file.
@@ -146,6 +150,54 @@ pub fn select_files(reply: &str, scope: &[PathBuf]) -> Vec<PathBuf> {
     wanted
 }
 
+/// The files a plan rewrites, from the model's answer or straight from the scope.
+///
+/// A **free-text** change (`modify/code`) may touch one file of many, so the model chooses from the
+/// scope and [`select_files`] filters its answer to it. A **component edit** does not get to choose:
+/// its scope is the component's own header, source and test, which are one contract in three files,
+/// and a subset of them cannot agree with itself — a run that rewrote two of the three (the model
+/// picked two one run and three the next) leaves the third stale and is rolled back whole. So every
+/// file in scope is rewritten, and the "which files" question is not asked at all.
+pub fn files_to_rewrite(scope: &[PathBuf], reply: &str, whole_scope: bool) -> Vec<PathBuf> {
+    if whole_scope {
+        scope.to_vec()
+    } else {
+        select_files(reply, scope)
+    }
+}
+
+/// The request a *later* file of a plan is rewritten against: the user's instruction, plus the
+/// rewrites already planned for the files before it.
+///
+/// Each file goes through its own single-file rewrite, so the model writing `foo.cpp` never sees
+/// the header it wrote a moment earlier — and the two agree only by luck. When they do not, the
+/// mismatch is a compile error in whichever came second (a header declaring `value(float*)` while
+/// the test calls `value()`), and the whole plan is rolled back for a reason the caller can only
+/// guess at. Carrying the earlier rewrites forward makes the first file the contract the rest are
+/// written against, which is what the header already is in C++.
+///
+/// Empty `planned` returns `request` unchanged: the first file has nothing yet to agree with.
+pub fn plan_context(request: &str, planned: &[PlannedChange]) -> String {
+    if planned.is_empty() {
+        return request.to_string();
+    }
+    let mut out = String::new();
+    out.push_str(request);
+    out.push_str(
+        "\n\nAlready planned as part of THIS same change — these files have been rewritten to the \
+         definitions below. Keep your rewrite of the current file consistent with their \
+         declarations, names, signatures and types; do not invent a different design for the same \
+         thing:\n",
+    );
+    for change in planned {
+        out.push_str(&format!(
+            "\nFile: {}\n```cpp\n{}\n```\n",
+            change.file, change.content
+        ));
+    }
+    out
+}
+
 /// Adapts a [`CodeModifyBackend`] and one plan to the modify spine.
 struct CodeDriver<'a> {
     backend: &'a dyn CodeModifyBackend,
@@ -158,6 +210,11 @@ struct CodeDriver<'a> {
     backups: Mutex<BTreeMap<String, String>>,
     /// The round-start measurement, kept for the report's "before" figures.
     before: Mutex<Option<CodeObs>>,
+    /// The observation the last round was *judged* on. `reject_round` sees the round's true
+    /// "after" — the broken build, before any file is restored. The measurement taken after a
+    /// rollback describes the *restored* tree instead, so reading the report off it would hide
+    /// both the regression and the compiler messages that explain it.
+    judged: Mutex<Option<CodeObs>>,
     /// The latest measurement.
     current: Mutex<CodeObs>,
     /// Whether a measurement has happened yet: the first `verify` must take one.
@@ -175,14 +232,23 @@ impl CodeDriver<'_> {
         let mut report = self.report.into_inner().unwrap();
         let before = self.before.into_inner().unwrap().unwrap_or_default();
         let after = self.current.into_inner().unwrap();
+        // Speak from the round that was judged, not from wherever the disk settled: a rollback
+        // restores the files, so a later measurement describes the *restored* tree — clean, and
+        // clueless about why the round failed.
+        let judged = self
+            .judged
+            .into_inner()
+            .unwrap()
+            .unwrap_or_else(|| after.clone());
 
         report.rounds = rounds;
         report.build_errors_before = total(&before.build_errors);
-        report.build_errors_after = total(&after.build_errors);
+        report.build_errors_after = total(&judged.build_errors);
+        report.build_error_detail = judged.build_errors.clone();
         report.host_tests_passed_before = before.host_tests_passed;
-        report.host_tests_passed_after = after.host_tests_passed;
+        report.host_tests_passed_after = judged.host_tests_passed;
         report.target_tests_passed_before = before.target_tests_passed;
-        report.target_tests_passed_after = after.target_tests_passed;
+        report.target_tests_passed_after = judged.target_tests_passed;
 
         // Layered verification, stated plainly rather than left to be inferred.
         report.verified = if after.target_tests_passed.is_some() {
@@ -232,8 +298,17 @@ pub struct ModifyCodeReport {
     pub files_changed: Vec<String>,
     pub files_reverted: Vec<String>,
     pub files_skipped: Vec<String>,
+    /// The model rewrote the file(s) and every rewrite matched what was already on disk: the request
+    /// is in effect and there was nothing to write. A no-op, not the failure an empty plan otherwise
+    /// means — a re-run against files that already say what was asked lands here. `success` is true,
+    /// because the requested state does hold, but `files_changed` is empty because nothing moved.
+    pub up_to_date: bool,
     pub build_errors_before: usize,
     pub build_errors_after: usize,
+    /// The compiler's own messages behind [`Self::build_errors_after`], grouped by file. The count
+    /// says *that* the build got worse; this says *why*, which is the only thing a retry — or the
+    /// person reading the report — can act on. Empty when the judged build was clean.
+    pub build_error_detail: ErrorsByFile,
     pub host_tests_passed_before: Option<bool>,
     pub host_tests_passed_after: Option<bool>,
     pub target_tests_passed_before: Option<bool>,
@@ -254,8 +329,10 @@ impl ModifyCodeReport {
             files_changed: Vec::new(),
             files_reverted: Vec::new(),
             files_skipped: Vec::new(),
+            up_to_date: false,
             build_errors_before: 0,
             build_errors_after: 0,
+            build_error_detail: ErrorsByFile::new(),
             host_tests_passed_before: None,
             host_tests_passed_after: None,
             target_tests_passed_before: None,
@@ -271,6 +348,15 @@ impl ModifyCodeReport {
         let mut out = String::new();
         if let Some(error) = &self.error {
             out.push_str(&format!("Modify: {error}\n"));
+        }
+        // A no-op has nothing else to say: the verify figures below describe a measurement that was
+        // never taken (the disk did not change), and printing them "0 → 0, not run → not run" would
+        // dress the no-op up as a verified run.
+        if self.up_to_date {
+            out.push_str(
+                "already up to date: the file(s) already say what was asked; nothing written\n",
+            );
+            return out;
         }
         if !self.files_changed.is_empty() {
             out.push_str(&format!(
@@ -299,6 +385,16 @@ impl ModifyCodeReport {
             show(self.target_tests_passed_before),
             show(self.target_tests_passed_after),
         ));
+        // The counts above say the build broke; these lines are what it said when it did. Without
+        // them a rolled-back edit is a change that "was not kept" for no stated reason.
+        if !self.build_error_detail.is_empty() {
+            out.push_str("compile errors:\n");
+            for (file, errors) in &self.build_error_detail {
+                for error in errors {
+                    out.push_str(&format!("  {file}: {error}\n"));
+                }
+            }
+        }
         for caveat in &self.caveats {
             out.push_str(&format!("note: {caveat}\n"));
         }
@@ -373,6 +469,10 @@ impl ModifyDriver for CodeDriver<'_> {
         let build_worse = total(&after.build_errors) > total(&before.build_errors);
         let host_worse = worse(before.host_tests_passed, after.host_tests_passed);
         let target_worse = worse(before.target_tests_passed, after.target_tests_passed);
+        // Remember what this round ended on, before a rollback restores the files. The report is
+        // written from here, so "build 0 → 2 error(s)" — and the messages behind it — survive the
+        // revert that removes the broken code from the disk.
+        *self.judged.lock().unwrap() = Some(after.clone());
         if !(build_worse || host_worse || target_worse) {
             return false;
         }
@@ -437,6 +537,18 @@ pub async fn run_code_modify(
         report.error = Some("the model proposed no changes; nothing was written".to_string());
         return report;
     };
+    if plan.is_empty() {
+        // The model rewrote the file(s) and every rewrite matched what is already on disk, so the
+        // request is in effect and there is nothing to write — and nothing to verify, because the
+        // disk is unchanged. A no-op: reporting the failure above would misdescribe work the model
+        // did correctly. See `CodeModifyBackend::plan` for the empty-list contract.
+        report.up_to_date = true;
+        report.success = true;
+        report
+            .log
+            .push("already up to date: nothing to write".to_string());
+        return report;
+    }
 
     let mut targets = Vec::new();
     let mut contents = BTreeMap::new();
@@ -467,6 +579,7 @@ pub async fn run_code_modify(
         contents: Mutex::new(contents),
         backups: Mutex::new(BTreeMap::new()),
         before: Mutex::new(None),
+        judged: Mutex::new(None),
         current: Mutex::new(CodeObs::default()),
         measured: Mutex::new(false),
         wrote_since_verify: Mutex::new(0),
@@ -633,6 +746,42 @@ mod tests {
         );
     }
 
+    /// A rollback restores the files, so a measurement taken after it describes the *restored*
+    /// tree — clean, and clueless about why the round failed. The report must speak from the round
+    /// that was judged, or a rejected edit reads as "the project got worse" with nothing to show
+    /// for it: no count, and no compiler message.
+    #[tokio::test]
+    async fn reports_the_errors_of_the_round_it_rolled_back() {
+        let (tmp, _file, name) = project("int original;\n");
+
+        // before: clean · the round's after: 2 errors · the post-revert re-measure: clean again.
+        let backend = Fake::new(vec![errs(&[]), errs(&[("a.cpp", 2)]), errs(&[])])
+            .planning(vec![(name.clone(), "int broken( ;\n".to_string())])
+            .hosting(vec![Some(true), Some(true), Some(true)])
+            .targeting(vec![None, None, None]);
+        let report = run_code_modify(&backend, "break it", &[tmp.path().to_path_buf()], 3).await;
+
+        assert!(!report.success);
+        assert_eq!(report.files_reverted, vec![name]);
+        assert_eq!(
+            report.build_errors_after, 2,
+            "the count must describe the round that was rolled back, not the restored tree: {report:?}"
+        );
+        assert!(
+            report
+                .build_error_detail
+                .values()
+                .flatten()
+                .any(|e| e.contains("boom")),
+            "the compiler's own message must survive the revert: {report:?}"
+        );
+        let summary = report.summary();
+        assert!(
+            summary.contains("compile errors:") && summary.contains("boom"),
+            "a rolled-back edit must say why: {summary}"
+        );
+    }
+
     /// Host tests are a gate: a change that breaks them is rolled back even though it
     /// still compiles.
     #[tokio::test]
@@ -736,6 +885,129 @@ mod tests {
             backend.build_calls(),
             2,
             "the verdict measurement is reused for the final state"
+        );
+    }
+
+    /// The first file of a plan has nothing to agree with, so its prompt is the request
+    /// unchanged — carry-forward must not alter the first rewrite.
+    #[test]
+    fn first_file_has_nothing_to_agree_with() {
+        assert_eq!(plan_context("add a timeout", &[]), "add a timeout");
+    }
+
+    /// A later file is shown the rewrites already planned, so it is written against the
+    /// same declarations as the file that came before it — the drift that rolled the
+    /// whole plan back with a compile error in the file that came second.
+    #[test]
+    fn later_files_are_shown_the_rewrites_already_planned() {
+        let planned = vec![
+            PlannedChange {
+                file: "include/rolling_average.hpp".to_string(),
+                content: "bool value(float* out) const;".to_string(),
+            },
+            PlannedChange {
+                file: "src/rolling_average.cpp".to_string(),
+                content: "bool value(float* out) const { return false; }".to_string(),
+            },
+        ];
+
+        let context = plan_context("make it a rolling average", &planned);
+
+        assert!(
+            context.starts_with("make it a rolling average"),
+            "{context}"
+        );
+        assert!(
+            context.contains("Already planned as part of THIS same change"),
+            "{context}"
+        );
+        // Each earlier rewrite is present, path first, and in plan order — the header
+        // before the source — so the contract the rest follow is unambiguous.
+        let header = context.find("include/rolling_average.hpp").unwrap();
+        let source = context.find("src/rolling_average.cpp").unwrap();
+        assert!(header < source, "{context}");
+        assert!(
+            context.contains("bool value(float* out) const;"),
+            "{context}"
+        );
+        assert!(
+            context.contains("bool value(float* out) const { return false; }"),
+            "{context}"
+        );
+    }
+
+    /// A plan whose rewrites all match the files already on disk is a no-op, not the failure that
+    /// "the model proposed nothing" is: the request is already in effect. A re-run against finished
+    /// files must say so, and — since the disk did not change — must not pay for a build to say it.
+    #[tokio::test]
+    async fn an_empty_plan_that_matched_everything_is_reported_as_up_to_date() {
+        let (tmp, file, _name) = project("int done;\n");
+
+        let backend = Fake::new(vec![]).planning(vec![]);
+        let report = run_code_modify(&backend, "do it", &[tmp.path().to_path_buf()], 1).await;
+
+        assert!(report.up_to_date, "{report:?}");
+        assert!(report.success, "{report:?}");
+        assert!(report.error.is_none(), "{report:?}");
+        assert!(report.files_changed.is_empty());
+        assert_eq!(
+            backend.build_calls(),
+            0,
+            "nothing was written, so there is nothing to verify"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "int done;\n");
+        assert!(
+            report.summary().contains("already up to date"),
+            "{}",
+            report.summary()
+        );
+    }
+
+    /// `None` stays a failure: the model proposed nothing usable at all, which is not the same as
+    /// proposing that the files are already correct.
+    #[tokio::test]
+    async fn a_plan_that_proposed_nothing_is_still_a_failure() {
+        let (tmp, _file, _name) = project("int original;\n");
+
+        let backend = Fake::new(vec![]);
+        let report = run_code_modify(&backend, "do it", &[tmp.path().to_path_buf()], 1).await;
+
+        assert!(!report.success, "{report:?}");
+        assert!(!report.up_to_date, "{report:?}");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("proposed no changes")),
+            "{report:?}"
+        );
+    }
+
+    /// The one decision the component edit makes differently: it rewrites its whole scope, because
+    /// the header, source and test are one contract and a subset of them cannot agree with itself.
+    /// A free-text change keeps the model's choice, still filtered to the scope as a guardrail.
+    #[test]
+    fn a_component_edit_rewrites_the_whole_scope() {
+        let scope = vec![
+            PathBuf::from("/c/include/a.hpp"),
+            PathBuf::from("/c/src/a.cpp"),
+            PathBuf::from("/c/test/a_test.cpp"),
+        ];
+        let reply = "- /c/include/a.hpp\n";
+
+        assert_eq!(
+            files_to_rewrite(&scope, reply, true),
+            scope,
+            "every file in a component's scope is rewritten"
+        );
+        assert_eq!(
+            files_to_rewrite(&scope, reply, false),
+            vec![PathBuf::from("/c/include/a.hpp")],
+            "a free-text change keeps the model's choice"
+        );
+        assert!(
+            files_to_rewrite(&scope, "/etc/passwd\n", false).is_empty(),
+            "the scope still bounds a free-text choice"
         );
     }
 }

@@ -11,6 +11,8 @@
 //! are not registered here.
 
 use crate::actors::vscode_tool_definitions;
+// Aliased: `registry` in this file is the `ToolRegistry` being built, not the ESP component one.
+use crate::build::registry as registry_tools;
 use crate::subsystems::build::build_manager::BuildManagerMessage;
 use crate::subsystems::project::project_build::{ProjectBuildActor, ProjectBuildMessage};
 use crate::subsystems::project::project_install::{ProjectInstallActor, ProjectInstallMessage};
@@ -191,6 +193,12 @@ pub async fn build_default_registry(
         web_search_handler(name)
     })?;
 
+    // The **ESP Component Registry** — what exists upstream, for a design that must not invent a driver
+    // that somebody has already published (and published, tested and licensed).
+    register_static(&registry, registry_tools::tool_definitions(), |name| {
+        registry_handler(name)
+    })?;
+
     // RAG tools (generic — the RAG framework lives in this crate). Their
     // definitions come from `vscode_tool_definitions()` (partitioned above).
     // Default-domain resolution happens inside the RagActor (mailbox-serialized).
@@ -327,6 +335,15 @@ fn web_search_handler(name: String) -> ToolHandler {
     Arc::new(move |args| {
         let name = name.clone();
         Box::pin(async move { web_search::call(&name, args).await })
+    })
+}
+
+/// The ESP Component Registry tools. No actor behind them: a registry answer is fetched and shaped, and
+/// nothing about it is state — the version a design reads today is the version the registry has today.
+fn registry_handler(name: String) -> ToolHandler {
+    Arc::new(move |args| {
+        let name = name.clone();
+        Box::pin(async move { crate::build::registry::call(&name, args).await })
     })
 }
 

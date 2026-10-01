@@ -258,6 +258,8 @@ impl Actor for GoBuildModule {
                 platforms: _platforms,
                 structure: _structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let bc = r#"module __P__

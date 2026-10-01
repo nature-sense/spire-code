@@ -88,7 +88,10 @@ pub fn unknown_names(caps: &Value) -> Vec<String> {
 /// Every **capability path** in a declared tree, sorted — the names a seeder makes nodes for.
 ///
 /// The rule is structural, and it needs no vocabulary lookup: **a key whose value is a mapping is a
-/// capability; a scalar or a list is a property *of* the enclosing capability.** So
+/// capability; a scalar or a list is a property *of* the enclosing capability.** A mapping whose
+/// children are themselves *all* mappings is instead a **path segment** — its children are the
+/// capabilities (`radio.ieee802154` → zigbee/thread, `media.video` → encode/decode) — which is how
+/// `compute.ml` stays a capability while holding the mapping `accelerator` as a property. So
 ///
 /// ```text
 /// media: { video: { encode: { codec: h264 } }, camera: { interface: mipi-csi } }
@@ -124,7 +127,14 @@ pub fn capability_paths(tree: &Value) -> Vec<String> {
                 walk(&Value::Object(child.clone()), &path, out);
                 continue;
             }
-            if child.values().any(Value::is_object) {
+            // A **grouping** is a non-empty mapping whose children are all mappings — its names are
+            // the capabilities (`radio.ieee802154` → zigbee/thread, `media.video` → encode/decode).
+            // A mapping with any scalar or list child is a **leaf**: that child is a *property* of
+            // it (`compute.ml` → runtime beside accelerator), so the name itself is what a board
+            // declares. An empty mapping is a leaf too — `zigbee: {}` is a capability that carries
+            // nothing else. The test is `all`, not `any`: with `any`, `compute.ml` descended into
+            // `accelerator` and named `compute.ml.accelerator.tops`, a property's precision.
+            if !child.is_empty() && child.values().all(Value::is_object) {
                 walk(&Value::Object(child.clone()), &path, out);
             } else {
                 out.push(path);
@@ -183,6 +193,46 @@ mod capability_path_tests {
             capability_paths(&serde_json::json!({ "radio": {} })).is_empty(),
             "a declared-but-empty category names nothing"
         );
+    }
+
+    /// A capability that holds a **map-valued property** is still one capability. `compute.ml`
+    /// carries the scalar `runtime` beside the mapping `accelerator`, and the earlier `any`-based
+    /// rule descended into `accelerator` and named `compute.ml.accelerator.tops` — a property's
+    /// precision — instead of `compute.ml`.
+    #[test]
+    fn a_map_valued_property_does_not_become_a_capability() {
+        let ml = serde_json::json!({
+            "compute": {
+                "ml": {
+                    "accelerator": { "kind": "npu", "tops": { "int8": 3.0 } },
+                    "runtime": "rknn"
+                }
+            }
+        });
+        assert_eq!(
+            capability_paths(&ml),
+            vec!["compute.ml"],
+            "`accelerator`/`tops`/`runtime` are properties of `compute.ml`, not capabilities under it"
+        );
+
+        // A **grouping** — a mapping whose children are all mappings — is unaffected.
+        let video = serde_json::json!({
+            "media": { "video": { "encode": { "codec": "h264" }, "decode": { "codec": "hevc" } } }
+        });
+        assert_eq!(
+            capability_paths(&video),
+            vec!["media.video.decode", "media.video.encode"],
+            "`media.video` is only a path segment; its all-mapping children are the capabilities"
+        );
+    }
+
+    /// `io.buses` is a leaf whose children are all scalars, so it is named itself — the schema was
+    /// flattened out of `{ instances: { i2c, spi, uart } }` (all mappings, which read as a grouping)
+    /// into the counts directly, the one shape the structural rule cannot disambiguate.
+    #[test]
+    fn a_leaf_whose_children_are_scalars_is_named_itself() {
+        let buses = serde_json::json!({ "io": { "buses": { "i2c": 2, "spi": 2, "uart": 2 } } });
+        assert_eq!(capability_paths(&buses), vec!["io.buses"]);
     }
 }
 
@@ -308,7 +358,13 @@ pub fn carries(companions: Option<&Value>) -> Vec<(String, Value)> {
             list.iter()
                 .filter_map(|entry| {
                     let chip = entry.get("chip")?.as_str()?.to_string();
-                    Some((chip, entry.clone()))
+                    // The chip id is the edge's *target*, so it is not also a property of it: what
+                    // travels beside it is the **rest** of the entry (`role`, `link`, `firmware`).
+                    // Leaving `chip` in would store it twice — as the endpoint and as a property —
+                    // and read it back as a redundant field.
+                    let mut properties = entry.as_object()?.clone();
+                    properties.remove("chip");
+                    Some((chip, Value::Object(properties)))
                 })
                 .collect()
         })
@@ -346,6 +402,40 @@ mod carries_tests {
     }
 }
 
+/// The **pin functions** a board declares, flattened: each function path and the mapping written
+/// for it — the assignment a BSP addresses.
+///
+/// A function is a name, not a taxonomy: `grove: { a: …, b: … }` is two functions (`grove.a`,
+/// `grove.b`), while `grove: { i2c: […] }` is one — the same leaf/grouping test
+/// [`capability_paths`] uses. A **bare list** is a set of pins with no per-pin attributes
+/// (`strapping: [GPIO2, GPIO8, GPIO9]`); it is wrapped under `pins:` rather than dropped, because an
+/// edge property map has to have a key and the list *is* the whole assignment.
+pub fn pin_functions(tree: &Value) -> Vec<(String, Value)> {
+    fn walk(value: &Value, prefix: &str, out: &mut Vec<(String, Value)>) {
+        let Some(obj) = value.as_object() else {
+            return;
+        };
+        for (key, child) in obj {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match child {
+                Value::Object(m) if !m.is_empty() && m.values().all(Value::is_object) => {
+                    walk(child, &path, out);
+                }
+                Value::Object(_) => out.push((path, child.clone())),
+                other => out.push((path, serde_json::json!({ "pins": other }))),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, "", &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// A declared block as **seeder input**: what a graph writer needs, with no tree left in it.
 ///
 /// Flattened here, on this side of the message, because it cannot be flattened on the other:
@@ -354,9 +444,12 @@ mod carries_tests {
 ///
 /// * `capabilities` — every path the entry declares, as node names. A chip's `capabilities:` and a
 ///   board's `realized:` are deliberately the same shape, so both contribute here.
-/// * `realizes` — a board's realization edges: the path, and the `via`/`firmware` written under it.
+/// * `realizes` — a board's realization edges: the path, and the values written under it.
+/// * `provides` — a chip's capability edges: the path, and the silicon's own values under it — the
+///   mirror of `realizes`, so the chip-side facts (`interface`, `cores`, `tops`, …) are stored too.
 /// * `carries` — a board's companion edges: the chip, and what is written beside it.
-/// * `pins` — the wiring, passed through untouched. It is board facts for a BSP, not graph edges.
+/// * `pins` — a board's wiring: each function (`led`, `grove.a`) and its assignment, for the seeder
+///   to write as `Pin` nodes and `pins` edges.
 ///
 /// Keys with nothing in them are omitted, so an entry that declares nothing produces nothing — and
 /// a caller can tell that from `null` without inspecting four empty containers.
@@ -364,8 +457,25 @@ pub fn seeder_input(blocks: &Value) -> Value {
     let mut out = serde_json::Map::new();
     let mut names: Vec<String> = Vec::new();
 
+    // A chip's `capabilities:` is a **`provides`** list — the silicon's own values for each
+    // capability — beside the names it contributes. A board's `realized:` is the same shape on the
+    // other side of the ledger, which is why both go through `realizations`.
     if let Some(caps) = blocks.get("capabilities") {
-        names.extend(capability_paths(caps));
+        let provided = realizations(caps);
+        names.extend(provided.iter().map(|(path, _)| path.clone()));
+        if !provided.is_empty() {
+            out.insert(
+                "provides".into(),
+                Value::Array(
+                    provided
+                        .into_iter()
+                        .map(|(capability, properties)| {
+                            serde_json::json!({ "capability": capability, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
     }
     if let Some(realized) = blocks.get("realized") {
         let edges = realizations(realized);
@@ -400,8 +510,24 @@ pub fn seeder_input(blocks: &Value) -> Value {
             );
         }
     }
+    // A board's `pins:` are **functions and their assignments** — wiring that gets its own `Pin`
+    // nodes and `pins` edges in the graph, not a blob on the board. Flattened to function paths
+    // here, for the same reason the capabilities are.
     if let Some(pins) = blocks.get("pins") {
-        out.insert("pins".into(), pins.clone());
+        let functions = pin_functions(pins);
+        if !functions.is_empty() {
+            out.insert(
+                "pins".into(),
+                Value::Array(
+                    functions
+                        .into_iter()
+                        .map(|(function, properties)| {
+                            serde_json::json!({ "function": function, "properties": properties })
+                        })
+                        .collect(),
+                ),
+            );
+        }
     }
 
     names.sort();
@@ -438,8 +564,7 @@ mod seeder_input_tests {
     use super::*;
 
     /// A chip contributes names and nothing else; a board contributes names, its realization edges,
-    /// its companion edges — and passes its wiring through, because a BSP needs it and the graph
-    /// does not.
+    /// its companion edges — and its wiring as functions, each with the assignment a BSP addresses.
     #[test]
     fn a_declared_block_becomes_seeder_input() {
         let chip = serde_json::json!({
@@ -463,11 +588,68 @@ mod seeder_input_tests {
         assert_eq!(got["realizes"][0]["properties"]["via"], "esp32p4");
         assert_eq!(got["carries"][0]["chip"], "esp32c6");
         assert_eq!(got["carries"][0]["properties"]["role"], "radio");
-        assert_eq!(got["pins"]["led"]["pin"], "GPIO48", "wiring passes through");
+        assert_eq!(got["pins"][0]["function"], "led");
+        assert_eq!(got["pins"][0]["properties"]["pin"], "GPIO48");
 
         assert!(
             seeder_input(&serde_json::json!({})).is_null(),
             "nothing declared, nothing sent"
+        );
+    }
+
+    /// A chip names nodes **and** states each capability's values: `capabilities:` becomes a
+    /// `provides` list (path + the values written under it), which is where the chip-side facts live
+    /// on the graph. It is the mirror of a board's `realizes` and keeps `capabilities` as names.
+    #[test]
+    fn a_chip_capability_becomes_a_provides_edge_with_its_values() {
+        let chip = serde_json::json!({
+            "capabilities": { "media": { "camera": { "interface": "mipi-csi" } } }
+        });
+        let got = seeder_input(&chip);
+        assert_eq!(got["capabilities"], serde_json::json!(["media.camera"]));
+        assert_eq!(got["provides"][0]["capability"], "media.camera");
+        assert_eq!(got["provides"][0]["properties"]["interface"], "mipi-csi");
+        assert!(
+            got.get("realizes").is_none(),
+            "a chip realizes nothing - it provides"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pin_function_tests {
+    use super::*;
+
+    /// A grouping flattens to dotted function paths and a leaf keeps its assignment — the same
+    /// leaf/grouping test the capability walk uses, because a pin block nests the same way.
+    #[test]
+    fn grouping_and_leaves_flatten_to_function_paths() {
+        let pins = serde_json::json!({
+            "led": { "pin": "GPIO8", "addressable": true },
+            "i2c_internal": { "sda": "GPIO12", "scl": "GPIO11" },
+            "grove": { "a": { "i2c": ["GPIO2", "GPIO1"] }, "b": { "gpio": ["GPIO9", "GPIO8"] } }
+        });
+        let got = pin_functions(&pins);
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["grove.a", "grove.b", "i2c_internal", "led"]);
+        let led = got.iter().find(|(n, _)| n == "led").expect("led");
+        assert_eq!(led.1["pin"], "GPIO8");
+        assert_eq!(led.1["addressable"], true);
+        let grove_a = got.iter().find(|(n, _)| n == "grove.a").expect("grove.a");
+        assert_eq!(grove_a.1["i2c"], serde_json::json!(["GPIO2", "GPIO1"]));
+    }
+
+    /// A bare list is a set of pins with no per-pin attributes; it is wrapped under `pins:` so it
+    /// survives as an edge property rather than being dropped for having no key.
+    #[test]
+    fn a_bare_list_of_pins_is_wrapped() {
+        let pins = serde_json::json!({ "strapping": ["GPIO2", "GPIO8", "GPIO9"] });
+        let got = pin_functions(&pins);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "strapping");
+        assert_eq!(
+            got[0].1,
+            serde_json::json!({ "pins": ["GPIO2", "GPIO8", "GPIO9"] })
         );
     }
 }

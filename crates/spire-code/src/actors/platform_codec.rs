@@ -119,12 +119,35 @@ pub fn platform_to_registry_json(p: &Platform) -> serde_json::Value {
             serde_json::json!(str_list(&hal.features)),
         );
     }
+    // The board's BSP — a name as its SDK writes it (`m5stack_core_s3`), not a Rust crate.
+    // Board-scoped, so it travels with the board the way the HAL travels with the chip.
+    if let Some(bsp) = &p.bsp {
+        props.insert("bsp".into(), serde_json::json!(bsp));
+    }
 
     serde_json::json!({
         "id": p.id,
         "name": p.name,
         "properties": props,
     })
+}
+
+/// A platform as the **bootstrap payload**: the registry JSON (the typed props) with the entry's
+/// capability blocks attached, **flattened** for the seeder.
+///
+/// The seeder lives in `spire-core`, which does not depend on this crate, so it cannot walk the
+/// registry's YAML trees; it consumes the flattened shape
+/// [`crate::capability_vocabulary::seeder_input`] produces — `capabilities` as node names,
+/// `realizes`/`carries` as edge lists, `pins` passed through. Attaching the *raw* blocks
+/// ([`capability_blocks`]) instead would compile and read fine on this side while the other side
+/// found no array to iterate, seeding platform nodes and **no capabilities at all** — which is why
+/// this is a function with a test rather than three lines inside a startup phase.
+pub fn platform_seed_payload(p: &Platform) -> serde_json::Value {
+    let mut node = platform_to_registry_json(p);
+    if let Some(blocks) = capability_blocks(p) {
+        node["capability_blocks"] = crate::capability_vocabulary::seeder_input(&blocks);
+    }
+    node
 }
 
 /// Rebuild a `crate::platform::Platform` from the generic registry JSON node the
@@ -202,6 +225,53 @@ mod capability_block_tests {
         assert!(
             capability_blocks(&plain).is_none(),
             "nothing declared, nothing sent"
+        );
+    }
+
+    /// The bootstrap payload carries the blocks **flattened** into the shape `spire-core`'s seeder
+    /// consumes — `capabilities` as names, `realizes`/`carries` as edge lists — never the raw tree.
+    /// A raw tree compiles and reads fine on this side while the seeder finds no array to iterate,
+    /// seeding platform nodes and no capability nodes or edges at all; this is the test that pins
+    /// the handoff, which nothing on either side covered before.
+    #[test]
+    fn the_seed_payload_flattens_the_blocks_the_seeder_consumes() {
+        let _lock = crate::PLATFORM_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let (boards, platforms) = (tmp.path().join("boards"), tmp.path().join("platforms"));
+        std::fs::create_dir_all(&boards).unwrap();
+        std::fs::create_dir_all(&platforms).unwrap();
+        let _env = crate::platform::PlatformDirGuard::set(&platforms);
+
+        std::fs::write(
+            boards.join("board.yaml"),
+            "id: board\nname: Board\nos: esp-idf\nchip: esp32p4\n\
+             realized:\n  media:\n    camera: { interface: mipi-csi, via: esp32p4 }\n\
+             companions:\n  - chip: esp32c5\n    role: radio\n",
+        )
+        .unwrap();
+
+        let board = crate::platform::Platform::load_directory(&boards)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let payload = platform_seed_payload(&board);
+        let blocks = payload
+            .get("capability_blocks")
+            .expect("the board declares something");
+
+        assert!(
+            blocks["capabilities"].is_array(),
+            "the seeder iterates an array of names: {blocks}"
+        );
+        assert_eq!(blocks["capabilities"], serde_json::json!(["media.camera"]));
+        assert_eq!(blocks["realizes"][0]["capability"], "media.camera");
+        assert_eq!(blocks["realizes"][0]["properties"]["via"], "esp32p4");
+        assert_eq!(blocks["carries"][0]["chip"], "esp32c5");
+        assert!(
+            blocks.get("realized").is_none() && blocks.get("companions").is_none(),
+            "the raw keys must not travel: the seeder reads `realizes`/`carries`: {blocks}"
         );
     }
 }
@@ -290,6 +360,9 @@ pub fn platform_json_to_spire(node: &serde_json::Value) -> Option<Platform> {
                 version: get_str("hal_version"),
                 features: get_list("hal_features"),
             }),
+        // The board's BSP name — absent when the board names none, which is the "we generate our own
+        // backend" case rather than an empty name.
+        bsp: get_opt("bsp"),
         // An empty `rust_target` means "no Rust toolchain", not a platform with a blank
         // one — the `device` block above follows the same rule.
         rust: {
@@ -330,6 +403,7 @@ mod tests {
             family: Some("esp32".into()),
             chip: None,
             hal: None,
+            bsp: None,
             rust: Some(PlatformRust {
                 target: "riscv32imac-esp-espidf".into(),
                 idf_target: Some("esp32c6".into()),
@@ -359,6 +433,7 @@ mod tests {
             family: None,
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             library_hints: None,
         }
@@ -400,6 +475,33 @@ mod tests {
             Some("RISC-V RV32IMAC via esp-idf-hal; no std-vs-no_std choice to make."),
             "the wizard reads the hint off the platform, so it must survive the graph"
         );
+    }
+
+    /// The board's BSP is **board-scoped**, so it must survive the graph beside the chip's HAL. It
+    /// is a name as the vendor's SDK writes it, not a Rust crate.
+    #[test]
+    fn a_board_bsp_round_trips_through_the_registry_shape() {
+        let mut board = rpi5();
+        board.bsp = Some("m5stack_core_s3".into());
+
+        let json = platform_to_registry_json(&board);
+        let props = json.get("properties").expect("properties");
+        assert_eq!(props.get("bsp").expect("bsp"), "m5stack_core_s3");
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert_eq!(back.bsp.as_deref(), Some("m5stack_core_s3"));
+    }
+
+    /// A platform naming no BSP stores none — "we generate our backend" has to stay
+    /// distinguishable from a board pointing at someone else's.
+    #[test]
+    fn a_platform_without_a_bsp_stores_no_bsp_properties() {
+        let json = platform_to_registry_json(&rpi5());
+        let props = json.get("properties").expect("properties");
+        assert!(props.get("bsp").is_none(), "{props}");
+
+        let back = platform_json_to_spire(&json).expect("round trip");
+        assert!(back.bsp.is_none(), "no BSP is not an empty BSP");
     }
 
     /// A C platform carries neither field, so the shape the existing registry already holds

@@ -64,7 +64,10 @@ categories:
       # TOPS to state. Its keys are precisions, because the same part gives different numbers at
       # INT8 and FP16, and an INT8-only accelerator cannot run a FP16 model at all.
       accelerator: { kind: "enum[npu, vector-coprocessor, gpu]", tops: { str: float } }
-      runtime:     "enum[esp-dl, rknn, onnxruntime, tflite-micro, openvino, none]"
+      # `vivante` added for the Allwinner A733, whose NPU stack is Vivante / Acuity. Naming it is
+      # what lets that chip state `runtime` at all: with only the map-valued `accelerator` present,
+      # `ml` read to the loader as a *grouping* and its node came out `compute.ml.accelerator`.
+      runtime:     "enum[esp-dl, rknn, onnxruntime, tflite-micro, openvino, vivante, none]"
       # The *formats* the converter accepts — distinct from the runtime that executes the
       # result, and distinct again from the model's *task* (classifier, detector, LLM), which
       # is what actually decides whether a given model is runnable here.
@@ -75,7 +78,10 @@ categories:
     usb:         { ports: int, role: "enum[host, device, otg]" }
     can:         { instances: int }
     pcie:        { lanes: int }
-    buses:       { instances: { i2c: int, spi: int, uart: int } }
+    # Flat, not `{ instances: { ... } }`: the loader names a capability by walking to the first
+    # mapping that is not *all* mappings, so a nested property named a node `io.buses.instances`
+    # instead of `io.buses`. The counts are the keys directly, which is what a board declares.
+    buses:       { i2c: int, spi: int, uart: int }
     # A Linux SBC exposes its SoC's GPIO as a numbered header, not as BSP-named pins - that is a
     # *realization* (a capability the board has), never a `pins:` wiring map. `pins:` stays
     # bare-metal-only, because its names are compile-time BSP names the firmware addresses

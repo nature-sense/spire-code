@@ -1,0 +1,102 @@
+# Board wisdom corpus: **ESP-BSP** (espressif/esp-bsp) — the board support
+# packages: twenty-six boards, including the six M5Stack ones (`m5stack_core`,
+# `m5stack_core_2`, `m5stack_core_s3`, `m5stack_tab5`, `m5dial`, `m5_atom_s3`).
+#
+# A BSP is the layer that knows a **board** rather than a chip: which GPIO is the
+# display's CS, which I2C port the IMU is on, what the button is wired to, which
+# drivers have to be present before anything works. That is precisely the
+# information a component is forbidden to hold — a driver takes a bus handle and
+# knows no pins — so it has to come from somewhere, and this is the somewhere.
+#
+# Scoped to the parts that state board facts or show a board being brought up,
+# and each was checked against the real tree:
+#
+#   * `bsp/*/README.md` — the board's own page: the pin table, the buses, what is
+#     fitted and what is optional. The single most valuable file per board.
+#   * `bsp/*/API.md` — the BSP's API: how the board is initialised and what it
+#     exposes over the generic `bsp/` interfaces.
+#   * `bsp/*/include/*.h` — the headers: `bsp/*.h` (the pin macros, which are the
+#     board facts in code) and the display/touch/config interfaces. Both depths
+#     are listed because a BSP may put them directly under `include/` or in an
+#     `include/bsp/` subdirectory — the M5Stack ones use `include/bsp/`.
+#   * `bsp/*/idf_component.yml` — **the board's dependencies**: which version of
+#     which driver the BSP pulls. It is the answer to "what has to be present for
+#     this board", and it is what makes a bring-up reproducible rather than a
+#     guess.
+#   * `examples/*/main/*.c` and the READMEs — the bring-up code, which is where
+#     the *order* lives: display, then touch, then LVGL, then whatever the
+#     example is actually about. An example that compiles for this board is the
+#     strongest evidence a generated bring-up sequence can be handed.
+#   * the **shared components** esp-bsp ships under `components/` — the LCDs
+#     (`esp_lcd_ili9341`, `esp_lcd_st7796`…), the touch controllers, the sensor
+#     and IO-expander drivers, and `esp_lvgl_port`. These are not incidental: a
+#     board's `idf_component.yml` names them, so they *are* how that board's
+#     display and touch are brought up, and a BSP README without them is a pin
+#     table with nothing to point at.
+#
+# That last one is why `**/README.md` is here rather than a list of the four
+# places a README can be — measured on the real tree the 112 markdown files it
+# claims are 26 board READMEs, 24 board `API.md` (two boards carry none), 49
+# shared-component READMEs, 12 example READMEs and the repository's own, which is
+# exactly the set wanted. (The measured breakdown is in the comment because the
+# pattern is broad: if a future run of this corpus grows a directory this manifest
+# does not expect, this is the line to revisit — and the two boards without an
+# `API.md` are why the board rows do not add up to the twenty-six in `bsp/`.)
+#
+# What is *not* here: the BSP sources (`src/`), the private headers, the per-board
+# `doc/` directories (photographs and pinout images — a corpus of pixels), the
+# SquareLine UI project, and the `test_apps/` CI apps. The generic
+# `esp_bsp_generic` board is included like any other: it is the honest starting
+# point when a board has no BSP of its own.
+version: "1.0"
+pipeline:
+  name: ESP-BSP — board support packages (incl. M5Stack)
+  corpus: esp-bsp
+  settings:
+    chunk_size: 1800
+    chunk_overlap: 120
+    embedding_model: ""
+  domains:
+    - name: esp-bsp
+      patterns:
+        - "**/*.h"
+        - "**/*.c"
+        - "**/*.md"
+        - "**/*.yml"
+  sources:
+    - id: esp-bsp
+      type: github_repo
+      enabled: true
+      url: https://github.com/espressif/esp-bsp.git
+      processing:
+        parser: code
+        languages:
+          - "C"
+        # Absolute-path matching, so every pattern carries `**/`; each directory
+        # at both depths where the tree has both (`include/*.h` beside
+        # `include/bsp/*.h`, and `examples/x/main/…` beside any nested form).
+        include_paths:
+          - "**/bsp/*/README.md"
+          - "**/bsp/*/API.md"
+          - "**/bsp/*/idf_component.yml"
+          - "**/bsp/*/include/*.h"
+          - "**/bsp/*/include/**/*.h"
+          - "**/examples/*/main/*.c"
+          - "**/examples/*/main/**/*.c"
+          - "**/README.md"
+        # Images and the per-board documentation directory: a pinout photograph and
+        # a .pdf are not retrievable text, and ingesting them costs a fetch and a
+        # chunk to return nothing. `SquareLine`/`test_apps`/`docu` are the
+        # genuinely non-component parts of the repo that `**/README.md` would
+        # otherwise sweep up — a UI-designer project, the CI apps, and the
+        # contributor docs.
+        exclude_paths:
+          - "**/bsp/*/doc/**"
+          - "**/examples/*/doc/**"
+          - "**/SquareLine/**"
+          - "**/test_apps/**"
+          - "**/docu/**"
+          - "**/*.png"
+          - "**/*.jpg"
+          - "**/*.pdf"
+          - "LICENSE"

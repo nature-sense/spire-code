@@ -36,7 +36,7 @@ use crate::subsystems::project::project_creation::ProjectCreationMessage;
 use crate::subsystems::project::project_sync::ProjectSyncMessage;
 use crate::subsystems::project::spec_design::SpecDesignMessage;
 use spire_actor::registry::ServiceRegistry;
-use spire_core::actors::rag::RagMessage;
+use spire_core::actors::rag::{RagChunkResult, RagMessage};
 use spire_core::subsystems::tools::file_watcher::{FileChangeNotification, FileWatcherMessage};
 
 /// Messages for the Coordinator actor.
@@ -288,6 +288,7 @@ impl CoordinatorActor {
             &path.to_string_lossy(),
             &content,
             &errors,
+            &[],
         );
         // One shared LLM + structural-check path (see `llm_rewrite`).
         let (proposed, _syntax_ok) = match self.llm_rewrite(prompt).await {
@@ -830,9 +831,391 @@ impl CoordinatorActor {
             "files_changed": report.files_changed,
             "files_reverted": report.files_reverted,
             "files_skipped": report.files_skipped,
+            "up_to_date": report.up_to_date,
             "caveats": report.caveats,
             "output": report.summary(),
         })
+    }
+
+    /// The two-step rewrite that `modify/code` and `idf_component_edit` share: settle which files
+    /// the request touches, then rewrite each one whole.
+    ///
+    /// Shared rather than written twice because every interesting part of it is a *detail* — the
+    /// answer is filtered to the scope (the model chooses from what it was given, it does not get to
+    /// name a path of its own), and a rewrite that does not parse is skipped rather than written. A
+    /// second copy of this is a second place for those two to be forgotten.
+    ///
+    /// `whole_scope` is the one thing that differs. A free-text change lets the model choose, because
+    /// its instruction may touch one file of many. A component edit sets it, rewriting its entire
+    /// scope — a subset of a component's interdependent files cannot agree with itself.
+    async fn plan_rewrites(
+        &self,
+        request: &str,
+        scope: &[std::path::PathBuf],
+        whole_scope: bool,
+    ) -> Option<Vec<crate::build::modify_code::PlannedChange>> {
+        let candidates: Vec<String> = scope
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // 1. Which files? A plain list keeps the reply small, and the answer is filtered to the scope.
+        //    `llm_text`, not `llm_rewrite`: this answer is a list of paths, and checking it as C++ made
+        //    every reply fail the structural check. A component edit does not ask at all — its scope
+        //    is the answer — see `files_to_rewrite`.
+        let reply = if whole_scope {
+            String::new()
+        } else {
+            let listing = crate::build::generic_helpers::modify_scope_prompt(&candidates, request);
+            self.llm_text(listing).await.ok()?
+        };
+        let wanted = crate::build::modify_code::files_to_rewrite(scope, &reply, whole_scope);
+        if wanted.is_empty() {
+            return None;
+        }
+
+        // 2. Rewrite each through the same single-file path — and the same structural check — the
+        //    compile-fix loop already trusts. A file whose rewrite does not parse is skipped, never
+        //    written: this runs unattended.
+        //
+        //    The header is written **first**, because in C++ it is the contract the source and the
+        //    test are written against; `sort_by_key` is stable, so everything else keeps the order
+        //    the model chose. Each later file is then shown the rewrites already planned (see
+        //    `plan_context`), so the set is written against ONE contract instead of three. Rewritten
+        //    blind of each other they agreed only by luck — often enough not at all, which is what
+        //    rolled the whole plan back with a compile error in the file that came second.
+        let mut wanted = wanted;
+        wanted.sort_by_key(|p| {
+            !matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("h" | "hpp" | "hh" | "hxx" | "h++")
+            )
+        });
+        let mut changes = Vec::new();
+        // A rewrite that comes back byte-identical to the file is the model's own way of saying the
+        // file already says what was asked. Recorded rather than dropped, so an edit that finds
+        // nothing to do reports as up to date instead of as the failure an empty plan otherwise is.
+        let mut already_matching = false;
+        for path in wanted {
+            let Ok(current) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let file = path.to_string_lossy().to_string();
+            let context = crate::build::modify_code::plan_context(request, &changes);
+            let file_prompt =
+                crate::build::generic_helpers::modify_code_prompt(&file, &current, &context);
+            let Ok((proposed, syntax_ok)) = self.llm_rewrite(file_prompt).await else {
+                continue;
+            };
+            if !syntax_ok || proposed.trim().is_empty() {
+                continue;
+            }
+            if proposed == current {
+                already_matching = true;
+                continue;
+            }
+            changes.push(crate::build::modify_code::PlannedChange {
+                file,
+                content: proposed,
+            });
+        }
+        // `Some(vec![])` is a no-op ("already up to date"), `None` is "nothing usable" — the two are
+        // different outcomes and `run_code_modify` reports them differently. See
+        // `CodeModifyBackend::plan`.
+        if changes.is_empty() && !already_matching {
+            return None;
+        }
+        Some(changes)
+    }
+
+    /// `idf_component_edit` — write or change one component's protocol.
+    ///
+    /// The spine is `modify/code`'s; what differs is the **gate**. A component is accepted when its own
+    /// host test compiles and passes, which needs no board, no chip and no IDF — so a protocol can be
+    /// written and checked in seconds rather than in the minutes an `idf.py build` takes. The chip build
+    /// is the second, *optional* gate: it catches what a host test cannot (a wrong `REQUIRES`, a link
+    /// error against the real IDF driver) and runs only when the caller names a chip. When it does not
+    /// run, the report says so rather than implying the code was checked against one.
+    async fn handle_idf_component_edit(&self, args: &serde_json::Value) -> serde_json::Value {
+        let root = args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let instruction = args
+            .get("instruction")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if root.is_empty() || name.is_empty() {
+            return serde_json::json!({
+                "success": false,
+                "error": "idf_component_edit needs 'root' (the component library) and 'name' (the component)",
+            });
+        }
+        let root = std::path::PathBuf::from(root);
+
+        // Retrieval is **pre-fetched**, not a tool the model calls: the edit runs through
+        // `run_code_modify`, whose loop is one prompt with no tools, so whatever the model can see has
+        // to be in the prompt before it is asked. Best-effort by design — a component must still be
+        // writable with no corpus, no RAG actor (the standalone binary) or no embedder, so every
+        // failure here is an empty section rather than a refusal.
+        //
+        // `domain` is an **override**: naming one replaces the pair with that corpus alone, which is
+        // what makes a single corpus selectable from the UI. Empty asks the pair (the facts for the
+        // bytes, `esp-idf-lib` for the shape) — see `retrieve_component_reference`.
+        let domain = args
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+        let reference = self
+            .retrieve_component_reference(&root, &name, &domain, top_k)
+            .await;
+
+        let request = match crate::build::idf_projects::component_edit_request(
+            &root,
+            &name,
+            &instruction,
+            &reference.markdown,
+        ) {
+            Ok(request) => request,
+            Err(e) => return serde_json::json!({ "success": false, "error": e }),
+        };
+
+        // The gate has to be **runnable** before anything is planned. A change whose check cannot run
+        // is an unattended write, which is the one thing this path exists to prevent — and a missing
+        // `cmake` would otherwise look like a clean build (no errors) rather than like no check at all.
+        if let Err(e) = crate::build::idf_projects::build_host_test(&root, &name).await {
+            return serde_json::json!({
+                "success": false,
+                "error": e,
+                "output": format!("Component edit refused: {e}"),
+            });
+        }
+
+        let platform = args
+            .get("platform")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+
+        let backend = CoordinatorComponentModify {
+            coord: self,
+            scope: crate::build::idf_projects::component_scope(&root, &name),
+            root,
+            name,
+            platform,
+            compiled: std::sync::Mutex::new(None),
+            failed_build_output: std::sync::Mutex::new(None),
+        };
+        // One plan, one round: writing a protocol is a single intent.
+        let report =
+            crate::build::modify_code::run_code_modify(&backend, &request, &backend.scope, 1).await;
+
+        // The compiler's own words, when the round was rejected because the host test did not build.
+        // The per-file map holds only `file:line:col: error:` lines; a `REQUIRES` mistake, or a link
+        // error on a mismatch between the three files, names no file at all — so without this the
+        // rejection would tell the caller nothing it can act on. Logged as well as returned, so a run
+        // is diagnosable from `spire-ui.log` alone.
+        let build_output = backend.failed_build_output();
+        if let Some(text) = &build_output {
+            tracing::info!(
+                "[COORDINATOR] idf_component_edit {}: host test did not build, raw output:\n{}",
+                backend.name,
+                text
+            );
+        }
+
+        let verified = format!("{:?}", report.verified);
+        // What the optional gate did, in the caller's terms rather than left to be inferred from
+        // the spine's generic "target tests" wording.
+        let chip_build = if backend.platform.is_some() {
+            "run: the chip build is part of this gate"
+        } else {
+            "not run: no chip named, so nothing here was checked against the real IDF driver"
+        };
+
+        // ── The record ──
+        //
+        // The instruction is the one thing in this run that no report carries: what was *asked*.
+        // It is what answers "why does this file look like this" months later, and until it is in
+        // the graph its only home is a chat transcript. So the run is written down as typed nodes —
+        // a `Module` spine per component, an `EditRecord` per run, and a `has_edit` edge between
+        // them — on the project graph, so it survives restarts the way the composition does.
+        //
+        // Prior history is read *first*: what a caller wants from `history` is what was asked
+        // **before** this run, not an echo of the record this run just wrote.
+        //
+        // Both halves are **best-effort**. The edit has already passed its gate, so a graph that
+        // cannot be reached or written is a lost note, not a lost edit — turning a good edit into a
+        // failed one because memory did not land is the one outcome worth avoiding.
+        let root_as_str = backend.root.to_string_lossy().to_string();
+        let history = crate::build::edit_history::component_edit_history(
+            &self.memory_graph_tx,
+            &root_as_str,
+            &backend.name,
+            crate::build::edit_history::RESPONSE_HISTORY_LIMIT,
+        )
+        .await;
+        let recorded = crate::build::edit_history::record_component_edit(
+            &self.memory_graph_tx,
+            &crate::build::edit_history::EditFacts {
+                instruction: &instruction,
+                component: &backend.name,
+                root: &root_as_str,
+                success: report.success,
+                verified: &verified,
+                up_to_date: report.up_to_date,
+                files_changed: &report.files_changed,
+                files_reverted: &report.files_reverted,
+                files_skipped: &report.files_skipped,
+                chip_build,
+                caveats: &report.caveats,
+            },
+        )
+        .await;
+        if let Err(e) = &recorded {
+            tracing::warn!(
+                "[COORDINATOR] idf_component_edit {}: the edit was not recorded: {e}",
+                backend.name
+            );
+        }
+
+        serde_json::json!({
+            "success": report.success,
+            "verified": verified,
+            "chip_build": chip_build,
+            // What the lookups found, named by corpus rather than reduced to a yes/no: a run where the
+            // facts answered and the precedents did not is a different situation from one where
+            // neither did, and only the names say which happened.
+            "reference": reference.report(),
+            "files_changed": report.files_changed,
+            "files_reverted": report.files_reverted,
+            "files_skipped": report.files_skipped,
+            // A no-op, not a failure: the files already said what was asked. Surfaced so a caller can
+            // tell "nothing to do" apart from "the model proposed nothing".
+            "up_to_date": report.up_to_date,
+            "caveats": report.caveats,
+            // The raw compiler/linker text, so a rejection that names no file is still actionable.
+            "build_output": build_output,
+            // What was asked of this component **before** this run, newest first — the visible half
+            // of the record, so a caller can see that a request is a repeat, and that the history is
+            // accumulating rather than being claimed. Empty is honest: nothing recorded yet.
+            "history": history,
+            "output": report.summary(),
+        })
+    }
+
+    /// What the knowledge store already holds about a component's device, as prompt-ready markdown.
+    ///
+    /// **Pre-fetched, not a tool.** `idf_component_edit` runs through `run_code_modify`, whose loop is
+    /// one prompt with no tool calls, so a model that wanted to look the device up could not — what it
+    /// can see has to be in the prompt *before* it is asked. This is the seam that puts it there.
+    ///
+    /// **Two corpora, asked together** (see `component_device_lookups`): the part number against
+    /// `device-facts`, the only source of *this* device's bytes, and the device in prose against
+    /// `esp-idf-lib`, where its shape comes from. Each section is labelled with what it is evidence
+    /// *of*, because a model told to write a protocol from retrieved material has to know which block
+    /// states the command words and which is a comparable device's driver — taking the second one's
+    /// command word is the failure this pairing exists to prevent.
+    ///
+    /// `domain` is an **override that replaces the pair with the one corpus it names**, which is what
+    /// keeps a corpus selectable from the UI. The query follows the corpus: naming `device-facts` asks
+    /// it by part number, naming anything else asks in prose, which is what a corpus of code is
+    /// matched by.
+    ///
+    /// **Best-effort by design.** A protocol must still be writable with no corpus, no RAG actor (the
+    /// standalone binary) or no embedder, so every failure here — nothing to ask for, no actor, a send
+    /// that cannot be delivered, a retrieval that errors — is empty rather than a refusal. The caller
+    /// reports which it was; the edit itself never fails because knowledge was missing.
+    async fn retrieve_component_reference(
+        &self,
+        root: &std::path::Path,
+        name: &str,
+        domain: &str,
+        top_k: usize,
+    ) -> ComponentReference {
+        use crate::build::idf_projects::{
+            ReferenceRole, DEVICE_FACTS_DOMAIN, DRIVER_PRECEDENTS_DOMAIN,
+        };
+
+        // A library has no device behind it, so there is nothing to look up and no query to make.
+        let Some(lookups) = crate::build::idf_projects::component_device_lookups(root, name) else {
+            return ComponentReference::none();
+        };
+        let Ok((registry, _)) = self.ffi_deps() else {
+            return ComponentReference::none();
+        };
+        // Owned, and not borrowed from `registry`: the sends below are awaited, and the registry
+        // must not be held across them.
+        let Some(rag_tx) = registry.get::<RagMessage>("rag") else {
+            return ComponentReference::none();
+        };
+
+        let mut asked: Vec<(String, String, ReferenceRole)> = Vec::new();
+        if domain.is_empty() {
+            asked.push((
+                DEVICE_FACTS_DOMAIN.to_string(),
+                lookups.facts,
+                ReferenceRole::DeviceFacts,
+            ));
+            asked.push((
+                DRIVER_PRECEDENTS_DOMAIN.to_string(),
+                lookups.precedents,
+                ReferenceRole::DriverPrecedent,
+            ));
+        } else if domain == DEVICE_FACTS_DOMAIN {
+            asked.push((
+                domain.to_string(),
+                lookups.facts,
+                ReferenceRole::DeviceFacts,
+            ));
+        } else {
+            asked.push((
+                domain.to_string(),
+                lookups.precedents,
+                ReferenceRole::DriverPrecedent,
+            ));
+        }
+        let mut sections: Vec<(String, Vec<RagChunkResult>)> = Vec::new();
+        for (corpus, query, role) in asked {
+            let chunks = rag_query_corpus(&rag_tx, &corpus, &query, top_k).await;
+            sections.push((
+                crate::build::idf_projects::reference_heading(role, &corpus),
+                chunks,
+            ));
+        }
+
+        let borrowed: Vec<(String, &[RagChunkResult])> = sections
+            .iter()
+            .map(|(title, chunks)| (title.clone(), chunks.as_slice()))
+            .collect();
+        ComponentReference {
+            markdown: crate::build::idf_projects::format_retrieved_reference(&borrowed),
+            // Reported per corpus: the situation this seam was built for was not an error but a wrong
+            // answer, so "the facts answered and the precedents did not" has to be distinguishable
+            // from "neither answered" — which is what the list says and an empty string cannot.
+            answered: sections
+                .iter()
+                .filter(|(_, chunks)| chunks.iter().any(|c| !c.text.trim().is_empty()))
+                .map(|(title, _)| title.clone())
+                .collect(),
+        }
     }
 
     /// `modify-contract` — resolve the HAL cascade: contract → implementations.
@@ -915,6 +1298,73 @@ impl CoordinatorActor {
     }
 }
 
+/// What a pre-fetch found, for the prompt and for the report.
+///
+/// The two are kept together because they are two views of one fact — what the store had — and the
+/// report is what makes a *silent* miss visible. The failure this seam was built for was not an
+/// error but a wrong answer: a `sht20` edit was handed `sht3x`'s commands and nothing said so, so the
+/// report has to distinguish "nothing was retrieved" from "something was, and from this corpus".
+struct ComponentReference {
+    /// The labelled sections, as prompt-ready markdown. Empty when nothing was found.
+    markdown: String,
+    /// The heading of each section that had material, in the order it was asked.
+    answered: Vec<String>,
+}
+
+impl ComponentReference {
+    /// Nothing found — no device behind the component, no store, or no corpus that could answer.
+    fn none() -> Self {
+        Self {
+            markdown: String::new(),
+            answered: Vec::new(),
+        }
+    }
+
+    /// The `"reference"` line of the RPC result, in the caller's terms rather than left to be
+    /// inferred from whether the output happens to mention a source.
+    fn report(&self) -> String {
+        if self.answered.is_empty() {
+            return "none: nothing was retrieved for this component, so the prompt carried only what \
+                    was typed"
+                .to_string();
+        }
+        format!(
+            "used: retrieved material was put in the prompt the model wrote the protocol from — {}",
+            self.answered.join("; ")
+        )
+    }
+}
+
+/// One retrieval against one corpus, or an empty result when the RAG actor cannot answer.
+///
+/// Deliberately silent: a store that is missing, a corpus that was never ingested and a query that
+/// matched nothing all arrive here as "no chunks", and all three mean the same thing to the caller —
+/// nothing to show, and nothing to refuse over.
+async fn rag_query_corpus(
+    rag_tx: &mpsc::Sender<RagMessage>,
+    corpus: &str,
+    query: &str,
+    top_k: usize,
+) -> Vec<RagChunkResult> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if rag_tx
+        .send(RagMessage::Query {
+            domain: corpus.to_string(),
+            query: query.to_string(),
+            top_k,
+            reply_to: reply,
+        })
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    match rx.await {
+        Ok(Ok(chunks)) => chunks,
+        _ => Vec::new(),
+    }
+}
+
 /// Source files the model may consider when the caller named no scope.
 ///
 /// Bounded and shallow on purpose: this is a prompt, not an index. A project with
@@ -969,6 +1419,122 @@ fn source_files(root: &std::path::Path, limit: usize) -> Vec<std::path::PathBuf>
     found
 }
 
+/// Bridges an **`idf_component_edit`** run to the component's own host test.
+///
+/// Same spine as `modify/code` ([`crate::build::modify_code`]), different acceptance rule: the compile
+/// it measures is the component's **host test**, built by CMake on this machine, and the test leg is
+/// `ctest` over that binary. No board, no chip, no IDF — which is what makes writing a protocol a
+/// matter of seconds.
+///
+/// The chip build rides on [`CodeModifyBackend::target_tests`], which is the leg the spine already
+/// treats as optional: naming a chip adds it, naming none leaves it out **and says so** in the report,
+/// rather than quietly calling the change verified.
+struct CoordinatorComponentModify<'a> {
+    coord: &'a CoordinatorActor,
+    /// The files the model may rewrite — never the manifest, the seam or the fake.
+    scope: Vec<std::path::PathBuf>,
+    root: std::path::PathBuf,
+    /// The component, by the name the caller used.
+    name: String,
+    /// The chip to build for, when the caller named one.
+    platform: Option<String>,
+    /// Whether the last compile succeeded. `build` records it and `host_tests` reads it, so `ctest`
+    /// never runs a binary the failed build did not replace.
+    compiled: std::sync::Mutex<Option<bool>>,
+    /// The raw text of the last **failed** build — the compiler's and the linker's own words, kept
+    /// because [`ErrorsByFile`] carries only `file:line:col: error:` lines and drops the rest. A
+    /// cross-file mismatch (the header declares a member the `.cpp` never defines) surfaces as a
+    /// *link* error — `Undefined symbols … ld: symbol(s) not found` — which names no file and no line,
+    /// so the per-file map cannot hold it and the rejection would otherwise read as a shrug. Only a
+    /// failure writes here, so the clean re-measure taken after the revert cannot overwrite the one
+    /// build whose output explains why the change was not kept.
+    failed_build_output: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl crate::build::modify_code::CodeModifyBackend for CoordinatorComponentModify<'_> {
+    async fn plan(
+        &self,
+        prompt: &str,
+        scope: &[std::path::PathBuf],
+    ) -> Option<Vec<crate::build::modify_code::PlannedChange>> {
+        // A component's header, source and test are one contract in three files, so every one of them
+        // is rewritten — the model does not get to pick a subset that cannot agree with itself.
+        self.coord.plan_rewrites(prompt, scope, true).await
+    }
+
+    async fn build(&self) -> crate::build::autofix::ErrorsByFile {
+        let outcome = crate::build::idf_projects::build_host_test(&self.root, &self.name).await;
+        match outcome {
+            Ok(built) => {
+                *self.compiled.lock().unwrap() = Some(built.success);
+                if built.success {
+                    return crate::build::autofix::ErrorsByFile::new();
+                }
+                // The commands' own output, kept before the per-file map is built: a link error (the
+                // common shape of a cross-file mismatch) has no `file:line:col`, so it exists only here.
+                *self.failed_build_output.lock().unwrap() = Some(built.output.clone());
+                // A failed build is reported per file where the compiler named one, and under the
+                // component itself where it did not (a missing `REQUIRES`, a link error): an empty map
+                // would read as a clean compile.
+                if built.build_errors.is_empty() {
+                    let mut errors = crate::build::autofix::ErrorsByFile::new();
+                    errors.insert(
+                        format!("components/{}", self.name),
+                        vec![
+                            "the host test did not build, and no compiler error named a file"
+                                .into(),
+                        ],
+                    );
+                    return errors;
+                }
+                built.build_errors
+            }
+            Err(e) => {
+                *self.compiled.lock().unwrap() = Some(false);
+                *self.failed_build_output.lock().unwrap() = Some(e.clone());
+                let mut errors = crate::build::autofix::ErrorsByFile::new();
+                errors.insert(format!("components/{}", self.name), vec![e]);
+                errors
+            }
+        }
+    }
+
+    async fn host_tests(&self) -> Option<bool> {
+        // Nothing was re-linked, so there is nothing to run: a pass here would be the *previous*
+        // protocol's result, reported as if it were this one's.
+        if *self.compiled.lock().unwrap() != Some(true) {
+            return None;
+        }
+        crate::build::idf_projects::run_host_test_binary(&self.root, &self.name)
+            .await
+            .ok()
+    }
+
+    async fn target_tests(&self) -> Option<bool> {
+        // The optional gate. `None` for "no chip named", which the spine turns into a stated caveat
+        // rather than a silent pass.
+        let platform = self.platform.as_ref()?;
+        let result = self
+            .coord
+            .call_tool_json(
+                "build_build",
+                serde_json::json!({ "path": self.root, "platform": platform }),
+            )
+            .await;
+        result.get("success").and_then(|v| v.as_bool())
+    }
+}
+
+impl CoordinatorComponentModify<'_> {
+    /// What the last **failed** build printed, when there was one — the compiler's and the linker's
+    /// own words, unredacted. Read after the run so the tool can hand the caller the text the per-file
+    /// map cannot hold.
+    fn failed_build_output(&self) -> Option<String> {
+        self.failed_build_output.lock().unwrap().clone()
+    }
+}
+
 /// Bridges `modify/code` ([`crate::build::modify_code`]) to the real LLM, build and
 /// device actors.
 struct CoordinatorCodeModify<'a> {
@@ -999,48 +1565,8 @@ impl crate::build::modify_code::CodeModifyBackend for CoordinatorCodeModify<'_> 
         prompt: &str,
         scope: &[std::path::PathBuf],
     ) -> Option<Vec<crate::build::modify_code::PlannedChange>> {
-        let candidates: Vec<String> = scope
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-        if candidates.is_empty() {
-            return None;
-        }
-
-        // 1. Which files? A plain list keeps the reply small, and the answer is filtered
-        //    to the scope: the model chooses from what it was given, it does not get to
-        //    name a path of its own. `llm_text`, not `llm_rewrite`: this answer is a list
-        //    of paths, and checking it as C++ made every reply fail the structural check.
-        let listing = crate::build::generic_helpers::modify_scope_prompt(&candidates, prompt);
-        let reply = self.coord.llm_text(listing).await.ok()?;
-        let wanted = crate::build::modify_code::select_files(&reply, scope);
-        if wanted.is_empty() {
-            return None;
-        }
-
-        // 2. Rewrite each through the same single-file path — and the same structural
-        //    check — the compile-fix loop already trusts. A file whose rewrite does not
-        //    parse is skipped, never written: this runs unattended.
-        let mut changes = Vec::new();
-        for path in wanted {
-            let Ok(current) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let file = path.to_string_lossy().to_string();
-            let file_prompt =
-                crate::build::generic_helpers::modify_code_prompt(&file, &current, prompt);
-            let Ok((proposed, syntax_ok)) = self.coord.llm_rewrite(file_prompt).await else {
-                continue;
-            };
-            if !syntax_ok || proposed.trim().is_empty() || proposed == current {
-                continue;
-            }
-            changes.push(crate::build::modify_code::PlannedChange {
-                file,
-                content: proposed,
-            });
-        }
-        (!changes.is_empty()).then_some(changes)
+        // A free-text change may touch one file of many, so the model chooses from the scope.
+        self.coord.plan_rewrites(prompt, scope, false).await
     }
 
     async fn build(&self) -> crate::build::autofix::ErrorsByFile {
@@ -1254,6 +1780,52 @@ impl CoordinatorActor {
             return self.handle_modify_code(&args).await;
         }
 
+        // `idf-component/edit` — write or change one component's protocol. It lives here for the
+        // same reason `modify/code` does: the planning leg needs the LLM actor.
+        if method == "idf-component/edit"
+            || (method == "tools/call"
+                && params.get("tool").and_then(|v| v.as_str()) == Some("idf_component_edit"))
+        {
+            let args = if method == "tools/call" {
+                params
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                params.clone()
+            };
+            return self.handle_idf_component_edit(&args).await;
+        }
+
+        // `idf-design/application` — the design phase, before any component exists. It lives here for
+        // the same reason `idf-component/edit` does: the leg that decides needs the planning model, and
+        // the spec it returns is a thing a person approves before anything is written.
+        if method == "idf-design/application"
+            || (method == "tools/call"
+                && params.get("tool").and_then(|v| v.as_str()) == Some("idf_design_application"))
+        {
+            let args = if method == "tools/call" {
+                params
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                params.clone()
+            };
+            return self.handle_idf_design_application(&args).await;
+        }
+
+        // `idf-env/check` and `idf-env/fix` — test and then repair this machine's ESP-IDF. They are
+        // named here only so the dashed method names have a home beside the other `idf-*` verbs;
+        // there is no model in the loop, so both forward straight through the ToolRouter to the build
+        // manager, which is exactly the path `tools/call` takes for them.
+        if method == "idf-env/check" {
+            return self.call_tool_json("idf_env_check", params.clone()).await;
+        }
+        if method == "idf-env/fix" {
+            return self.call_tool_json("idf_env_fix", params.clone()).await;
+        }
+
         // `modify-contract` — resolve the HAL drift cascade. Same reason for living here:
         // the generation leg needs the LLM actor.
         if method == "modify-contract"
@@ -1306,6 +1878,30 @@ impl CoordinatorActor {
             "createProject/GenerateSpec" => {
                 return self.handle_create_project_generate_spec(&params).await;
             }
+            "createProject/DesignApplication" => {
+                return self.handle_create_project_design_application(&params).await;
+            }
+            // **A composition a person already wrote.** The design phase's other door: instead of
+            // asking a model for a decomposition, read one out of a `composition.spire` — the same
+            // file the scaffold writes and a person edits. It answers in the same shape as
+            // `createProject/DesignApplication`, so the wizard's review step and everything after it
+            // are unchanged: what a person approves is what is scaffolded, whichever door it came
+            // through.
+            "createProject/ParseComposition" => {
+                Self::handle_create_project_parse_composition(&params)
+            }
+            "createProject/RepairFromBuild" => {
+                return self.handle_create_project_repair_from_build(&params).await;
+            }
+            // **Did the composition land?** The design's framework and components against the sources
+            // the fill actually wrote — structural, because a fill that ignored the design still
+            // *compiles*, so nothing else would notice.
+            "createProject/VerifyApplication" => Self::verify_application(&params),
+            // **What the composition actually needs.** The scaffold pinned the board's BSP before the
+            // composition existed; this corrects the manifest against the sources the fill wrote, so a
+            // composition that reaches for no board support pins none — and its first build is the
+            // framework and the library rather than the board's whole peripheral stack.
+            "createProject/FinalizeManifest" => Self::finalize_manifest(&params),
             "createProject/GenerateCode" => {
                 return self.handle_create_project_generate_code(&params).await;
             }
@@ -2553,6 +3149,137 @@ impl CoordinatorActor {
                         serde_json::json!({"error": format!("Memory graph response error: {}", e)})
                     }
                 }
+            }
+
+            // ── Capability profile ──
+            // The resolved read: a board's capabilities, with the values the seeder stored on the
+            // edges. Prefer the shared knowledge store — the FFI seeds there, because its project
+            // graph is not up until a project is opened — and fall back to the project graph, which
+            // is where the CLI's `PlatformBootstrapPhase` seeds the same data.
+            "capabilities/profile" => {
+                let board_id = params
+                    .get("board")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if board_id.is_empty() {
+                    return serde_json::json!({"error": "Missing 'board' parameter"});
+                }
+                let graph = self
+                    .registry
+                    .as_ref()
+                    .and_then(|r| r.get::<MemoryGraphMessage>("knowledge_graph"))
+                    .unwrap_or_else(|| self.memory_graph_tx.clone());
+                match crate::capabilities::resolved_profile(&graph, board_id).await {
+                    Ok(profile) => profile,
+                    Err(e) => serde_json::json!({"error": e.to_string()}),
+                }
+            }
+
+            // ── Platform configuration (the full view) ──
+            // Everything the configuration screen shows, read from the **graph** — the canonical
+            // store — not the registry YAML, which is only the seed. The platform nodes carry the
+            // typed facts; every declared value rides an edge: `realizes`/`provides`/`carries` for
+            // capabilities and companions, `pins` for wiring.
+            "platforms/config" => {
+                use spire_core::models::memory_graph::RelationshipType;
+
+                let graph = self
+                    .registry
+                    .as_ref()
+                    .and_then(|r| r.get::<MemoryGraphMessage>("knowledge_graph"))
+                    .unwrap_or_else(|| self.memory_graph_tx.clone());
+
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if graph
+                    .send(MemoryGraphMessage::GetPlatforms { reply_to: tx })
+                    .await
+                    .is_err()
+                {
+                    return serde_json::json!({"error": "Memory graph actor not available"});
+                }
+                let nodes = match rx.await {
+                    Ok(Ok(nodes)) => nodes,
+                    Ok(Err(e)) => return serde_json::json!({"error": e.to_string()}),
+                    Err(e) => {
+                        return serde_json::json!({"error": format!("Memory graph response error: {e}")})
+                    }
+                };
+
+                let mut out = Vec::new();
+                for node in &nodes {
+                    let Some(platform) =
+                        crate::actors::platform_codec::platform_json_to_spire(node)
+                    else {
+                        continue;
+                    };
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = graph
+                        .send(MemoryGraphMessage::GetRelationships {
+                            node_id: platform.id.clone(),
+                            reply_to: tx,
+                        })
+                        .await;
+                    let edges = rx
+                        .await
+                        .unwrap_or_else(|_| Ok(Vec::new()))
+                        .unwrap_or_default();
+
+                    let mut realizes = Vec::new();
+                    let mut provides = Vec::new();
+                    let mut carries = Vec::new();
+                    let mut pins = Vec::new();
+                    for e in &edges {
+                        let properties =
+                            serde_json::to_value(&e.properties).unwrap_or(serde_json::Value::Null);
+                        match &e.edge_type {
+                            RelationshipType::Realizes if e.from_id == platform.id => {
+                                realizes.push(serde_json::json!({
+                                    "capability": e.to_id,
+                                    "properties": properties,
+                                }));
+                            }
+                            RelationshipType::Provides if e.from_id == platform.id => {
+                                provides.push(serde_json::json!({
+                                    "capability": e.to_id,
+                                    "properties": properties,
+                                }));
+                            }
+                            RelationshipType::Carries if e.from_id == platform.id => {
+                                carries.push(serde_json::json!({
+                                    "chip": e.to_id,
+                                    "properties": properties,
+                                }));
+                            }
+                            RelationshipType::Pins if e.from_id == platform.id => {
+                                let function = e
+                                    .to_id
+                                    .strip_prefix(&format!("{}/pins/", platform.id))
+                                    .unwrap_or(&e.to_id)
+                                    .to_string();
+                                pins.push(serde_json::json!({
+                                    "function": function,
+                                    "properties": properties,
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let listing = PlatformConfig {
+                        platform: &platform,
+                        embedded: platform.is_embedded(),
+                        kind: platform.kind(),
+                        capability_blocks: serde_json::json!({
+                            "realizes": realizes,
+                            "provides": provides,
+                            "carries": carries,
+                            "pins": pins,
+                        }),
+                    };
+                    out.push(serde_json::to_value(listing).unwrap_or(serde_json::Value::Null));
+                }
+
+                serde_json::json!({ "platforms": out })
             }
 
             // ── System methods ──
@@ -4632,6 +5359,50 @@ impl CoordinatorActor {
         (structure, embedded)
     }
 
+    /// The **decomposition** a creation request carries, when it carries one.
+    ///
+    /// Parsed and **checked** before anything is created — the same six rules the design phase ran — so
+    /// a spec that was edited by hand (or by a later UI) is held to them too. A project scaffolded from
+    /// a decomposition that does not hold together is a project whose stated design is wrong, and its
+    /// `SPIRE.application.json` would be the lie; the refusal lists the problems instead.
+    fn params_application(
+        params: &serde_json::Value,
+    ) -> Result<Option<crate::build::application_spec::ApplicationSpec>, String> {
+        let Some(value) = params.get("application").filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let spec: crate::build::application_spec::ApplicationSpec =
+            serde_json::from_value(value.clone())
+                .map_err(|e| format!("`application` is not an application spec: {e}"))?;
+        crate::build::application_spec::validate(&spec).map_err(|problems| {
+            format!(
+                "`application` is not a decomposition that holds together:\n  - {}",
+                problems.join("\n  - ")
+            )
+        })?;
+        Ok(Some(spec))
+    }
+
+    /// The **framework** a design request pinned, when it pinned one.
+    ///
+    /// An unknown name is refused here rather than reaching a scaffold or a design: a project
+    /// scaffolded under a framework nobody knows is a tree that lies about itself, and the refusal
+    /// says the name back so the caller can see what it asked for. An absent or empty field means the
+    /// choice is left to the design phase.
+    fn params_framework(
+        params: &serde_json::Value,
+    ) -> Result<Option<crate::build::application_spec::ApplicationFramework>, String> {
+        match params
+            .get("framework")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            None => Ok(None),
+            Some(name) => crate::build::application_spec::framework_from_name(name).map(Some),
+        }
+    }
+
     async fn handle_create_project_plan(&self, params: &serde_json::Value) -> serde_json::Value {
         let (registry, _ffi_state) = match self.ffi_deps() {
             Ok(d) => d,
@@ -4669,6 +5440,10 @@ impl CoordinatorActor {
             .unwrap_or_default();
 
         let (structure, embedded) = Self::params_structure_embedded(params);
+        let application = match Self::params_application(params) {
+            Ok(application) => application,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
         // Where the container an application depends on lives, when the wizard's picker
         // supplied one. Absent for every other structure — and an application without it is refused
         // downstream by name, rather than scaffolded against nothing.
@@ -4692,6 +5467,7 @@ impl CoordinatorActor {
                     structure,
                     embedded_root,
                     embedded,
+                    application,
                     reply_to: t,
                 })
                 .await;
@@ -4744,8 +5520,9 @@ impl CoordinatorActor {
             .unwrap_or_default();
 
         let (structure, embedded) = Self::params_structure_embedded(params);
-        // The HAL directory an application depends on — the plan *is* its scaffold (see
-        // `embedded_app_template_plan`), so this matters here and not only at write time.
+        // The library an ESP-IDF application is built against. The plan needs it for the same reason
+        // the scaffold does: the library's `SPIRE.md` is read into the prompt, so a plan asked for
+        // without it is a plan written against an architecture the model was never shown.
         let embedded_root = params
             .get("embeddedRoot")
             .and_then(|v| v.as_str())
@@ -4833,6 +5610,10 @@ impl CoordinatorActor {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let application = match Self::params_application(params) {
+            Ok(application) => application,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
 
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
@@ -4847,6 +5628,7 @@ impl CoordinatorActor {
                     structure,
                     embedded_root,
                     embedded,
+                    application,
                     reply_to: t,
                 })
                 .await;
@@ -5046,6 +5828,14 @@ impl CoordinatorActor {
             .get("spec")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        // The library this project is built against: out of a *sibling* project, the same field the
+        // plan and the scaffold take. Read for its `SPIRE.md`.
+        let library_root = params
+            .get("embeddedRoot")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
@@ -5056,6 +5846,7 @@ impl CoordinatorActor {
                     goal,
                     root_dir: PathBuf::from(root_dir),
                     spec,
+                    library_root,
                     reply_to: t,
                 })
                 .await;
@@ -5116,6 +5907,598 @@ impl CoordinatorActor {
             Ok(Err(e)) => serde_json::json!({"error": e.to_string()}),
             Err(e) => serde_json::json!({"error": e}),
         }
+    }
+
+    /// `createProject/DesignApplication` — the **design phase**: a board and the design form's
+    /// answers in, a validated application spec out, for a person to review and approve.
+    ///
+    /// Nothing is written to disk, and nothing has to exist yet: the spec is designed *before* the
+    /// tree it describes, which is what makes it reviewable — a person says yes to a decomposition
+    /// rather than to a pile of generated code. The response carries the spec plus the exact line the
+    /// application will state its framework with, because that line is how the choice reaches the
+    /// build.
+    ///
+    /// The board is required rather than defaulted: a guessed chip or BSP is a build that fails on
+    /// hardware, and whoever asks this already knows the board.
+    async fn handle_create_project_design_application(
+        &self,
+        params: &serde_json::Value,
+    ) -> serde_json::Value {
+        use crate::build::application_spec::board_from_json;
+
+        let Some(board_value) = params.get("board").cloned() else {
+            return serde_json::json!({
+                "error": "`board` is required: { \"chip\": \"esp32s3\", \"bsp\": \"…\", \"hal\": \"…\" }"
+            });
+        };
+        let board = match board_from_json(&board_value) {
+            Ok(board) => board,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if description.is_empty() {
+            return serde_json::json!({
+                "error": "`description` is required — the design form's answers are what the \
+                          decomposition is derived from"
+            });
+        }
+
+        // Pinned up front, or left to the model to choose and justify in the spec.
+        let framework = match Self::params_framework(params) {
+            Ok(framework) => framework,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+
+        // The **library** the application is built against, when one was named: its components are what
+        // makes the design's `"source": "existing"` a fact instead of a guess. A path that is not a
+        // component library is refused by name rather than read as an empty one — a design built on
+        // facts read from the wrong directory is worse than no design at all.
+        let library = match params
+            .get("libraryRoot")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            None => None,
+            Some(path) => {
+                let root = std::path::Path::new(path);
+                match std::fs::read_to_string(root.join("CMakeLists.txt")) {
+                    Ok(cmake) if crate::build::idf_projects::declares_library(&cmake) => {
+                        Some(crate::build::idf_projects::library_facts(root))
+                    }
+                    _ => {
+                        return serde_json::json!({
+                            "error": format!(
+                                "`libraryRoot` is not a component library — '{path}' has no \
+                                 CMakeLists.txt stating `set(SPIRE_PROJECT_STRUCTURE idf_library)`, so \
+                                 the design cannot be told which components already exist"
+                            )
+                        })
+                    }
+                }
+            }
+        };
+
+        let spec = match self
+            .design_application(&board, &description, framework, library.as_ref())
+            .await
+        {
+            Ok(spec) => spec,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+
+        // The marker is shown at review because it is the *whole* of what the choice becomes in the
+        // tree: one stated line, which the scaffold writes.
+        let marker = spec.framework.marker_line();
+        match serde_json::to_value(&spec) {
+            Ok(spec) => serde_json::json!({ "spec": spec, "marker": marker }),
+            Err(e) => {
+                serde_json::json!({ "error": format!("the spec could not be serialized: {e}") })
+            }
+        }
+    }
+
+    /// `createProject/ParseComposition` — a **composition a person already wrote**, read into the
+    /// design phase by the same rules a project's own file is read by.
+    ///
+    /// The design phase had one door: ask a model for a decomposition
+    /// ([`handle_create_project_design_application`]). This is the other one. A `composition.spire` is
+    /// the file the scaffold writes and a person edits, so someone who already has one — or who wants
+    /// to start from the worked example — should not have to describe it again in six answers and hope
+    /// a model reproduces it.
+    ///
+    /// Nothing here re-implements the reading: [`application_spec::parse_composition`] is the same
+    /// parser [`idf_projects::read_application`](crate::build::idf_projects::read_application) reads a
+    /// project's file with, and [`design_that_holds_together`](crate::build::idf_projects::design_that_holds_together)
+    /// is the same six-rule check — so a composition handed in through this door is held to exactly
+    /// what one read off a tree is. A file that does not parse, or parses and does not hold together,
+    /// is refused **by name** with every broken rule at once, before any tree exists.
+    ///
+    /// Nothing is written, and no board, library or description is needed: a composition *states* its
+    /// board. The answer carries the spec and the marker line, exactly as the design phase's does, so
+    /// the caller has one shape to handle whichever door the design came through.
+    fn handle_create_project_parse_composition(params: &serde_json::Value) -> serde_json::Value {
+        use crate::build::application_spec::parse_composition;
+        use crate::build::idf_projects::{design_that_holds_together, COMPOSITION_FILE};
+
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            return serde_json::json!({
+                "error": "createProject/ParseComposition needs 'text': the contents of a \
+                          composition.spire — YAML of the form {framework, board, units, wiring}"
+            });
+        }
+
+        // The file's own name, when the caller knows it, so a refusal names the file to open rather
+        // than this step. A caller reading the text without a name (a paste, a fixture) gets the name
+        // the file would have had.
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(COMPOSITION_FILE);
+
+        let spec = match parse_composition(text) {
+            Ok(spec) => spec,
+            Err(e) => {
+                return serde_json::json!({ "error": format!("{name} is not a composition: {e}") })
+            }
+        };
+        let spec = match design_that_holds_together(name, spec) {
+            Ok(spec) => spec,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+
+        let marker = spec.framework.marker_line();
+        match serde_json::to_value(&spec) {
+            Ok(spec) => serde_json::json!({ "spec": spec, "marker": marker }),
+            Err(e) => serde_json::json!({
+                "error": format!("the composition could not be serialized: {e}")
+            }),
+        }
+    }
+
+    /// The reviewed composition a `createProject/*` pass runs against: **the tree's**, and the caller's
+    /// copy only for a tree that states none.
+    ///
+    /// One rule, obeyed in both directions. The resolution is
+    /// [`idf_projects::design_in_force`](crate::build::idf_projects::design_in_force) — the same one the
+    /// legs that *write* a tree ask through `design_for_scaffold` — so a pass cannot report on a project
+    /// checked against a design the tree does not have. `composition.spire` is the file a person edits,
+    /// so the copy a caller is still holding is a **fallback** here rather than the authority: a project
+    /// can state its design in full with nobody left holding a copy, and a pass that insisted on being
+    /// handed one would refuse to run on the application that states it best. A caller whose copy is out
+    /// of date is told rather than silently obeyed (`design_in_force` warns), because the answer it would
+    /// otherwise receive describes a different application.
+    ///
+    /// Reading here settles nothing: these passes check and correct a tree they did not write, and the
+    /// leg that is about to write one — the fill's planner — is where the record is brought into
+    /// agreement with the composition (see `idf_projects::read_application_and_sync_record`).
+    ///
+    /// `Err` is the JSON `error` object as it stands: every one of them is a complaint about the
+    /// *request*, which is the caller's to fix.
+    fn application_for_pass(
+        params: &serde_json::Value,
+        caller: &str,
+        root: &std::path::Path,
+    ) -> Result<crate::build::application_spec::ApplicationSpec, serde_json::Value> {
+        let requested = match params.get("application").filter(|value| !value.is_null()) {
+            Some(application) => match serde_json::from_value(application.clone()) {
+                Ok(spec) => Some(spec),
+                // The copy is unusable, which is the request's problem and not the tree's: said here
+                // rather than passed through the resolver, so a malformed copy is never quietly
+                // replaced by the tree's design.
+                Err(e) => {
+                    return Err(serde_json::json!({
+                        "error": format!("{caller}: 'application' is not an application spec: {e}")
+                    }))
+                }
+            },
+            None => None,
+        };
+        match crate::build::idf_projects::design_in_force(root, requested) {
+            Ok(Some(spec)) => Ok(spec),
+            // Neither the request nor the tree states a design, so there is nothing to run against —
+            // and answering that with a pass is how a project nobody designed is declared correct.
+            Ok(None) => Err(serde_json::json!({
+                "error": format!(
+                    "{caller} needs 'application' (the reviewed decomposition) and 'rootDir' (the tree \
+                     it was written into): this tree carries no composition and no record, so there is \
+                     no design to run against"
+                )
+            })),
+            // A tree whose own composition does not parse is a refusal, not a fall-through: the file a
+            // person edits is not readable, and carrying on with something else is how a project is
+            // checked against a design it does not have.
+            Err(e) => Err(serde_json::json!({ "error": format!("{caller}: {e}") })),
+        }
+    }
+
+    /// `createProject/VerifyApplication` — the design's composition against the sources the fill wrote.
+    ///
+    /// A *structural* check, and the reason it exists is a live run: the fill was handed the reviewed
+    /// `actors` decomposition, the framework's own idiom and the library's headers, and answered with one
+    /// flat FreeRTOS poll loop and its own `Sps30`/`Sht20` classes. Nothing caught it, because a flat loop
+    /// **compiles** — so the two things that *are* checkable without reading the code as a person would
+    /// are checked here, and the caller is told rather than handed a plausible wrong application.
+    ///
+    /// It writes nothing and repairs nothing: what to do about a gap is the caller's, and a second fill is
+    /// not obviously the answer (see `idf_projects::composition_gaps`).
+    ///
+    /// The design is the tree's, and the caller's copy only for a tree that states none — see
+    /// [`CoordinatorActor::application_for_pass`] — which is what lets a project whose composition was
+    /// written by hand be checked without anyone holding a copy of it, and keeps the check from being
+    /// answered by a copy the tree does not carry. Writing nothing is kept exactly: this reads the
+    /// composition and never settles the record beside it.
+    fn verify_application(params: &serde_json::Value) -> serde_json::Value {
+        let root = params
+            .get("rootDir")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if root.is_empty() {
+            return serde_json::json!({
+                "error": "createProject/VerifyApplication needs 'rootDir': the application the \
+                          composition was to be written into"
+            });
+        }
+        let spec = match Self::application_for_pass(
+            params,
+            "createProject/VerifyApplication",
+            std::path::Path::new(&root),
+        ) {
+            Ok(spec) => spec,
+            Err(error) => return error,
+        };
+        let gaps = crate::build::idf_projects::composition_gaps(std::path::Path::new(&root), &spec);
+        serde_json::json!({ "ok": gaps.is_empty(), "gaps": gaps })
+    }
+
+    /// `createProject/FinalizeManifest` — the manifest's dependencies, settled against the composition
+    /// the fill actually wrote.
+    ///
+    /// The scaffold states the design's dependencies *before* any of it exists, and the board's BSP is
+    /// the one it can only be guessing at: a design names a board, but only the composition says whether
+    /// it drives the board's peripherals. A composition that reaches for none — a sensor-only app whose
+    /// display and touch are still stubs — otherwise downloads and compiles the BSP's whole peripheral
+    /// stack and dead-strips every byte of it, which is the first build's minutes rather than its
+    /// seconds.
+    ///
+    /// It **writes** `main/idf_component.yml` — the one file it is here to correct — and answers with the
+    /// dependencies it now declares, so the caller can report them. Called after the fill has been
+    /// executed and before the build; see `idf_projects::finalize_application_manifest`.
+    ///
+    /// The design is the tree's, and the caller's copy only for a tree that states none, by the rule every
+    /// `createProject/*` pass follows — see [`CoordinatorActor::application_for_pass`]. A manifest
+    /// corrected against no design at all would be a manifest corrected against nothing, so that stays
+    /// a refusal.
+    fn finalize_manifest(params: &serde_json::Value) -> serde_json::Value {
+        let root = params
+            .get("rootDir")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if root.is_empty() {
+            return serde_json::json!({
+                "error": "createProject/FinalizeManifest needs 'rootDir': the application whose \
+                          dependencies follow from its composition"
+            });
+        }
+        let spec = match Self::application_for_pass(
+            params,
+            "createProject/FinalizeManifest",
+            std::path::Path::new(&root),
+        ) {
+            Ok(spec) => spec,
+            Err(error) => return error,
+        };
+        match crate::build::idf_projects::finalize_application_manifest(
+            std::path::Path::new(&root),
+            &spec,
+        ) {
+            Ok(dependencies) => serde_json::json!({ "ok": true, "dependencies": dependencies }),
+            Err(e) => serde_json::json!({ "error": e }),
+        }
+    }
+
+    /// `createProject/RepairFromBuild` — a **build's errors back to the model**, as fill steps.
+    ///
+    /// The build belongs to the caller: it owns the toolchain and it is the one that knows how this
+    /// machine builds. What the core owns is the other half — reading a compiler's output, deciding which
+    /// *fillable* file each error belongs to, and asking for a whole-file rewrite of it under the same
+    /// rules the fill wrote by.
+    ///
+    /// Two things make it belong here rather than in the caller. The first is the permission model: the
+    /// scaffold's `fill_roots` say what a model may write, and a repair that could rewrite anything would
+    /// be a repair that could break the manifest defining the build. The second is that the rewrite goes
+    /// through `compile_fix_prompt` and `llm_rewrite`, which parses every proposal with tree-sitter and
+    /// refuses one that does not parse — so a repair cannot write what the fill could not have.
+    ///
+    /// Like `createProject/Fill`, it **writes nothing**: it returns steps, and the caller executes them
+    /// through `createProject/ExecutePlan`, which is where the structural guard lives. A diagnostic whose
+    /// every candidate is a locked file or one the library owns comes back in `unrepaired` instead —
+    /// that is a mistake for a person, not for another model turn.
+    async fn handle_create_project_repair_from_build(
+        &self,
+        params: &serde_json::Value,
+    ) -> serde_json::Value {
+        use crate::build::generic_helpers::group_diagnostics;
+
+        let root = params
+            .get("rootDir")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if root.is_empty() {
+            return serde_json::json!({
+                "error": "`rootDir` is required: the project the build ran in, and the one its paths \
+                          are read against"
+            });
+        }
+        let diagnostics = params
+            .get("diagnostics")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if diagnostics.is_empty() {
+            return serde_json::json!({
+                "error": "`diagnostics` is required: the build's own output, verbatim, so that the \
+                          messages a repair repeats are the compiler's and not a summary of them"
+            });
+        }
+        // The scaffold's spec, for the same reason `createProject/Fill` takes it: `fill_roots` is the
+        // whole permission this repair has.
+        let spec: crate::subsystems::build::build_manager::ScaffoldSpec = match params
+            .get("spec")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            Some(spec) => spec,
+            None => {
+                return serde_json::json!({
+                    "error": "`spec` is required: a repair may only touch the files the scaffold left \
+                              open, and the spec is where that is written down"
+                })
+            }
+        };
+
+        let found = group_diagnostics(&diagnostics);
+        if found.is_empty() {
+            // A build whose output names no `error:` line has nothing to repair — a warning is not a
+            // broken build — but the **shape** is the same as a repair's, because the caller decodes it
+            // as one. See [`Self::repair_reply`].
+            return Self::repair_reply(
+                Vec::new(),
+                0,
+                Vec::new(),
+                Vec::new(),
+                "nothing to repair: the build's output names no `error:` line, so there is no compiler \
+                 diagnostic to act on — a warning is not a broken build",
+            );
+        }
+        self.repair_from_diagnostics(std::path::Path::new(&root), &spec, found)
+            .await
+    }
+
+    /// **The one shape a repair answers in**, whichever answer the build earned.
+    ///
+    /// `steps`/`diagnostics`/`refused`/`unrepaired`/`next` are what the caller decodes, so both answers —
+    /// a rewrite pass and "there was nothing to repair" — are built here and neither can drift from the
+    /// other. They *had* drifted: the nothing-to-repair answer omitted the two lists it had no use for,
+    /// and a warning-only build came back to the caller as "the repair could not run: Key 'refused' not
+    /// found", taking the whole build→repair→rebuild verify down with it. A shape that is only ever
+    /// built in one place cannot do that again.
+    fn repair_reply(
+        steps: Vec<crate::subsystems::project::project_creation::CreationStep>,
+        diagnostics: usize,
+        refused: Vec<serde_json::Value>,
+        unrepaired: Vec<String>,
+        next: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "steps": steps,
+            "diagnostics": diagnostics,
+            "refused": refused,
+            "unrepaired": unrepaired,
+            "next": next,
+        })
+    }
+
+    /// The rewrite pass itself: one model call per **fillable** file the compiler named.
+    ///
+    /// Split from the handler so the handler reads as the contract (what is required, what is refused,
+    /// what comes back) and this reads as the loop. Every file goes through `compile_fix_prompt` — which
+    /// carries the file's current content and the compiler's own lines, including the `note:` lines that
+    /// say what it expected — and then through `llm_rewrite`, whose tree-sitter gate is what makes it safe
+    /// to hand the result to a writer.
+    async fn repair_from_diagnostics(
+        &self,
+        root: &std::path::Path,
+        spec: &crate::subsystems::build::build_manager::ScaffoldSpec,
+        found: Vec<crate::build::generic_helpers::BuildDiagnostic>,
+    ) -> serde_json::Value {
+        use crate::build::generic_helpers::{
+            compile_fix_prompt, related_sources, repairable_sources,
+        };
+        use crate::subsystems::project::project_creation::{
+            CreationStep, CreationStepType, StepStatus,
+        };
+
+        let repairable = repairable_sources(root, &spec.fill_roots, &found);
+        let mut steps: Vec<CreationStep> = Vec::new();
+        let mut refused: Vec<serde_json::Value> = Vec::new();
+
+        for (path, errors) in &repairable {
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(e) => {
+                    refused.push(serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "reason": format!("cannot read it: {e}")
+                    }));
+                    continue;
+                }
+            };
+            // Every line of every diagnostic that named this file, notes included: the note saying what
+            // the compiler expected is usually the whole repair.
+            let lines: Vec<String> = errors
+                .iter()
+                .flat_map(|diagnostic| diagnostic.lines.clone())
+                .collect();
+            // The other fillable files this diagnostic named — read-only context, so a mismatch
+            // spread across two files can be lined up in one pass instead of looping on one of them.
+            let related = related_sources(root, &spec.fill_roots, errors, path);
+            let prompt = compile_fix_prompt(&path.to_string_lossy(), &content, &lines, &related);
+            match self.llm_rewrite(prompt).await {
+                Ok((proposed, syntax_ok)) if syntax_ok => {
+                    let relative = path
+                        .strip_prefix(root)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+                    steps.push(CreationStep {
+                        id: format!("repair-{}", steps.len() + 1),
+                        step_type: CreationStepType::WriteSourceFile,
+                        description: format!("Repair {relative} ({} compiler lines)", lines.len()),
+                        status: StepStatus::Pending,
+                        parameters: serde_json::json!({
+                            // Absolute, which the executor takes as given; the structural guard
+                            // normalizes it against the root either way.
+                            "path": path.to_string_lossy(),
+                            "content": proposed,
+                        }),
+                        result: None,
+                    });
+                }
+                // A proposal that does not parse is refused rather than written — `llm_rewrite` already
+                // spent a second attempt on it with the syntax error quoted back.
+                Ok(_) => refused.push(serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "reason": "the rewrite did not parse, so it was not written"
+                })),
+                Err(e) => refused.push(serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "reason": e
+                })),
+            }
+        }
+
+        // What the compiler blamed on a file this repair may not touch — the library's headers, or the
+        // scaffold's own. Reported by their first line, which is the compiler's, so the caller can show
+        // a person exactly what has to be theirs.
+        let unrepaired: Vec<String> = found
+            .iter()
+            .filter(|diagnostic| {
+                repairable_sources(root, &spec.fill_roots, std::slice::from_ref(*diagnostic))
+                    .is_empty()
+            })
+            .map(|diagnostic| diagnostic.lines.first().cloned().unwrap_or_default())
+            .collect();
+
+        Self::repair_reply(
+            steps,
+            found.len(),
+            refused,
+            unrepaired,
+            "execute these steps (`createProject/ExecutePlan`) and build again: a repair that is not \
+             rebuilt is a repair nobody checked",
+        )
+    }
+
+    /// Ask the **planning** model for a decomposition, and check the answer.
+    ///
+    /// The LLM leg lives here rather than in the creation actor for the reason `idf_component_edit`
+    /// does: it needs the model and nothing else — no project, no files, no graph — and the design
+    /// phase deliberately happens *before* the tree it describes exists. Everything decided behind
+    /// this call (the request, the six rules, the repair turn, the attempt limit) is in
+    /// [`crate::build::application_spec`], which is where it is tested without an LLM at all.
+    async fn design_application(
+        &self,
+        board: &crate::build::application_spec::BoardChoice,
+        description: &str,
+        framework: Option<crate::build::application_spec::ApplicationFramework>,
+        library: Option<&crate::build::application_spec::LibraryFacts>,
+    ) -> Result<crate::build::application_spec::ApplicationSpec, String> {
+        // Route through the LLM actor's mailbox, so every LLM call in the app shares one
+        // actor-owned config and client.
+        let llm_tx = self.llm_tx.clone();
+        crate::build::application_spec::design_application(
+            board,
+            description,
+            framework,
+            library,
+            |prompt| {
+                let tx = llm_tx.clone();
+                async move {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    if tx
+                        .send(crate::actors::LlmMessage::Complete {
+                            prompt,
+                            role: spire_core::subsystems::llm::llm::LlmModelRole::Planning,
+                            reply_to: reply_tx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err("LLM actor unavailable".to_string());
+                    }
+                    match reply_rx.await {
+                        Ok(Ok(text)) => Ok(text),
+                        Ok(Err(e)) => Err(format!("LLM error: {e}")),
+                        Err(e) => Err(format!("LLM reply lost: {e}")),
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    /// `idf_design_application` — the design phase, as the **model** calls it.
+    ///
+    /// The tool's arguments are flat (`chip`, `bsp`, `hal`, `description`, `framework`, `library`)
+    /// because that is what a model writes; the request behind it takes a `board` object because that is
+    /// what the wizard has. This normalizes the first into the second and delegates, so the design phase
+    /// has one implementation and two callers rather than two of everything.
+    async fn handle_idf_design_application(&self, args: &serde_json::Value) -> serde_json::Value {
+        let mut board = serde_json::Map::new();
+        for key in ["chip", "bsp", "hal"] {
+            if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
+                board.insert(key.to_string(), value.clone());
+            }
+        }
+        if board.is_empty() {
+            return serde_json::json!({
+                "error": "idf_design_application needs 'chip' and 'bsp' — the board the application \
+                          is designed for is part of the design, not a default"
+            });
+        }
+
+        let mut params = serde_json::Map::new();
+        params.insert("board".to_string(), serde_json::Value::Object(board));
+        for (from, to) in [
+            ("description", "description"),
+            ("framework", "framework"),
+            // The tool says `library`; the request says `libraryRoot`, as the create family does.
+            ("library", "libraryRoot"),
+        ] {
+            if let Some(value) = args.get(from).filter(|v| !v.is_null()) {
+                params.insert(to.to_string(), value.clone());
+            }
+        }
+        self.handle_create_project_design_application(&serde_json::Value::Object(params))
+            .await
     }
 
     /// `createProject/GenerateCode` — deterministic skeleton steps from a
@@ -5667,6 +7050,19 @@ struct PlatformListing<'a> {
     kind: crate::platform::PlatformKind,
 }
 
+/// One entry of the `platforms/config` payload: the typed platform — the **same shape**
+/// `platforms/list` sends, so the client decodes it with the model it already has — plus everything
+/// the graph holds about it, read from its edges (`realizes` / `provides` / `carries` / `pins`,
+/// each value included).
+#[derive(serde::Serialize)]
+struct PlatformConfig<'a> {
+    #[serde(flatten)]
+    platform: &'a crate::platform::Platform,
+    embedded: bool,
+    kind: crate::platform::PlatformKind,
+    capability_blocks: serde_json::Value,
+}
+
 fn platforms_listing(platforms: Vec<crate::platform::Platform>) -> serde_json::Value {
     let listing: Vec<PlatformListing> = platforms
         .iter()
@@ -5702,6 +7098,7 @@ mod platform_listing_tests {
             family: Some("x".into()),
             chip: None,
             hal: None,
+            bsp: None,
             rust: None,
             library_hints: Some("the board's own notes".into()),
         }
@@ -5909,6 +7306,242 @@ mod fix_loop_tests {
             created,
             vec!["touched.rs".to_string()],
             "a file the fix created — invisible to `git diff`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod design_request_params_tests {
+    use super::*;
+
+    /// A decomposition handed to a **creation** request is checked, not trusted.
+    ///
+    /// The wizard hands back whatever was reviewed — and possibly edited — so the same six rules the
+    /// design phase ran are run again here. It matters because the project *writes the spec down*: a
+    /// tree carrying `SPIRE.application.json` is a tree claiming that composition, so a project
+    /// scaffolded from one that does not hold together carries the lie in its own files.
+    #[test]
+    fn a_decomposition_that_does_not_hold_together_is_refused_with_its_problems() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        // Nothing asked: the ordinary case for a project made without a design phase.
+        assert_eq!(
+            CoordinatorActor::params_application(&serde_json::json!({})),
+            Ok(None)
+        );
+
+        // The worked example is taken as it stands.
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        assert_eq!(
+            CoordinatorActor::params_application(&serde_json::json!({ "application": spec })),
+            Ok(Some(spec))
+        );
+
+        // One edited into nonsense is refused by name, and the refusal says which rule broke.
+        let broken = serde_json::json!({
+            "application": {
+                "framework": "actors",
+                "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+                "units": [ { "id": "sampler", "kind": "stage" } ],
+            }
+        });
+        let error = CoordinatorActor::params_application(&broken)
+            .expect_err("a decomposition with a hole in it is refused");
+        assert!(
+            error.contains("is not a decomposition that holds together"),
+            "{error}"
+        );
+        assert!(
+            error.contains("stage"),
+            "and it says what is wrong: {error}"
+        );
+
+        // And something that is not a spec at all says so rather than being half-read.
+        let error = CoordinatorActor::params_application(&serde_json::json!({
+            "application": { "framework": "actors" }
+        }))
+        .expect_err("a spec with no units is not a spec");
+        assert!(error.contains("`application`"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod verify_application_tests {
+    use super::*;
+
+    /// The composition gate, in the shape it answers in: a tree written without the framework is refused
+    /// **by name**, and what the gate cannot look at it does not bless — a gate that passes when it could
+    /// not look is worse than no gate.
+    #[test]
+    fn a_flat_tree_is_refused_by_name_and_a_request_that_cannot_be_looked_at_is_an_error() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        let root = tempfile::tempdir().expect("a temp dir");
+        let main = root.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+
+        // One poll loop and none of the design's composition: the framework's absence is the gap.
+        std::fs::write(
+            main.join("main.cpp"),
+            "void app_main() { while (true) {} }\n",
+        )
+        .unwrap();
+        let reply = CoordinatorActor::verify_application(&serde_json::json!({
+            "rootDir": root.path().to_string_lossy(),
+            "application": parse_spec(examples::PM25_METER).expect("the worked example parses"),
+        }));
+        assert_eq!(reply["ok"], serde_json::json!(false), "{reply}");
+        let gaps = reply["gaps"].as_array().expect("gaps");
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the framework, and nothing else: no component of the design was re-declared here: {reply}"
+        );
+        assert!(
+            gaps[0]
+                .as_str()
+                .expect("a gap is a sentence")
+                .contains("uses no `spire::Actor"),
+            "{reply}"
+        );
+
+        // And the three requests that cannot be answered are errors, not passes.
+        assert!(
+            CoordinatorActor::verify_application(&serde_json::json!({}))["error"].is_string(),
+            "no design, no tree: an error"
+        );
+        assert!(
+            CoordinatorActor::verify_application(&serde_json::json!({
+                "rootDir": "",
+                "application": parse_spec(examples::PM25_METER).unwrap(),
+            }))["error"]
+                .is_string(),
+            "a design with no tree to check it against: an error"
+        );
+        assert!(
+            CoordinatorActor::verify_application(&serde_json::json!({
+                "rootDir": root.path().to_string_lossy(),
+                "application": { "framework": "actors" },
+            }))["error"]
+                .is_string(),
+            "something that is not a spec: an error, never a pass"
+        );
+    }
+
+    /// **The design can be the tree's, not the caller's.** A project can be designed entirely in its own
+    /// `composition.spire` with nobody left holding the reviewed form — and a pass that insisted on being
+    /// handed one would refuse to run on the application that states its design best.
+    #[test]
+    fn a_pass_runs_against_the_composition_the_tree_carries() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let root = tempfile::tempdir().expect("a temp dir");
+        let main = root.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(
+            main.join("main.cpp"),
+            "void app_main() { while (true) {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path()
+                .join(crate::build::idf_projects::COMPOSITION_FILE),
+            crate::build::idf_projects::render_composition(&spec).unwrap(),
+        )
+        .unwrap();
+
+        // No `application` in the request at all: the file is what there is to check against, and the
+        // flat tree is still refused against it — by the framework the file states, not by luck.
+        let reply = CoordinatorActor::verify_application(&serde_json::json!({
+            "rootDir": root.path().to_string_lossy(),
+        }));
+        assert_eq!(reply["ok"], serde_json::json!(false), "{reply}");
+        let gaps = reply["gaps"].as_array().expect("gaps");
+        assert!(
+            gaps.iter().any(|gap| gap
+                .as_str()
+                .expect("a gap is a sentence")
+                .contains("uses no `spire::Actor")),
+            "the gap is the one the composition's framework decides: {reply}"
+        );
+
+        // And the manifest pass reads the same file: this `main/` reaches for no board support, so the
+        // board's BSP is dropped — a decision the composition's own pins made, not a request field.
+        let reply = CoordinatorActor::finalize_manifest(&serde_json::json!({
+            "rootDir": root.path().to_string_lossy(),
+        }));
+        assert_eq!(reply["ok"], serde_json::json!(true), "{reply}");
+        assert_eq!(
+            reply["dependencies"],
+            serde_json::json!([]),
+            "nothing is pinned by `void app_main() {{}}`: {reply}"
+        );
+
+        // A tree that carries neither a composition nor a record still refuses, by name: a pass run
+        // against no design is a pass that would bless nothing in particular.
+        let empty = tempfile::tempdir().expect("a temp dir");
+        let reply = CoordinatorActor::finalize_manifest(&serde_json::json!({
+            "rootDir": empty.path().to_string_lossy(),
+        }));
+        assert!(
+            reply["error"]
+                .as_str()
+                .expect("an error is a sentence")
+                .contains("createProject/FinalizeManifest"),
+            "the refusal names the call that cannot be answered: {reply}"
+        );
+    }
+
+    /// **A pass is not run against a design the tree does not carry.** The copy a caller is still holding
+    /// is a fallback for a tree that states nothing, and where the two disagree the **tree** decides —
+    /// the rule the legs that write a tree obey too (`idf_projects::design_in_force`).
+    ///
+    /// The failure this closes is the write-side one in the other tense: a caller that redesigned in the
+    /// wizard and has not applied it to the file would otherwise be told its project is fine, because the
+    /// pass checked the project against the design the caller holds rather than the one the project
+    /// states — and a project the file says is something else is not that design's project.
+    #[test]
+    fn a_pass_runs_against_the_design_the_tree_carries_not_the_copy_it_was_handed() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        // The tree states `actors`; the caller hands in a `ramen` decomposition. Both are asked of the
+        // same flat `main/`, and their gaps are worded apart — `spire::Actor / spire::Scheduler` against
+        // `ramen` — so which design was used is what the answer says, not something to infer.
+        let authored = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let handed_in = parse_spec(examples::INSECT_TRAP).expect("the other worked example parses");
+        let root = tempfile::tempdir().expect("a temp dir");
+        let main = root.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(
+            main.join("main.cpp"),
+            "void app_main() { while (true) {} }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path()
+                .join(crate::build::idf_projects::COMPOSITION_FILE),
+            crate::build::idf_projects::render_composition(&authored).unwrap(),
+        )
+        .unwrap();
+
+        let reply = CoordinatorActor::verify_application(&serde_json::json!({
+            "rootDir": root.path().to_string_lossy(),
+            "application": &handed_in,
+        }));
+        let gaps = reply["gaps"].as_array().expect("gaps");
+        let text = gaps
+            .iter()
+            .filter_map(|gap| gap.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("spire::Actor"),
+            "the tree states `actors`, and that is the design the pass checked: {reply}"
+        );
+        assert!(
+            !text.contains("`ramen`"),
+            "the copy handed in states `ramen`, which is not the design this tree has: {reply}"
         );
     }
 }

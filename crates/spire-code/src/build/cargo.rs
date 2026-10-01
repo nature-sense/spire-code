@@ -1263,6 +1263,8 @@ impl Actor for CargoBuildModule {
                 platforms,
                 structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let result = self.scaffold_layout(&project_name, &goal, &platforms, structure);
@@ -1325,24 +1327,22 @@ impl CargoBuildModule {
         if structure == spire_core::build_types::ProjectStructure::SpireApp {
             return Ok(super::spire_app_scaffold::spire_app_scaffold(project_name));
         }
-        // Embedded container: the framework, fixed — the actor system, the two runtimes, an empty
-        // `drivers/` — plus the marker that declares the type. The platform list is echoed back and
-        // used for nothing else: a container is board-agnostic, and its boards are added one BSP at a
-        // time afterwards (`embedded_add_bsp`).
-        if structure == spire_core::build_types::ProjectStructure::Embedded {
-            return super::embedded_scaffold::embedded_scaffold(project_name, platforms);
-        }
-        // Embedded application: emitted by `project_creation`, which is the layer that has the
-        // embedded-HAL project's *directory* — the module layer only ever sees names, a goal, a
-        // platform list and a structure. Reaching here means that path was bypassed, so refuse
-        // rather than fall through to the Cargo layout below: a silent fall-through would emit a
-        // plain host crate for a firmware choice, and report nothing wrong.
-        if structure == spire_core::build_types::ProjectStructure::EmbeddedApp {
-            return Err(
-                "an embedded application is scaffolded by the project-creation layer, which reads \
-                 the embedded-HAL project it depends on; this path was given no HAL directory"
-                    .to_string(),
-            );
+        // The two **retired** embedded structures. They are still *recognized* — a project that
+        // declares one is read as one, and its subprojects still report their structure — but
+        // nothing creates them any more: the ESP-IDF project types replaced the container and the
+        // application it depended on. Refused by name rather than falling through to the Cargo
+        // layout below, because a silent fall-through would emit a plain host crate for a firmware
+        // choice and report nothing wrong.
+        if structure == spire_core::build_types::ProjectStructure::Embedded
+            || structure == spire_core::build_types::ProjectStructure::EmbeddedApp
+        {
+            return Err(format!(
+                "`{}` is a retired structure — the embedded container and its application were \
+                 replaced by the ESP-IDF component library and application. Nothing scaffolds it \
+                 any more: create a library with `idf_library` and an application with \
+                 `idf_application`.",
+                structure.as_str()
+            ));
         }
         let cross: Vec<&String> = platforms.iter().filter(|p| *p != "host").collect();
         if cross.is_empty() {
@@ -2064,123 +2064,5 @@ mod tests {
             assert_eq!(meta.targets[0].name, "demo");
             assert_eq!(meta.targets[0].kind, vec!["lib"]);
         }
-    }
-
-    /// The scaffold and the recognizer must not drift apart: the workspace the embedded-HAL
-    /// scaffold emits is the workspace this analyzer reads as `Embedded`.
-    ///
-    /// This is the pairing that matters — the marker is written in one module and read in
-    /// another, and a rename in either would otherwise show up only as a project the wizard
-    /// makes and the app then fails to recognize.
-    #[test]
-    fn embedded_scaffold_is_recognized_by_the_analyzer() {
-        let _lock = crate::PLATFORM_DIR_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let reg = tempfile::tempdir().unwrap();
-        std::fs::write(
-            reg.path().join("esp32c6.yaml"),
-            "id: esp32c6\nname: ESP32-C6\nos: esp-idf\nfamily: esp32\narchitecture:\n  \
-             cpu_family: riscv\n  cpu: esp32c6\n  endian: little\n  \
-             target_triple: riscv32imac-esp-espidf\n",
-        )
-        .unwrap();
-        let _env = crate::platform::PlatformDirGuard::set(reg.path());
-
-        let out =
-            crate::build::embedded_scaffold::embedded_scaffold("weather", &["esp32c6".to_string()])
-                .expect("the scaffold emits");
-        let tmp = tempfile::tempdir().unwrap();
-        for f in &out.files {
-            let p = tmp.path().join(&f.path);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, &f.content).unwrap();
-        }
-
-        let meta = CargoBuildModule::new().analyze(tmp.path()).unwrap();
-        assert_eq!(
-            meta.structure,
-            spire_core::build_types::ProjectStructure::Embedded,
-            "the emitted marker must be what the analyzer reads"
-        );
-    }
-
-    /// **The container, end to end, through the serializer the UI decodes.**
-    ///
-    /// `embedded_scaffold_is_recognized_by_the_analyzer` above stops at the `BuildMetadata`, and
-    /// `serialize_analysis_tests::container_members_inherit_the_workspace_structure` proves the
-    /// *serializer* copies `structure` through — but only from a hand-built fixture. Nothing joined
-    /// them, and that unjoined seam is exactly where "the container's crate decodes as native in the
-    /// app" lived: the member crate is emitted by the workspace-member branch, which derived nothing
-    /// of its own and so reported nothing for the field the pane gates on.
-    ///
-    /// So this runs the real scaffold through the real analyzer and the real serializer, and asserts
-    /// the member crate's subproject reports `"embedded"`.
-    #[test]
-    fn a_real_container_serializes_its_member_crate_as_embedded() {
-        // A container is board-agnostic — the platform list is echoed, never looked up — so creation
-        // needs no platform registry.
-        let out = crate::build::embedded_scaffold::embedded_scaffold(
-            "spire-embedded-container",
-            &["esp32c6".to_string()],
-        )
-        .expect("the container scaffold emits");
-        let tmp = tempfile::tempdir().unwrap();
-        for f in &out.files {
-            let p = tmp.path().join(&f.path);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, &f.content).unwrap();
-        }
-
-        // The REAL analyzer on the REAL bytes.
-        let mut cargo = CargoBuildModule::new()
-            .analyze(tmp.path())
-            .expect("the container analyzes");
-        // Normalize `project_path` relative to the scan root, exactly as
-        // `ProjectAnalyzerActor` does — that is what leaves the workspace root's path empty (hence
-        // skipped) and the member's `crates/<name>`.
-        if let Some(ref path) = cargo.project_path {
-            let rel = std::path::Path::new(path)
-                .strip_prefix(tmp.path())
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| path.clone());
-            cargo.project_path = Some(rel);
-        }
-        assert_eq!(
-            cargo.structure,
-            spire_core::build_types::ProjectStructure::Embedded,
-            "the scaffold's marker must survive the analyzer"
-        );
-
-        let analysis = crate::subsystems::project::project_analyzer::ProjectAnalysis {
-            project_root: tmp.path().to_string_lossy().to_string(),
-            project_name: "spire-embedded-container".to_string(),
-            file_tree: spire_core::analyzer::models::DirectoryNode::default(),
-            build_systems: vec![cargo],
-            languages: Vec::new(),
-            directory_roles: Vec::new(),
-            file_roles: Vec::new(),
-            entry_points: Vec::new(),
-            architecture_summary: String::new(),
-            total_files: 0,
-            total_dirs: 0,
-            total_lines: 0,
-        };
-        let json = crate::ffi::serialize_analysis(&analysis);
-        let subs = json
-            .get("subprojects")
-            .and_then(serde_json::Value::as_array)
-            .expect("subprojects is an array");
-        let member = subs
-            .iter()
-            .find(|s| {
-                s.get("path").and_then(|v| v.as_str()) == Some("crates/spire-embedded-container")
-            })
-            .unwrap_or_else(|| panic!("the member crate is a subproject: {subs:?}"));
-        assert_eq!(
-            member.get("structure").and_then(|v| v.as_str()),
-            Some("embedded"),
-            "a container's crate must report `embedded` straight from the scaffold: {member}"
-        );
     }
 }

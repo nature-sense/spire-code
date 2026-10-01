@@ -23,6 +23,20 @@ pub fn mock_sender<T: Send + 'static>() -> mpsc::Sender<T> {
 /// it over HTTP, parses the reply, and everything downstream is production code. Blocking
 /// std IO on its own thread on purpose — the test runtime is busy driving actors.
 pub fn fake_llm(replies: Vec<String>) -> String {
+    fake_llm_logging(
+        replies,
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    )
+}
+
+/// The same endpoint, keeping every request body it was sent.
+///
+/// For the tests whose subject is the *prompt* rather than the answer: what a model is asked is not
+/// observable from a reply, so the one place it can be checked is the wire.
+pub fn fake_llm_logging(
+    replies: Vec<String>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> String {
     use std::io::{Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -58,6 +72,9 @@ pub fn fake_llm(replies: Vec<String>) -> String {
                         break;
                     }
                 }
+            }
+            if let Ok(request) = String::from_utf8(buf.clone()) {
+                log.lock().unwrap().push(request);
             }
 
             let content = queue.pop_front().unwrap_or_else(|| "NONE".to_string());

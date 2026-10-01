@@ -1,0 +1,121 @@
+# composition.spire — the composition, as a person reviews it.
+#
+# This file is the **source of truth**. Open it, edit it, review it in a pull request; `git diff` on it
+# is a diff of the design. `SPIRE.application.json` is the *generated record* the fill phase reads back,
+# and it is the same spec in another form — so if the two ever disagree, this file wins.
+#
+# It is YAML, which is why it can carry these comments and why it reads as data rather than machinery.
+# JSON is a subset of YAML, so a JSON answer parses here too.
+#
+# Read it with `application_spec::parse_composition`. It is *strict*: a field of the wrong type or a
+# block that is not syntactically correct is refused, with the line and column that caused it.
+
+framework: actors
+justification: a touch UI, a reading a second and a battery gauge — interactive, human timescale
+
+board:
+  chip: esp32s3
+  bsp: m5stack_core_s3
+  hal: m5unified
+
+# Board facts are the *application's*: a bus and an address belong to the product, never to a component.
+# Addresses are quoted as a house rule: this reader keeps a scalar's text in a string field either way,
+# but a quoted address means the same thing in every YAML parser and reads as text, not as a number.
+board_facts:
+  - bus: i2c
+    device: sps30
+    address: "0x69"
+  - bus: i2c
+    device: sht20
+    address: "0x40"
+
+units:
+  # A component is framework-agnostic — a driver on a bus, or pure code. It carries no message and no
+  # state, which is what keeps it usable under either framework.
+  - id: sps30
+    kind: component
+    role: driver
+    source: stub
+    provides: PM1/2.5/4/10 readings
+    bus: i2c
+
+  - id: sht20
+    kind: component
+    role: driver
+    source: stub
+    provides: temperature and humidity
+    bus: i2c
+
+  - id: moving_average
+    kind: component
+    role: library
+    source: existing
+    provides: a rolling window
+
+  # An actor is the application's own composition: a message, the state behind it, and the refs it sends
+  # to. Facet annotations ride on the unit — `sleeps` and `wake` here are the *power* facet, because a
+  # facet is a lens over the composition and converges into units rather than owning an artifact.
+  - id: sampler
+    kind: actor
+    message: Tick
+    state: reads both sensors
+    uses: [sps30, sht20]
+    sends_to: [air_quality]
+    sleeps: true
+    wake: timer@1s
+
+  - id: air_quality
+    kind: actor
+    message: Reading
+    state: the rolling average
+    uses: [moving_average]
+    sends_to: [view]
+
+  - id: view
+    kind: actor
+    message: Report
+    state: the LVGL screen
+
+  - id: touch
+    kind: actor
+    message: Gesture
+    state: menu and calibration
+    sends_to: [view, sampler]
+
+  # The battery gauge. Its *unit id* is `power`; the **facet** block near the end is also called `power`.
+  # They are different planes — a unit and a lens — and both names are legal.
+  - id: power
+    kind: actor
+    message: Tick
+    state: the battery gauge
+    sends_to: [view]
+
+# `from -> to`, by unit id. Stated rather than derived, because the edges are what a reviewer checks.
+wiring:
+  - sampler -> air_quality
+  - air_quality -> view
+  - touch -> view
+  - touch -> sampler
+  - power -> view
+
+# ---------------------------------------------------------------------------------------------------
+# The facets: power, storage, networking and security. Each is optional, each is decided and checked
+# differently, and none of them is a separate artifact — they are lenses over the composition above.
+# ---------------------------------------------------------------------------------------------------
+
+# What a unit does for a facet is an annotation on that unit (`sleeps`, `storage_role`, `network_role`);
+# only the product-wide facts live here.
+power:
+  budget_mah: 2000
+  target_days: 30
+
+storage:
+  medium: flash
+  retention: until_uploaded
+
+network:
+  transport: wifi
+  provision: softap
+
+security:
+  requires: [tls]

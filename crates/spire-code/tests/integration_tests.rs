@@ -479,12 +479,15 @@ fn test_multiple_sequential_requests() {
     assert_eq!(r1["id"], 1);
     assert_eq!(r1["result"]["pong"], true);
 
-    // Request 2: system status (may be running or still initializing).
+    // Request 2: system status — `initializing` until the last phase finishes, `ready` after it. A
+    // request made here may land on either side of that line, and both are correct: the old assertion
+    // named `running`, which `SystemState` has never had, so what it actually tested was whether this
+    // machine finished starting up in time.
     let r2 = core.request_with_id(2, "system/status", serde_json::json!({}));
     assert_eq!(r2["id"], 2);
     let status2 = r2["result"]["status"].as_str().unwrap_or("");
     assert!(
-        status2 == "running" || status2 == "initializing",
+        status2 == "ready" || status2 == "initializing",
         "unexpected system status: {status2}"
     );
 

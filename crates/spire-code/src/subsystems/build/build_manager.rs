@@ -93,6 +93,15 @@ pub struct ScaffoldSpec {
     /// a host build target). Wiring: the wizard sets this for embedded projects.
     #[serde(default)]
     pub embedded: bool,
+    /// **A message for the person, when this scaffold did not use the design it was handed.**
+    ///
+    /// `Some` when the tree already stated its own design in `composition.spire`, so the
+    /// decomposition the caller passed in was dropped — the tree's wins, because a design changes
+    /// by editing that file (`idf_projects::design_for_scaffold`). The wizard shows this verbatim:
+    /// the rule has to be *said*, or a person reviews one composition and is handed a project
+    /// built from another. `None` in the ordinary case, and absent from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_warning: Option<String>,
 }
 
 fn is_native_structure(s: &spire_core::build_types::ProjectStructure) -> bool {
@@ -383,6 +392,14 @@ pub enum BuildManagerMessage {
         structure: Option<spire_core::build_types::ProjectStructure>,
         /// True for embedded projects (cross-compiled targets only — no host).
         embedded: bool,
+        /// The **component library** an ESP-IDF application is built against, forwarded to the
+        /// build module's scaffold. `None` for every other structure.
+        library: Option<String>,
+        /// The **decomposition** an ESP-IDF application was designed from, forwarded to the build
+        /// module's scaffold, which states its framework in the application's `CMakeLists.txt` and
+        /// writes the spec itself as `SPIRE.application.json`. `None` for every other structure, and
+        /// for an application whose design has not run.
+        application: Option<crate::build::application_spec::ApplicationSpec>,
         reply_to: oneshot::Sender<Result<crate::build::ScaffoldOutput, String>>,
     },
     /// Attach the UI broadcast sender for streaming build events.
@@ -527,6 +544,30 @@ impl BuildManagerActor {
             capability.name,
             os
         );
+        // A platform module can also own a config file, and for one operation it *must*: a scaffold
+        // request is routed by config file (`scaffold_build_config` → `module_tx_for(&config,
+        // None)`), with no platform to route by. Without this, a module can be registered, describe
+        // itself, answer `Build` and `Flash` — and be unreachable for the one thing that creates a
+        // project of its kind.
+        //
+        // A file that already has an owner keeps it: the config modules register first (or not, in
+        // `ffi.rs`, where this one is registered before `node` and `cmake`), and whoever owns a file
+        // is the module that *analyses* it. A platform module shadowing that would take analysis
+        // away from a module that implements it, to hand it to one declared not to.
+        for config in &capability.config_files {
+            match self.router.get(config) {
+                None => {
+                    self.router.insert(config.clone(), module_tx.clone());
+                }
+                Some(_) => tracing::warn!(
+                    "BuildManager: module '{}' also claims '{}', which another module already \
+                     owns; the file keeps its owner, and '{}' is reachable by its platform only",
+                    capability.name,
+                    config,
+                    capability.name
+                ),
+            }
+        }
         self.platform_router.insert(
             os,
             PlatformModule {
@@ -1821,6 +1862,13 @@ impl BuildManagerActor {
                 platforms: platforms.to_vec(),
                 structure,
                 embedded,
+                // This path has no library to name: it is reached by a caller that asked for a
+                // *build system*, not for a project type, and the two ESP-IDF types are reached
+                // through `ScaffoldBuildConfig` proper.
+                library: None,
+                // For the same reason, no decomposition: it is a fact about an application's design,
+                // and this path does not know of one.
+                application: None,
                 reply_to: tx,
             })
             .await
@@ -3541,26 +3589,129 @@ executable('{project_name}-{platform}',
                 }
             }
 
-            // Adding a board's BSP to the container: the crate, and the workspace member that makes
-            // it exist. This is the *routine* container operation — the framework is scaffolded once,
-            // a BSP is added as required, for a board with no upstream crate.
-            "embedded_add_bsp" => {
+            // Applying a **design** to a library: the components it names, written as stubs.
+            //
+            // The decomposition is checked here rather than trusted — the same rules the design phase
+            // ran — because the wizard may hand back an edited one, and a stub written from a design
+            // that does not hold together is a component nobody asked for. What the library already has
+            // is read once, so the plan is a snapshot of one moment rather than a view that shifts as
+            // the plan is applied.
+            "idf_apply_design" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let Some(application) = args.get("application").filter(|value| !value.is_null())
+                else {
+                    return serde_json::json!({
+                        "error": "idf_apply_design: 'application' (the reviewed decomposition) is \
+                                  required, and 'root' (the component library) with it"
+                    });
+                };
+                if root.is_empty() {
+                    return serde_json::json!({
+                        "error": "idf_apply_design: 'root' has to be the component library the \
+                                  design's components belong to"
+                    });
+                }
+                let spec: crate::build::application_spec::ApplicationSpec =
+                    match serde_json::from_value(application.clone()) {
+                        Ok(spec) => spec,
+                        Err(e) => {
+                            return serde_json::json!({
+                                "error": format!("idf_apply_design: 'application' is not an \
+                                                  application spec: {e}")
+                            })
+                        }
+                    };
+                if let Err(problems) = crate::build::application_spec::validate(&spec) {
+                    return serde_json::json!({
+                        "error": format!(
+                            "idf_apply_design: the decomposition does not hold together, so no \
+                             component was written:\n  - {}",
+                            problems.join("\n  - ")
+                        )
+                    });
+                }
+                let root = Path::new(&root);
+                let present = crate::build::idf_projects::component_names(root);
+                let plan = crate::build::application_spec::component_plan(&spec, |name| {
+                    present.iter().any(|known| known == name)
+                });
+                crate::build::idf_projects::apply_component_plan(root, &plan)
+            }
+
+            // Adding a **component** to an ESP-IDF component library: its skeleton, as a stub whose
+            // code the model fills in. The **kind** is stated by the caller and decides the shape —
+            // a `driver` is a device on a bus and gets a seam, a `library` is pure code and gets a
+            // plain unit test. A `bus` is required only for a driver, and means nothing for a
+            // library: a bus passed for a library would be a contract that lies.
+            "idf_add_component" => {
                 let root = args
                     .get("root")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                let board = args
-                    .get("board")
+                let name = args
+                    .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                if root.is_empty() || board.is_empty() {
+                let kind_arg = args
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let bus = args.get("bus").and_then(|v| v.as_str()).unwrap_or_default();
+                if root.is_empty() || name.is_empty() {
                     serde_json::json!({
-                        "error": "embedded_add_bsp: 'root' (the container directory) and 'board' (a platform id) are required"
+                        "error": "idf_add_component: 'root' (the component library directory) and \
+                                  'name' (the component) are required"
                     })
                 } else {
-                    match crate::build::embedded_scaffold::add_bsp(
+                    match crate::build::idf_projects::ComponentKind::from_str(kind_arg) {
+                        None => serde_json::json!({
+                            "error": format!(
+                                "idf_add_component: 'kind' has to be 'driver' (a device on a bus) or \
+                                 'library' (pure code) — got '{}'. Nothing here guesses which: the \
+                                 kind decides the skeleton, and it is not recoverable later.",
+                                kind_arg.trim()
+                            )
+                        }),
+                        Some(kind) => {
+                            match crate::build::idf_projects::add_component(
+                                std::path::Path::new(root),
+                                name,
+                                kind,
+                                bus,
+                            ) {
+                                Ok(result) => result,
+                                Err(e) => serde_json::json!({ "error": e }),
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Removing one: the directory, and nothing else. Refuses when another component is
+            // built on it, rather than editing that component's `REQUIRES` on the caller's behalf.
+            "idf_remove_component" => {
+                let root = args
+                    .get("root")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if root.is_empty() || name.is_empty() {
+                    serde_json::json!({
+                        "error": "idf_remove_component: 'root' (the component library directory) and \
+                                  'name' (the component) are required"
+                    })
+                } else {
+                    match crate::build::idf_projects::remove_component(
                         std::path::Path::new(root),
-                        board,
+                        name,
                     ) {
                         Ok(result) => result,
                         Err(e) => serde_json::json!({ "error": e }),
@@ -3568,32 +3719,15 @@ executable('{project_name}-{platform}',
                 }
             }
 
-            // Adding a driver to the container: the module, its host test, and the module-list line
-            // that makes the module exist at all.
-            "embedded_add_driver" => {
-                let root = args
-                    .get("root")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let device = args
-                    .get("device")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let bus = args.get("bus").and_then(|v| v.as_str()).unwrap_or_default();
-                if root.is_empty() || device.is_empty() || bus.is_empty() {
-                    serde_json::json!({
-                        "error": "embedded_add_driver: 'root' (the container directory), 'device', and 'bus' ('spi' or 'i2c') are required"
-                    })
-                } else {
-                    match crate::build::embedded_scaffold::add_driver(
-                        std::path::Path::new(root),
-                        device,
-                        bus,
-                    ) {
-                        Ok(result) => result,
-                        Err(e) => serde_json::json!({ "error": e }),
-                    }
-                }
+            // The ESP-IDF environment, tested and fixed. No model in the loop: what the doctor
+            // reports is a fact about this machine, and the fix is `idf_tools.py`'s own installer.
+            "idf_env_check" => {
+                serde_json::to_value(crate::build::idf_env::doctor_idf_environment().await)
+                    .unwrap_or(serde_json::json!({ "error": "idf_env_check serialization" }))
+            }
+            "idf_env_fix" => {
+                serde_json::to_value(crate::build::idf_env::repair_idf_environment().await)
+                    .unwrap_or(serde_json::json!({ "error": "idf_env_fix serialization" }))
             }
 
             "hal_diff_contracts" => {
@@ -4003,6 +4137,64 @@ executable('{project_name}-{platform}',
                 }),
             },
             spire_core::actors::ToolInfo {
+                name: "idf_component_edit".to_string(),
+                description: "Write or change one component of an ESP-IDF component library. What the model is given follows from the component's kind, which the component states in its own CMakeLists.txt: a `driver` gets the bus seam and the invariants a protocol keeps, a `library` gets the invariants pure code keeps — and both get the library's SPIRE.md, the component's own header, and the same gate. The change is kept only if the component's host test still compiles and passes (no board, no chip, no IDF) — otherwise every file is rolled back byte-for-byte. Naming a chip adds the chip build as a second gate; without one the result says the chip build did not run.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "root": { "type": "string", "description": "The component library directory" },
+                        "name": { "type": "string", "description": "The component to write or change" },
+                        "instruction": { "type": "string", "description": "What the user knows: for a driver, the datasheet material the protocol is written from; for a library, what the code should do and with what inputs and outputs" },
+                        "platform": { "type": "string", "description": "A chip to build for as a second gate (e.g. esp32s3); omitted means the host test is the whole check" }
+                    },
+                    "required": ["root", "name"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "idf_design_application".to_string(),
+                description: "Design the composition of an ESP-IDF application before any of it is written: what it senses and acts on, which components exist (a `driver` on a bus, a pure `library`), what each unit's mailbox or dataflow ports are, how they are wired, and — as the application's own facts — the bus and address of every device it drives. The framework (classical `actors` for a human-timescale interactive application, `ramen` dataflow for machine-rate streamed data) is chosen from the description and justified, or pinned by the caller. Returns a spec that has passed the checks, for a person to review, plus the line the application will state its framework with. Nothing is written to disk.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "chip": { "type": "string", "description": "The chip, e.g. esp32s3" },
+                        "bsp": { "type": "string", "description": "The board support package, as the registry names it (e.g. m5stack_core_s3)" },
+                        "hal": { "type": "string", "description": "The board abstraction the application is written against (m5unified, bsp), when there is one" },
+                        "description": { "type": "string", "description": "What the application has to do: what it senses and how fast, what it acts on, what it reacts to over time, what is parallel and at what rate, and what happens when something is missing" },
+                        "framework": { "type": "string", "enum": ["actors", "ramen"], "description": "Optional. Pin the framework instead of letting the design choose: `actors` for a human-timescale interactive application, `ramen` for machine-rate data flowing through stages" },
+                        "library": { "type": "string", "description": "Optional but important: the component library directory the application is built against. Its components are what makes the design's `\"source\": \"existing\"` a fact — without it the design cannot know which parts already exist. Naming a directory that is not a component library is refused rather than read as an empty one." }
+                    },
+                    "required": ["chip", "bsp", "description"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "idf_apply_design".to_string(),
+                description: "Apply a reviewed decomposition to an ESP-IDF component library: write the components the design names that the library does not have, as typed stubs whose code the model fills in — a `driver` gets a bus seam, a fake bus and a host-test harness, a `library` gets a plain unit test — and report what was written, what was already there, and where the design and the library *disagree* (a component the design says the library has and it does not, which is a person's call to resolve). Nothing of the design's composition is written here: the units, the wiring and the board facts belong to the application's `main/`.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "root": { "type": "string", "description": "The component library directory (the project whose CMakeLists.txt says `set(SPIRE_PROJECT_STRUCTURE idf_library)`)" },
+                        "application": { "type": "object", "description": "The reviewed application spec — the same object `idf_design_application` returned, checked again here rather than trusted" }
+                    },
+                    "required": ["root", "application"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "idf_env_check".to_string(),
+                description: "Test this machine's ESP-IDF environment and say what is wrong with it: where the install is, whether `idf.py` runs, whether `export.sh` activates, and which tools `idf_tools.py check` cannot find. Read-only — nothing is installed. Run it before blaming a chip build: it is the difference between \"the build failed\" and \"this machine has no working ESP-IDF\".".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "idf_env_fix".to_string(),
+                description: "Repair the ESP-IDF environment by installing exactly the tools `idf_env_check` found missing, then testing again. Nothing else is touched — the same `idf_tools.py install` a person would run by hand. Needs network access (the tools come from dl.espressif.com). A build and a flash do not use the debug tools it installs; `export.sh` does, which is why their absence breaks a shell.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            spire_core::actors::ToolInfo {
                 name: "modify_contract".to_string(),
                 description: "Resolve the HAL contract cascade for a platform: find the interfaces that are missing or drifted, generate their implementations, and keep a round only when the drift fell without breaking the build. Compile errors left in consumers are what Fix & Verify is for.".to_string(),
                 input_schema: serde_json::json!({
@@ -4120,19 +4312,21 @@ executable('{project_name}-{platform}',
             t("hal_fill_plan", "Plan (read-only) the HAL gap-fill work items for a platform.", root_plat.clone(), &["root"]),
             t("hal_fill_apply", "Apply a HAL gap-fill plan (write the concrete implementation files).",
               serde_json::json!({ "root": { "type": "string" }, "plan": { "type": "array" } }), &["root", "plan"]),
-            t("embedded_add_bsp", "Add a board's BSP crate to the spire-embedded container: the board's facts (pins, buses, polarity) as typed `todo!()`s, plus the workspace member that makes the crate exist. The container's framework is scaffolded once; a BSP is added as required, for a board with no upstream BSP.",
+            // ESP-IDF component library: the two operations that grow and shrink it.
+            t("idf_add_component", "Add a component to an ESP-IDF component library: its skeleton, as a typed stub whose code the model fills in. The kind is stated and decides the shape — a `driver` (a device on a bus) gets a bus seam, a fake bus and a host-test harness, and its protocol is written from the device's datasheet; a `library` (pure code: an algorithm, a filter, a codec) gets a plain unit test and no bus at all.",
               serde_json::json!({
-                  "root": { "type": "string", "description": "The container directory (the spire-embedded workspace root)" },
-                  "board": { "type": "string", "description": "Platform registry id of the board (e.g. esp32c3)" }
+                  "root": { "type": "string", "description": "The component library directory (the project whose CMakeLists.txt says `set(SPIRE_PROJECT_STRUCTURE idf_library)`)" },
+                  "name": { "type": "string", "description": "The component, e.g. sps30 or moving_average — becomes the component directory, its namespace and its class; for a driver, the device it speaks to" },
+                  "kind": { "type": "string", "enum": ["driver", "library"], "description": "What this component is, stated rather than guessed. `driver`: one device on one bus — a protocol, which needs a seam so a host test can stand in for the device. `library`: pure code with no device, no bus and no board. It decides the whole skeleton, and it is written into the component's CMakeLists.txt." },
+                  "bus": { "type": "string", "enum": ["i2c", "spi", "uart"], "description": "Required for `kind: driver` and meaningless for a `library`: which bus the device is on, a device fact the stub's REQUIRES follows from" }
               }),
-              &["root", "board"]),
-            t("embedded_add_driver", "Add a device driver to the spire-embedded container: the bus-generic module and a host test that proves it against a fake bus recording. The protocol is the fill's; the skeleton is generic over `embedded-hal`'s traits, so the driver runs on any board.",
+              &["root", "name", "kind"]),
+            t("idf_remove_component", "Remove a component from an ESP-IDF component library: its directory, and nothing else. Refuses when another component REQUIRES it, so a shared component is never deleted out from under its users.",
               serde_json::json!({
-                  "root": { "type": "string", "description": "The container directory (the spire-embedded workspace root)" },
-                  "device": { "type": "string", "description": "The device, e.g. bme280 — becomes the module and type name" },
-                  "bus": { "type": "string", "enum": ["spi", "i2c"], "description": "Which bus the device is on: a device fact, not a guess" }
+                  "root": { "type": "string", "description": "The component library directory" },
+                  "name": { "type": "string", "description": "The component to remove, by directory name" }
               }),
-              &["root", "device", "bus"]),
+              &["root", "name"]),
             t("hal_diff_contracts", "Diff two HAL contract summaries (added/removed/changed methods).",
               serde_json::json!({ "old_summary": { "type": "object" }, "new_summary": { "type": "object" } }),
               &["old_summary", "new_summary"]),
@@ -4261,6 +4455,8 @@ impl Actor for BuildManagerActor {
                 platforms,
                 structure,
                 embedded,
+                library,
+                application,
                 reply_to,
             } => {
                 if let Some(tx) = self.router.get(&build_file).cloned() {
@@ -4273,6 +4469,8 @@ impl Actor for BuildManagerActor {
                             structure: structure
                                 .unwrap_or(spire_core::build_types::ProjectStructure::Native),
                             embedded,
+                            library,
+                            application,
                             reply_to: t,
                         })
                         .await;
@@ -4429,6 +4627,51 @@ mod tests {
 
     use spire_actor::ServiceRegistry;
     use std::sync::Arc;
+
+    /// **The key the wizard's banner decodes must not drift.**
+    ///
+    /// `ScaffoldSpec.design_warning` is read by the Swift model *by name*
+    /// (`Models/ScaffoldSpec.swift`) with `decodeIfPresent`, so a renamed or dropped key is not an
+    /// error there — it is a banner that never appears, which is exactly the silence this field exists
+    /// to end. So the wire shape is pinned here instead: snake_case, and absent when there is nothing
+    /// to say.
+    #[test]
+    fn a_scaffold_report_crosses_the_wire_under_the_key_the_wizard_reads() {
+        let quiet = serde_json::to_value(ScaffoldSpec::default()).unwrap();
+        assert!(
+            quiet.get("design_warning").is_none(),
+            "nothing to say is said by absence, not by null: {quiet}"
+        );
+
+        let told = ScaffoldSpec {
+            design_warning: Some("the tree's design decides".to_string()),
+            ..ScaffoldSpec::default()
+        };
+        let json = serde_json::to_value(&told).unwrap();
+        assert_eq!(
+            json["design_warning"].as_str(),
+            Some("the tree's design decides"),
+            "the wizard reads this key by name: {json}"
+        );
+        assert_eq!(
+            serde_json::from_value::<ScaffoldSpec>(json)
+                .unwrap()
+                .design_warning,
+            told.design_warning,
+            "and it round-trips, so the spec the fill hands back still carries it"
+        );
+
+        // A core older than the field — no key at all — still decodes, as `None`.
+        let mut without = serde_json::to_value(&told).unwrap();
+        without.as_object_mut().unwrap().remove("design_warning");
+        assert_eq!(
+            serde_json::from_value::<ScaffoldSpec>(without)
+                .unwrap()
+                .design_warning,
+            None,
+            "the field is optional on the wire as well as in the type"
+        );
+    }
 
     #[test]
     fn ensure_impl_header_include_prepends_and_is_idempotent() {
@@ -4808,7 +5051,7 @@ mod tests {
             .expect_err("a linux platform has no flash step");
         assert!(err.contains("rpi5") && err.contains("linux"), "{err}");
 
-        // An id that is not in the registry: the same wording `run_esp_flash` uses, so the
+        // An id that is not in the registry: the same wording `run_idf_flash` uses, so the
         // message does not depend on how far the request got.
         let err = manager
             .route_for_flash("Cargo.toml", "no-such-board")
@@ -4983,7 +5226,10 @@ mod tests {
     /// is silently unreachable through `tools/call` (it falls through to the
     /// MCP catch-all and fails instantly, on every target).
     ///
-    /// Regression guard for build_clean / build_lint / build_format.
+    /// Regression guard for build_clean / build_lint / build_format, and for the
+    /// ESP-IDF environment pair (`idf_env_check` / `idf_env_fix`) — the app's own
+    /// diagnosis of an install that is present but broken, which a person reaches
+    /// from the same action row.
     #[test]
     fn ui_build_actions_are_registered_tools() {
         let names: Vec<String> = BuildManagerActor::list_tools()
@@ -5000,12 +5246,158 @@ mod tests {
             "build_lint",
             "build_format",
             "build_fix",
+            "idf_env_check",
+            "idf_env_fix",
         ] {
             assert!(
                 names.iter().any(|n| n == name),
                 "tool '{name}' is handled by call_tool but missing from list_tools(), \
                  so tools/call cannot reach it. Registered: {names:?}"
             );
+        }
+    }
+
+    /// The **design phase** and **applying it** are advertised, because a tool a model cannot discover
+    /// is a tool that does not exist: `build_default_registry` registers exactly what `ListTools`
+    /// returns, and the coordinator intercepts `idf_design_application` before this manager ever sees
+    /// it. This pins the half that can be checked here — the advertisement and the arguments each needs.
+    #[test]
+    fn the_idf_design_tools_are_advertised_with_their_required_arguments() {
+        let tools = BuildManagerActor::list_tools();
+        for (name, required_args) in [
+            ("idf_design_application", vec!["chip", "bsp", "description"]),
+            ("idf_apply_design", vec!["root", "application"]),
+        ] {
+            let tool = tools.iter().find(|t| t.name == name).unwrap_or_else(|| {
+                panic!(
+                    "`{name}` must be advertised or the model cannot reach it. Registered: {:?}",
+                    tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+                )
+            });
+            let required: Vec<&str> = tool.input_schema["required"]
+                .as_array()
+                .expect("required is an array")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            for arg in required_args {
+                assert!(
+                    required.contains(&arg),
+                    "'{arg}' is required by {name}, so the tool must say so: {required:?}"
+                );
+            }
+        }
+
+        // A framework is pinned by name, so the schema offers the names.
+        let design = tools
+            .iter()
+            .find(|t| t.name == "idf_design_application")
+            .expect("advertised");
+        assert!(
+            design.input_schema["properties"]["framework"]["enum"].is_array(),
+            "the framework is pinned by name, so the schema offers the names"
+        );
+    }
+
+    /// **Applying a design** to a library, through the tool: the components it names are written, what
+    /// was already there is reported, a disagreement between the design and the library is carried
+    /// through rather than resolved, and a decomposition that does not hold together is refused
+    /// *before* anything is written.
+    #[test]
+    fn applying_a_design_writes_the_components_it_names() {
+        use crate::build::application_spec::{examples, parse_spec};
+        use crate::build::idf_projects::{component_kind, ComponentKind};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let manager = BuildManagerActor::new(mpsc::channel(1).0);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_library(root, "sensors");
+
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let args = serde_json::json!({
+            "root": root.to_string_lossy(),
+            "application": spec,
+        });
+        let report = rt.block_on(manager.call_tool("idf_apply_design", args.clone()));
+
+        // The two drivers the design asks to be written are written…
+        let added: Vec<&str> = report["added"]
+            .as_array()
+            .expect("added")
+            .iter()
+            .filter_map(|entry| entry["component"].as_str())
+            .collect();
+        assert_eq!(added, vec!["sps30", "sht20"], "{report}");
+        // …and their **role** became their own stated kind, with the bus a device fact in the manifest
+        // rather than something inferred later.
+        let manifest = std::fs::read_to_string(root.join("components/sps30/CMakeLists.txt"))
+            .expect("the stub's manifest");
+        assert!(
+            manifest.contains("SPIRE_COMPONENT_KIND driver") && manifest.contains("esp_driver_i2c"),
+            "{manifest}"
+        );
+        assert_eq!(component_kind(root, "sps30"), Some(ComponentKind::Driver));
+        assert!(root.join("components/sps30/src/sps30.cpp").is_file());
+
+        // The design says the library already has `moving_average` and it does not: a disagreement,
+        // stated rather than resolved by writing a component the design never asked to be written.
+        let problems: Vec<&str> = report["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect();
+        assert_eq!(problems.len(), 1, "{report}");
+        assert!(
+            problems[0].contains("already has 'moving_average' and it does not"),
+            "{report}"
+        );
+        assert!(!root.join("components/moving_average").exists());
+
+        // Applying the same design again writes nothing: the library now is what the design asked for,
+        // which is what makes this safe to run twice.
+        let again = rt.block_on(manager.call_tool("idf_apply_design", args));
+        assert_eq!(
+            again["added"].as_array().expect("added").len(),
+            0,
+            "{again}"
+        );
+        let present: Vec<&str> = again["present"]
+            .as_array()
+            .expect("present")
+            .iter()
+            .filter_map(|p| p.as_str())
+            .collect();
+        assert_eq!(present, vec!["sps30", "sht20"], "{again}");
+
+        // A decomposition that does not hold together is refused, and nothing is written for it.
+        let holed = serde_json::json!({
+            "root": root.to_string_lossy(),
+            "application": {
+                "framework": "actors",
+                "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+                "units": [ { "id": "ticker", "kind": "stage" } ],
+            },
+        });
+        let refused = rt.block_on(manager.call_tool("idf_apply_design", holed));
+        let error = refused["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{refused}"));
+        assert!(error.contains("does not hold together"), "{error}");
+        assert!(
+            !root.join("components/ticker").exists(),
+            "a design that does not hold together writes nothing:\n{refused}"
+        );
+    }
+
+    /// A component library at `root`, written from the scaffold — the ordinary starting point.
+    fn write_library(root: &std::path::Path, name: &str) {
+        let out = crate::build::idf_projects::library_scaffold(name, &[]).expect("scaffolds");
+        for file in &out.files {
+            let path = root.join(&file.path);
+            std::fs::create_dir_all(path.parent().expect("a file has a parent")).unwrap();
+            std::fs::write(&path, &file.content).unwrap();
         }
     }
 

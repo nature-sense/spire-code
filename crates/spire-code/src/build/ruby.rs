@@ -231,6 +231,8 @@ impl Actor for RubyBuildModule {
                 platforms: _platforms,
                 structure: _structure,
                 embedded: _,
+                library: _library,
+                application: _application,
                 reply_to,
             } => {
                 let bc = r#"source "https://rubygems.org"
