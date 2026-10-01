@@ -69,3 +69,19 @@ spire-core = { path = "../spire-core" }
 # linker. (Release already has debug = false, so no debug info is lost.)
 [profile.release]
 strip = "none"
+# The **debug** tree is the one that fills the disk.
+#
+# With no `debug` here, Cargo's dev default is full DWARF (`debug = 2`) plus split debuginfo, which made
+# one `cargo test` write ~4.6 GB — more than this machine has spare. rustc died mid-link with "No space
+# left on device" and left partial artifacts behind, so the next build redid more work and the freed
+# space went straight back into another 4.6 GB tree.
+#
+# `line-tables-only` was measured next: 3.5 GB, and `du` showed the bulk is the dependencies' rlibs,
+# each carrying its own debuginfo. That still does not leave room for the release tree beside it, which
+# `make app` needs. So: **none**. A test failure still prints the test's name, the assertion's values and
+# a symbolised backtrace; what is lost is the source line, and the trade for a build that finishes is the
+# right way round on a disk with a few GB of headroom. Release is untouched (it already has `debug = false`).
+[profile.dev]
+debug = false
+incremental = false
+
