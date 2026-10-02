@@ -41,31 +41,36 @@ pub const MG_ANCHOR_TYPE: &str = "Unknown";
 pub const MG_ANCHOR_SUBTYPE: &str = "appspec";
 
 /// Property that records a node's logical spec name (before the project
-/// prefix) so reads are unambiguous without reparsing names.
-const PROP_LOGICAL: &str = "logical";
+/// prefix) so reads are unambiguous without reparsing names. Shared with
+/// [`super::composition_persist`].
+pub(crate) const PROP_LOGICAL: &str = "logical";
 /// Complex (non-scalar) spec properties are serialized to canonical JSON
 /// strings under this prefix; scalar values are stored verbatim.
 const PROP_JSON_PREFIX: &str = "json:";
 /// Human-readable Markdown review copy rendered on the anchor node.
 const PROP_REVIEW_MD: &str = "spec_md";
 
-const QUERY_LIMIT_ALL: u32 = 100_000;
+pub(crate) const QUERY_LIMIT_ALL: u32 = 100_000;
 
 fn now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
 }
 
-fn mem_name(project: &str, logical: &str) -> String {
+/// Scoped memory name `{project}::{logical}` — shared with
+/// [`super::composition_persist`] so both graphs scope the same way.
+pub(crate) fn mem_name(project: &str, logical: &str) -> String {
     format!("{project}::{logical}")
 }
 
-fn un_mem_name<'a>(project: &str, mem: &'a str) -> Option<&'a str> {
+pub(crate) fn un_mem_name<'a>(project: &str, mem: &'a str) -> Option<&'a str> {
     mem.strip_prefix(&format!("{project}::"))
 }
 
 /// Property encoding: scalars verbatim, arrays/objects as canonical JSON
 /// strings under `json:` so the open AttrNode store never loses structure.
-fn encode_props(props: &[(String, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+pub(crate) fn encode_props(
+    props: &[(String, serde_json::Value)],
+) -> HashMap<String, serde_json::Value> {
     let mut out = HashMap::with_capacity(props.len());
     for (k, v) in props {
         match v {
@@ -104,7 +109,7 @@ pub fn decode_props(map: &HashMap<String, serde_json::Value>) -> Vec<(String, se
     out
 }
 
-async fn merge_node(
+pub(crate) async fn merge_node(
     mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
     node: AttrNode,
 ) -> Result<AttrNode, String> {
@@ -118,7 +123,7 @@ async fn merge_node(
         .map_err(|e| format!("merge failed: {e}"))
 }
 
-async fn create_rel(
+pub(crate) async fn create_rel(
     mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
     predicate: &str,
     from_id: &str,
@@ -246,7 +251,7 @@ pub async fn store_spec_graph(
     Some(anchor_id)
 }
 
-async fn query_nodes(
+pub(crate) async fn query_nodes(
     mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
     node_type: Option<&str>,
     subtype: Option<&str>,
@@ -269,7 +274,7 @@ async fn query_nodes(
         .map_err(|e| format!("query failed: {e}"))
 }
 
-async fn rels_of_node(
+pub(crate) async fn rels_of_node(
     mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
     node_id: &str,
 ) -> Result<Vec<GraphEdge>, String> {
