@@ -23,6 +23,18 @@
 //! The AttrNode store plumbing (the property codec, the merge/query/relationship helpers and the
 //! `{project}::{logical}` scoping) is shared with [`super::spec_persist`], the sibling writer for the
 //! native `AppSpec`.
+//!
+//! # The design record
+//!
+//! Storing a composition is not the same as **deciding** one — a person may edit `composition.spire`
+//! and have the graph re-written from it long after the design was agreed — so the decision is stored
+//! as a node of its own. [`store_design_record`] writes a `design_record` child of the anchor (via
+//! `HAS_DESIGN_RECORD`) carrying the door the design came through, when it was decided, and the
+//! fingerprint of the composition it ratifies; [`load_design_freshness`] compares that fingerprint
+//! with the composition in the graph, so a reader is *told* whether the record still stands
+//! ([`DesignFreshness`]) rather than left to assume it. A composition edited after the decision is
+//! [`DesignFreshness::Stale`]; a project whose composition was stored with no decision recorded is
+//! [`DesignFreshness::Absent`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -31,7 +43,8 @@ use spire_core::subsystems::graph::memory_graph::MemoryGraphMessage;
 use tracing::{info, warn};
 
 use super::composition_graph::{
-    self, node, CompositionEdge, CompositionGraph, CompositionNode, ROOT,
+    self, edge, node, CompositionEdge, CompositionGraph, CompositionNode, DesignFreshness,
+    DesignRecord, DESIGN_RECORD_NAME, ROOT,
 };
 use super::spec_persist::{
     create_rel, decode_props, encode_props, mem_name, merge_node, query_nodes, rels_of_node,
@@ -250,8 +263,138 @@ pub async fn roundtrip_composition_graph(
     load_composition_graph(mg_tx, project_name).await.ok()
 }
 
+/// Persist the **design record** — the decision, not the composition — as a child of the project's
+/// anchor.
+///
+/// The anchor has to exist first: the record is a fact *about* a composition, and a record with nothing
+/// to ratify is worse than no record, because a reader would take it for a decided design. So a project
+/// whose composition was never stored returns `None` rather than being given one by the back door.
+///
+/// Returns the stored record node's id. Relationships are append-only in the store, so re-deciding a
+/// design appends another `HAS_DESIGN_RECORD` to the same (upserted) node — a reader that wants the
+/// link rather than the node should dedupe, as [`load_composition_graph`] does.
+pub async fn store_design_record(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    project_name: &str,
+    record: &DesignRecord,
+) -> Option<String> {
+    let anchors = match query_nodes(
+        mg_tx,
+        Some(MG_NODE_TYPE),
+        Some(node::ANCHOR),
+        Some(project_name),
+        1,
+    )
+    .await
+    {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            warn!("[CompositionPersist] anchor lookup failed for '{project_name}': {e}");
+            return None;
+        }
+    };
+    let Some(anchor) = anchors.into_iter().next() else {
+        warn!(
+            "[CompositionPersist] no composition is stored for '{project_name}', so there is nothing \
+             for a design record to ratify; not stored"
+        );
+        return None;
+    };
+
+    let spec_node = composition_graph::design_record_node(record);
+    let mut properties = encode_props(&spec_node.properties);
+    properties.insert(PROP_LOGICAL.to_string(), serde_json::json!(spec_node.name));
+    let node = AttrNode {
+        id: uuid::Uuid::new_v4().to_string(),
+        node_type: MG_NODE_TYPE.to_string(),
+        subtype: Some(node::DESIGN_RECORD.to_string()),
+        name: mem_name(project_name, &spec_node.name),
+        description: spec_node.description.clone(),
+        properties,
+        embedding_id: None,
+        created_at: now(),
+        updated_at: now(),
+        version: 1,
+    };
+    let stored = match merge_node(mg_tx, node).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            warn!("[CompositionPersist] design record store failed for '{project_name}': {e}");
+            return None;
+        }
+    };
+    if let Err(e) = create_rel(mg_tx, edge::HAS_DESIGN_RECORD, &anchor.id, &stored.id).await {
+        warn!(
+            "[CompositionPersist] design record {} not linked to the anchor for \
+             '{project_name}': {e}",
+            stored.id
+        );
+    }
+    info!(
+        "[CompositionPersist] stored design record for '{project_name}': v{} from {} ({})",
+        record.version,
+        record.source.as_str(),
+        record.fingerprint
+    );
+    Some(stored.id)
+}
+
+/// Read a project's stored [`DesignRecord`], when it has one.
+///
+/// `Ok(None)` means **no design was ever decided**, and never "the record is broken": a record that is
+/// present and unreadable is an `Err`, because a caller that confused the two would offer to re-design
+/// over a decision nobody superseded.
+pub async fn load_design_record(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    project_name: &str,
+) -> Result<Option<DesignRecord>, String> {
+    let nodes = query_nodes(
+        mg_tx,
+        Some(MG_NODE_TYPE),
+        Some(node::DESIGN_RECORD),
+        Some(&mem_name(project_name, DESIGN_RECORD_NAME)),
+        QUERY_LIMIT_ALL,
+    )
+    .await?;
+    let Some(node) = nodes.into_iter().next() else {
+        return Ok(None);
+    };
+    let g = CompositionGraph {
+        nodes: vec![CompositionNode {
+            node_type: node::DESIGN_RECORD.to_string(),
+            name: DESIGN_RECORD_NAME.to_string(),
+            description: node.description.clone(),
+            properties: decode_props(&node.properties),
+        }],
+        edges: Vec::new(),
+    };
+    match composition_graph::reconstruct_design_record(&g)? {
+        Some(record) => Ok(Some(record)),
+        None => Err(format!(
+            "the stored design record for '{project_name}' is present but unreadable"
+        )),
+    }
+}
+
+/// **Does the stored design still ratify the stored composition?** — [`DesignFreshness`], read out of
+/// the memory graph.
+///
+/// `Err` only when something is stored and broken, or when the project states no composition at all:
+/// this module's loaders agree that a project with nothing stored is an error naming the project
+/// rather than a silently empty answer. A composition that *is* stored with no decision recorded is
+/// [`DesignFreshness::Absent`] — the honest "nobody has designed this yet".
+pub async fn load_design_freshness(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    project_name: &str,
+) -> Result<DesignFreshness, String> {
+    let spec = load_composition_graph(mg_tx, project_name).await?;
+    let record = load_design_record(mg_tx, project_name).await?;
+    Ok(composition_graph::freshness(record.as_ref(), &spec))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::composition_graph::{fingerprint, DesignSource};
     use super::*;
     use crate::build::application_spec::{examples, parse_spec};
     use spire_core::models::memory_graph::GraphEdge;
@@ -450,5 +593,186 @@ mod tests {
             .block_on(load_composition_graph(&tx, "no-such-project"))
             .unwrap_err();
         assert!(err.contains("no stored composition"));
+    }
+
+    fn stored_edges(fake: &FakeGraph, predicate: &str) -> usize {
+        fake.edges()
+            .iter()
+            .filter(|e| matches!(&e.edge_type, RelationshipType::Custom(p) if p == predicate))
+            .count()
+    }
+
+    #[test]
+    fn a_design_record_hangs_off_the_anchor_and_reloads_without_touching_the_composition() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let spec = pm25();
+        let g = composition_graph::decompose(&spec);
+        let (tx, fake) = fake_pair();
+        rt.block_on(store_composition_graph(&tx, "pm25-reader", &spec, &g))
+            .expect("the composition persisted first");
+
+        let record = DesignRecord::now(&spec, DesignSource::CompositionFile, 2);
+        let id = rt.block_on(store_design_record(&tx, "pm25-reader", &record));
+        assert!(id.is_some(), "the record persisted with its anchor present");
+
+        let stored = fake.nodes();
+        let record_node = stored
+            .iter()
+            .find(|n| n.subtype.as_deref() == Some(node::DESIGN_RECORD))
+            .expect("the record node is stored");
+        assert_eq!(
+            record_node.name, "pm25-reader::design_record",
+            "the record is scoped to its project like every other node"
+        );
+        assert!(
+            record_node.properties.contains_key("fingerprint"),
+            "the fingerprint is what makes the record checkable"
+        );
+        let anchor_node = stored
+            .iter()
+            .find(|n| n.subtype.as_deref() == Some(node::ANCHOR))
+            .expect("anchor present");
+        assert_eq!(
+            stored_edges(&fake, edge::HAS_DESIGN_RECORD),
+            1,
+            "the record hangs off the anchor"
+        );
+        let link = fake
+            .edges()
+            .into_iter()
+            .find(|e| {
+                matches!(&e.edge_type, RelationshipType::Custom(p) if p == edge::HAS_DESIGN_RECORD)
+            })
+            .expect("the link exists");
+        assert_eq!(
+            (link.from_id, link.to_id),
+            (anchor_node.id.clone(), record_node.id.clone())
+        );
+
+        assert_eq!(
+            rt.block_on(load_design_record(&tx, "pm25-reader"))
+                .expect("the record reloads"),
+            Some(record)
+        );
+        // The record is a child of the same project, so the composition read back has to be unmoved by
+        // it: a record is a fact about a composition, never part of one.
+        assert_eq!(
+            rt.block_on(load_composition_graph(&tx, "pm25-reader"))
+                .expect("the composition reloads"),
+            spec
+        );
+    }
+
+    #[test]
+    fn a_design_record_needs_a_composition_to_ratify() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, _fake) = fake_pair();
+        let record = DesignRecord::now(&pm25(), DesignSource::Model, 1);
+
+        assert!(
+            rt.block_on(store_design_record(&tx, "nowhere", &record))
+                .is_none(),
+            "a record with nothing to ratify is not stored"
+        );
+        assert_eq!(
+            rt.block_on(load_design_record(&tx, "nowhere"))
+                .expect("loads"),
+            None
+        );
+        let err = rt
+            .block_on(load_design_freshness(&tx, "nowhere"))
+            .unwrap_err();
+        assert!(err.contains("no stored composition"), "{err}");
+    }
+
+    #[test]
+    fn freshness_is_absent_before_a_decision_and_current_after_one() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let spec = pm25();
+        let g = composition_graph::decompose(&spec);
+        let (tx, _fake) = fake_pair();
+        rt.block_on(store_composition_graph(&tx, "pm25-reader", &spec, &g))
+            .expect("the composition persisted");
+
+        assert_eq!(
+            rt.block_on(load_design_freshness(&tx, "pm25-reader"))
+                .expect("freshness reads"),
+            DesignFreshness::Absent,
+            "a composition nobody has decided is undecided, which is not the same as stale"
+        );
+
+        let record = DesignRecord::now(&spec, DesignSource::Answers, 1);
+        rt.block_on(store_design_record(&tx, "pm25-reader", &record))
+            .expect("the record persisted");
+        assert_eq!(
+            rt.block_on(load_design_freshness(&tx, "pm25-reader"))
+                .expect("freshness reads"),
+            DesignFreshness::Current
+        );
+    }
+
+    #[test]
+    fn a_record_decided_from_another_design_reads_as_stale() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // The graph holds a design the record was never decided from: the record ratifies the PM2.5
+        // meter, while what is stored is something else entirely.
+        let stored = parse_spec(examples::INSECT_TRAP).expect("the insect trap example parses");
+        let g = composition_graph::decompose(&stored);
+        let (tx, _fake) = fake_pair();
+        rt.block_on(store_composition_graph(&tx, "trap", &stored, &g))
+            .expect("the composition persisted");
+        let record = DesignRecord::now(&pm25(), DesignSource::Answers, 1);
+        rt.block_on(store_design_record(&tx, "trap", &record))
+            .expect("the record persisted");
+
+        match rt
+            .block_on(load_design_freshness(&tx, "trap"))
+            .expect("freshness reads")
+        {
+            DesignFreshness::Stale { recorded, current } => {
+                assert_eq!(recorded, record.fingerprint);
+                assert_eq!(current, fingerprint(&stored));
+            }
+            other => panic!("a record from another design must read as stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_stored_record_is_an_error_not_an_absent_one() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let spec = pm25();
+        let g = composition_graph::decompose(&spec);
+        let (tx, fake) = fake_pair();
+        rt.block_on(store_composition_graph(&tx, "pm25-reader", &spec, &g))
+            .expect("the composition persisted");
+
+        // What a half-written or foreign graph holds: the right node, none of the provenance.
+        let mut properties = HashMap::new();
+        properties.insert("framework".to_string(), serde_json::json!("actors"));
+        fake.nodes.lock().unwrap().push(AttrNode {
+            id: "corrupt".to_string(),
+            node_type: MG_NODE_TYPE.to_string(),
+            subtype: Some(node::DESIGN_RECORD.to_string()),
+            name: mem_name("pm25-reader", DESIGN_RECORD_NAME),
+            description: None,
+            properties,
+            embedding_id: None,
+            created_at: now(),
+            updated_at: now(),
+            version: 1,
+        });
+
+        let err = rt
+            .block_on(load_design_record(&tx, "pm25-reader"))
+            .unwrap_err();
+        assert!(
+            err.contains("design record") && err.contains("source_kind"),
+            "the refusal names the record and the property it is missing: {err}"
+        );
+        assert!(
+            rt.block_on(load_design_freshness(&tx, "pm25-reader"))
+                .is_err(),
+            "a broken record is never reported as merely undecided"
+        );
     }
 }
