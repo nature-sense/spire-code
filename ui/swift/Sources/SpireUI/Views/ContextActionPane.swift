@@ -111,6 +111,17 @@ struct ContextActionPane: View {
             ComponentSection(project: project)
         }
 
+        // An ESP-IDF **application** is *made of* components rather than growing them — an actor per
+        // job, a stage per edge of the data path, the message types they share — so what it is built
+        // from is worth listing for the same reason a library's product is. Gated on the project's
+        // declared structure (as above), not on the selection, so the section does not appear and
+        // vanish as the user clicks around the tree.
+        //
+        // Read-only: it says what the application is made of, and nothing here writes to any of them.
+        if project.subprojects.contains(where: { $0.structure == "idf_application" }) {
+            ComponentList(project: project)
+        }
+
         // The "Container" card used to sit here: add a board's BSP, or a device driver. It went with
         // the container itself — an ESP-IDF project grows a component with `idf_add_component`, and on
         // ESP-IDF a BSP is a component like any other. A project that still declares `embedded` is

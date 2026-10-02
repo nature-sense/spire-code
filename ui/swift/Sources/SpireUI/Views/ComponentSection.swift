@@ -93,17 +93,7 @@ struct ComponentSection: View {
     // MARK: - A component
 
     private func row(_ component: SubprojectInfo) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon(for: component))
-                .font(.caption)
-                .foregroundStyle(theme.accent)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(component.name).font(.callout.weight(.semibold))
-                Text(rowSubtitle(component))
-                    .font(.caption2)
-                    .foregroundStyle(theme.textTertiary)
-            }
-            Spacer(minLength: 0)
+        ComponentRow(component: component) {
             // A **framework** component has nothing to write and nothing to remove: it arrives
             // complete, it is what the library *is*, and both operations are refused if asked for
             // anyway. Offering the buttons would be inviting a refusal.
@@ -135,33 +125,6 @@ struct ComponentSection: View {
                           + "its code nor its place is yours to change here.")
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 8).fill(theme.surface))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 1))
-    }
-
-    /// A shipped framework component reads as one thing; everything else reads as its kind.
-    private func icon(for component: SubprojectInfo) -> String {
-        if component.componentFramework != nil { return "square.stack.3d.up" }
-        return component.componentKind == "library" ? "function" : "shippingbox"
-    }
-
-    /// What the component says it is — and, for the framework, that it is not the library's own work.
-    ///
-    /// From the component's own `CMakeLists.txt`, so it is shown rather than guessed at — and for one
-    /// that states nothing (written by hand) the row says that, which is a fact too.
-    private func rowSubtitle(_ component: SubprojectInfo) -> String {
-        if let framework = component.componentFramework {
-            return "\(component.path) · the \(framework) framework · shipped with the library"
-        }
-        let what: String
-        switch component.componentKind {
-        case "driver": what = "a driver: one device, one bus"
-        case "library": what = "a library: pure code, no bus"
-        default: what = "states no kind"
-        }
-        return "\(component.path) · \(what)"
     }
 
 
