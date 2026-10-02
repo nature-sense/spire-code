@@ -1799,6 +1799,16 @@ final class SpireBridge {
     /// scaffolded is the thing that was reviewed — the decoded type is for reading, never for the trip
     /// back.
     ///
+    /// The raw spec JSON is returned beside the decoded one on purpose. The wizard sends *that* value to
+    /// `createProject/Scaffold` and to `idf_apply_design` when the design is approved, so the thing
+    /// scaffolded is the thing that was reviewed — the decoded type is for reading, never for the trip
+    /// back.
+    ///
+    /// `source` travels the same way for the same reason: it is the **door** this design came through
+    /// (`answers` — the framework pinned by the caller; `model` — the model chose and justified it), and
+    /// the scaffold records it as the decision behind the composition it writes. Nothing in a
+    /// composition says who chose it, so the wizard hands it back rather than leaving the core to guess.
+    ///
     /// `framework` is passed only when the form pinned it; otherwise the model chooses and justifies,
     /// which is the derived-and-confirmed shape: chosen where it can be informed, confirmed where it can
     /// be overridden.
@@ -1807,30 +1817,32 @@ final class SpireBridge {
         description: String,
         framework: String? = nil,
         libraryRoot: String? = nil
-    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, error: String?) {
+    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, source: String?, error: String?) {
         var params: [String: Any] = ["board": board, "description": description]
         if let framework, !framework.isEmpty { params["framework"] = framework }
         if let libraryRoot, !libraryRoot.trimmingCharacters(in: .whitespaces).isEmpty {
             params["libraryRoot"] = libraryRoot
         }
         guard let json = await callRawMethod("createProject/DesignApplication", args: params) else {
-            return (nil, nil, "core unavailable")
+            return (nil, nil, nil, "core unavailable")
         }
-        if let error = json["error"] as? String { return (nil, nil, error) }
+        if let error = json["error"] as? String { return (nil, nil, nil, error) }
         guard let spec = json["spec"] as? [String: Any] else {
-            return (nil, nil, "the design came back without a spec")
+            return (nil, nil, nil, "the design came back without a spec")
         }
+        let source = json["source"] as? String
         do {
             let design = try MessageSerializer.decode(Data(
                 try JSONSerialization.data(withJSONObject: spec)
             )) as ApplicationDesign
             Self.logScaffold(
-                "createProject/DesignApplication OK: framework=\(design.framework), \(design.units.count) units"
+                "createProject/DesignApplication OK: framework=\(design.framework), "
+                    + "\(design.units.count) units, source=\(source ?? "?")"
             )
-            return (design, spec, nil)
+            return (design, spec, source, nil)
         } catch {
             Self.logScaffold("createProject/DesignApplication DECODE FAILED: \(error)")
-            return (nil, spec, "the design did not decode: \(error)")
+            return (nil, spec, source, "the design did not decode: \(error)")
         }
     }
 
@@ -1843,34 +1855,36 @@ final class SpireBridge {
     /// own file with, so what is reviewed here is held to exactly what a file on a tree is.
     ///
     /// The return shape is deliberately `designApplication`'s, down to the raw `spec` that goes back
-    /// untouched to `createProject/Scaffold`: the wizard handles one thing whichever door the design
-    /// came through. `name` is the file's own name, so a refusal names the file to open rather than the
-    /// step that read it.
+    /// untouched to `createProject/Scaffold` — and the `source` the core names for this door
+    /// (`composition_file`), so the wizard handles one thing whichever door the design came through and
+    /// the scaffold records the right one. `name` is the file's own name, so a refusal names the file to
+    /// open rather than the step that read it.
     func parseComposition(
         text: String,
         name: String? = nil
-    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, error: String?) {
+    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, source: String?, error: String?) {
         var params: [String: Any] = ["text": text]
         if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty { params["name"] = name }
         guard let json = await callRawMethod("createProject/ParseComposition", args: params) else {
-            return (nil, nil, "core unavailable")
+            return (nil, nil, nil, "core unavailable")
         }
-        if let error = json["error"] as? String { return (nil, nil, error) }
+        if let error = json["error"] as? String { return (nil, nil, nil, error) }
         guard let spec = json["spec"] as? [String: Any] else {
-            return (nil, nil, "the composition came back without a spec")
+            return (nil, nil, nil, "the composition came back without a spec")
         }
+        let source = json["source"] as? String
         do {
             let design = try MessageSerializer.decode(Data(
                 try JSONSerialization.data(withJSONObject: spec)
             )) as ApplicationDesign
             Self.logScaffold(
                 "createProject/ParseComposition OK: framework=\(design.framework), "
-                    + "\(design.units.count) units"
+                    + "\(design.units.count) units, source=\(source ?? "?")"
             )
-            return (design, spec, nil)
+            return (design, spec, source, nil)
         } catch {
             Self.logScaffold("createProject/ParseComposition DECODE FAILED: \(error)")
-            return (nil, spec, "the composition did not decode: \(error)")
+            return (nil, spec, source, "the composition did not decode: \(error)")
         }
     }
 
@@ -1975,10 +1989,16 @@ final class SpireBridge {
     /// `embeddedRoot` is the container an `EmbeddedApp` depends on. It travels only for that structure
     /// — the core refuses an application without it — and is omitted entirely otherwise, so every
     /// other request is byte-for-byte what it was.
+    /// `designSource` is the **door the reviewed design came through** (`answers`, `model` or
+    /// `composition_file`) — see `designApplication`/`parseComposition`, which answer with it. The core
+    /// records it as the decision behind the composition the scaffold writes, and it cannot be derived
+    /// from the spec, so it is omitted entirely when there is nothing to say: the core then stores the
+    /// composition with no decision attached, rather than inventing one.
     func scaffoldProject(buildSystem: String, projectName: String, root: String,
                          platforms: [String] = [], structure: String = "native",
                          embedded: Bool = false, embeddedRoot: String? = nil,
-                         application: [String: Any]? = nil) async -> String? {
+                         application: [String: Any]? = nil,
+                         designSource: String? = nil) async -> String? {
         do {
             var params: [String: Any] = [
                 "projectName": projectName,
@@ -1999,6 +2019,13 @@ final class SpireBridge {
             // stated framework — which is why the parameter is optional and omitted, not empty.
             if let application {
                 params["application"] = application
+            }
+            // **The door that design came through**, carried back from the design phase untouched: the
+            // core records it as the decision behind the composition this scaffold writes. Omitted when
+            // there is nothing to say — a caller that does not know which door its design came through
+            // gets a composition with no decision recorded, never a guessed one.
+            if let designSource, !designSource.trimmingCharacters(in: .whitespaces).isEmpty {
+                params["designSource"] = designSource
             }
             let body: [String: Any] = [
                 "method": "createProject/Scaffold",

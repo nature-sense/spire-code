@@ -556,6 +556,14 @@ pub enum ProjectCreationMessage {
         /// written into the application's `CMakeLists.txt`, so the fill phase, a person and another
         /// tool all read the same choice back instead of inferring one.
         application: Option<crate::build::application_spec::ApplicationSpec>,
+        /// **The door the reviewed design came through**, when the caller knows it — see
+        /// [`DesignSource`](super::composition_graph::DesignSource).
+        ///
+        /// The scaffold is where a design is *accepted*, so it is where the decision is recorded for the
+        /// composition it writes. A door cannot be recovered from a composition (nothing in the spec
+        /// says who chose it), so it is stated rather than derived — and a caller that states nothing
+        /// gets a composition with no decision attached, rather than a door guessed on its behalf.
+        design_source: Option<super::composition_graph::DesignSource>,
         reply_to: oneshot::Sender<Result<crate::subsystems::build::build_manager::ScaffoldSpec>>,
     },
     /// Phase 2 of the two-phase creation flow (LLM, constrained): fill the
@@ -1320,6 +1328,72 @@ and NEVER repeat any line or block."
         };
         let g = super::spec_graph::decompose(spec);
         super::spec_persist::store_spec_graph(mg_tx, project_name, goal, &g).await
+    }
+
+    /// **Record the decision the tree was just written from** — the graph's half of what
+    /// `application_scaffold` writes as `composition.spire` and the record beside it.
+    ///
+    /// Called by the scaffold leg, which is the one place a reviewed design is *accepted*: the leg has
+    /// just written the design into the tree, so what the graph holds and what the files hold are the
+    /// same design. Best-effort, like [`Self::store_app_spec_in_graph`] — the tree is written either
+    /// way, and a graph that could not be reached must not fail a creation.
+    ///
+    /// A composition that is **already ratified** is not stored again and not decided again: re-running
+    /// the scaffold on a design nobody changed is not a new decision, and storing it would append a
+    /// second `HAS_DESIGN_RECORD` for one decision, which the latest-wins read of the record would then
+    /// report as another door for it. `source` is [`DesignSource::accepted`]'s answer, and `None` is an
+    /// answer: the composition is written to the graph with no decision attached, so
+    /// [`DesignFreshness`](super::composition_graph::DesignFreshness) says exactly that.
+    async fn store_accepted_design(
+        &self,
+        project_name: &str,
+        spec: &crate::build::application_spec::ApplicationSpec,
+        source: Option<super::composition_graph::DesignSource>,
+    ) {
+        use super::composition_graph::{decompose, DesignRecord};
+        use super::composition_persist::{
+            load_design_record, store_composition_graph, store_design_record,
+        };
+
+        let Some(mg_tx) = &self.memory_graph_tx else {
+            return;
+        };
+
+        // The decision this one would supersede, when there is one. A record that is *present and
+        // unreadable* is refused by name rather than read as "no decision" (the layer's rule) — but it
+        // must not block a fresh decision either, so this one starts the count again.
+        let superseded = match load_design_record(mg_tx, project_name).await {
+            // The composition in hand is the very one this record ratifies — the fingerprint is over
+            // the canonical JSON, so an unchanged design re-read from the file counts too.
+            Ok(Some(record)) if record.ratifies(spec) => return,
+            Ok(Some(record)) => Some(record.version),
+            Ok(None) => None,
+            Err(e) => {
+                warn!("[ProjectCreation] {e}");
+                None
+            }
+        };
+
+        let g = decompose(spec);
+        if store_composition_graph(mg_tx, project_name, spec, &g)
+            .await
+            .is_none()
+        {
+            // No anchor persisted, so there is nothing a record could ratify — and the store itself
+            // already said why.
+            return;
+        }
+
+        let Some(source) = source else {
+            info!(
+                "[ProjectCreation] composition for '{project_name}' stored with no decision: the \
+                 request stated no design source and the tree did not decide"
+            );
+            return;
+        };
+        let version = superseded.map_or(1, |version| version + 1);
+        let record = DesignRecord::now(spec, source, version);
+        store_design_record(mg_tx, project_name, &record).await;
     }
 
     /// Find the appspec node id for a project (upserted by the requirements
@@ -2647,6 +2721,7 @@ impl Actor for ProjectCreationActor {
                 embedded_root,
                 embedded,
                 application,
+                design_source,
                 reply_to,
             } => {
                 let platforms = if platforms.is_empty() {
@@ -2681,6 +2756,15 @@ impl Actor for ProjectCreationActor {
                         // wizard shows. Every statement below (`REQUIRES`, the record, the
                         // composition) is written from `design.spec`, so a caller whose copy was
                         // dropped is told here rather than left to discover it in the tree.
+                        //
+                        // The accepted design is kept on this side of the message as well: the copy the
+                        // build manager gets is what `application_scaffold` writes into the tree, and
+                        // **this** copy is what the graph is written from below
+                        // (`store_accepted_design`) — one design, not two reads of it. Whether the tree,
+                        // rather than the caller, decided is taken here too, because the report below
+                        // consumes it.
+                        let accepted = design.spec.clone();
+                        let design_dropped = design.dropped.is_some();
                         let application = design.spec;
                         let (t, r) = oneshot::channel();
                         self.build_manager_tx
@@ -2746,6 +2830,27 @@ impl Actor for ProjectCreationActor {
                             ProjectCreationActor::ensure_scaffold_git(&root, build_system).await
                         {
                             warn!("[ProjectCreation] git scaffold baseline skipped: {ge}");
+                        }
+
+                        // **The decision, recorded where the composition is written.** An application is
+                        // the one structure with a composition, and `application_scaffold` has just put
+                        // it in the tree — so the graph is brought into agreement here, in the leg that
+                        // accepted the design, rather than left for a reader to discover it was not.
+                        //
+                        // The door is the caller's when it stated one, and otherwise the tree's own file
+                        // when the file is what decided; a request that says neither gets a composition
+                        // and no record (see `DesignSource::accepted`) — never a guessed door.
+                        if structure
+                            == Some(spire_core::build_types::ProjectStructure::IdfApplication)
+                        {
+                            if let Some(accepted) = accepted.as_ref() {
+                                let source = super::composition_graph::DesignSource::accepted(
+                                    design_source,
+                                    design_dropped,
+                                );
+                                self.store_accepted_design(&project_name, accepted, source)
+                                    .await;
+                            }
                         }
 
                         // Persist the scaffolded structure in the graph.
@@ -3055,6 +3160,7 @@ fn materialize_scaffold_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spire_core::models::memory_graph::GraphEdge;
 
     fn dummy_fs() -> mpsc::Sender<spire_core::modules::FilesystemMessage> {
         mpsc::channel(4).0
@@ -3731,6 +3837,330 @@ mod tests {
         for e in generated_from {
             assert_eq!(e.to_id, appspec_id, "every artifact points at the spec");
         }
+    }
+
+    /// In-memory double of the memory-graph actor, with the semantics the composition store depends on:
+    /// an upsert keeps the node's id and takes the new properties (which is what makes a *re-decision*
+    /// visible), queries filter by type/subtype/name, and relationships answer in both directions.
+    struct FakeGraph {
+        nodes: std::sync::Arc<std::sync::Mutex<Vec<AttrNode>>>,
+        edges: std::sync::Arc<std::sync::Mutex<Vec<GraphEdge>>>,
+    }
+
+    impl FakeGraph {
+        fn nodes(&self) -> Vec<AttrNode> {
+            self.nodes.lock().unwrap().clone()
+        }
+
+        fn edges(&self) -> Vec<GraphEdge> {
+            self.edges.lock().unwrap().clone()
+        }
+
+        /// How many relationships of `predicate` the graph holds — append-only, so a re-decision shows
+        /// up here even though the node it points at is upserted.
+        fn edges_of(&self, predicate: &str) -> usize {
+            use spire_core::models::memory_graph::RelationshipType;
+            self.edges()
+                .iter()
+                .filter(|e| matches!(&e.edge_type, RelationshipType::Custom(p) if p == predicate))
+                .count()
+        }
+
+        fn of_subtype(&self, subtype: &str) -> usize {
+            self.nodes()
+                .iter()
+                .filter(|n| n.subtype.as_deref() == Some(subtype))
+                .count()
+        }
+    }
+
+    fn fake_graph() -> (mpsc::Sender<MemoryGraphMessage>, FakeGraph) {
+        let fake = FakeGraph {
+            nodes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            edges: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (tx, mut rx) = mpsc::channel::<MemoryGraphMessage>(256);
+        let nodes = fake.nodes.clone();
+        let edges = fake.edges.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake graph runtime");
+            rt.block_on(async move {
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        MemoryGraphMessage::MergeAttrNode { node, reply_to } => {
+                            let mut list = nodes.lock().unwrap();
+                            let key = |n: &AttrNode| {
+                                (n.node_type.clone(), n.subtype.clone(), n.name.clone())
+                            };
+                            let found = list.iter().position(|n| key(n) == key(&node));
+                            let reply = match found {
+                                // The id survives the upsert, so relationships keep pointing at the
+                                // node; the properties are the new ones.
+                                Some(i) => {
+                                    let id = list[i].id.clone();
+                                    let mut merged = node;
+                                    merged.id = id;
+                                    list[i] = merged.clone();
+                                    merged
+                                }
+                                None => {
+                                    list.push(node.clone());
+                                    node
+                                }
+                            };
+                            drop(list);
+                            let _ = reply_to.send(Ok(reply));
+                        }
+                        MemoryGraphMessage::QueryAttrNodes {
+                            node_type,
+                            subtype,
+                            name,
+                            limit,
+                            reply_to,
+                        } => {
+                            let out: Vec<AttrNode> = nodes
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|n| node_type.as_deref().is_none_or(|t| n.node_type == t))
+                                .filter(|n| {
+                                    subtype
+                                        .as_deref()
+                                        .is_none_or(|s| n.subtype.as_deref() == Some(s))
+                                })
+                                .filter(|n| name.as_deref().is_none_or(|x| n.name == x))
+                                .take(limit.unwrap_or(u32::MAX) as usize)
+                                .cloned()
+                                .collect();
+                            let _ = reply_to.send(Ok(out));
+                        }
+                        MemoryGraphMessage::CreateRelationship { rel, reply_to } => {
+                            let edge = GraphEdge {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                edge_type: rel.edge_type.clone(),
+                                from_id: rel.from_id.clone(),
+                                to_id: rel.to_id.clone(),
+                                properties: rel.properties.clone().unwrap_or_default(),
+                                created_at: chrono::Utc::now(),
+                                weight: rel.weight,
+                            };
+                            edges.lock().unwrap().push(edge.clone());
+                            let _ = reply_to.send(Ok(edge));
+                        }
+                        MemoryGraphMessage::GetRelationships { node_id, reply_to } => {
+                            let out: Vec<GraphEdge> = edges
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .filter(|e| e.from_id == node_id || e.to_id == node_id)
+                                .cloned()
+                                .collect();
+                            let _ = reply_to.send(Ok(out));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        });
+        (tx, fake)
+    }
+
+    /// **The decision lands where the composition does.** The scaffold leg is where a reviewed design is
+    /// accepted, and this is the half of it that reaches the graph: the decomposed composition, plus the
+    /// record saying who decided it and the fingerprint of what that decision ratifies.
+    #[test]
+    fn accepting_a_design_stores_the_composition_and_the_decision_behind_it() {
+        use crate::build::application_spec::{examples, parse_spec};
+        use crate::subsystems::project::composition_graph::{
+            edge, fingerprint, node, DesignFreshness, DesignSource,
+        };
+        use crate::subsystems::project::composition_persist::{
+            load_composition_graph, load_design_freshness, load_design_record,
+        };
+        use spire_core::models::memory_graph::RelationshipType;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let (mg_tx, fake) = fake_graph();
+        let mut actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
+        actor.set_memory_graph(mg_tx.clone());
+
+        rt.block_on(actor.store_accepted_design("pm25-meter", &spec, Some(DesignSource::Model)));
+
+        // The composition round-trips out of the graph — the same design the tree was written from.
+        assert_eq!(
+            rt.block_on(load_composition_graph(&mg_tx, "pm25-meter"))
+                .expect("the composition is stored"),
+            spec,
+            "what the graph holds is what the scaffold wrote into the tree"
+        );
+
+        // …and the decision beside it: the door the caller stated, and what it ratifies.
+        let record = rt
+            .block_on(load_design_record(&mg_tx, "pm25-meter"))
+            .expect("the record reads")
+            .expect("a decision was recorded");
+        assert_eq!(
+            record.source,
+            DesignSource::Model,
+            "the door it came through"
+        );
+        assert_eq!(record.version, 1, "the first decision for this composition");
+        assert_eq!(record.fingerprint, fingerprint(&spec));
+        assert!(record.ratifies(&spec));
+        assert_eq!(
+            rt.block_on(load_design_freshness(&mg_tx, "pm25-meter")),
+            Ok(DesignFreshness::Current)
+        );
+
+        // One anchor, one record, one link — and the link is the anchor's, not a floating node.
+        assert_eq!(fake.of_subtype(node::ANCHOR), 1);
+        assert_eq!(
+            fake.of_subtype(node::DESIGN_RECORD),
+            1,
+            "one record per composition"
+        );
+        let anchor_id = fake
+            .nodes()
+            .into_iter()
+            .find(|n| n.subtype.as_deref() == Some(node::ANCHOR))
+            .expect("the anchor is stored")
+            .id;
+        let links: Vec<_> = fake
+            .edges()
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.edge_type, RelationshipType::Custom(p) if p == edge::HAS_DESIGN_RECORD)
+            })
+            .collect();
+        assert_eq!(links.len(), 1, "one decision, one link");
+        assert_eq!(links[0].from_id, anchor_id, "hanging off the anchor");
+    }
+
+    /// **A design nobody changed is not decided twice** — and one that *did* change is decided again,
+    /// one version on, through the door the changed composition came through.
+    #[test]
+    fn an_unchanged_design_is_not_decided_twice_and_an_edited_one_supersedes_it() {
+        use crate::build::application_spec::{examples, parse_spec};
+        use crate::subsystems::project::composition_graph::{
+            edge, node, DesignFreshness, DesignSource,
+        };
+        use crate::subsystems::project::composition_persist::{
+            load_composition_graph, load_design_freshness, load_design_record,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let (mg_tx, fake) = fake_graph();
+        let mut actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
+        actor.set_memory_graph(mg_tx.clone());
+
+        for _ in 0..2 {
+            rt.block_on(actor.store_accepted_design(
+                "pm25-meter",
+                &spec,
+                Some(DesignSource::Model),
+            ));
+        }
+        let record = rt
+            .block_on(load_design_record(&mg_tx, "pm25-meter"))
+            .expect("the record reads")
+            .expect("a decision was recorded");
+        assert_eq!(
+            record.version, 1,
+            "re-running the scaffold on the same design is not a new decision"
+        );
+        assert_eq!(
+            fake.edges_of(edge::HAS_DESIGN_RECORD),
+            1,
+            "and not a second link to the same decision"
+        );
+
+        // The supported way to change a design is to edit it: the next accept supersedes the decision —
+        // one version on, and through the door this composition actually came in by.
+        let mut edited = spec.clone();
+        edited.justification = "a second look at the same product".to_string();
+        rt.block_on(actor.store_accepted_design(
+            "pm25-meter",
+            &edited,
+            Some(DesignSource::CompositionFile),
+        ));
+
+        let record = rt
+            .block_on(load_design_record(&mg_tx, "pm25-meter"))
+            .expect("the record reads")
+            .expect("the decision stands, superseded");
+        assert_eq!(
+            record.version, 2,
+            "a superseding decision is the next version"
+        );
+        assert_eq!(record.source, DesignSource::CompositionFile);
+        assert!(record.ratifies(&edited));
+        assert_eq!(
+            fake.of_subtype(node::DESIGN_RECORD),
+            1,
+            "the record node is upserted rather than stacked"
+        );
+        assert_eq!(
+            fake.edges_of(edge::HAS_DESIGN_RECORD),
+            2,
+            "relationships are append-only: two decisions, two links"
+        );
+        assert_eq!(
+            rt.block_on(load_composition_graph(&mg_tx, "pm25-meter"))
+                .expect("the composition reads"),
+            edited,
+            "the graph holds the composition as it stands, not the one first decided"
+        );
+        assert_eq!(
+            rt.block_on(load_design_freshness(&mg_tx, "pm25-meter")),
+            Ok(DesignFreshness::Current),
+            "the new decision ratifies what it was decided from"
+        );
+    }
+
+    /// A request that states no door gets a composition and **no decision**: the two things a spec cannot
+    /// tell apart (`answers` / `model`) are not invented on its behalf, so freshness answers `Absent`
+    /// instead of naming a door nobody named.
+    #[test]
+    fn a_design_with_no_stated_door_is_a_composition_with_no_decision_attached() {
+        use crate::build::application_spec::{examples, parse_spec};
+        use crate::subsystems::project::composition_graph::{edge, node, DesignFreshness};
+        use crate::subsystems::project::composition_persist::{
+            load_composition_graph, load_design_freshness, load_design_record,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let (mg_tx, fake) = fake_graph();
+        let mut actor = ProjectCreationActor::new(dummy_fs(), dummy_bm(), dummy_mcp());
+        actor.set_memory_graph(mg_tx.clone());
+
+        rt.block_on(actor.store_accepted_design("pm25-meter", &spec, None));
+
+        assert_eq!(
+            rt.block_on(load_composition_graph(&mg_tx, "pm25-meter"))
+                .expect("the composition is stored"),
+            spec
+        );
+        assert_eq!(
+            rt.block_on(load_design_record(&mg_tx, "pm25-meter")),
+            Ok(None),
+            "nothing was decided, so there is no record to read"
+        );
+        assert_eq!(
+            rt.block_on(load_design_freshness(&mg_tx, "pm25-meter")),
+            Ok(DesignFreshness::Absent)
+        );
+        assert_eq!(
+            fake.of_subtype(node::DESIGN_RECORD),
+            0,
+            "no door, no record"
+        );
+        assert_eq!(fake.edges_of(edge::HAS_DESIGN_RECORD), 0);
     }
 
     #[test]

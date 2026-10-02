@@ -109,6 +109,13 @@ struct CreateProjectSheet: View {
     @State private var design: ApplicationDesign?
     @State private var designSpec: [String: Any]?
 
+    /// **The door the reviewed design came through**, named by the core and carried back with the spec
+    /// it decided (`source`: `answers` when the form's answers pinned the framework, `model` when the
+    /// model chose it, `composition_file` for a file a person wrote). The scaffold records it as the
+    /// decision behind the composition it writes, and nothing in a composition says who chose it — so it
+    /// travels beside the spec rather than being re-derived from it.
+    @State private var designSource: String?
+
     /// Where a design came from, when it did not come from the six answers: the `composition.spire` a
     /// person opened. Shown **at review** — the step where the design is read, and so where it matters
     /// which file it came from — and cleared by `backToForm`, alongside the design itself.
@@ -702,7 +709,7 @@ struct CreateProjectSheet: View {
         let libraryRoot = library
         let started = open("Designing the composition…")
         Task {
-            let (design, spec, error) = await bridge.designApplication(
+            let (design, spec, source, error) = await bridge.designApplication(
                 board: boardJSON,
                 description: description,
                 framework: nil,
@@ -712,6 +719,10 @@ struct CreateProjectSheet: View {
                 if let design, let spec {
                     self.design = design
                     self.designSpec = spec
+                    // The door the core named for a design asked for here: the form pins no framework,
+                    // so the model chose and justified one. Handed back to the scaffold, which records
+                    // it as the decision behind the composition.
+                    self.designSource = source
                     finish(
                         "Designed: \(design.framework), \(design.units.count) unit(s), "
                             + "\(design.componentsToWrite.count) to write",
@@ -830,6 +841,7 @@ struct CreateProjectSheet: View {
         stage = .form
         design = nil
         designSpec = nil
+        designSource = nil
         failure = nil
         designWarning = nil
         // A design sent back is not the file that was opened: the form is where the next one comes
@@ -922,7 +934,7 @@ struct CreateProjectSheet: View {
         creationLog = []
         let started = open("Opening \(name)…")
         Task {
-            let (design, spec, error) = await bridge.parseComposition(text: text, name: name)
+            let (design, spec, source, error) = await bridge.parseComposition(text: text, name: name)
             await MainActor.run {
                 guard let design, let spec else {
                     let why = error ?? "the composition came back empty"
@@ -933,6 +945,8 @@ struct CreateProjectSheet: View {
                 // The spec goes back to the core **untouched**: what is reviewed is what is scaffolded.
                 self.design = design
                 self.designSpec = spec
+                // …and so does the door the core named for this one: a file a person wrote.
+                self.designSource = source
                 self.loadedComposition = name
                 // The file's own justification is the goal the fill is handed: a composition states
                 // what it is, and the form's answers — the usual goal — were never filled in.
@@ -965,6 +979,10 @@ struct CreateProjectSheet: View {
         if !isApplication { creationLog = [] }
         progress = "Scaffolding…"
         let spec = designSpec
+        // The door the reviewed design came through, carried back with the spec it decided: the scaffold
+        // records it as the decision behind the composition this run writes. `nil` (a design the core did
+        // not name a door for) sends nothing, and the core records no decision rather than a guessed one.
+        let designSource = designSource
         let libraryRoot = library
         // The platform the scaffold and the build both run for: the **design's** chip, since a
         // composition opened from a file left the form's picker empty. One rule, so the scaffold's
@@ -1041,7 +1059,8 @@ struct CreateProjectSheet: View {
                 platforms: scaffoldPlatforms,
                 structure: structure,
                 embeddedRoot: libraryRoot,
-                application: spec
+                application: spec,
+                designSource: designSource
             )
             if let error {
                 await MainActor.run {

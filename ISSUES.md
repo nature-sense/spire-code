@@ -4430,3 +4430,116 @@ no units — so it does not reach this layout; it is worth pointing at a design 
 one `idf.py build` away.
 
 
+## The composition is a graph, and the decision behind it is a node (2026-10-02)
+
+**A composition was a file that only its own parser could read.** `SPIRE.application.json` held the whole
+application as one JSON blob and `composition.spire` held it as YAML, so anything that wanted to ask a
+*question* about a design — which units send to which, what a driver is wired to, whether this project still
+is what it was decided to be — had to read the file and re-derive the answer in whatever process happened to
+be asking. The memory graph is the single source of truth for everything else in Spire, and the composition
+was the one thing in it that was not in it.
+
+**So the composition decomposes into the graph, and rebuilds out of it, exactly.** `composition_graph` holds
+the shape: one `anchor` (name == the project) carrying the framework and the justification, one node per
+board, board fact, component, actor, stage and message, and one `Custom` relationship per edge — `HAS_BOARD`,
+`HAS_BOARD_FACT`, `HAS_UNIT`, `HAS_MESSAGE`, `USES`, `SENDS_TO`, `WIRED_TO`. The anchor also carries a
+rendered `composition.spire` as a *review copy*: the file projection of the graph, kept for a reader who
+wants to read the thing they know, never the source. `decompose` → `reconstruct` is a hard property, tested
+against the PM2.5 fixture: what comes back is `==` what went in, node for node and edge for edge.
+`composition_persist` is the store, and its AttrNode plumbing — the `{project}::{logical}` scoping, the
+property codec, merge/query/relationship helpers — is shared with `spec_persist`, the sibling writer for the
+native `AppSpec`. One way to write a graph-native document, not two.
+
+**Storing a composition is not deciding one.** A person edits `composition.spire` — that is the file the
+whole design phase is arranged around — and the graph gets re-written from it long after the design was
+agreed. So the decision is **a node of its own** (`design_record`), not a flag on the anchor: a composition
+can be stored without being decided, and that is the ordinary state of a tree somebody edited. It hangs off
+the anchor by `HAS_DESIGN_RECORD`, and it mirrors the framework and the justification from the anchor on
+purpose — a decision should read as one self-contained statement, and "why is this an `actors`
+application?" should not need a join — beside the door it came through, when, which version, and the
+fingerprint of the composition it ratifies.
+
+**The fingerprint is what makes the record checkable rather than merely informative.** It is FNV-1a over the
+composition's *canonical JSON* — the same bytes `SPIRE.application.json` holds — so the fingerprint a record
+carries is the hash of the record a person can open, and two things that are the same design fingerprint the
+same however they were serialized. It is order-exact (swapping two units is a different design) and
+framework-sensitive (the framework is the first thing a design decides, so it has to move the hash). FNV
+rather than a cryptographic hash, deliberately: this answers "has it changed?", between two values one
+process already holds, and it is a change detector rather than a defence against a forger. `DesignFreshness`
+is the three-valued answer — `Absent`, `Current`, `Stale { recorded, current }` — and **absent is not
+stale**: "nobody decided this" and "the decision no longer applies" are different things to say to a person,
+and the second carries both fingerprints so a reader sees they differ without re-deriving either. A record
+that is *present and unreadable* (no framework, no source, no timestamp, no fingerprint, or a source name
+nobody knows) is **refused**, never read as "undecided": reading a corrupt decision as no decision at all is
+the confident kind of wrong, and it is how a project gets re-designed over a decision nobody superseded.
+
+
+**The wiring exposed a hole in the taxonomy, which is what the wiring was for.** `DesignSource` had three
+doors and two of them overlapped: `answers` and `model` were both "the design form asked a model". They are
+not the same fact. The axis is **who decided**, and the design form is one door with two readings — a caller
+that pins the framework has decided, and the model fills the decomposition in around that choice
+(`answers`); one that leaves the framework open is asking the model to *choose and justify* it, which a
+person then accepts at review (`model` — and the wizard's own door: it deliberately pins nothing, so the
+choice is confirmed rather than assumed). The third door is a `composition.spire` a person wrote
+(`composition_file`), whether it was handed in (`createProject/ParseComposition`) or is already on the tree,
+which is the same file by a different road. So **both design doors now answer with the door they used**,
+beside the spec and the marker line, and it travels back the way the spec does: reviewed value in, unchanged
+value out, never re-derived on the way.
+
+**The accept is the scaffold, so that is where the graph is written.** A design becomes real when the tree
+is written from it: `createProject/Scaffold` resolves the design the one way everything else does
+(`design_for_scaffold` — the tree's if it carries one, the caller's otherwise) and has `application_scaffold`
+write `composition.spire` and the record beside it. That leg now writes the graph's half too — the
+decomposed composition, and the decision that ratifies it — because it is the leg that *accepted* the design
+and it holds both the design and the door. The door is the caller's when it stated one (`designSource`), and
+otherwise the tree's own file when the file is what decided, which the leg already knows: it just dropped the
+caller's copy. A request that states neither gets a composition and **no** record — `Absent`, honestly,
+rather than a door invented for it. Guessing there would mean choosing between "the caller's answers" and
+"the model's choice" over a request that declined to make the distinction, which is the one thing the record
+exists to carry.
+
+**A design nobody changed is not decided twice.** Re-running the scaffold is not a new decision, so a
+composition whose stored record already ratifies it (fingerprint, so an unchanged design re-read from the
+file counts) is neither stored again nor decided again — which is also what keeps a re-run from appending a
+second `HAS_DESIGN_RECORD` for one decision and making the latest-wins read of the record report another
+door for it. A design that *did* change is decided again and the record says so: upserted by name, so the id
+survives and the link keeps pointing at it, with the next version and the new door; the relationship itself
+is append-only, which is the store's documented behaviour and why a reader dedupes.
+
+**Verified, by running it.** 14 pure tests in `composition_graph` (the PM2.5 shape and the round trip, the
+ramen one too, facets and unit annotations surviving it, the anchor requirement, the record attaching
+without disturbing the composition, every door round-tripping through its node, the fingerprint's
+order-exactness and framework-sensitivity, ratify/stale, absent ≠ stale, a broken record refused — and one
+this round adds, for the door rule) and 8 in `composition_persist` against an in-memory double of the graph
+actor with real merge-by-key semantics (a composition round-tripping, an upsert deduping its relationships,
+a missing project refused by name, the record hanging off the anchor and reloading without touching the
+composition, a record needing a composition to ratify, absent → current → stale, and an unreadable record
+being an error rather than an absence). Then, for the accept path, 3 tests through
+`ProjectCreationActor::store_accepted_design` (stored and `Current`; an unchanged design not decided twice
+and an edited one superseding it one version on with two links; no door ⇒ a composition with no record) and
+2 for the boundary (`designSource` read, absent or refused by name; both design doors answering with
+theirs). `cargo test -p spire-code` green — 17 binaries, 644 tests, 0 failures, 491 of them in the lib —
+`cargo fmt --check` clean, clippy clean in everything new, and `swift build` + `swift test` green for the
+wizard that hands the door back.
+
+**Still not built.** Nothing *reads* the freshness yet. `load_design_freshness` is the seam and it has no
+caller: no pass reports that the composition a tree carries is not the one that was decided, and no screen
+says so. The natural next one is a pass that reads a tree it did not write — `createProject/VerifyApplication`
+already resolves the design in force through `application_for_pass`, so it is the argument in the right
+shape — but what such a warning should *say*, and whether it should gate anything, is a design question
+rather than a wiring one, and a warning nobody can act on is worse than none. Equally open: **nothing
+re-stores the graph when `composition.spire` is edited outside a scaffold.** The graph's composition can lag
+the file until the next write leg touches it, and the file-side rule that keeps `SPIRE.application.json` in
+agreement with the file it was derived from (`idf_projects::read_application_and_sync_record`) has no
+graph-side twin — a reader between the edit and that leg would be told the old decision still stands, which
+is the one thing the record was built to prevent.
+
+**Deferred, and still undecided.** The `DRIVES` edge (component → board fact) is deliberately not in the
+decomposition: a fact's `device` already names a unit id, so an edge would be a second way to say one thing —
+but a traversal from a driver to the address it serves is exactly what a reader will want, and neither answer
+is obviously right. Ports: a ramen stage's `pulls`/`pushes` are scalars on the stage node rather than nodes
+of their own, which is honest for one port per side and wrong the moment a stage has two. And the per-unit
+executor is still unbuilt — a unit is a component with its own host test (`A unit is a component`, above),
+but nothing runs *one* unit against a scripted bus, which is what would make a unit's test something the
+system runs rather than something a person wrote.
+

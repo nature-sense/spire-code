@@ -29,6 +29,7 @@ use spire_core::transport::socket::TransportMessage;
 
 // FFI-inline RPC handlers moved into this single router (see `SetFfiDeps`).
 use crate::ffi::{dummy_tx, populate_target_graph, resolve_project_root, serialize_analysis};
+use crate::subsystems::project::composition_graph::DesignSource;
 use crate::subsystems::project::project_analyzer::ProjectAnalysis;
 use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
 use crate::subsystems::project::project_build::ProjectBuildMessage;
@@ -5383,6 +5384,41 @@ impl CoordinatorActor {
         Ok(Some(spec))
     }
 
+    /// `designSource` — **the door a reviewed design came through**, when the caller says it:
+    /// `answers`, `composition_file` or `model` (see [`DesignSource`]).
+    ///
+    /// Optional, and an unknown name is refused rather than ignored. What this field is for is the one
+    /// thing about a design that does not survive into the spec — *who decided it* — and the scaffold
+    /// records it as the decision behind the composition it writes. A typo dropped silently would
+    /// therefore record no decision at all while looking exactly like a run that had.
+    fn params_design_source(params: &serde_json::Value) -> Result<Option<DesignSource>, String> {
+        match params
+            .get("designSource")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            None => Ok(None),
+            Some(name) => DesignSource::from_name(name)
+                .map(Some)
+                .map_err(|e| format!("`designSource`: {e}")),
+        }
+    }
+
+    /// **The door a design form request came through**, from whether the caller pinned the framework.
+    ///
+    /// One door, two different facts about the design — see [`DesignSource`]. A pinned framework is the
+    /// caller's decision, with the model filling the decomposition in around it; an open one is the
+    /// model's to choose and justify, which a person then accepts at review.
+    fn design_source_for_request(
+        framework: Option<crate::build::application_spec::ApplicationFramework>,
+    ) -> DesignSource {
+        match framework {
+            Some(_) => DesignSource::Answers,
+            None => DesignSource::Model,
+        }
+    }
+
     /// The **framework** a design request pinned, when it pinned one.
     ///
     /// An unknown name is refused here rather than reaching a scaffold or a design: a project
@@ -5614,6 +5650,13 @@ impl CoordinatorActor {
             Ok(application) => application,
             Err(e) => return serde_json::json!({ "error": e }),
         };
+        // **The door the reviewed design came through**, when the caller knows it: recorded by the
+        // scaffold as the decision behind the composition it writes, and not derivable on the other
+        // side — a spec does not say who chose it.
+        let design_source = match Self::params_design_source(params) {
+            Ok(source) => source,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
 
         let result: Result<_, String> = async {
             let (t, r) = tokio::sync::oneshot::channel();
@@ -5629,6 +5672,7 @@ impl CoordinatorActor {
                     embedded_root,
                     embedded,
                     application,
+                    design_source,
                     reply_to: t,
                 })
                 .await;
@@ -5916,7 +5960,8 @@ impl CoordinatorActor {
     /// tree it describes, which is what makes it reviewable — a person says yes to a decomposition
     /// rather than to a pile of generated code. The response carries the spec plus the exact line the
     /// application will state its framework with, because that line is how the choice reaches the
-    /// build.
+    /// build — and the **door** this design came through, which the scaffold records as the decision
+    /// behind the composition it writes.
     ///
     /// The board is required rather than defaulted: a guessed chip or BSP is a build that fails on
     /// hardware, and whoever asks this already knows the board.
@@ -5985,6 +6030,13 @@ impl CoordinatorActor {
             }
         };
 
+        // **The door this design came through**, decided here because it is the one thing about a design
+        // that does not survive into the spec: a framework the caller **pinned** means the design form's
+        // answers decided and the model filled the decomposition in around them, while a framework left
+        // open is the model's own choice, made and justified for the person to accept at review. Both
+        // are this one door, and neither is the other — see `DesignSource`.
+        let source = Self::design_source_for_request(framework);
+
         let spec = match self
             .design_application(&board, &description, framework, library.as_ref())
             .await
@@ -5994,10 +6046,13 @@ impl CoordinatorActor {
         };
 
         // The marker is shown at review because it is the *whole* of what the choice becomes in the
-        // tree: one stated line, which the scaffold writes.
+        // tree: one stated line, which the scaffold writes. `source` travels with it for the same
+        // reason: the scaffold records the decision, and the door is the caller's to hand back.
         let marker = spec.framework.marker_line();
         match serde_json::to_value(&spec) {
-            Ok(spec) => serde_json::json!({ "spec": spec, "marker": marker }),
+            Ok(spec) => {
+                serde_json::json!({ "spec": spec, "marker": marker, "source": source.as_str() })
+            }
             Err(e) => {
                 serde_json::json!({ "error": format!("the spec could not be serialized: {e}") })
             }
@@ -6022,7 +6077,8 @@ impl CoordinatorActor {
     ///
     /// Nothing is written, and no board, library or description is needed: a composition *states* its
     /// board. The answer carries the spec and the marker line, exactly as the design phase's does, so
-    /// the caller has one shape to handle whichever door the design came through.
+    /// the caller has one shape to handle whichever door the design came through — and the door itself
+    /// (`composition_file`), which is the one thing about it a spec cannot say.
     fn handle_create_project_parse_composition(params: &serde_json::Value) -> serde_json::Value {
         use crate::build::application_spec::parse_composition;
         use crate::build::idf_projects::{design_that_holds_together, COMPOSITION_FILE};
@@ -6059,9 +6115,16 @@ impl CoordinatorActor {
             Err(e) => return serde_json::json!({ "error": e }),
         };
 
+        // The marker and the door, exactly as the design phase answers with them: the caller has one
+        // shape to handle whichever door the design came through, and the scaffold records the door it
+        // was handed. Nothing is written here — the decision is recorded where the design is accepted.
         let marker = spec.framework.marker_line();
         match serde_json::to_value(&spec) {
-            Ok(spec) => serde_json::json!({ "spec": spec, "marker": marker }),
+            Ok(spec) => serde_json::json!({
+                "spec": spec,
+                "marker": marker,
+                "source": DesignSource::CompositionFile.as_str(),
+            }),
             Err(e) => serde_json::json!({
                 "error": format!("the composition could not be serialized: {e}")
             }),
@@ -7362,6 +7425,83 @@ mod design_request_params_tests {
         }))
         .expect_err("a spec with no units is not a spec");
         assert!(error.contains("`application`"), "{error}");
+    }
+
+    /// **The door a design came through is answered with the design**, because it is the one thing about
+    /// it that a composition cannot say: nothing in a spec records who chose it. The scaffold records the
+    /// decision, so the door has to travel with the spec to reach it.
+    #[test]
+    fn a_design_answer_names_the_door_it_came_through() {
+        use crate::build::application_spec::framework_from_name;
+
+        // A caller that pins the framework has decided it; the model filled the decomposition in around
+        // the answer.
+        assert_eq!(
+            CoordinatorActor::design_source_for_request(framework_from_name("actors").ok()),
+            DesignSource::Answers
+        );
+        // Left open, the choice is the model's to make and justify — which is the wizard's own door: it
+        // deliberately does not pin one, so that the choice is confirmed at review rather than assumed.
+        assert_eq!(
+            CoordinatorActor::design_source_for_request(None),
+            DesignSource::Model
+        );
+
+        // The other door is a file a person wrote, and it says so — in the answer the caller hands back.
+        let answer =
+            CoordinatorActor::handle_create_project_parse_composition(&serde_json::json!({
+                "text": crate::build::application_spec::examples::PM25_METER,
+            }));
+        assert_eq!(
+            answer["source"],
+            DesignSource::CompositionFile.as_str(),
+            "the door is named: {answer}"
+        );
+        assert!(answer.get("spec").is_some(), "and the design comes with it");
+        assert!(answer.get("marker").is_some());
+    }
+
+    /// `designSource` is read, refused **by name** when it is not one, and absent means absent.
+    #[test]
+    fn the_door_a_scaffold_is_handed_is_read_or_refused_by_name() {
+        // A caller that says nothing is not given a default door: the composition is stored and no
+        // decision is recorded, which is the honest answer for a request that declined to make one.
+        assert_eq!(
+            CoordinatorActor::params_design_source(&serde_json::json!({})),
+            Ok(None)
+        );
+        assert_eq!(
+            CoordinatorActor::params_design_source(&serde_json::json!({ "designSource": "   " })),
+            Ok(None),
+            "an empty field is nothing said, not a name"
+        );
+
+        // The three doors are the three names, and each reads back as itself.
+        for (name, source) in [
+            ("answers", DesignSource::Answers),
+            ("composition_file", DesignSource::CompositionFile),
+            ("model", DesignSource::Model),
+        ] {
+            assert_eq!(
+                CoordinatorActor::params_design_source(
+                    &serde_json::json!({ "designSource": name })
+                ),
+                Ok(Some(source)),
+                "`{name}` is a door"
+            );
+        }
+
+        // A name nobody knows is refused rather than dropped: what the scaffold records as the decision
+        // behind the composition would otherwise be nothing at all, while looking like a run that had.
+        let err = CoordinatorActor::params_design_source(
+            &serde_json::json!({ "designSource": "answer" }),
+        )
+        .expect_err("a name that is not a door is refused");
+        assert!(
+            err.contains("designSource"),
+            "the refusal names the field: {err}"
+        );
+        assert!(err.contains("answer"), "…and what it was given: {err}");
     }
 }
 

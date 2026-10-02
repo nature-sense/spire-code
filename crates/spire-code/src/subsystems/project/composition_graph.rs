@@ -541,13 +541,22 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
 /// decomposition a person *wrote* in `composition.spire` and one a *model* proposed from six answers
 /// carry different confidence, and a record that did not say which is a record that cannot say "a
 /// person reviewed this" and mean anything by it.
+///
+/// The axis is **who decided** — the only division the doors actually make. The design form
+/// (`createProject/DesignApplication`) is one door with two readings: a caller that pins the framework
+/// has decided, and the model fills the decomposition in around that choice; a caller that pins
+/// nothing is asking the model to *choose and justify* one. Both are one model round trip, and they
+/// are not the same fact about the design — which is what [`Self::Answers`] and [`Self::Model`] say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesignSource {
-    /// The six wizard questions (`createProject/DesignApplication`).
+    /// The **caller's answers** decided: `createProject/DesignApplication` with the framework pinned,
+    /// so the decomposition was filled in around a choice that was already made.
     Answers,
-    /// A `composition.spire` a person handed in (`createProject/ParseComposition`).
+    /// A `composition.spire` a person handed in (`createProject/ParseComposition`) — or the one a tree
+    /// already carried, which is the same file by a different road.
     CompositionFile,
-    /// A decomposition the design model returned and a person accepted.
+    /// The **model** decided: `createProject/DesignApplication` with no framework pinned, where the
+    /// choice is the model's to make and justify and a person accepts it at review.
     Model,
 }
 
@@ -568,6 +577,35 @@ impl DesignSource {
             other => Err(format!(
                 "'{other}' is not a design source (expected `answers`, `composition_file` or `model`)"
             )),
+        }
+    }
+
+    /// **The door an accepted design came through**, from what the caller said and what the tree did —
+    /// the rule the leg that writes a tree records a decision by.
+    ///
+    /// The two inputs are the only things a scaffold knows, and they are not the same kind of thing. A
+    /// caller that **states** a door is believed: the door is not recoverable from the spec (nothing in
+    /// a composition says who chose it), so what the caller says is the only record of it — and a caller
+    /// reading *this* project's `composition.spire` is exactly the `CompositionFile` case, which is why
+    /// a stated door wins even over a tree that decided.
+    ///
+    /// A caller that says nothing leaves one fact behind: a tree that already carried a design **was**
+    /// the design — the leg resolved the two and dropped the caller's copy, so the composition written
+    /// is the file's. That is read off the tree rather than guessed, and recorded as
+    /// [`DesignSource::CompositionFile`].
+    ///
+    /// `None` — neither stated nor readable — records **nothing**: the composition is stored and no
+    /// decision is attached to it, so [`freshness`] answers [`DesignFreshness::Absent`]. Guessing here
+    /// would mean choosing between "the caller's answers" and "the model's choice", which is precisely
+    /// the distinction the record exists to keep, over a request that declined to make it.
+    pub fn accepted(
+        stated: Option<DesignSource>,
+        caller_design_dropped: bool,
+    ) -> Option<DesignSource> {
+        match (stated, caller_design_dropped) {
+            (Some(stated), _) => Some(stated),
+            (None, true) => Some(DesignSource::CompositionFile),
+            (None, false) => None,
         }
     }
 }
@@ -906,6 +944,44 @@ mod tests {
             assert_eq!(back.framework, spec.framework);
             assert_eq!(back.justification, spec.justification);
         }
+    }
+
+    #[test]
+    fn the_door_a_scaffold_records_is_stated_or_read_off_the_tree() {
+        // A caller that says which door its design came through is believed — including when the tree
+        // also decided, because only the caller knows whether it read this project's own file.
+        for stated in [
+            DesignSource::Answers,
+            DesignSource::CompositionFile,
+            DesignSource::Model,
+        ] {
+            assert_eq!(
+                DesignSource::accepted(Some(stated), false),
+                Some(stated),
+                "a stated door survives a tree that decided nothing"
+            );
+            assert_eq!(
+                DesignSource::accepted(Some(stated), true),
+                Some(stated),
+                "and one that decided: the door is not recoverable from the spec"
+            );
+        }
+
+        // Nothing stated, over a tree whose own `composition.spire` was the design that got written:
+        // the file decided, which the leg knows because it dropped the caller's copy.
+        assert_eq!(
+            DesignSource::accepted(None, true),
+            Some(DesignSource::CompositionFile),
+            "a tree that decided is read off the tree"
+        );
+
+        // Nothing stated, over a tree that decided nothing: no record at all. The composition is still
+        // stored; what is not invented is a door — `answers` and `model` are the reader's distinction.
+        assert_eq!(
+            DesignSource::accepted(None, false),
+            None,
+            "an unstated door is not guessed at"
+        );
     }
 
     #[test]
