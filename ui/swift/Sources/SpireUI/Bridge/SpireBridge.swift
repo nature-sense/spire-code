@@ -1929,13 +1929,22 @@ final class SpireBridge {
     /// live run was handed the reviewed decomposition and answered with one flat FreeRTOS poll loop
     /// instead, and nothing else would have noticed. Empty `gaps` means "not obviously absent" — never
     /// "correct"; the build and a reader are what say that.
+    ///
+    /// `projectName` is the **same name this sheet handed `scaffoldProject`**, carried back with the
+    /// request: the core files the design's decision under that name, and the tree's own directory is
+    /// not always that name — a sheet with a `fixedLocation` keeps the folder it was given while the
+    /// name field stays editable, so a folder is not a name. The core falls back to the root's own name
+    /// when this says nothing, which is right for the default flow (`<location>/<name>`) and wrong the
+    /// moment the two differ: the pass would look the decision up under one key, find none, and report
+    /// `absent` beside the gaps for a design that was decided.
     func verifyComposition(
         root: String,
-        application: [String: Any]
+        application: [String: Any],
+        projectName: String
     ) async -> (gaps: [String], error: String?) {
         guard let json = await callRawMethod(
             "createProject/VerifyApplication",
-            args: ["rootDir": root, "application": application]
+            args: ["rootDir": root, "application": application, "projectName": projectName]
         ) else {
             return ([], "core unavailable")
         }

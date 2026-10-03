@@ -1157,7 +1157,13 @@ struct CreateProjectSheet: View {
                 // dismissing, and handing over an application nobody designed.
                 if let spec {
                     let verifyStarted = await MainActor.run { open("Checking the tree against the design…") }
-                    let (gaps, error) = await bridge.verifyComposition(root: root, application: spec)
+                    // The name the scaffold was handed travels with the check: the core files the design's
+                    // decision under *that*, and a fixed location means the folder is not the name.
+                    let (gaps, error) = await bridge.verifyComposition(
+                        root: root,
+                        application: spec,
+                        projectName: trimmedName
+                    )
                     if let error {
                         await MainActor.run {
                             progress = nil
