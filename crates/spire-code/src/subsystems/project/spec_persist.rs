@@ -46,7 +46,15 @@ pub const MG_ANCHOR_SUBTYPE: &str = "appspec";
 pub(crate) const PROP_LOGICAL: &str = "logical";
 /// Complex (non-scalar) spec properties are serialized to canonical JSON
 /// strings under this prefix; scalar values are stored verbatim.
-const PROP_JSON_PREFIX: &str = "json:";
+///
+/// The prefix has to be a legal *property name*: the AttrNode store inlines the
+/// key into GQL (`SET n.<key> = …`, `INSERT (n:SPIRE_NODE {<key>: …})`) and a
+/// `:` is not accepted there — `json:wiring` made SeleneDB refuse the whole
+/// write ("parse failed: expected … or prop_access"), so every array/object
+/// property was silently lost and the composition anchor — which always carries
+/// `wiring` — never persisted at all. An underscore keeps the same
+/// "this value is encoded JSON" reading while staying storable.
+const PROP_JSON_PREFIX: &str = "json_";
 /// Human-readable Markdown review copy rendered on the anchor node.
 const PROP_REVIEW_MD: &str = "spec_md";
 
@@ -67,7 +75,8 @@ pub(crate) fn un_mem_name<'a>(project: &str, mem: &'a str) -> Option<&'a str> {
 }
 
 /// Property encoding: scalars verbatim, arrays/objects as canonical JSON
-/// strings under `json:` so the open AttrNode store never loses structure.
+/// strings under [`PROP_JSON_PREFIX`] so the open AttrNode store never loses
+/// structure.
 pub(crate) fn encode_props(
     props: &[(String, serde_json::Value)],
 ) -> HashMap<String, serde_json::Value> {
@@ -90,7 +99,7 @@ pub(crate) fn encode_props(
     out
 }
 
-/// Inverse of [`encode_props`]: `json:`-prefixed keys are parsed back.
+/// Inverse of [`encode_props`]: `json_`-prefixed keys are parsed back.
 pub fn decode_props(map: &HashMap<String, serde_json::Value>) -> Vec<(String, serde_json::Value)> {
     let mut out = Vec::with_capacity(map.len());
     for (k, v) in map {

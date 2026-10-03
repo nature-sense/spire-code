@@ -1978,7 +1978,9 @@ which any existing test could see:
    each) while the seeder passed `&[]`, so edges were stored and then **silently dropped by every
    read**. They now carry what the working caller carries (`store_capability_edge_via_gql`), and
    `RelationshipType` gained `Realizes` / `Via` / `Carries`, so the predicates read back **named**
-   rather than as `Unknown` — an edge findable only by shape is not one you can query.
+   rather than as `Unknown` — an edge findable only by shape is not one you can query. (That is also
+   what makes these three immune to the read-back defect found much later, in the second-half-of-the-
+   seam entry: a *named* predicate was the one case the reader already handled.)
 
 This is the lesson this file had already reached two entries above and not yet acted on: a writer
 that never reads back is green while being wrong. The second half of the test is the part that
@@ -4542,4 +4544,284 @@ of their own, which is honest for one port per side and wrong the moment a stage
 executor is still unbuilt — a unit is a component with its own host test (`A unit is a component`, above),
 but nothing runs *one* unit against a scripted bus, which is what would make a unit's test something the
 system runs rather than something a person wrote.
+
+## The decision is read, and the two questions stay apart (2026-10-02)
+
+**The entry above ended with `load_design_freshness` having no caller.** This round gives it one, and it is
+the caller that entry predicted — `createProject/VerifyApplication`, the pass that runs against a tree it
+did *not* write — in the shape it needs: the freshness of **the design the pass just checked**, answered
+*beside* the gaps rather than in them.
+
+**The reader is the whole of it; no screen shows it yet, and that is deliberate.** What the entry above left
+open was what a *warning* should say and whether it should gate anything, and that is still open: "this
+design was edited since it was agreed" is only actionable if the person reading it knows what to do instead,
+and no caller has decided that yet. So this round builds the answer and leaves the saying to the round that
+knows what it wants said.
+
+**A second loader, because the first question cannot be asked of a file.**
+`load_design_freshness` compares a record with the composition **stored beside it** — the pair
+`store_accepted_design` writes together when a design is accepted — so by construction it can only report
+that the store agrees with itself, and no hand edit can move it.
+`load_design_freshness_against` is handed the design a **tree** states instead (`design_in_force`, which is
+`composition.spire` for a project that has one) and asks what a reader of a tree actually has: *does the
+decision still describe what is in front of me?* Neither replaces the other — the first is the store's own
+consistency, the second is the drift the record was built to make visible — and a test writes both down for
+one project: an accepted design, one hand edit, the store's reading still `Current` while the tree's reads
+`Stale { recorded, current }`, side by side in the same test.
+
+**`createProject/VerifyApplication` answers two questions now, and they are not the same kind of thing.**
+The structural half is unchanged and pure (`verify_application_against`) except that it hands back the root
+and **the design it checked**: the second question is asked of that design, and not of one re-read from a
+file a person might be editing while the pass runs. What is new is `freshness` beside `ok` and `gaps` — and
+the split is the point. `ok` is about the tree and it asks the caller to do something; a stale or absent
+decision is a fact about the project's history. **A stale design is not a broken tree** — editing the
+composition is the supported way to change a design — so nothing in the graph may move `ok`, and the pure
+shape that composes the answer (`verify_application_answer`) is where that is *stated* rather than trusted:
+one function, one shape, the two questions sealed apart, and a test that pins `ok: true` with a stale
+decision under it.
+
+**`unknown` is a fourth state, and it belongs to the reader rather than to `DesignFreshness`.** A record
+that is stored and broken, a graph that cannot be reached, a root with no name to look a project up by: each
+is this pass saying *it could not ask*, which is not the same as `absent` — "asked, and nobody has decided" —
+for the same reason `absent` is not `stale`. A screen showing "nobody has decided this" for a graph it never
+reached would be inventing a history for a project that has one. So the graph's taxonomy stays three-valued
+for the domain's sake and the wire carries the reader's fourth: `{ state: "unknown", why }`.
+
+**The project is looked up by the name the record was filed under — which the tree does not carry.** This is
+the part that was wrong when it was first written down, and it is worth stating in the corrected form. A
+record is keyed by the `projectName` the **scaffold request** stated (`store_accepted_design(&project_name)`,
+travelling unchanged through `ScaffoldProject`), and *not* by the directory the tree sits in — `project_creation`
+derives `root_dir.file_name()` for its own planning, but the store is handed the request's field. The two
+coincide in the wizard's default flow (`<location>/<name>`) and **diverge in a reachable one**: a sheet opened
+with a `fixedLocation` keeps the folder it was given while the name beside it stays editable (`trimmedName` is
+what `scaffoldProject` is handed), and a caller can always file a design under a name the folder does not have.
+So `params_project_name` takes `projectName` first — authoritative because it is the key — and falls back to
+the root's own name, descended through a wrapper (`resolve_project_root`) the way every other root resolution
+here does, for a caller that states none. **The wizard's verify call now carries the name back**
+(`verifyComposition(root:application:projectName:)`, handed the same `trimmedName` the scaffold got): without it
+the pass looks the decision up under the folder's name, finds nothing, and reports `absent` — "nobody has
+decided this" — for a design that was decided one screen earlier. The fallback is right where the names
+coincide, which is why it stays.
+
+It also **declines** things the writers do rather than guessing one of them: a root with no name at all
+(`"."`, `"/"`) and no field gets an `unknown`, not an invented `my_project`/`spire-app`; and a scaffold called
+with no `projectName` files its record under the *empty* name (`mem_name("", …)` → `::spire.design_record`),
+which no reader would ever reconstruct. What remains open is the shape of that same gap one step out: nothing
+in the graph records *which* name a tree's decision sits under, so a caller that scaffolds under one name and
+verifies without stating it still reads `absent` rather than `unknown`. The graph's name-keyed design is the
+reason (there is no path→project index to consult — see the entry above on what a reader can and cannot
+derive), and the fix is the one applied here: the caller that wrote the decision is the caller that hands the
+key back.
+
+**Verified, by running it.** `cargo test -p spire-code --lib` green — **494 tests, 0 failures, 3 of them new**:
+the hand-edit pair in `composition_persist` (which is where the two loaders are told apart), the answer's shape
+in `verify_application_tests`, and the lookup key beside it
+(`the_name_a_decision_is_looked_up_by_is_the_callers_when_it_states_one` — the caller's name trimmed and taking
+precedence, an empty field treated as nothing said, the root's name as the fallback through a `resolve_project_root`
+wrapper, and `None` for a root that names no project). The key is worth a test of its own because everything else
+in the pass is asked *about* a project and this is what picks which one: the failure it guards against reads
+`absent`, which is a claim about a project's history rather than a crash. The three tests that existed there were
+moved to the triple rather than left passing by accident, and one of them had been asserting
+`contains("uses no `spire::Actor")` with the closing backtick missing — right, because the gap names the framework
+as one backticked run (`spire::Actor / spire::Scheduler / spire::Registry`), and unreadable until now.
+`cargo fmt --check` clean, clippy clean in everything new (the crate's 11 warnings are all pre-existing and all
+elsewhere: `platform_codec`, `idf_projects`, `build_manager`, `tests/common`, `modify_contract`).
+
+**Still not built.** Nothing *shows* the freshness: the Swift bridge's `verifyComposition` reads `gaps` and
+ignores the added field (a new key is compatible, so the wizard keeps working), and the log line it writes is
+about the gaps. It does now **send** `projectName` — the key the record was filed under, which is the one thing
+the pass cannot derive for itself and which the wizard already has in hand (`trimmedName`) — so the freshness it
+reports on the wizard's own path is a real `current` rather than an `absent` from looking under the wrong name.
+The wizard's own path is still the wrong place to start for *showing* it — the scaffold records the decision in
+the same run that writes the tree, so the pass would report `current` and a person would learn nothing. The
+interesting readers are the ones that open a project they did not just write. Also still open from the entry
+above: **nothing re-stores the graph when `composition.spire` is edited outside a scaffold.** That is now a
+*visible* staleness rather than a quietly wrong reassurance, which is what the record was for, but the graph
+still lags the file until the next write leg touches it.
+
+## The store refused the anchor, and no decision was ever filed (2026-10-02)
+
+**The entry above was proved the way it asked to be proved — through dispatch, with a real memory graph — and
+proving it turned up what the doubles had been hiding: the composition anchor never persisted, so the
+record-keeping that entry describes had never once run in production.**
+
+**The test is the one the entry above said was missing.** `createProject/VerifyApplication` is driven through
+the same `route` harness the rest of `actor_tests.rs` uses, over
+`spawn_initialized_memory_graph` + `spawn_coordinator_with_graph(…, false)` — the first test in the suite to
+**assert on** the graph half rather than leave the store best-effort in the background. A decision is filed
+for the project the way
+`store_accepted_design` files it (PM25_METER decomposed, then `DesignRecord::now(spec, Answers, 1)`), the tree
+is written into a folder whose name is **not** the project's (`the-folder-the-sheet-was-pointed-at` against
+`sensor-hub`), and the same call is made twice, differing in `projectName` alone: the stated name finds the
+decision (`current`), the fallback finds none (`absent`), `ok` and `gaps` are identical in both answers, and
+one hand edit to `composition.spire` moves it to `stale` with both fingerprints named. Everything the entry
+above claimed about the key — and about the two questions staying apart — holds when the graph is real.
+
+**It failed on the first real write, and not in the pass.** `store_composition_graph` returned `None`: the
+anchor had not been stored. The cause was in the seam between the two crates, and it was one character. The
+AttrNode store writes properties by **inlining the key into GQL** (`memory_graph.rs`: `INSERT (n:SPIRE_NODE
+{…})` for scalars, `MATCH (n) … SET n.<key> = …` for arrays and objects), and `spec_persist::encode_props`
+renamed every array/object property to `json:<key>` — "complex values are serialized to canonical JSON strings
+under this prefix". A colon is not a legal property name there, so SeleneDB refused the entire statement:
+
+```text
+GQL write failed: parse failed: expected or_kw, xor_kw, and_kw, is_suffix, comp_op, add_op, mul_op, or prop_access
+```
+
+Scalars were untouched — `framework`, `justification`, `version` and the rendered `composition` YAML all
+stored — which is why nothing had noticed.
+
+**What it cost, and why it is more than one test's worth of bug.** The anchor *always* carries `wiring` (an
+array, in `decompose`'s own property map, before any project-specific value), so **every** anchor write
+failed, for every project, always. `store_composition_graph` returns `None` when the anchor is not stored, and
+`store_accepted_design` returns early when *that* is `None` (`project_creation.rs`: "no anchor persisted, so
+there is nothing a record could ratify") — so `store_design_record` was never even reached. No anchor, no
+decomposed children, no `design_record`, for any accepted design: `load_design_freshness` answered `Absent`
+for designs that had been decided one screen earlier. The reader from the entry above was reading a store
+nothing could write to — and the reason nobody saw it is that `Absent` is a *plausible* answer, the very value
+a project nobody ever decided has.
+
+**The suite could not have seen it — and one test walked straight over it.** Every test in this area writes
+through `fake_graph()`, which hands back what it was given: a key the real writer refuses is a key the double
+cheerfully stores, and the rule lives in the store, so only a store can enforce it. *One* test did more than
+that: `system_flow_tests.rs` spawns the real `MemoryGraphActor` and routes `createProject/Scaffold` for an
+`idf_application` with a spec in hand — the call that reaches `store_accepted_design` and so
+`store_composition_graph` — and it passed, because everything it asserted afterwards was about the tree: the
+manifest, the components on disk, the flow's answer. That is not a hole in that test, it is the shape of the
+write: `store_accepted_design` logs and returns rather than failing the request, so a scaffold that leaves no
+*record* of its decision still answers `200`, and nothing had asked the graph what it received. The assertion
+that caught it is kept exactly as the regression guard rather than folded away — `store_composition_graph(…)
+.is_some()`, "the composition is stored, or there would be nothing for a record to ratify" — because it is the
+one line in the suite that fails when the graph stops accepting what the store writes.
+
+**Reproduced before mended, and the reproduction named the field.** A temporary probe (since deleted) sent the
+anchor `decompose` actually produces through `MergeAttrNode` verbatim: **stored**. The same node with its
+properties put through `encode_props` — `wiring` renamed `json:wiring` — refused, with the parse error above;
+the other four properties each stored alone. So the fix went where the convention is set: the prefix becomes
+`json_` in `spec_persist.rs`, one constant with the reason written above it (why `:` cannot be a property name
+here, and what it silently cost), followed by the two doc comments and the one assertion in
+`composition_persist`'s reader test that named the old key. `decode_props` strips the same constant, so the
+round trip is unchanged: arrays and objects still go in as canonical JSON strings and come back parsed.
+
+**Verified, by running it.** The probe re-run against the same graph then returned `Some(anchor)` and
+`Some(record)` for the project — the two writes that had always failed. The new end-to-end test passes, and
+`cargo test -p spire-code --all-targets` is green with it: **648 passed, 0 failed** across all 18 test targets
+(the 494 lib tests unchanged, 7 ignored as before), `cargo fmt --check` clean, clippy reporting no warnings in
+anything new or touched. Nothing moved on the Swift side: the prefix is server-side and the wire shape is
+untouched.
+
+**Still open.** Two things this round did not do. The general fix belongs in the writer rather than the caller:
+quoting the key where `memory_graph.rs` inlines it (`SET n.\`json:wiring\` = …`) would make *any* key storable —
+that is the real defect — and it is deferred because it is a shared write path for every node type and selene's
+grammar for delimited identifiers is unverified, whereas the caller-side prefix could be fixed and verified
+now. And no test yet round-trips a stored *spec* out of a real store: the spec side of the same convention was
+affected identically — `store_spec_graph` writes nodes carrying array properties of their own, so every such
+write that hit a `json_`-keyed property was refused in exactly the same way, silently — but the prefix change
+is one constant shared by both writers, so the *write* half closed with it; what is missing is the assertion,
+and it is still missing: the section below round-trips the *composition* through a real store (its nodes'
+array properties, `wiring` above all) and leaves the spec writer's to a test that does not exist yet.
+
+## The other half of the seam: the predicate read back, and the edge's caller-given properties (fixed)
+
+**Found by asking for the composition back.** The entry above closed with the write accepted and freshness read
+off it — and with the round trip still untested, on the reasoning that a reader that bypassed `decode_props`
+would see JSON text where it expects a list. The assertion was added to the same end-to-end test
+(`load_composition_graph(&graph_tx, filed_name)` against the spec that was stored) and it failed **on the
+edges, not the properties**: the composition read back as a shape — every node present, 16 of them — and as a
+design with no units in it (`ApplicationSpec { units: [], .. }`, so no wiring and no board facts either, since
+both hang off units).
+
+**The cause is one line, and it is the mirror image of the first defect.** `composition_persist` writes each
+decomposed edge as `RelationshipType::Custom(predicate)`; `memory_graph.rs` writes a predicate as the GQL
+label (`relationship_type_to_gql_label`, which returns the `Custom` string verbatim) and separately stores it as
+the edge's `edge_type` **property**. The read path (`graph_edge_from_props`) reads that property back and
+parsed it as a *variant name*:
+
+```rust
+let edge_type = serde_json::from_str::<RelationshipType>(&format!("\"{}\"", edge_type_str))
+    .unwrap_or(RelationshipType::Unknown);
+```
+
+`RelationshipType` is `#[serde(other)] Unknown`, so this call **cannot fail** for an unrecognised label — it
+returns `Ok(Unknown)`, and the `unwrap_or` is dead code. Every predicate that is not a variant's
+`#[serde(rename)]` therefore came back `Unknown`: the composition's nine (`HAS_UNIT`, `WIRED_TO`, `SENDS_TO`,
+`USES`, `HAS_BOARD`, `HAS_BOARD_FACT`, `HAS_FACET`, `HAS_MESSAGE`, `HAS_DESIGN_RECORD`), the spec's
+twenty-two, and every edge `rag_ingest` writes. Reconstruction filters on
+`RelationshipType::Custom(predicate)`, so it dropped all 29 edges and rebuilt an empty design from a full
+graph. The nodes were never in doubt; the graph had *forgotten what its own edges meant*.
+
+**Why nothing had caught it.** The writer's doc comment on the label helper celebrated the `Custom` path, and
+the enum's docs prescribe naming a predicate that has to be read back — which is true, and is why the
+capability edges (`realizes`, `via`, `carries`) and `has_edit` were never affected: they are named. But naming
+is not something a *caller outside the crate* can do for its own vocabulary, and both of spire-code's
+decomposition vocabularies are `Custom` by design. The defect lived where the two crates disagree about who
+owns the inverse mapping, and — like the first one — it could only be seen through a real store, because the
+`fake_graph()` double hands back the `Custom` value it was given. A store is the only thing that can lose it.
+
+**The fix makes the writer/reader pair an involution**, in the store, at the one place a label becomes a type:
+`relationship_type_from_gql_label` returns the matching variant when the label names one and
+`Custom(<label>)` otherwise, so a predicate written as `Custom("HAS_UNIT")` comes back as exactly that. This
+repairs the composition vocabulary, the spec vocabulary and the rag edges at once, and it needs no variant
+names for either vocabulary — the label is where the writer put the predicate, so the reader takes it from
+there. The two doc comments that described the old behaviour (`HasEdit`'s rationale, and the capability-edge
+paragraph) were corrected in place: an unnamed predicate now comes back as its own text under `Custom`, which a
+query can match by string but no `match` arm can reach and no compiler checks — still the reason to name one,
+without the false claim that it returns `Unknown`.
+
+**Verified, by running it.** The probe re-run returned `read back -> Ok("units=8 wiring=5")` for the PM2.5
+example (the spec's own counts) with all seven distinct predicates reporting as `Custom("<predicate>")`; the
+end-to-end test's round-trip assertion now passes, so the composition that a request states is found, ratifies
+the decision, and reads back property for property out of the same store the request wrote to. A regression test
+was added **in spire-core, next to the platform seeder's**, because the behaviour under test is the store's:
+`an_unnamed_predicate_round_trips_as_its_own_text` writes `Custom("HAS_UNIT")`, `Custom("SENDS_TO")` and
+`Custom("has_edit")` as real edges and asserts the first two come back as their own text and the third as the
+`HasEdit` variant — pinning both directions of the mapping, including the precedence the enum's naming rests
+on.
+
+### The caller's own properties on an edge, dropped on the floor (fixed)
+
+Found immediately after this one, in the same three writers. With the predicate reading back, the next thing a
+caller hands `CreateRelationship` and expects back is its own `properties` — `rag_ingest` names `{domain,
+relation}` on every edge it extracts, and the RAG knowledge store's own tests are agnostic because nothing reads
+them back. The handler built its stored property list from uuid, type, timestamp and weight alone and **never
+read `rel.properties`**; the two sibling writers did exactly the same (`StreamOp::CreateRelationship` and
+`StreamOp::MergeRelationship`, the streaming path spire-code's spec and composition writers go through), so this
+is one shape repeated three times rather than one slip.
+
+**Why the field looked honoured.** `graph_edge_from_props` reads *every* non-metadata key back into
+`GraphEdge.properties`, and the write replies `GraphEdge { properties: HashMap::new(), .. }` — a reply that neither
+lies nor tells the truth, because nothing reads the caller's map back. A writer that never reads back is green
+while being wrong: the same lesson as each entry above, now on the third field of the same message.
+
+**Fixed by giving the three writers the treatment the store already had.** `store_capability_edge_via_gql` — the
+one edge writer that was ever read back, by the capability tests — renders each property as a native literal via
+`format_value_as_gql`: scalars typed, arrays/objects as the JSON-encoded string the parser accepts, which
+`selene_value_to_json` decodes on the way in. The three `RelationshipInput` writers now build their clause from one
+shared `edge_props_parts` — metadata *plus* `rel.properties` rendered that way — and reply with
+`properties: rel.properties.clone().unwrap_or_default()`, so the caller is handed back what it gave.
+`store_edge_via_gql` takes the rendered parts, which keeps its empty-clause guard in one place.
+
+**Verified, by running it.** `a_callers_edge_properties_survive_the_write` (spire-core, beside the predicate test)
+writes an edge named `Custom("SENDS_TO")` carrying a scalar (`domain: "hardware"`) and an array
+(`measurements: [1, 2, 3]`) and asserts that the reply *and* a real read hand both back. It failed first with
+`properties: {}` on the reply, so the test is the proof rather than a restatement of the fix. The array arm is the
+point: it is the same `format_value_as_gql` ↔ `selene_value_to_json` pair the first defect was about, on the edge
+side this time.
+
+### What the fix left open: the weight written as text, and the predicate written as a bare label
+
+`weight` is written as **text** (`weight: '0.8'`) while `parse_edge_from_row` accepts only a numeric literal
+(`Value::Float` / `Value::Int`) for it, so a stored weight has always read back as `None`. spire-code's startup
+phases pass 0.7-0.9 on real edges, so this is a live loss rather than a theoretical one, in the same three
+writers as above. It is left open because the fix changes the type of an existing on-disk property column (the
+snapshots the app reopens hold weights as text), which is a migration decision rather than a read-back fix — and
+the regression test asserts everything *except* the weight and says so where the next person edits.
+
+And a predicate is written as a **bare GQL label**, so it must spell a label atom: `Unknown` is a reserved word
+there (`GQL write failed: parse failed: expected label_atom`) and a separator is rejected too (`HAS-UNIT`,
+`HAS.UNIT`), which means any caller whose predicate is not `[A-Za-z_][A-Za-z0-9_]*` cannot store that edge at
+all — reachable today through `rag_ingest`, whose predicates are LLM-extracted relation names. Both vocabularies
+in spire-code are `[A-Z][A-Z_]*`, so neither is affected today. A property **key** is inlined exactly the same
+way, so it has to spell an identifier too (`domain` and `relation`, the two `rag_ingest` writes, do), which
+`edge_props_parts`' own doc comment now records.
 

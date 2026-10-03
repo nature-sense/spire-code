@@ -14,6 +14,9 @@
 //!   discriminator as `subtype`, the logical name in the `logical` property, memory name scoped
 //!   `{project}::{logical}` so upserts never collide across projects);
 //! - every decomposed edge becomes a `Custom(<predicate>)` relationship between the stored node ids.
+//!   The predicate survives the store-and-read as `Custom` because spire-core writes the label as the
+//!   predicate text and reads it back with `relationship_type_from_gql_label` (the inverse of the
+//!   writer), so a reader can match on the predicate rather than see it flattened to `Unknown`.
 //!
 //! [`load_composition_graph`] reassembles a [`CompositionGraph`] from `QueryAttrNodes` +
 //! `GetRelationships` and rebuilds the [`ApplicationSpec`] via
@@ -35,6 +38,13 @@
 //! ([`DesignFreshness`]) rather than left to assume it. A composition edited after the decision is
 //! [`DesignFreshness::Stale`]; a project whose composition was stored with no decision recorded is
 //! [`DesignFreshness::Absent`].
+//!
+//! Two questions, and the second is the one a reader of a *tree* has. [`load_design_freshness`] asks it
+//! of the pair the store holds — the record against the composition written beside it — which the
+//! accepting leg made agree by construction, so only a re-store can move it.
+//! [`load_design_freshness_against`] is handed the design the **tree** states instead, so a person's
+//! hand edit to `composition.spire` — the supported way to change a design — is visible where the
+//! record is read rather than only where it is written.
 
 use std::collections::{HashMap, HashSet};
 
@@ -392,6 +402,33 @@ pub async fn load_design_freshness(
     Ok(composition_graph::freshness(record.as_ref(), &spec))
 }
 
+/// **Does the stored decision still describe the design `spec` states?** — [`DesignFreshness`] for a
+/// *tree's* design, rather than for the copy the graph keeps beside the record.
+///
+/// The twin of [`load_design_freshness`], and the difference between them is the whole point. That one
+/// compares the record with the composition **stored next to it** — the pair the leg that accepts a
+/// design wrote together — so it can only ever answer "does the store agree with itself", which the
+/// writer made true by construction and which no edit to a file can move. This one is handed the design
+/// a *tree* states ([`design_in_force`](crate::build::idf_projects::design_in_force), which is what
+/// `composition.spire` is) and asks the question a reader of a tree actually has: **does the decision
+/// still describe what is in front of me?** A person hand-editing `composition.spire` moves the answer
+/// here and nowhere else, which is exactly the drift the record was built to make visible.
+///
+/// Two consequences worth stating. A project the graph has never seen reads [`DesignFreshness::Absent`]
+/// rather than an error: this reader needs the *decision*, not the composition, so "nobody has decided
+/// this" is the honest answer about a tree the store holds no history for. And **reading settles
+/// nothing**: the record stands until a leg that writes a tree decides again (see
+/// `project_creation::store_accepted_design`), so a `Stale` here is a fact to report rather than one to
+/// repair.
+pub async fn load_design_freshness_against(
+    mg_tx: &tokio::sync::mpsc::Sender<MemoryGraphMessage>,
+    project_name: &str,
+    spec: &ApplicationSpec,
+) -> Result<DesignFreshness, String> {
+    let record = load_design_record(mg_tx, project_name).await?;
+    Ok(composition_graph::freshness(record.as_ref(), spec))
+}
+
 #[cfg(test)]
 mod tests {
     use super::composition_graph::{fingerprint, DesignSource};
@@ -541,7 +578,7 @@ mod tests {
             "the anchor carries the rendered composition"
         );
         assert!(
-            anchor_node.properties.contains_key("json:wiring"),
+            anchor_node.properties.contains_key("json_wiring"),
             "the wiring list is stored as JSON"
         );
         assert!(
@@ -735,6 +772,71 @@ mod tests {
             }
             other => panic!("a record from another design must read as stale, got {other:?}"),
         }
+    }
+
+    /// **The hand edit, and the two questions it pulls apart.** `composition.spire` is the file a person
+    /// edits while the graph keeps what was decided, so the pair the store holds still ratifies *itself*
+    /// — nobody wrote to the graph — and the design the **tree** states is another design entirely.
+    /// Reading a tree is what a pass does, so `Stale` is the answer that matters, and staying `Current`
+    /// beside it is what makes this test say that the difference is the edit rather than the loader.
+    #[test]
+    fn a_hand_edited_composition_is_stale_against_the_tree_and_current_beside_it() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let decided = pm25();
+        let g = composition_graph::decompose(&decided);
+        let (tx, _fake) = fake_pair();
+        rt.block_on(store_composition_graph(&tx, "pm25-reader", &decided, &g))
+            .expect("the composition persisted");
+        // The door a hand edit comes through, which is the one this round is about.
+        let record = DesignRecord::now(&decided, DesignSource::CompositionFile, 1);
+        rt.block_on(store_design_record(&tx, "pm25-reader", &record))
+            .expect("the record persisted");
+
+        // Nothing edited yet: both readings agree, so what follows is the edit and not the loaders.
+        assert_eq!(
+            rt.block_on(load_design_freshness(&tx, "pm25-reader"))
+                .expect("freshness reads"),
+            DesignFreshness::Current
+        );
+        assert_eq!(
+            rt.block_on(load_design_freshness_against(&tx, "pm25-reader", &decided))
+                .expect("freshness reads"),
+            DesignFreshness::Current
+        );
+
+        // The edit: the tree now states another design, and the graph holds the pair as it was accepted.
+        let edited = parse_spec(examples::INSECT_TRAP).expect("the insect trap example parses");
+        assert_eq!(
+            rt.block_on(load_design_freshness(&tx, "pm25-reader"))
+                .expect("freshness reads"),
+            DesignFreshness::Current,
+            "the store against itself cannot see a file, which is why it is not the question to ask"
+        );
+        match rt
+            .block_on(load_design_freshness_against(&tx, "pm25-reader", &edited))
+            .expect("freshness reads")
+        {
+            DesignFreshness::Stale { recorded, current } => {
+                assert_eq!(
+                    recorded, record.fingerprint,
+                    "the fingerprint the design was decided from"
+                );
+                assert_eq!(
+                    current,
+                    fingerprint(&edited),
+                    "and the one the tree states now, which is what a reader is asking about"
+                );
+            }
+            other => panic!("an edit since the decision must read as stale, got {other:?}"),
+        }
+
+        // A tree the graph has never seen is **undecided**, not unreadable: there is no decision to be
+        // stale against, and nothing was stored that could be broken.
+        assert_eq!(
+            rt.block_on(load_design_freshness_against(&tx, "another-tree", &edited))
+                .expect("freshness reads"),
+            DesignFreshness::Absent
+        );
     }
 
     #[test]

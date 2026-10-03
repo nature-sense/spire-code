@@ -3716,3 +3716,160 @@ async fn live_device_test_runs_a_cross_built_binary_on_the_board() {
     let output = result["output"].as_str().unwrap_or_default();
     println!("--- board output ---\n{output}");
 }
+
+// ===========================================================================
+// createProject/VerifyApplication: the decision is looked up by the name the
+// request states, not by the directory the tree sits in
+// ===========================================================================
+
+/// **The name the wizard hands back is what finds the decision.**
+///
+/// The whole path, not the pieces: a real memory graph, a decision filed under the *request's* name —
+/// which is where `project_creation::store_accepted_design` files it — a tree in a directory that is not
+/// that name, and the answer read off the wire through the routing a caller uses.
+///
+/// The folder and the name are apart here because they are apart in a real flow: a sheet opened on a
+/// `fixedLocation` keeps the folder it was given while the name beside it stays editable, and a caller
+/// can always file a design under a name its folder does not have. The two calls below differ **only**
+/// in `projectName`, and which half of the answer moves is the point: the *history* does (`current`
+/// against `absent`), and the *tree* does not (`ok` and `gaps` are identical). Without the parameter the
+/// pass looks the decision up under the folder's name, finds none, and reports `absent` for a project
+/// that has a decision — a claim about a project's history that nothing in the tree is wrong about, and
+/// the one failure this parameter exists to close.
+#[tokio::test]
+async fn test_verify_application_finds_the_decision_under_the_name_the_request_states() {
+    use spire_code::build::application_spec::{examples, parse_spec};
+    use spire_code::build::idf_projects::{render_composition, COMPOSITION_FILE};
+    use spire_code::subsystems::project::composition_graph::{
+        decompose, DesignRecord, DesignSource,
+    };
+    use spire_code::subsystems::project::composition_persist::{
+        load_composition_graph, store_composition_graph, store_design_record,
+    };
+
+    let system = ActorSystem::new();
+    let (graph_tx, _graph_dir) = spawn_initialized_memory_graph(&system).await;
+    let coord_tx = spawn_coordinator_with_graph(&system, graph_tx.clone(), false).await;
+
+    // The decision, filed under the name the request stated — the key a caller has to hand back.
+    let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+    let filed_name = "sensor-hub";
+    assert!(
+        store_composition_graph(&graph_tx, filed_name, &spec, &decompose(&spec))
+            .await
+            .is_some(),
+        "the composition is stored, or there would be nothing for a record to ratify"
+    );
+    assert!(
+        store_design_record(
+            &graph_tx,
+            filed_name,
+            &DesignRecord::now(&spec, DesignSource::Answers, 1)
+        )
+        .await
+        .is_some(),
+        "the decision is filed under '{filed_name}'"
+    );
+
+    // The composition reads back **out of the same store** — the half of the seam the doubles could not
+    // exercise either way, in both of its directions. The nodes: the anchor's properties go in as canonical
+    // JSON under `json_*` keys and come back parsed, so array properties (`wiring` above all) survive the
+    // round trip rather than reading as the JSON text they are stored as. The edges: a decomposed predicate
+    // is written as `Custom(<predicate>)` and has to come back as exactly that, or `reconstruct` drops every
+    // edge and rebuilds a design with no units in it from a graph that still holds all of them.
+    assert_eq!(
+        load_composition_graph(&graph_tx, filed_name)
+            .await
+            .expect("the stored composition reads back"),
+        spec,
+        "the graph holds the composition that was stored, property for property"
+    );
+
+    // The tree: the design that decision ratifies, in a directory whose name is **not** the project's.
+    let root = tempfile::tempdir().expect("a temp dir");
+    let tree = root.path().join("the-folder-the-sheet-was-pointed-at");
+    std::fs::create_dir_all(tree.join("main")).unwrap();
+    std::fs::write(
+        tree.join("main/main.cpp"),
+        "void app_main() { while (true) {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tree.join(COMPOSITION_FILE),
+        render_composition(&spec).expect("the design renders"),
+    )
+    .unwrap();
+    assert_ne!(
+        tree.file_name().and_then(|name| name.to_str()),
+        Some(filed_name),
+        "the premise: the tree's own directory is not the name its decision was filed under"
+    );
+
+    // Asked with the name the request states: the decision is found, and it still describes the design
+    // the *tree* carries rather than the copy the graph keeps beside the record.
+    let stated = route(
+        &coord_tx,
+        "createProject/VerifyApplication",
+        serde_json::json!({
+            "rootDir": tree.to_string_lossy(),
+            "projectName": filed_name,
+        }),
+    )
+    .await;
+    assert_eq!(
+        stated["freshness"]["state"],
+        serde_json::json!("current"),
+        "the decision filed under '{filed_name}' describes this composition: {stated}"
+    );
+
+    // The same tree, the same graph, the same call **without** the name. The fallback is the folder's
+    // name and no decision is filed under it — the failure the parameter closes, shown as a difference.
+    let unstated = route(
+        &coord_tx,
+        "createProject/VerifyApplication",
+        serde_json::json!({ "rootDir": tree.to_string_lossy() }),
+    )
+    .await;
+    assert_eq!(
+        unstated["freshness"]["state"],
+        serde_json::json!("absent"),
+        "the folder's name is not the name the decision is filed under: {unstated}"
+    );
+
+    // **And the two halves stay apart.** Moving the name moved no part of the tree's answer: a decision
+    // that cannot be found is a fact about a project's history, never a fault in the composition, so a
+    // project whose decision is missing is still the project the design describes, gaps and all.
+    assert_eq!(
+        stated["ok"], unstated["ok"],
+        "the tree's answer does not move with the name"
+    );
+    assert_eq!(stated["gaps"], unstated["gaps"], "and neither do its gaps");
+
+    // A hand edit to the tree — the supported way to change a design — is what the reader follows, so
+    // the same call now answers `stale` and names both fingerprints. Measured against the *tree's*
+    // design: the record agrees with the copy the graph keeps beside it and with nothing else.
+    let other = parse_spec(examples::INSECT_TRAP).expect("the other worked example parses");
+    std::fs::write(
+        tree.join(COMPOSITION_FILE),
+        render_composition(&other).expect("the other design renders"),
+    )
+    .unwrap();
+    let edited = route(
+        &coord_tx,
+        "createProject/VerifyApplication",
+        serde_json::json!({
+            "rootDir": tree.to_string_lossy(),
+            "projectName": filed_name,
+        }),
+    )
+    .await;
+    assert_eq!(
+        edited["freshness"]["state"],
+        serde_json::json!("stale"),
+        "the decision no longer describes the file a person edited: {edited}"
+    );
+    assert_ne!(
+        edited["freshness"]["recorded"], edited["freshness"]["current"],
+        "both fingerprints are named, so a reader sees *that* they differ: {edited}"
+    );
+}

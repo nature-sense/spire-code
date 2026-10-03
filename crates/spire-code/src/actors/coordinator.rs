@@ -29,7 +29,7 @@ use spire_core::transport::socket::TransportMessage;
 
 // FFI-inline RPC handlers moved into this single router (see `SetFfiDeps`).
 use crate::ffi::{dummy_tx, populate_target_graph, resolve_project_root, serialize_analysis};
-use crate::subsystems::project::composition_graph::DesignSource;
+use crate::subsystems::project::composition_graph::{DesignFreshness, DesignSource};
 use crate::subsystems::project::project_analyzer::ProjectAnalysis;
 use crate::subsystems::project::project_analyzer::ProjectAnalyzerMessage;
 use crate::subsystems::project::project_build::ProjectBuildMessage;
@@ -1894,10 +1894,14 @@ impl CoordinatorActor {
             "createProject/RepairFromBuild" => {
                 return self.handle_create_project_repair_from_build(&params).await;
             }
-            // **Did the composition land?** The design's framework and components against the sources
-            // the fill actually wrote — structural, because a fill that ignored the design still
-            // *compiles*, so nothing else would notice.
-            "createProject/VerifyApplication" => Self::verify_application(&params),
+            // **Did the composition land, and does the decision behind it still stand?** The design's
+            // framework and components against the sources the fill actually wrote — structural, because a
+            // fill that ignored the design still *compiles*, so nothing else would notice — and, beside
+            // it, the freshness of the record the design was accepted with, which only the graph can
+            // answer. The second is never a failure of the first: see `handle_verify_application`.
+            "createProject/VerifyApplication" => {
+                return self.handle_verify_application(&params).await;
+            }
             // **What the composition actually needs.** The scaffold pinned the board's BSP before the
             // composition existed; this corrects the manifest against the sources the fill wrote, so a
             // composition that reaches for no board support pins none — and its first build is the
@@ -5384,6 +5388,44 @@ impl CoordinatorActor {
         Ok(Some(spec))
     }
 
+    /// **What this tree's decision is filed under** — the key the record is looked up by.
+    ///
+    /// `projectName` when the caller states it, and otherwise the name of the root being checked,
+    /// *descended through a wrapper* the way every other root resolution here does
+    /// ([`resolve_project_root`]).
+    ///
+    /// The caller's field comes first because it is the authoritative one, and a caller that scaffolded
+    /// this tree **should hand its own name back**: `store_accepted_design` keys the record by the
+    /// `projectName` the scaffold request stated — that field travels to the store untouched
+    /// (`ProjectCreationMessage::ScaffoldProject { project_name }`) — and the tree's directory is **not**
+    /// always that name. A sheet with a *fixed location* keeps the root it was handed while the name beside
+    /// it stays editable (`CreateProjectSheet.fixedLocation` seeds the field from the folder and then the
+    /// `locationField` is hidden, so the two can differ), which makes a tree that does not carry the name
+    /// its own decision was filed under reachable rather than theoretical. The root's name is the *fallback*
+    /// for a caller that states none — the wizard's default flow, where the root is `<location>/<name>` —
+    /// and not a rule the tree states: a project scaffolded under one name and verified without it reads
+    /// `absent` here, which is exactly why the field exists instead of being derived.
+    ///
+    /// `None` only when there is no name either way (no field, and a root that names no directory of its
+    /// own: `"."`, `"/"`), and the caller then answers that it could not ask rather than guessing. A
+    /// decision *could* sit under a name this reader cannot derive — a scaffold with no `projectName`
+    /// files its record under the empty one (`mem_name("", …)`, i.e. `::spire.design_record`), and the legs
+    /// that plan a tree invent one for themselves (`my_project` / `spire-app`) — so a reader that picked
+    /// one of those would be asserting a key, not looking up a project.
+    fn params_project_name(params: &serde_json::Value, root: &std::path::Path) -> Option<String> {
+        let named = params
+            .get("projectName")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        match named {
+            Some(name) => Some(name.to_string()),
+            None => resolve_project_root(root)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+        }
+    }
+
     /// `designSource` — **the door a reviewed design came through**, when the caller says it:
     /// `answers`, `composition_file` or `model` (see [`DesignSource`]).
     ///
@@ -6203,7 +6245,21 @@ impl CoordinatorActor {
     /// written by hand be checked without anyone holding a copy of it, and keeps the check from being
     /// answered by a copy the tree does not carry. Writing nothing is kept exactly: this reads the
     /// composition and never settles the record beside it.
-    fn verify_application(params: &serde_json::Value) -> serde_json::Value {
+    ///
+    /// The root and the **design it checked** come back with the gaps instead of the caller resolving
+    /// them a second time: the answer to "does the decision still stand?" is about the same design as
+    /// these gaps, and a second read of `composition.spire` would be a second design if a person is
+    /// editing while the pass runs.
+    fn verify_application_against(
+        params: &serde_json::Value,
+    ) -> Result<
+        (
+            std::path::PathBuf,
+            crate::build::application_spec::ApplicationSpec,
+            Vec<String>,
+        ),
+        serde_json::Value,
+    > {
         let root = params
             .get("rootDir")
             .and_then(|v| v.as_str())
@@ -6211,21 +6267,103 @@ impl CoordinatorActor {
             .trim()
             .to_string();
         if root.is_empty() {
-            return serde_json::json!({
+            return Err(serde_json::json!({
                 "error": "createProject/VerifyApplication needs 'rootDir': the application the \
                           composition was to be written into"
-            });
+            }));
         }
-        let spec = match Self::application_for_pass(
-            params,
-            "createProject/VerifyApplication",
-            std::path::Path::new(&root),
-        ) {
-            Ok(spec) => spec,
+        let root = std::path::PathBuf::from(root);
+        let spec = Self::application_for_pass(params, "createProject/VerifyApplication", &root)?;
+        let gaps = crate::build::idf_projects::composition_gaps(&root, &spec);
+        Ok((root, spec, gaps))
+    }
+
+    /// The pass's answer as it goes over the wire: **whether the composition landed** (`ok`, and the
+    /// gaps that say why not) and **whether the decision behind that design still stands** (`freshness`).
+    ///
+    /// Two questions in one answer, and deliberately not the same kind of thing: `ok` is about the tree
+    /// and it asks the caller to do something, while a stale or absent decision is a fact about the
+    /// project's history that nothing in the tree is wrong about. One shape for the two, so the second is
+    /// never written as though it moved the first.
+    fn verify_application_answer(
+        gaps: &[String],
+        freshness: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({ "ok": gaps.is_empty(), "gaps": gaps, "freshness": freshness })
+    }
+
+    /// `createProject/VerifyApplication`, with the graph added to it — the one part of this pass that
+    /// cannot be answered out of the tree.
+    ///
+    /// The structural half is pure and answers what the tree says ([`Self::verify_application_against`]).
+    /// What this adds is the **decision recorded behind that design**, which the leg that accepted the
+    /// design stored (`project_creation::store_accepted_design`) and which no file in the tree carries:
+    /// *does the decision still describe the application in front of me?*
+    ///
+    /// **Answered against the design the tree states** — the one the check above just ran against — and
+    /// not against the copy the graph keeps beside the record. That pair agrees by construction (the
+    /// accepting leg writes it together), so asking there can only ever be told the store agrees with
+    /// itself. `composition.spire` is the file a person edits, and an edit since the decision is exactly
+    /// what reads `stale` here.
+    ///
+    /// **Nothing here can fail the pass.** A graph that cannot be reached, a record that is stored and
+    /// broken, a tree the graph has never seen: each is something `freshness` *says* (`unknown`, with the
+    /// reason) and `ok` is left exactly as the structural check left it. A stale design is not a broken
+    /// tree — editing the composition is the supported way to change a design — so a caller that could
+    /// not tell the two apart could act on neither.
+    async fn handle_verify_application(&self, params: &serde_json::Value) -> serde_json::Value {
+        let (root, spec, gaps) = match Self::verify_application_against(params) {
+            Ok(checked) => checked,
             Err(error) => return error,
         };
-        let gaps = crate::build::idf_projects::composition_gaps(std::path::Path::new(&root), &spec);
-        serde_json::json!({ "ok": gaps.is_empty(), "gaps": gaps })
+        let freshness = self.design_freshness(params, &root, &spec).await;
+        Self::verify_application_answer(&gaps, freshness)
+    }
+
+    /// **Does the decision behind a design still describe it?** — read out of the memory graph, as this
+    /// pass answers it.
+    ///
+    /// `unknown` is the one state here that is not a [`DesignFreshness`]: it is this *reader* saying it
+    /// could not ask (a record that is stored and broken, a tree whose root names no project), and it is
+    /// kept apart from `absent` for the same reason `absent` is kept apart from `stale`. A screen that
+    /// said "nobody has decided this" for a graph it never reached would be inventing a history for a
+    /// project that has one.
+    async fn design_freshness(
+        &self,
+        params: &serde_json::Value,
+        root: &std::path::Path,
+        spec: &crate::build::application_spec::ApplicationSpec,
+    ) -> serde_json::Value {
+        let Some(project_name) = Self::params_project_name(params, root) else {
+            return serde_json::json!({
+                "state": "unknown",
+                "why": "the tree's root has no name, so there is nothing to look its decision up by"
+            });
+        };
+        match crate::subsystems::project::composition_persist::load_design_freshness_against(
+            &self.memory_graph_tx,
+            &project_name,
+            spec,
+        )
+        .await
+        {
+            Ok(freshness) => Self::freshness_json(&freshness),
+            Err(why) => serde_json::json!({ "state": "unknown", "why": why }),
+        }
+    }
+
+    /// A [`DesignFreshness`] as it is answered: the state's name, and for `stale` the two fingerprints —
+    /// so a reader sees *that* they differ, without re-deriving either.
+    fn freshness_json(freshness: &DesignFreshness) -> serde_json::Value {
+        match freshness {
+            DesignFreshness::Absent => serde_json::json!({ "state": "absent" }),
+            DesignFreshness::Current => serde_json::json!({ "state": "current" }),
+            DesignFreshness::Stale { recorded, current } => serde_json::json!({
+                "state": "stale",
+                "recorded": recorded,
+                "current": current,
+            }),
+        }
     }
 
     /// `createProject/FinalizeManifest` — the manifest's dependencies, settled against the composition
@@ -7526,45 +7664,102 @@ mod verify_application_tests {
             "void app_main() { while (true) {} }\n",
         )
         .unwrap();
-        let reply = CoordinatorActor::verify_application(&serde_json::json!({
-            "rootDir": root.path().to_string_lossy(),
-            "application": parse_spec(examples::PM25_METER).expect("the worked example parses"),
-        }));
-        assert_eq!(reply["ok"], serde_json::json!(false), "{reply}");
-        let gaps = reply["gaps"].as_array().expect("gaps");
+        let (checked, design, gaps) =
+            CoordinatorActor::verify_application_against(&serde_json::json!({
+                "rootDir": root.path().to_string_lossy(),
+                "application": parse_spec(examples::PM25_METER).expect("the worked example parses"),
+            }))
+            .expect("the check runs");
+        assert_eq!(
+            checked.as_path(),
+            root.path(),
+            "the root it checked comes back with the gaps"
+        );
+        assert_eq!(
+            design,
+            parse_spec(examples::PM25_METER).expect("the worked example parses"),
+            "and so does the design it checked against, which is what the freshness is asked about"
+        );
         assert_eq!(
             gaps.len(),
             1,
-            "the framework, and nothing else: no component of the design was re-declared here: {reply}"
+            "the framework, and nothing else: no component of the design was re-declared here: {gaps:?}"
         );
         assert!(
-            gaps[0]
-                .as_str()
-                .expect("a gap is a sentence")
-                .contains("uses no `spire::Actor"),
-            "{reply}"
+            // The framework is named as one backticked run — `spire::Actor / spire::Scheduler /
+            // spire::Registry` — so this asserts the opening of it, closing backtick and all.
+            gaps[0].contains("uses no `spire::Actor"),
+            "the one gap names the framework's absence: {gaps:?}"
         );
 
         // And the three requests that cannot be answered are errors, not passes.
         assert!(
-            CoordinatorActor::verify_application(&serde_json::json!({}))["error"].is_string(),
+            CoordinatorActor::verify_application_against(&serde_json::json!({})).unwrap_err()
+                ["error"]
+                .is_string(),
             "no design, no tree: an error"
         );
         assert!(
-            CoordinatorActor::verify_application(&serde_json::json!({
+            CoordinatorActor::verify_application_against(&serde_json::json!({
                 "rootDir": "",
                 "application": parse_spec(examples::PM25_METER).unwrap(),
-            }))["error"]
+            }))
+            .unwrap_err()["error"]
                 .is_string(),
             "a design with no tree to check it against: an error"
         );
         assert!(
-            CoordinatorActor::verify_application(&serde_json::json!({
+            CoordinatorActor::verify_application_against(&serde_json::json!({
                 "rootDir": root.path().to_string_lossy(),
                 "application": { "framework": "actors" },
-            }))["error"]
+            }))
+            .unwrap_err()["error"]
                 .is_string(),
             "something that is not a spec: an error, never a pass"
+        );
+    }
+
+    /// **One answer, two questions, and the second never moves the first.** `ok` is about the *tree* and
+    /// it is what asks a caller to act; a stale or absent decision is a fact about the project's history.
+    /// A design that was accepted and then edited by hand leaves the tree exactly as correct as it was — so
+    /// `ok` stays what the structural check made it, and what a reader gets is `freshness` beside it.
+    #[test]
+    fn a_decision_that_moved_on_is_reported_beside_ok_and_never_in_it() {
+        let stale = CoordinatorActor::freshness_json(&DesignFreshness::Stale {
+            recorded: "0123456789abcdef".to_string(),
+            current: "fedcba9876543210".to_string(),
+        });
+        assert_eq!(stale["state"], serde_json::json!("stale"));
+        assert_eq!(stale["recorded"], serde_json::json!("0123456789abcdef"));
+        assert_eq!(stale["current"], serde_json::json!("fedcba9876543210"));
+
+        let answer = CoordinatorActor::verify_application_answer(
+            &["the composition never mentions `spire::Actor`".to_string()],
+            stale.clone(),
+        );
+        assert_eq!(answer["ok"], serde_json::json!(false), "{answer}");
+        assert_eq!(
+            answer["freshness"], stale,
+            "the decision is carried as it read: {answer}"
+        );
+
+        // The composition landed and the decision no longer applies: **a pass all the same.** Editing the
+        // composition is the supported way to change a design, so a tree carrying the edited one is not a
+        // tree with a gap in it.
+        let answer = CoordinatorActor::verify_application_answer(&[], stale);
+        assert_eq!(answer["ok"], serde_json::json!(true), "{answer}");
+        assert_eq!(answer["gaps"], serde_json::json!([]), "{answer}");
+
+        // And the two states that are not a verdict on a design: nobody decided it, and a reader that
+        // could not ask at all (which is not a `DesignFreshness` variant — see `design_freshness`).
+        assert_eq!(
+            CoordinatorActor::freshness_json(&DesignFreshness::Absent)["state"],
+            serde_json::json!("absent"),
+            "asked, and nobody has decided, which is not the same as stale"
+        );
+        assert_eq!(
+            CoordinatorActor::freshness_json(&DesignFreshness::Current)["state"],
+            serde_json::json!("current")
         );
     }
 
@@ -7593,17 +7788,24 @@ mod verify_application_tests {
 
         // No `application` in the request at all: the file is what there is to check against, and the
         // flat tree is still refused against it — by the framework the file states, not by luck.
-        let reply = CoordinatorActor::verify_application(&serde_json::json!({
-            "rootDir": root.path().to_string_lossy(),
-        }));
-        assert_eq!(reply["ok"], serde_json::json!(false), "{reply}");
-        let gaps = reply["gaps"].as_array().expect("gaps");
+        let (checked, design, gaps) =
+            CoordinatorActor::verify_application_against(&serde_json::json!({
+                "rootDir": root.path().to_string_lossy(),
+            }))
+            .expect("the check runs against the file");
+        assert_eq!(
+            checked.as_path(),
+            root.path(),
+            "the root it checked comes back with the gaps"
+        );
+        assert_eq!(
+            design, spec,
+            "and the design that comes back is the one the tree's own file states"
+        );
         assert!(
-            gaps.iter().any(|gap| gap
-                .as_str()
-                .expect("a gap is a sentence")
-                .contains("uses no `spire::Actor")),
-            "the gap is the one the composition's framework decides: {reply}"
+            // As above: the framework names are one backticked run, so the opening is what is asserted.
+            gaps.iter().any(|gap| gap.contains("uses no `spire::Actor")),
+            "the gap is the one the composition's framework decides: {gaps:?}"
         );
 
         // And the manifest pass reads the same file: this `main/` reaches for no board support, so the
@@ -7665,23 +7867,91 @@ mod verify_application_tests {
         )
         .unwrap();
 
-        let reply = CoordinatorActor::verify_application(&serde_json::json!({
-            "rootDir": root.path().to_string_lossy(),
-            "application": &handed_in,
-        }));
-        let gaps = reply["gaps"].as_array().expect("gaps");
-        let text = gaps
-            .iter()
-            .filter_map(|gap| gap.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let (checked, design, gaps) =
+            CoordinatorActor::verify_application_against(&serde_json::json!({
+                "rootDir": root.path().to_string_lossy(),
+                "application": &handed_in,
+            }))
+            .expect("the check runs");
+        assert_eq!(checked.as_path(), root.path());
+        assert_eq!(
+            design, authored,
+            "the design that comes back is the tree's, not the copy the caller handed in"
+        );
+        let text = gaps.join("\n");
         assert!(
             text.contains("spire::Actor"),
-            "the tree states `actors`, and that is the design the pass checked: {reply}"
+            "the tree states `actors`, and that is the design the pass checked: {gaps:?}"
         );
         assert!(
             !text.contains("`ramen`"),
-            "the copy handed in states `ramen`, which is not the design this tree has: {reply}"
+            "the copy handed in states `ramen`, which is not the design this tree has: {gaps:?}"
+        );
+    }
+
+    /// **The key the decision is looked up by.** The caller's name when it states one (trimmed, and an
+    /// empty field is nothing said); otherwise the root's own name, descended through a wrapper the way the
+    /// roots are resolved everywhere else. What is asserted here is *which* name is asked, because a reader
+    /// that spelled it differently than the scaffold did would report `absent` for a project that has a
+    /// decision — the failure this parameter exists to close.
+    ///
+    /// The caller's field wins because the *tree does not carry the name its record was filed under*: the
+    /// scaffold stores it under the request's `projectName`, and a sheet with a fixed location keeps the
+    /// root while the name stays editable. The fallback is the default flow (`<location>/<name>`), where the
+    /// two coincide — which is why it is a fallback and not the rule.
+    #[test]
+    fn the_name_a_decision_is_looked_up_by_is_the_callers_when_it_states_one() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let project = root.path().join("pm25-meter");
+        std::fs::create_dir_all(&project).unwrap();
+        // A build file, so this directory *is* the project rather than another wrapper to descend.
+        std::fs::write(project.join("CMakeLists.txt"), "").unwrap();
+
+        // Stated: taken as given, trimmed — and this is the name the scaffold filed the record under, even
+        // when it differs from the directory the tree sits in (a fixed-location sheet, a renamed folder).
+        assert_eq!(
+            CoordinatorActor::params_project_name(
+                &serde_json::json!({ "projectName": "  what-the-person-typed  " }),
+                &project
+            ),
+            Some("what-the-person-typed".to_string()),
+            "the caller's own name, which is the key the record was written with"
+        );
+        // Nothing said, twice: a missing field and an empty one are the same thing — the fallback, not a
+        // project named " ".
+        assert_eq!(
+            CoordinatorActor::params_project_name(&serde_json::json!({}), &project),
+            Some("pm25-meter".to_string()),
+            "the root's own name, which is what the default flow (`<location>/<name>`) makes it"
+        );
+        assert_eq!(
+            CoordinatorActor::params_project_name(
+                &serde_json::json!({ "projectName": "   " }),
+                &project
+            ),
+            Some("pm25-meter".to_string()),
+            "an empty field is nothing said, not a name"
+        );
+
+        // Handed the **wrapper**: the name comes from the project inside it, the way every other root
+        // resolution here descends (`resolve_project_root`), so a sheet that opens the outer folder still
+        // asks about the project.
+        assert_eq!(
+            CoordinatorActor::params_project_name(&serde_json::json!({}), root.path()),
+            Some("pm25-meter".to_string()),
+            "the project, not the folder that holds it"
+        );
+
+        // And a root with no name to be looked up by at all is *not* guessed at: the caller answers
+        // `unknown` (see `design_freshness`) rather than looking under one the writers invent
+        // (`my_project` / `spire-app`) or asserting the empty name a nameless scaffold files under.
+        assert_eq!(
+            CoordinatorActor::params_project_name(
+                &serde_json::json!({}),
+                std::path::Path::new("/")
+            ),
+            None,
+            "a filesystem root names no project"
         );
     }
 }

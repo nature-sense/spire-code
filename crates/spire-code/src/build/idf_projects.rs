@@ -5076,7 +5076,14 @@ mod tests {
             .filter(|path| path.contains("/include/"))
             .collect();
 
-        for ident in ["sampler", "air_quality", "view", "touch", "power", "messages"] {
+        for ident in [
+            "sampler",
+            "air_quality",
+            "view",
+            "touch",
+            "power",
+            "messages",
+        ] {
             let flat = format!("components/{ident}/include/{ident}.hpp");
             assert!(headers.contains(&flat), "{flat} is emitted:\n{headers:#?}");
             assert!(
@@ -5718,10 +5725,7 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
             header.contains("class Sampler final : public spire::Actor<messages::Tick>"),
             "{header}"
         );
-        assert!(
-            header.contains("#include <messages.hpp>"),
-            "{header}"
-        );
+        assert!(header.contains("#include <messages.hpp>"), "{header}");
         let messages = &manifest("components/messages/include/messages.hpp").content;
         for message in [
             "struct Tick {}",
