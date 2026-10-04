@@ -476,3 +476,79 @@ units:
         "and no model was asked to repair it: the file is the thing to fix"
     );
 }
+
+/// **The composition, read back off a project** — the door the composition panel opens.
+///
+/// The third way a design reaches a screen, and the only one that reads a *tree*: `idf_component_edit`
+/// builds a unit's Write from the design the project states, so the panel that lists the components shows
+/// that same design back (`project/applicationDesign`). Routed through the coordinator rather than
+/// exercised at `idf_projects`, because the **route** is what a viewer depends on — a method nothing
+/// answers comes back as an "unknown method" rather than as a design.
+#[tokio::test]
+async fn the_design_a_project_states_is_read_back_for_reading() {
+    use spire_code::build::application_spec::{parse_spec, ApplicationSpec};
+    use spire_code::build::idf_projects::{render_composition, APPLICATION_FILE, COMPOSITION_FILE};
+
+    let designed = parse_spec(examples::PM25_METER).expect("the worked example parses");
+    let root = tempfile::tempdir().expect("a temp dir");
+    std::fs::write(
+        root.path().join(COMPOSITION_FILE),
+        render_composition(&designed).expect("it renders"),
+    )
+    .unwrap();
+    // A record beside it that disagrees, to prove the read **settles nothing**: a viewer is not a leg that
+    // writes a tree, so the record is still wrong afterwards.
+    std::fs::write(root.path().join(APPLICATION_FILE), "{ not a composition }").unwrap();
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let url = fake_llm_logging(vec![examples::PM25_METER.to_string()], log.clone());
+    let coord = app(&url).await;
+
+    let result = call(
+        &coord,
+        "project/applicationDesign",
+        serde_json::json!({ "root": root.path().to_string_lossy() }),
+    )
+    .await;
+
+    assert_eq!(
+        result["file"],
+        serde_json::json!(COMPOSITION_FILE),
+        "the file to open to change the design travels with it: {result}"
+    );
+    let read_back: ApplicationSpec = serde_json::from_value(result["spec"].clone())
+        .unwrap_or_else(|e| panic!("the spec comes back: {e}\n{result}"));
+    assert_eq!(
+        read_back, designed,
+        "and it is the design the tree states: {result}"
+    );
+    assert_eq!(
+        result["yaml"],
+        serde_json::json!(render_composition(&designed).unwrap()),
+        "the composition as the file holds it is shown beside the reading: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(APPLICATION_FILE)).unwrap(),
+        "{ not a composition }",
+        "reading the design wrote nothing"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "no model was asked: the design was already written down"
+    );
+
+    // A project nobody has designed states nothing — an answer, not an error, and no file named.
+    let undesigned = tempfile::tempdir().expect("a temp dir");
+    let result = call(
+        &coord,
+        "project/applicationDesign",
+        serde_json::json!({ "root": undesigned.path().to_string_lossy() }),
+    )
+    .await;
+    assert!(
+        result.get("error").is_none(),
+        "nothing stated is not a failure: {result}"
+    );
+    assert_eq!(result["spec"], serde_json::Value::Null, "{result}");
+    assert_eq!(result["file"], serde_json::Value::Null, "{result}");
+}

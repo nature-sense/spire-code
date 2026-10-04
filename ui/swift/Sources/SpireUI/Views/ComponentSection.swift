@@ -19,6 +19,7 @@ struct ComponentSection: View {
     @State private var adding = false
     @State private var editing: SubprojectInfo?
     @State private var removing: SubprojectInfo?
+    @State private var historyFor: SubprojectInfo?
     @State private var busy: String?
     @State private var failure: String?
     @State private var outcome: String?
@@ -75,6 +76,9 @@ struct ComponentSection: View {
         .sheet(item: $editing) { component in
             ComponentSheet(mode: .edit(component), root: project.root) { finish($0) }
         }
+        .sheet(item: $historyFor) { component in
+            ComponentEditHistorySheet(root: project.root, component: component.name)
+        }
         .alert(
             "Remove \(removing?.name ?? "")?",
             isPresented: Binding(
@@ -98,6 +102,22 @@ struct ComponentSection: View {
             // complete, it is what the library *is*, and both operations are refused if asked for
             // anyway. Offering the buttons would be inviting a refusal.
             if component.componentFramework == nil {
+                // The recorded edits for this component: a log of what was asked and what the gate
+                // did, readable before or after a Write rather than only in its result.
+                Button {
+                    failure = nil
+                    outcome = nil
+                    historyFor = component
+                } label: {
+                    // Named, not a bare clock: the recorded edits are the only place the words typed into
+                    // a Write are kept, so the way in has to be readable without hovering for it.
+                    Label("History", systemImage: "clock.arrow.circlepath")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .disabled(busy != nil)
+                .help("Recorded edits for this component")
                 Button("Write") {
                     failure = nil
                     outcome = nil
@@ -151,8 +171,11 @@ struct ComponentSection: View {
     private func finish(_ result: ComponentSheet.Result) {
         busy = nil
         switch result {
-        case .ok(let summary):
-            outcome = summary
+        case .ok(let instruction, let summary):
+            // The sheet is gone by the time this is read, so what was asked is echoed above what the run
+            // did. A stub add asks for nothing, so its empty instruction contributes no line.
+            let asked = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+            outcome = asked.isEmpty ? summary : "You asked:\n\(asked)\n\n\(summary)"
             Task { await bridge.fetchProjectAnalysis() }
         case .failed(let message):
             failure = message

@@ -570,3 +570,71 @@ fn test_mcp_get_tools_unknown_server() {
     // Should return an empty array for unknown server
     assert_eq!(response["result"], serde_json::json!([]));
 }
+
+/// `idf-component/history` is answerable over **both** names the app uses, and refuses a request
+/// that names no component rather than answering with an empty log.
+///
+/// The edit-history pane is the only caller of this method, and the app reaches it two ways: the
+/// dashed method name (`SpireBridge.componentEditHistory` sends `idf-component/history` directly) and
+/// the tool name through `tools/call` (what the tool registry advertises). Both are pinned here
+/// because the dispatch lives in two places — a `method ==` arm and the `tool ==` inside it — and a
+/// divergence between them is invisible in a unit test that calls the handler directly.
+///
+/// The graph is hermetic (`CoreProcess::spawn` gives each test its own data dir), so the history is
+/// legitimately empty: what is asserted is the **shape** the pane decodes — `success`, the component
+/// echoed back, and `history` as a list — not a count, which is a fact about this temp dir.
+#[test]
+fn test_idf_component_history_is_answerable_over_both_names() {
+    let mut core = CoreProcess::spawn();
+    let root = "/tmp/spire-integration-library";
+
+    // 1. The dashed method, as the bridge calls it.
+    let by_method = core.request(
+        "idf-component/history",
+        serde_json::json!({ "root": root, "name": "sps30", "limit": 5 }),
+    );
+    assert!(
+        by_method["result"].get("error").is_none(),
+        "the method must be dispatched, not answered with `Method not found`: {by_method}"
+    );
+    assert_eq!(by_method["result"]["success"], true);
+    assert_eq!(by_method["result"]["component"], "sps30");
+    let history = by_method["result"]["history"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`history` is the list the pane iterates: {by_method}"));
+    assert_eq!(
+        by_method["result"]["count"].as_u64().unwrap_or(99),
+        history.len() as u64,
+        "the count is the list's own length, so a pane can trust either"
+    );
+
+    // 2. The same call by tool name, through `tools/call` — the spelling the registry advertises.
+    let by_tool = core.request_with_id(
+        2,
+        "tools/call",
+        serde_json::json!({
+            "tool": "idf_component_history",
+            "args": { "root": root, "name": "sps30", "limit": 5 }
+        }),
+    );
+    assert_eq!(by_tool["id"], 2);
+    assert_eq!(
+        by_tool["result"], by_method["result"],
+        "one handler, so the two spellings cannot disagree about what a history is"
+    );
+
+    // 3. A request that names no component: a refusal, and one that says which argument was missing.
+    let refused = core.request_with_id(
+        3,
+        "idf-component/history",
+        serde_json::json!({ "name": "sps30" }),
+    );
+    assert_eq!(refused["result"]["success"], false);
+    assert!(
+        refused["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("root"),
+        "the refusal names the argument that was missing: {refused}"
+    );
+}

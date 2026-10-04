@@ -152,7 +152,8 @@ pub fn platform_seed_payload(p: &Platform) -> serde_json::Value {
 
 /// Rebuild a `crate::platform::Platform` from the generic registry JSON node the
 /// knowledge crate returns for `Platform` nodes.
-/// The capability blocks an entry declares — `capabilities:`, `realized:`, `pins:`, `companions:` —
+/// The capability blocks an entry declares — `capabilities:`, `realized:`, `pins:`, `companions:`,
+/// `devices:` —
 /// read from its **YAML document**, not through the typed `Platform`.
 ///
 /// Raw on purpose, and it is the same reading `generic_helpers` already does for `library_hints`.
@@ -170,7 +171,7 @@ pub fn capability_blocks(platform: &crate::platform::Platform) -> Option<serde_j
         .find(|path| path.is_file())?;
     let doc: serde_json::Value = serde_yaml::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let mut out = serde_json::Map::new();
-    for key in ["capabilities", "realized", "pins", "companions"] {
+    for key in ["capabilities", "realized", "pins", "companions", "devices"] {
         if let Some(block) = doc.get(key) {
             out.insert(key.to_string(), block.clone());
         }
@@ -229,7 +230,8 @@ mod capability_block_tests {
     }
 
     /// The bootstrap payload carries the blocks **flattened** into the shape `spire-core`'s seeder
-    /// consumes — `capabilities` as names, `realizes`/`carries` as edge lists — never the raw tree.
+    /// consumes — `capabilities` as names, `realizes`/`carries`/`devices` as edge/part lists — never
+    /// the raw tree.
     /// A raw tree compiles and reads fine on this side while the seeder finds no array to iterate,
     /// seeding platform nodes and no capability nodes or edges at all; this is the test that pins
     /// the handoff, which nothing on either side covered before.
@@ -248,6 +250,7 @@ mod capability_block_tests {
             boards.join("board.yaml"),
             "id: board\nname: Board\nos: esp-idf\nchip: esp32p4\n\
              realized:\n  media:\n    camera: { interface: mipi-csi, via: esp32p4 }\n\
+             devices:\n  display: { role: media.camera, part: GC0308, bus: camera }\n\
              companions:\n  - chip: esp32c5\n    role: radio\n",
         )
         .unwrap();
@@ -269,6 +272,15 @@ mod capability_block_tests {
         assert_eq!(blocks["realizes"][0]["capability"], "media.camera");
         assert_eq!(blocks["realizes"][0]["properties"]["via"], "esp32p4");
         assert_eq!(blocks["carries"][0]["chip"], "esp32c5");
+        // A device travels flattened too: the name, the `role` capability it is, and the rest as
+        // edge properties — never the raw mapping with `role` still inside it.
+        assert_eq!(blocks["devices"][0]["device"], "display");
+        assert_eq!(blocks["devices"][0]["role"], "media.camera");
+        assert_eq!(blocks["devices"][0]["properties"]["part"], "GC0308");
+        assert!(
+            blocks["devices"][0]["properties"].get("role").is_none(),
+            "`role` is the edge's endpoint, not also a property: {blocks}"
+        );
         assert!(
             blocks.get("realized").is_none() && blocks.get("companions").is_none(),
             "the raw keys must not travel: the seeder reads `realizes`/`carries`: {blocks}"

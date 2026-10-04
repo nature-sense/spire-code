@@ -71,6 +71,7 @@ pub async fn resolved_profile(
     let mut realizes: Vec<Value> = Vec::new();
     let mut carries: Vec<Value> = Vec::new();
     let mut pins: Vec<Value> = Vec::new();
+    let mut devices: Vec<Value> = Vec::new();
 
     for edge in &edges_of(graph, board_id).await? {
         match &edge.edge_type {
@@ -114,6 +115,27 @@ pub async fn resolved_profile(
                     "properties": values(edge),
                 }));
             }
+            // A part the board carries: the `Device` node is the name an application's `resources:`
+            // refers to, the `devices` edge carries the board's values for it (`part`, `bus`,
+            // `address`), and the part's `role` — the capability it *is* — is a second edge out of the
+            // device node, so it is read from there and never duplicates the vocabulary.
+            RelationshipType::Devices if edge.from_id == board_id => {
+                let name = edge
+                    .to_id
+                    .strip_prefix(&format!("{board_id}/devices/"))
+                    .unwrap_or(&edge.to_id)
+                    .to_string();
+                let device_edges = edges_of(graph, &edge.to_id).await?;
+                let role = device_edges
+                    .iter()
+                    .find(|e| e.edge_type == RelationshipType::Role && e.from_id == edge.to_id)
+                    .map(|e| e.to_id.clone());
+                devices.push(json!({
+                    "name": name,
+                    "role": role,
+                    "properties": values(edge),
+                }));
+            }
             _ => {}
         }
     }
@@ -123,5 +145,6 @@ pub async fn resolved_profile(
         "realizes": realizes,
         "carries": carries,
         "pins": pins,
+        "devices": devices,
     }))
 }

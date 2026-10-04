@@ -14,6 +14,13 @@ struct WelcomeView: View {
     @Environment(AppTheme.self) private var theme
     @State private var isOpening = false
 
+    /// The gate on the new board/resource flow, and the only way between the two. Off by default:
+    /// the wizard is what people have. On, the wizard is **gated off** and the experimental entry
+    /// stands in its place — reachable from here and nowhere else, until it can do what the wizard
+    /// does.
+    @AppStorage("experimentalFlow") private var experimentalFlow = false
+    @State private var showExperimentalFlow = false
+
     var body: some View {
         VStack(spacing: 32) {
             masthead
@@ -23,6 +30,7 @@ struct WelcomeView: View {
                 newColumn
             }
             .frame(maxWidth: 960)
+            experimentalFooter
             Spacer(minLength: 0)
         }
         .padding(.top, 44)
@@ -30,6 +38,25 @@ struct WelcomeView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(theme.background)
         .onAppear { bridge.loadRecentProjects() }
+        .sheet(isPresented: $showExperimentalFlow) {
+            BoardResourceFlowView()
+                .environment(bridge)
+                .environment(theme)
+        }
+    }
+
+    /// The experimental flow's own door. It stands **where the wizard was** when the flag is on: the
+    /// old flow is gated off, not merely joined, so there is one way to start a project at a time and
+    /// the switch below is the only way between them.
+    private var experimentalFooter: some View {
+        HStack(spacing: 12) {
+            Spacer()
+            Toggle("Experimental board & resources flow", isOn: $experimentalFlow)
+                .toggleStyle(.switch)
+                .font(.caption)
+                .foregroundStyle(theme.textSecondary)
+        }
+        .frame(maxWidth: 960)
     }
 
     // MARK: - Masthead
@@ -156,10 +183,39 @@ struct WelcomeView: View {
     private var newColumn: some View {
         VStack(alignment: .leading, spacing: ProjectListMetrics.columnSpacing) {
             columnHeading("New project")
-            ProjectTypePicker()
+            if experimentalFlow {
+                experimentalEntry
+            } else {
+                ProjectTypePicker()
+            }
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// What stands where the project types do while the experimental flow is on — the old wizard is
+    /// gated off, so a project starts one way at a time and the switch is what changes which.
+    private var experimentalEntry: some View {
+        VStack(alignment: .leading, spacing: ProjectListMetrics.groupSpacing) {
+            SectionHeading("Board & resources (experimental)")
+            Button { showExperimentalFlow = true } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "cpu").font(.title3)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Choose a board and its resources").font(.callout.weight(.medium))
+                        Text("The new flow — no project type, no wizard")
+                            .font(.caption)
+                            .foregroundStyle(theme.textSecondary)
+                    }
+                    Spacer(minLength: 8)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 8).fill(theme.surface))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
     }
 
     private func columnHeading(_ title: String) -> some View {

@@ -403,6 +403,16 @@ fn record_to_json(node: &AttrNode) -> serde_json::Value {
         "verified": prop("verified"),
         "up_to_date": prop("up_to_date"),
         "files_changed": prop("files_changed"),
+        // The rest of the record, so a history pane shows the whole run and not just its headline:
+        // what the chip gate did, what could not be checked, and the files that were reverted or left
+        // alone. `component`/`library` are what a caller reads a record *as* when several components'
+        // histories sit in one list. All additive — an older reader ignores what it does not know.
+        "files_reverted": prop("files_reverted"),
+        "files_skipped": prop("files_skipped"),
+        "chip_build": prop("chip_build"),
+        "caveats": prop("caveats"),
+        "component": prop("component"),
+        "library": prop("library"),
         "at": node.created_at.to_rfc3339(),
     })
 }
@@ -613,5 +623,54 @@ mod tests {
         assert_eq!(first_line("   "), "");
         let long = "y".repeat(MAX_DESCRIPTION_CHARS + 10);
         assert!(first_line(&long).ends_with('…'));
+    }
+
+    /// The whole record reaches the caller, not just its headline: the chip gate's word, what could
+    /// not be checked, and the files that were reverted or left alone — the properties a history pane
+    /// reads. Additive to the inline window the edit tool already returns.
+    #[tokio::test]
+    async fn the_record_carries_the_whole_run_not_just_its_headline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let graph = fresh_graph(tmp.path()).await;
+        let root = "/home/someone/spire-idf";
+        let changed = vec!["src/sps30.cpp".to_string()];
+        let reverted = vec!["src/sps30_test.cpp".to_string()];
+        let caveats = vec!["no board: the chip build did not run".to_string()];
+
+        record_component_edit(
+            &graph,
+            &EditFacts {
+                instruction: "Read PM2.5 from the SPS30.",
+                component: "sps30",
+                root,
+                success: false,
+                verified: "HostOnly",
+                up_to_date: false,
+                files_changed: &changed,
+                files_reverted: &reverted,
+                files_skipped: &[],
+                chip_build: "not run: no chip named",
+                caveats: &caveats,
+            },
+        )
+        .await
+        .expect("record the edit");
+
+        let history = component_edit_history(&graph, root, "sps30", 5).await;
+        assert_eq!(history.len(), 1, "{history:#?}");
+        let record = &history[0];
+        assert_eq!(record["chip_build"], "not run: no chip named");
+        assert_eq!(
+            record["caveats"],
+            serde_json::json!(["no board: the chip build did not run"])
+        );
+        assert_eq!(
+            record["files_reverted"],
+            serde_json::json!(["src/sps30_test.cpp"])
+        );
+        assert_eq!(record["files_skipped"], serde_json::json!([]));
+        assert_eq!(record["component"], "sps30");
+        assert_eq!(record["library"], "spire-idf");
+        assert_eq!(record["success"], serde_json::json!(false));
     }
 }

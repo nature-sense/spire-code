@@ -10,11 +10,31 @@ struct CapabilityBlocks: Codable, Hashable {
     let provides: [CapabilityEdge]
     let carries: [CompanionEdge]
     let pins: [PinFunction]
+    /// The **parts** the entry declares (`devices:`) — each with the capability it *is* and its own
+    /// values (`part`, `bus`, `address`).
+    ///
+    /// Decoded **tolerantly**: a reply from a core older than the device layer omits the key, and a
+    /// required field would fail the whole `platforms/config` decode — an empty screen rather than a
+    /// missing group. `[]` says "declares no parts", which is the truth for a chip.
+    let devices: [BoardDevice]
 
-    /// True when the entry declares nothing at all — so the screen can say so rather than draw four
-    /// empty groups.
+    enum CodingKeys: String, CodingKey {
+        case realizes, provides, carries, pins, devices
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        realizes = try container.decode([CapabilityEdge].self, forKey: .realizes)
+        provides = try container.decode([CapabilityEdge].self, forKey: .provides)
+        carries = try container.decode([CompanionEdge].self, forKey: .carries)
+        pins = try container.decode([PinFunction].self, forKey: .pins)
+        devices = try container.decodeIfPresent([BoardDevice].self, forKey: .devices) ?? []
+    }
+
+    /// True when the entry declares nothing at all — so the screen can say so rather than draw empty
+    /// groups.
     var isEmpty: Bool {
-        realizes.isEmpty && provides.isEmpty && carries.isEmpty && pins.isEmpty
+        realizes.isEmpty && provides.isEmpty && carries.isEmpty && pins.isEmpty && devices.isEmpty
     }
 }
 
@@ -88,6 +108,13 @@ enum JSONValue: Codable, Hashable {
         case .object(let o): try container.encode(o)
         case .null: try container.encodeNil()
         }
+    }
+
+    /// The scalar text, when this is a string — a property read by name (`bus`, `address`) rather
+    /// than rendered. `nil` for anything else, so a caller can tell "absent" from "empty".
+    var stringValue: String? {
+        if case .string(let s) = self { return s }
+        return nil
     }
 
     /// A scalar's text. A list or object is summarised into one line so a value row stays a row —

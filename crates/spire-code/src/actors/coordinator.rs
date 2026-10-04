@@ -932,14 +932,20 @@ impl CoordinatorActor {
         Some(changes)
     }
 
-    /// `idf_component_edit` — write or change one component's protocol.
+    /// `idf_component_edit` — write or change one component of a library, or one **unit** of an
+    /// application.
     ///
     /// The spine is `modify/code`'s; what differs is the **gate**. A component is accepted when its own
     /// host test compiles and passes, which needs no board, no chip and no IDF — so a protocol can be
-    /// written and checked in seconds rather than in the minutes an `idf.py build` takes. The chip build
-    /// is the second, *optional* gate: it catches what a host test cannot (a wrong `REQUIRES`, a link
-    /// error against the real IDF driver) and runs only when the caller names a chip. When it does not
-    /// run, the report says so rather than implying the code was checked against one.
+    /// written and checked in seconds rather than in the minutes an `idf.py build` takes. That gate is the
+    /// same for every kind, which is why one path serves them: a driver's host test stands a fake bus in
+    /// for the device that is not there, and a **unit** of an application — an actor or a stage — is
+    /// compiled against the framework and the fakes its own test build already names. What the model is
+    /// *given* is where the kinds part: a driver is written from a datasheet, a unit from the reviewed
+    /// design the application carries (`component_edit_request` takes the branch). The chip build is the
+    /// second, *optional* gate: it catches what a host test cannot (a wrong `REQUIRES`, a link error
+    /// against the real IDF driver) and runs only when the caller names a chip. When it does not run, the
+    /// report says so rather than implying the code was checked against one.
     async fn handle_idf_component_edit(&self, args: &serde_json::Value) -> serde_json::Value {
         let root = args
             .get("root")
@@ -962,7 +968,8 @@ impl CoordinatorActor {
         if root.is_empty() || name.is_empty() {
             return serde_json::json!({
                 "success": false,
-                "error": "idf_component_edit needs 'root' (the component library) and 'name' (the component)",
+                "error": "idf_component_edit needs 'root' (the component library, or the application \
+                          whose unit is being edited) and 'name' (the component or unit)",
             });
         }
         let root = std::path::PathBuf::from(root);
@@ -1119,6 +1126,53 @@ impl CoordinatorActor {
             // accumulating rather than being claimed. Empty is honest: nothing recorded yet.
             "history": history,
             "output": report.summary(),
+        })
+    }
+
+    /// `idf-component/history` — the recorded edits of one component, newest first.
+    ///
+    /// Read-only, and answered here because the record lives in the memory graph this actor owns
+    /// (`memory_graph_tx`) — the same store `idf-component/edit` writes to. That tool's response
+    /// already embeds the last few records; this method is the on-demand read behind a history pane, so
+    /// a caller can ask for more than the inline window shows, or read the record with no edit in flight.
+    async fn handle_idf_component_history(&self, args: &serde_json::Value) -> serde_json::Value {
+        let root = args
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let component = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if root.is_empty() || component.is_empty() {
+            return serde_json::json!({
+                "success": false,
+                "error": "idf_component_history needs 'root' (the component library) and 'name' (the component)",
+            });
+        }
+        // Bounded like the write side: a stray `limit` cannot pull the whole store, and the reader
+        // orders within its own (generous) ceiling before truncating to this.
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as u32;
+        let history = crate::build::edit_history::component_edit_history(
+            &self.memory_graph_tx,
+            &root,
+            &component,
+            limit,
+        )
+        .await;
+        serde_json::json!({
+            "success": true,
+            "component": component,
+            "count": history.len(),
+            "history": history,
         })
     }
 
@@ -1798,6 +1852,24 @@ impl CoordinatorActor {
             return self.handle_idf_component_edit(&args).await;
         }
 
+        // `idf-component/history` — a component's recorded edits, read straight from the memory graph.
+        // It lives here (and not in the build manager) because the record does, and it needs no model:
+        // the graph is the whole answer.
+        if method == "idf-component/history"
+            || (method == "tools/call"
+                && params.get("tool").and_then(|v| v.as_str()) == Some("idf_component_history"))
+        {
+            let args = if method == "tools/call" {
+                params
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                params.clone()
+            };
+            return self.handle_idf_component_history(&args).await;
+        }
+
         // `idf-design/application` — the design phase, before any component exists. It lives here for
         // the same reason `idf-component/edit` does: the leg that decides needs the planning model, and
         // the spec it returns is a thing a person approves before anything is written.
@@ -1890,6 +1962,15 @@ impl CoordinatorActor {
             // through.
             "createProject/ParseComposition" => {
                 Self::handle_create_project_parse_composition(&params)
+            }
+            // **The design a project states, read back for reading only.** The composition panel's whole
+            // answer: what an application in front of the user is *made of*. It is the same reading
+            // `idf_component_edit` builds a unit's Write from (`idf_projects::read_application`), so what
+            // is shown is what the code is written from. It writes nothing — looking at a design is not a
+            // leg that is about to write a tree — which is why it is answered here rather than through a
+            // `tools/call`.
+            "project/applicationDesign" => {
+                return Self::handle_project_application_design(&params);
             }
             "createProject/RepairFromBuild" => {
                 return self.handle_create_project_repair_from_build(&params).await;
@@ -3180,6 +3261,25 @@ impl CoordinatorActor {
                 }
             }
 
+            // ── Capability vocabulary ──
+            // The **catalogue**, not a board's facts: every capability path a device `role:` may name,
+            // grouped by category. Read straight from the embedded vocabulary, which is also what
+            // validates a board's `devices:` and an application's `resources[].role`, so the picker
+            // and the validator are one source and cannot offer a name the writer would refuse.
+            "capabilities/vocabulary" => {
+                let categories: Vec<serde_json::Value> =
+                    crate::capability_vocabulary::categorized_paths()
+                        .into_iter()
+                        .map(|(category, capabilities)| {
+                            serde_json::json!({
+                                "category": category,
+                                "capabilities": capabilities,
+                            })
+                        })
+                        .collect();
+                serde_json::json!({ "categories": categories })
+            }
+
             // ── Platform configuration (the full view) ──
             // Everything the configuration screen shows, read from the **graph** — the canonical
             // store — not the registry YAML, which is only the seed. The platform nodes carry the
@@ -3233,6 +3333,7 @@ impl CoordinatorActor {
                     let mut provides = Vec::new();
                     let mut carries = Vec::new();
                     let mut pins = Vec::new();
+                    let mut devices = Vec::new();
                     for e in &edges {
                         let properties =
                             serde_json::to_value(&e.properties).unwrap_or(serde_json::Value::Null);
@@ -3266,6 +3367,40 @@ impl CoordinatorActor {
                                     "properties": properties,
                                 }));
                             }
+                            // A part the board carries: the `Device` node's name is what an
+                            // application's `resources:` refers to; the board's values ride the
+                            // `devices` edge, and the part's `role` is a second edge out of the
+                            // device node, looked up here so it is *read*, never re-derived.
+                            RelationshipType::Devices if e.from_id == platform.id => {
+                                let name = e
+                                    .to_id
+                                    .strip_prefix(&format!("{}/devices/", platform.id))
+                                    .unwrap_or(&e.to_id)
+                                    .to_string();
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = graph
+                                    .send(MemoryGraphMessage::GetRelationships {
+                                        node_id: e.to_id.clone(),
+                                        reply_to: tx,
+                                    })
+                                    .await;
+                                let device_edges = rx
+                                    .await
+                                    .unwrap_or_else(|_| Ok(Vec::new()))
+                                    .unwrap_or_default();
+                                let role = device_edges
+                                    .iter()
+                                    .find(|d| {
+                                        d.edge_type == RelationshipType::Role
+                                            && d.from_id == e.to_id
+                                    })
+                                    .map(|d| d.to_id.clone());
+                                devices.push(serde_json::json!({
+                                    "name": name,
+                                    "role": role,
+                                    "properties": properties,
+                                }));
+                            }
                             _ => {}
                         }
                     }
@@ -3279,6 +3414,7 @@ impl CoordinatorActor {
                             "provides": provides,
                             "carries": carries,
                             "pins": pins,
+                            "devices": devices,
                         }),
                     };
                     out.push(serde_json::to_value(listing).unwrap_or(serde_json::Value::Null));
@@ -6174,6 +6310,76 @@ impl CoordinatorActor {
         }
     }
 
+    /// `project/applicationDesign` — **the design a project states, read back for reading only.**
+    ///
+    /// The composition panel's whole answer: what the application in front of the user is *made of*. It
+    /// is the same reading `idf_component_edit` builds a unit's Write from
+    /// ([`idf_projects::read_application`](crate::build::idf_projects::read_application)), so what is
+    /// shown here is what the code is written from — a viewer that resolved the design a second way could
+    /// show an architecture the units are not built from.
+    ///
+    /// **It writes nothing**, which is why it reads through `read_application` and not its settling
+    /// sibling: a person looking at a design is not a leg that is about to write a tree, and a read that
+    /// rewrote the record beside the composition would make opening the panel a change.
+    ///
+    /// The answer carries the three things a viewer needs. `spec` is the design itself, so it can be
+    /// shown a field at a time; `yaml` is
+    /// [`idf_projects::render_composition`](crate::build::idf_projects::render_composition) of it — the
+    /// composition **as the file holds it**, which is the text shown beneath the reading; and `file` names
+    /// which of the two files on the tree it came from (`composition.spire` is the source a person edits,
+    /// `SPIRE.application.json` the record an application scaffolded before it carries), so the viewer can
+    /// name the file to open to change the design.
+    ///
+    /// `Ok(None)` is an answer rather than a failure — a tree nobody has designed yet states nothing — and
+    /// it comes back with nulls, for the caller to say so. A composition that is there and does not hold
+    /// together is an error, exactly as it is for the edit leg: a viewer that fell back to the record when
+    /// the file was broken would show a design the tree does not have.
+    fn handle_project_application_design(params: &serde_json::Value) -> serde_json::Value {
+        use crate::build::idf_projects::{
+            read_application, render_composition, APPLICATION_FILE, COMPOSITION_FILE,
+        };
+
+        let root = params
+            .get("root")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if root.is_empty() {
+            return serde_json::json!({
+                "error": "project/applicationDesign needs 'root': the project whose design is to be read"
+            });
+        }
+        let root = std::path::PathBuf::from(root);
+
+        let spec = match read_application(&root) {
+            Ok(spec) => spec,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let Some(spec) = spec else {
+            // Nothing stated rather than a failure: a project before its design states no design, and a
+            // null file says the same about *where* it would be.
+            return serde_json::json!({ "file": null, "spec": null, "yaml": null });
+        };
+
+        // Which file holds the design is the thing to open to change it, so it travels with the design.
+        let file = if root.join(COMPOSITION_FILE).is_file() {
+            COMPOSITION_FILE
+        } else {
+            APPLICATION_FILE
+        };
+        let yaml = match render_composition(&spec) {
+            Ok(yaml) => yaml,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        match serde_json::to_value(&spec) {
+            Ok(spec) => serde_json::json!({ "file": file, "spec": spec, "yaml": yaml }),
+            Err(e) => serde_json::json!({
+                "error": format!("the design could not be serialized: {e}")
+            }),
+        }
+    }
+
     /// The reviewed composition a `createProject/*` pass runs against: **the tree's**, and the caller's
     /// copy only for a tree that states none.
     ///
@@ -7953,6 +8159,88 @@ mod verify_application_tests {
             ),
             None,
             "a filesystem root names no project"
+        );
+    }
+}
+
+#[cfg(test)]
+mod application_design_tests {
+    use super::*;
+
+    /// **The design the panel shows is the design the tree states**, read back whole and in both of the
+    /// shapes the viewer needs — and read *without writing*.
+    ///
+    /// The record beside the composition is left deliberately wrong, so that "writes nothing" is a fact
+    /// this test states rather than an intention: the settling read would have repaired it, and this read
+    /// must not, because opening a viewer is not a leg that writes a tree.
+    #[test]
+    fn the_design_reads_back_with_its_file_and_composition() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let root = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            root.path()
+                .join(crate::build::idf_projects::COMPOSITION_FILE),
+            crate::build::idf_projects::render_composition(&spec).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path()
+                .join(crate::build::idf_projects::APPLICATION_FILE),
+            "{ this is not a composition }",
+        )
+        .unwrap();
+
+        let reply = CoordinatorActor::handle_project_application_design(
+            &serde_json::json!({ "root": root.path().to_string_lossy() }),
+        );
+        assert_eq!(
+            reply["file"],
+            serde_json::json!(crate::build::idf_projects::COMPOSITION_FILE),
+            "the file the design is read from names the thing to open: {reply}"
+        );
+        assert_eq!(
+            reply["spec"],
+            serde_json::to_value(&spec).expect("the design serializes"),
+            "the design comes back whole: {reply}"
+        );
+        assert_eq!(
+            reply["yaml"],
+            serde_json::json!(crate::build::idf_projects::render_composition(&spec).unwrap()),
+            "and so does the composition as the file holds it: {reply}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                root.path()
+                    .join(crate::build::idf_projects::APPLICATION_FILE)
+            )
+            .unwrap(),
+            "{ this is not a composition }",
+            "reading the design wrote nothing: the record is exactly as it was"
+        );
+
+        // A tree nobody designed states nothing — an answer, not an error, with no file named either.
+        let undesigned = tempfile::tempdir().expect("a temp dir");
+        let reply = CoordinatorActor::handle_project_application_design(
+            &serde_json::json!({ "root": undesigned.path().to_string_lossy() }),
+        );
+        assert!(
+            reply.get("error").is_none(),
+            "nothing stated is not a failure: {reply}"
+        );
+        assert_eq!(reply["spec"], serde_json::Value::Null, "{reply}");
+        assert_eq!(reply["yaml"], serde_json::Value::Null, "{reply}");
+        assert_eq!(reply["file"], serde_json::Value::Null, "{reply}");
+
+        // A root that was not given is refused by name rather than read as the current directory.
+        let reply = CoordinatorActor::handle_project_application_design(&serde_json::json!({}));
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("'root'"),
+            "the refusal names the field it needs: {reply}"
         );
     }
 }

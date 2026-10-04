@@ -4138,13 +4138,13 @@ executable('{project_name}-{platform}',
             },
             spire_core::actors::ToolInfo {
                 name: "idf_component_edit".to_string(),
-                description: "Write or change one component of an ESP-IDF component library. What the model is given follows from the component's kind, which the component states in its own CMakeLists.txt: a `driver` gets the bus seam and the invariants a protocol keeps, a `library` gets the invariants pure code keeps — and both get the library's SPIRE.md, the component's own header, and the same gate. The change is kept only if the component's host test still compiles and passes (no board, no chip, no IDF) — otherwise every file is rolled back byte-for-byte. Naming a chip adds the chip build as a second gate; without one the result says the chip build did not run.".to_string(),
+                description: "Write or change one component of an ESP-IDF component library, or one **unit** of an ESP-IDF application. What the model is given follows from the component's kind, which the component states in its own CMakeLists.txt: a `driver` gets the bus seam and the invariants a protocol keeps, a `library` gets the invariants pure code keeps, and an `actor` or a `stage` — a unit of an application — gets the **reviewed design** the application carries (its message and the peers it sends to, or the value it pulls and pushes, plus the wiring and the board facts) and the framework's own rules. A library's component also gets the library's SPIRE.md and the component's own header. Both get the same gate: the change is kept only if the component's host test still compiles and passes (no board, no chip, no IDF) — otherwise every file is rolled back byte-for-byte. Naming a chip adds the chip build as a second gate; without one the result says the chip build did not run.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "root": { "type": "string", "description": "The component library directory" },
-                        "name": { "type": "string", "description": "The component to write or change" },
-                        "instruction": { "type": "string", "description": "What the user knows: for a driver, the datasheet material the protocol is written from; for a library, what the code should do and with what inputs and outputs" },
+                        "root": { "type": "string", "description": "The component library directory, or — for a unit — the application directory that holds `components/<name>/` and states its design in `SPIRE.application.json` (or `composition.spire`)" },
+                        "name": { "type": "string", "description": "The component or unit to write or change" },
+                        "instruction": { "type": "string", "description": "What the user knows: for a driver, the datasheet material the protocol is written from; for a library, what the code should do and with what inputs and outputs; for a unit (an actor or a stage), what it should do with the message it receives, or the value it pulls" },
                         "platform": { "type": "string", "description": "A chip to build for as a second gate (e.g. esp32s3); omitted means the host test is the whole check" }
                     },
                     "required": ["root", "name"]
@@ -4205,6 +4205,19 @@ executable('{project_name}-{platform}',
                         "target": { "type": "string", "description": "Specific build target within the project" }
                     },
                     "required": ["path"]
+                }),
+            },
+            spire_core::actors::ToolInfo {
+                name: "idf_component_history".to_string(),
+                description: "The recorded edits of one component of an ESP-IDF component library — or of one unit (an actor or a stage) of an ESP-IDF application — newest first: what was asked, whether the gate kept the change, how far verification reached, and which files moved. Read-only — the same records `idf_component_edit` echoes in its response, but fetched on demand (and beyond the inline window) for a history pane.".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "root": { "type": "string", "description": "The component library root" },
+                        "name": { "type": "string", "description": "The component whose history is read" },
+                        "limit": { "type": "integer", "description": "How many records to return, newest first (default 50, max 200)" }
+                    },
+                    "required": ["root", "name"]
                 }),
             },
             spire_core::actors::ToolInfo {

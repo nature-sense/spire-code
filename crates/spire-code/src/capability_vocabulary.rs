@@ -501,6 +501,23 @@ pub fn is_known_path(path: &str) -> bool {
         .any(|known| known == path)
 }
 
+/// The capability paths a device `role:` may name, grouped by their **category** — the catalogue an
+/// application's non-board resources are picked from.
+///
+/// The grouping lives here, beside the walk that produces the paths, so a picker and the validator
+/// cannot disagree: every path returned is one [`is_known_path`] accepts, because both are
+/// [`capability_paths`] over the same embedded vocabulary. Categories with no paths are omitted, and
+/// each group's paths are sorted, so a picker's sections are stable.
+pub fn categorized_paths() -> Vec<(String, Vec<String>)> {
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for path in capability_paths(&vocabulary()["categories"]) {
+        let category = path.split('.').next().unwrap_or(&path).to_string();
+        groups.entry(category).or_default().push(path);
+    }
+    groups.into_iter().collect()
+}
+
 /// The device roles in a `devices:` block the vocabulary does not know, as `name (role …)` — a
 /// device claiming to *be* a capability nobody named.
 ///
@@ -901,5 +918,44 @@ mod refusal_tests {
             got.get("capabilities").is_none(),
             "all refused, nothing named: {got}"
         );
+    }
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use super::*;
+
+    /// The catalogue a resource's `role` is picked from: every path a device may name, grouped by
+    /// category and sorted. It has to be the **same walk** [`is_known_path`] uses, or a picker could
+    /// offer a name the writer refuses — so every listed path is checked against the validator.
+    #[test]
+    fn the_catalogue_groups_known_paths_by_category() {
+        let catalogue = categorized_paths();
+        assert!(!catalogue.is_empty(), "the vocabulary is not empty");
+
+        let categories: Vec<&str> = catalogue.iter().map(|(c, _)| c.as_str()).collect();
+        let mut sorted = categories.clone();
+        sorted.sort();
+        assert_eq!(categories, sorted, "categories are sorted");
+        assert!(
+            catalogue.iter().all(|(_, paths)| !paths.is_empty()),
+            "no category is offered empty"
+        );
+
+        // Offer and accept are one source: nothing in the catalogue may be refused by the validator.
+        for (_, paths) in &catalogue {
+            for path in paths {
+                assert!(is_known_path(path), "`{path}` is offered and must be known");
+            }
+        }
+
+        // The nesting rule is the walk's: `media.video.encode` is a path, `media.video` is not.
+        let media = catalogue
+            .iter()
+            .find(|(c, _)| c == "media")
+            .expect("media is a category");
+        assert!(media.1.iter().any(|p| p == "media.video.encode"));
+        assert!(media.1.iter().any(|p| p == "media.display"));
+        assert!(!media.1.iter().any(|p| p == "media.video"));
     }
 }

@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import SwiftUI
 @testable import SpireUI
 
 /// The `platforms/list` payload, as the wizard consumes it.
@@ -198,6 +199,25 @@ func deviceProcessListingDescribesWhatIsRunning() throws {
 func bridgeInit() {
     let bridge = SpireBridge()
     #expect(bridge != nil)
+}
+
+/// The history sheet has to carry its own size, because macOS sizes a sheet to the fitting size of
+/// its content *at presentation* — and this one's records arrive asynchronously. Sized by its
+/// content it was laid out while the view still said "Reading the record…", so it opened at about a
+/// third of its height (560×146) and grew into place afterwards. Assert the sheet's size, which must
+/// not depend on what has loaded.
+@Test("The history sheet is a fixed size, not the height of its loading state")
+@MainActor
+func componentEditHistorySheetIsFixedSize() {
+    let host = NSHostingController(
+        rootView: ComponentEditHistorySheet(root: "/tmp/unused", component: "demo")
+            .environment(SpireBridge())
+            .environment(AppTheme())
+    )
+    host.view.layoutSubtreeIfNeeded()
+    let size = host.view.fittingSize
+    #expect(size.width == 560)
+    #expect(size.height == 550)
 }
 
 // MARK: - FileTree watcher-event regression tests
@@ -550,6 +570,52 @@ func designReplyDecodes() throws {
         id: "preprocess", kind: "stage", pulls: "frames", pushes: "tensors"
     )
     #expect(stage.summary == "stage: pulls frames, pushes tensors")
+}
+
+/// The **composition panel's** reply, as the viewer reads it — a design read back *off a tree* rather
+/// than one a model has just chosen.
+///
+/// It is the same `ApplicationDesign` the review decodes, shown beneath the file it came from, so this
+/// pins the shape the panel adds: `spec` (the design), `yaml` (the composition as the file holds it), and
+/// `file` (which file to open to change it). The design a tree states is the one a unit's Write is written
+/// from, and its line names the drivers a unit `uses` — the wording a person reads here is the wording the
+/// code is written under.
+@Test("A design read back off a tree decodes with the file it came from")
+func readBackDesignDecodes() throws {
+    let json = """
+    {
+      "file": "composition.spire",
+      "spec": {
+        "framework": "actors",
+        "board": { "chip": "esp32s3", "bsp": "waveshare/esp32_s3" },
+        "board_facts": [ { "bus": "i2c", "device": "sps30", "address": "0x69" } ],
+        "units": [
+          { "id": "sps30", "kind": "component", "role": "driver", "source": "stub",
+            "provides": "PM1/2.5/4/10 readings", "bus": "i2c" },
+          { "id": "sampler", "kind": "actor", "message": "Tick", "state": "both sensors",
+            "uses": ["sps30"], "sends_to": ["air_quality"] }
+        ],
+        "wiring": ["sampler -> air_quality"]
+      },
+      "yaml": "framework: actors\\nboard:\\n  chip: esp32s3\\n"
+    }
+    """
+
+    let reply = (try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]) ?? [:]
+    let spec = (reply["spec"] as? [String: Any]) ?? [:]
+    let design: ApplicationDesign = try MessageSerializer.decode(
+        try JSONSerialization.data(withJSONObject: spec)
+    )
+
+    // The file names the thing a person opens to change the design, rather than the step that read it.
+    #expect(reply["file"] as? String == "composition.spire")
+    #expect(design.components.map(\.id) == ["sps30"])
+    // The line a reviewer reads is the one a Write is written under: the drivers the actor wraps are
+    // named (`uses`), not left to the code.
+    #expect(design.composition.first?.summary
+            == "actor on Tick, holding both sensors, uses sps30, sends to air_quality")
+    // The composition as the file holds it travels beside the reading, for the panel's lower half.
+    #expect((reply["yaml"] as? String)?.contains("framework: actors") == true)
 }
 
 /// The design form's six answers become the `description` the design request is built from.
@@ -1105,4 +1171,459 @@ func aScaffoldReportDecodesAndReEncodes() throws {
             "nothing to say is sent as nothing: \(quietJSON)")
 }
 
+/// The edit-history record, as `component_edit_history` emits it.
+///
+/// The pane exists to show the **whole** run — what the chip gate did, what could not be checked, and
+/// the files that were reverted or left alone — so every one of those keys is pinned here against the
+/// exact JSON `record_to_json` produces. A key that silently stopped decoding would drop a fact the
+/// user opened the log to read, and would do it without an error.
+///
+/// The second half is the reason the decoder is lenient: records written before those properties
+/// existed are still in the graph, and a history that refuses to decode is worse than one with a gap.
+@Test("An edit record decodes the whole run, and a legacy one still opens")
+func editRecordsDecode() throws {
+    let json = """
+    {
+      "instruction": "Read PM2.5 from the SPS30.",
+      "success": false,
+      "verified": "HostOnly",
+      "up_to_date": false,
+      "files_changed": ["src/sps30.cpp"],
+      "files_reverted": ["src/sps30_test.cpp"],
+      "files_skipped": [],
+      "chip_build": "not run: no chip named",
+      "caveats": ["no board: the chip build did not run"],
+      "component": "sps30",
+      "library": "spire-idf",
+      "at": "2026-10-03T14:09:37+00:00"
+    }
+    """
+    let record = try JSONDecoder().decode(ComponentEditRecord.self, from: Data(json.utf8))
+    #expect(record.component == "sps30")
+    #expect(record.library == "spire-idf", "what the row reads as when several histories share a list")
+    #expect(!record.success, "the gate refused, and the log says so")
+    #expect(record.verified == "HostOnly")
+    #expect(record.filesChanged == ["src/sps30.cpp"])
+    #expect(record.filesReverted == ["src/sps30_test.cpp"])
+    #expect(record.filesSkipped.isEmpty, "an empty list is a fact — nothing was skipped")
+    #expect(record.chipBuild == "not run: no chip named")
+    #expect(record.caveats == ["no board: the chip build did not run"])
+    #expect(record.at == "2026-10-03T14:09:37+00:00")
+
+    // A record from before the extended keys: the six it always had, and nothing else.
+    let legacy = """
+    {
+      "instruction": "Add a temperature read.",
+      "success": true,
+      "verified": "WithTarget",
+      "up_to_date": true,
+      "files_changed": [],
+      "at": "2026-09-01T08:00:00+00:00"
+    }
+    """
+    let old = try JSONDecoder().decode(ComponentEditRecord.self, from: Data(legacy.utf8))
+    #expect(old.instruction == "Add a temperature read.", "the record is not lost")
+    #expect(old.upToDate, "`up_to_date` is not `success` — nothing moved because it need not")
+    #expect(old.chipBuild.isEmpty, "a missing key reads as absent, not as a refusal")
+    #expect(old.caveats.isEmpty)
+    #expect(old.component.isEmpty)
+}
+
+/// The two knowledge-graph payloads, as the graph pane consumes them.
+///
+/// `queryGraph` and `getRelationships` answer the same node shape with one difference that matters to
+/// the pane: a query returns a node's edges **inside** the node (`relationships`), while a traversal
+/// returns them as one flat list beside the nodes. Both are pinned here — including the camelCase
+/// `fromId`/`toId`, which is what the Rust side actually sends (`e.from_id` / `e.to_id` in
+/// `project_query.rs`) and the one thing a hand-written model gets wrong. Snake_case here would not
+/// throw; it would decode every node and then draw no edges at all.
+@Test("A graph query and a traversal decode, edges and all")
+func knowledgeGraphsDecode() throws {
+    let query = """
+    {
+      "total": 2,
+      "nodes": [
+        {
+          "id": "n-project", "name": "Spire", "type": "Project", "subtype": null,
+          "description": "The project.", "properties": { "root": "/x" },
+          "relationships": [
+            { "id": "r1", "type": "BelongsTo", "fromId": "n-entity", "toId": "n-project" },
+            { "id": "r2", "type": "HasEdit", "fromId": "n-project", "toId": "n-entity" }
+          ]
+        },
+        {
+          "id": "n-entity", "name": "SPS30", "type": "Entity", "subtype": "Class",
+          "description": null, "properties": {},
+          "relationships": [
+            { "id": "r1", "type": "BelongsTo", "fromId": "n-entity", "toId": "n-project" }
+          ]
+        }
+      ]
+    }
+    """
+    let graph = try JSONDecoder().decode(KnowledgeGraphResult.self, from: Data(query.utf8))
+    #expect(graph.total == 2)
+    #expect(graph.nodes.count == 2)
+    #expect(graph.nodes[0].type == "Project", "the type is what the ring layout colours by")
+    #expect(graph.nodes[0].subtype == nil, "absent, not empty")
+    #expect(graph.nodes[1].subtype == "Class", "the finer label survives")
+    #expect(graph.nodes[1].relationships?.count == 1)
+    #expect(graph.nodes[1].relationships?.first?.fromId == "n-entity",
+            "camelCase is what the core sends; snake_case would decode to an empty pane")
+    #expect(graph.nodes[1].relationships?.first?.toId == "n-project")
+    #expect(graph.nodes[1].relationships?.first?.type == "BelongsTo")
+    #expect(graph.nodes[0].relationships?.first?.weight == nil,
+            "a query edge carries no weight; it is optional, not required")
+    #expect(graph.nodes[0].description == "The project.", "a description is carried when present")
+
+    // A traversal: the same nodes without `description`/`relationships`, edges in one list beside them.
+    let traversal = """
+    {
+      "startNodeId": "n-project",
+      "nodes": [
+        { "id": "n-project", "name": "Spire", "type": "Project", "subtype": null },
+        { "id": "n-entity", "name": "SPS30", "type": "Entity", "subtype": "Class" }
+      ],
+      "relationships": [
+        { "id": "r1", "type": "BelongsTo", "fromId": "n-entity", "toId": "n-project", "weight": 1.0 }
+      ],
+      "totalNodes": 2,
+      "totalRelationships": 1
+    }
+    """
+    let edges = try JSONDecoder().decode(GraphRelationshipsResult.self, from: Data(traversal.utf8))
+    #expect(edges.startNodeId == "n-project", "the traversal is anchored, and the pane needs the anchor")
+    #expect(edges.nodes.count == 2)
+    #expect(edges.nodes[0].relationships == nil, "a traversal node carries no nested edges")
+    #expect(edges.relationships.count == 1)
+    #expect(edges.relationships[0].weight == 1.0)
+    #expect(edges.totalNodes == 2 && edges.totalRelationships == 1)
+}
+
+/// The contract-drift report, as `modify-contract` returns it.
+///
+/// The pane's whole point is the **arithmetic**: `drift_before` against `drift_after`, with the
+/// interfaces that closed, that were rolled back, and that are still open. A count that failed to
+/// decode would not throw — it would read as `0`, which is the one number the report must not invent.
+/// The refusal shape (`{"success": false, "error": …}`) is the second half: that is what "no platform
+/// selected" comes back as, and it must open as a refusal rather than as an unreadable error.
+@Test("A drift report decodes its counts, and a refusal decodes as a refusal")
+func driftReportsDecode() throws {
+    let json = """
+    {
+      "success": true,
+      "drift_before": 4,
+      "drift_after": 1,
+      "gaps_closed": ["rpi5/ISensor", "rpi5/IGpio"],
+      "gaps_reverted": ["rock3c/IUart"],
+      "gaps_remaining": ["rpi5/IClock"],
+      "output": "closed:\\n  rpi5/ISensor\\n  rpi5/IGpio\\nreverted:\\n  rock3c/IUart\\nstill open:\\n  rpi5/IClock"
+    }
+    """
+    let report = try JSONDecoder().decode(ModifyContractReport.self, from: Data(json.utf8))
+    #expect(report.success)
+    #expect(report.driftBefore == 4, "a count is a number, not a string the pane parses")
+    #expect(report.driftAfter == 1)
+    #expect(report.gapsClosed == ["rpi5/ISensor", "rpi5/IGpio"], "`platform/interface` is the unit")
+    #expect(report.gapsReverted == ["rock3c/IUart"],
+            "a rolled-back round is a fact the report keeps, not one it hides")
+    #expect(report.gapsRemaining == ["rpi5/IClock"])
+    #expect(report.output.contains("still open:\n  rpi5/IClock"),
+            "the coordinator's own summary arrives verbatim, newlines and all")
+    #expect(report.error == nil, "a run carries no error, even when it left drift behind")
+
+    // The refusal: the shape the coordinator sends when there is no path, and before that when there
+    // is no platform. The cascade never ran, so there is nothing to count — and `error` is the reason.
+    let refusal = """
+    {
+      "success": false,
+      "error": "modify-contract needs a project path",
+      "output": "Modify contract: needs a project path; nothing was changed."
+    }
+    """
+    let refused = try JSONDecoder().decode(ModifyContractReport.self, from: Data(refusal.utf8))
+    #expect(!refused.success)
+    #expect(refused.error == "modify-contract needs a project path", "the reason survives as the reason")
+    #expect(refused.output.contains("nothing was changed"), "so does what the refusal says happened")
+    #expect(refused.driftBefore == 0 && refused.driftAfter == 0)
+    #expect(refused.gapsClosed.isEmpty && refused.gapsReverted.isEmpty && refused.gapsRemaining.isEmpty)
+}
+
+
+
+// MARK: - The experimental board/resource flow
+
+/// A **board profile** decodes its declared parts, and a part's own values are read by name.
+///
+/// The `devices` array is the read the flow seeds its resource list from: the name is what a
+/// resource is called, the role is the capability it *is*, and `bus`/`address` are what a spec
+/// carries. A dropped key here would show a resource with no wiring rather than an error — the same
+/// quiet failure this suite pins elsewhere — so each is asserted.
+@Test("A board profile decodes its declared parts")
+func boardProfileDecodesDevices() throws {
+    let profile = try JSONDecoder().decode(BoardProfile.self, from: Data(profileFixture.utf8))
+
+    #expect(profile.board == "m5stack-core-s3")
+    #expect(profile.devices.count == 12, "the board's whole `devices:` block comes back")
+    #expect(
+        profile.devices.map(\.name) == [
+            "audio_in", "audio_out", "camera", "display", "expander", "imu",
+            "magnetometer", "pmu", "proximity", "rtc", "sd", "touch",
+        ],
+        "the core sends them in name order, and the flow shows them in that order")
+
+    let display = try #require(profile.devices.first { $0.name == "display" })
+    #expect(display.role == "media.display")
+    #expect(display.part == "ILI9342C")
+    #expect(display.bus == "display")
+    #expect(display.address == "", "a part the board gave no address is empty, not \"\" written by the core")
+
+    let rtc = try #require(profile.devices.first { $0.name == "rtc" })
+    #expect(rtc.address == "0x51", "an address is a property read by name")
+    #expect(rtc.bus == "i2c_internal")
+
+    // `resolved_profile` sends `via`/`provides` on a `realizes` entry; the shared `CapabilityEdge`
+    // ignores unknown keys rather than failing, so the profile still decodes whole.
+    #expect(profile.realizes.count == 7)
+    #expect(profile.realizes.first?.capability == "io.usb")
+    #expect(profile.pins.map(\.function).contains("i2c_internal"), "the wiring reads back too")
+}
+
+/// The **capability vocabulary** decodes as categories of paths — the catalogue a resource's role is
+/// picked from, and the same one the core validates against.
+@Test("The capability vocabulary decodes as categories")
+func vocabularyDecodesCategories() throws {
+    // The live `capabilities/vocabulary` reply, verbatim — categories in the vocabulary's own order,
+    // paths sorted within each.
+    let json = """
+    { "categories": [
+        { "capabilities": ["compute.cpu", "compute.gpu", "compute.ml"], "category": "compute" },
+        { "capabilities": ["io.buses", "io.can", "io.ethernet", "io.expander", "io.gpio", "io.pcie", "io.usb"], "category": "io" },
+        { "capabilities": ["media.audio", "media.camera", "media.display", "media.touch", "media.video.decode", "media.video.encode"], "category": "media" },
+        { "capabilities": ["power.battery", "power.pmu", "power.poe"], "category": "power" },
+        { "capabilities": ["radio.bluetooth", "radio.ieee802154.matter", "radio.ieee802154.thread", "radio.ieee802154.zigbee", "radio.wifi"], "category": "radio" },
+        { "capabilities": ["sensing.imu", "sensing.magnetometer", "sensing.particulate", "sensing.proximity", "sensing.temperature"], "category": "sensing" },
+        { "capabilities": ["storage.emmc", "storage.nvme", "storage.sd"], "category": "storage" },
+        { "capabilities": ["timekeeping.rtc"], "category": "timekeeping" }
+    ] }
+    """
+    let reply = try JSONDecoder().decode(VocabularyReply.self, from: Data(json.utf8))
+    #expect(
+        reply.categories.map(\.category) == [
+            "compute", "io", "media", "power", "radio", "sensing", "storage", "timekeeping",
+        ])
+    #expect(reply.categories[2].capabilities.contains("media.display"))
+
+    // The paths a board actually declares a part for are all in the catalogue — the picker and the
+    // writer's validator are one vocabulary, so anything offered can be written.
+    let offered = Set(reply.categories.flatMap(\.capabilities))
+    for role in ["media.display", "timekeeping.rtc", "io.expander", "sensing.particulate"] {
+        #expect(offered.contains(role), "\(role) is a capability the flow may offer")
+    }
+
+    // A role's own default resource name is its last segment — the same rule
+    // `toggleCatalogueResource` applies.
+    var state = BoardResourceFlowState()
+    state.toggleCatalogueResource(role: "sensing.particulate")
+    #expect(state.resources.map(\.name) == ["particulate"], "the catalogue's word becomes the resource's name")
+}
+
+/// `CapabilityBlocks` decodes **tolerantly**: a `platforms/config` reply from a core older than the
+/// device layer omits `devices`, and a required field would fail the whole reply — an empty screen
+/// rather than a missing group.
+@Test("Capability blocks decode without a devices key")
+func capabilityBlocksTolerateMissingDevices() throws {
+    let older = """
+    { "realizes": [], "provides": [], "carries": [], "pins": [] }
+    """
+    let blocks = try JSONDecoder().decode(CapabilityBlocks.self, from: Data(older.utf8))
+    #expect(blocks.devices.isEmpty, "absent devices is `no parts`, not a decode failure")
+    #expect(blocks.isEmpty)
+
+    let current = """
+    {
+      "realizes": [
+        { "capability": "io.usb", "properties": { "ports": 1, "role": "otg" } },
+        { "capability": "media.display", "properties": { "interface": "spi" } }
+      ],
+      "provides": [], "carries": [],
+      "pins": [ { "function": "i2c_internal", "properties": { "scl": "GPIO11", "sda": "GPIO12" } } ],
+      "devices": [
+        { "name": "display", "properties": { "bus": "display", "part": "ILI9342C" }, "role": "media.display" },
+        { "name": "rtc", "properties": { "address": "0x51", "bus": "i2c_internal", "part": "BM8563" }, "role": "timekeeping.rtc" }
+      ]
+    }
+    """
+    let withDevice = try JSONDecoder().decode(CapabilityBlocks.self, from: Data(current.utf8))
+    #expect(withDevice.devices.count == 2)
+    // A `platforms/config` block sends `capability` + `properties` and no `via`/`provides` — the
+    // other `realizes` shape the shared `CapabilityEdge` must accept (the profile sends both keys,
+    // null). Either way the block decodes whole.
+    #expect(withDevice.realizes.map(\.capability) == ["io.usb", "media.display"])
+    #expect(withDevice.pins.map(\.function) == ["i2c_internal"], "the wiring is read even when nothing realizes it")
+    #expect(withDevice.devices.map(\.name) == ["display", "rtc"])
+    #expect(!withDevice.isEmpty, "a declared part is something, so the block is not empty")
+}
+
+
+/// The flow's state, without a view: a chip is not offered as a board, choosing a board offers its
+/// parts **unselected** — the board *can* supply each, the application decides it *uses* it — a part
+/// toggles `via: board`, an added role becomes a `library` resource named by its last segment, a
+/// duplicate is refused, and a board part displaces an added resource that took its name.
+@Test("The board/resource flow toggles board parts and gates Continue")
+func boardResourceFlowTogglesParts() throws {
+    let platformsJSON = "[\(platformFixture(id: "m5stack-core-s3", kind: "board", embedded: true)),"
+        + "\(platformFixture(id: "esp32p4", kind: "chip", embedded: true)),"
+        + "\(platformFixture(id: "rpi5", kind: nil, embedded: false))]"
+    let platforms: [Platform] = try MessageSerializer.decode(Data(platformsJSON.utf8))
+
+    #expect(
+        BoardResourceFlowState.boards(from: platforms).map(\.id) == ["m5stack-core-s3"],
+        "a chip is not a board an application is built for")
+
+    let profile = try JSONDecoder().decode(BoardProfile.self, from: Data(profileFixture.utf8))
+    var state = BoardResourceFlowState()
+    state.choose(boardID: "m5stack-core-s3", profile: profile)
+
+    #expect(state.selectedBoardID == "m5stack-core-s3")
+    #expect(state.resources.isEmpty, "a board's parts are offered, not chosen for the application")
+    #expect(!state.canContinue, "a board alone declares no resource to build against")
+
+    // A part the board declares is selected by name: it enters the set reached `via: board`.
+    state.toggleBoardPart(name: "display")
+    let display = try #require(state.resources.first { $0.name == "display" })
+    #expect(display.via == .board, "a board's part is reached through the board")
+    #expect(display.bus == "display", "the board's bus rides into the draft")
+    #expect(display.json["address"] == nil, "an empty address is omitted, not written blank")
+    #expect(state.isBoardPartSelected("display"))
+    #expect(state.canContinue, "a board and one well-formed resource is enough")
+
+    // Selecting the same part again takes it back out — the toggle is symmetric.
+    state.toggleBoardPart(name: "display")
+    #expect(state.resources.isEmpty)
+    #expect(!state.canContinue)
+
+    // A name the board does not declare is ignored: the palette is the board's facts, not free text.
+    state.toggleBoardPart(name: "lidar")
+    #expect(state.resources.isEmpty)
+
+    // Selecting the board's `rtc` carries its wiring and role, as `display` did.
+    state.toggleBoardPart(name: "rtc")
+    let rtc = try #require(state.resources.first { $0.name == "rtc" })
+    #expect(rtc.json["address"] as? String == "0x51")
+    #expect(rtc.role == "timekeeping.rtc")
+    #expect(
+        state.resources.contains { $0.role == "timekeeping.rtc" },
+        "the selected part covers its capability — what the catalogue reads to disable a twin")
+
+    // A catalogue path: named by the role's last segment, reached through the library in v1.
+    state.toggleCatalogueResource(role: "sensing.particulate")
+    #expect(state.resources.last?.name == "particulate")
+    #expect(state.resources.last?.via == .library, "the forward-compat hook, for now")
+    #expect(state.declaresRole("sensing.particulate"), "an addition covers its capability")
+    #expect(state.declaredVia(role: "sensing.particulate") == .library, "an addition is the application's")
+    #expect(state.declaredVia(role: "timekeeping.rtc") == .board, "the board's part is the board's")
+    #expect(state.declaredVia(role: "radio.wifi") == nil, "a path nothing carries is open")
+
+    // The toggle is symmetric: choosing the same path again takes the addition back out.
+    state.toggleCatalogueResource(role: "sensing.particulate")
+    #expect(!state.resources.contains { $0.name == "particulate" })
+    #expect(!state.declaresRole("sensing.particulate"))
+
+    // Choosing a board keeps an addition it does not declare; selecting the board's same-named part
+    // then displaces it — one name is one resource, and the board's is the real one.
+    var collided = BoardResourceFlowState()
+    collided.toggleCatalogueResource(role: "timekeeping.rtc")  // name "rtc"
+    #expect(collided.resources.map(\.name) == ["rtc"])
+    collided.choose(boardID: "m5stack-core-s3", profile: profile)
+    #expect(
+        collided.resources.map(\.name) == ["rtc"],
+        "a capability the board does not (yet) carry is not the board's to drop")
+    collided.toggleBoardPart(name: "rtc")
+    #expect(collided.resources.count == 1, "one name is one resource")
+    #expect(
+        collided.resources.first?.via == .board,
+        "the board's `rtc` is the real one, so the added draft is dropped")
+
+    // Once the board's `rtc` is in, the catalogue cannot take it back: the gate is by role, so the
+    // same capability can never be declared twice.
+    collided.toggleCatalogueResource(role: "timekeeping.rtc")
+    #expect(collided.resources.count == 1, "the catalogue cannot re-declare a capability the board carries")
+    #expect(collided.resources.first?.via == .board, "the board's part is not the catalogue's to take")
+
+    // Switching boards drops the previous board's selected parts but keeps the application's additions.
+    var switched = BoardResourceFlowState()
+    switched.choose(boardID: "m5stack-core-s3", profile: profile)
+    switched.toggleBoardPart(name: "display")
+    switched.toggleCatalogueResource(role: "sensing.particulate")
+    switched.choose(boardID: "m5stack-core-s3", profile: profile)
+    #expect(
+        switched.resources.map(\.name) == ["particulate"],
+        "the new board's palette arrives unselected; the application's addition stays")
+
+    #expect(!BoardResourceFlowState().canContinue, "no board, nothing to continue with")
+}
+
+/// A `platforms/list`-shaped fixture — the fields a `Platform` needs, with `kind` present only when
+/// the caller passes one (the absent case is a payload from an older core).
+private func platformFixture(id: String, kind: String?, embedded: Bool) -> String {
+    let kindLine = kind.map { "\"kind\": \"\($0)\"," } ?? ""
+    return """
+    {
+      "id": "\(id)", "name": "\(id)", "os": "esp-idf",
+      "architecture": {
+        "cpu_family": "xtensa", "cpu": "\(id)", "endian": "little", "target_triple": "t"
+      },
+      "toolchain": {
+        "c": "c", "cpp": "cpp", "ar": "ar", "strip": "strip",
+        "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [], "needs_exe_wrapper": false
+      },
+      "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+      \(kindLine) "embedded": \(embedded)
+    }
+    """
+}
+
+/// A `capabilities/profile` reply **copied from the core** — the live reply for `m5stack-core-s3`,
+/// which is the board this suite exercises. Every key, every value and every ordering below is the
+/// released core's, so the fixture cannot drift into a shape the core does not send.
+///
+/// The `devices` block is verbatim and complete (all twelve parts, in the core's own name order) and
+/// `realizes` is verbatim (all seven, including the `via`/`provides` nulls); `pins` is abridged to
+/// the three functions the assertions name — the core's reply carries all nine, and the shape is the
+/// reply's.
+private let profileFixture = """
+{
+  "board": "m5stack-core-s3",
+  "realizes": [
+    { "capability": "io.usb", "properties": { "ports": 1, "role": "otg" }, "provides": null, "via": null },
+    { "capability": "media.audio", "properties": { "in": true, "out": true }, "provides": null, "via": null },
+    { "capability": "media.camera", "properties": { "interface": "parallel" }, "provides": null, "via": null },
+    { "capability": "media.display", "properties": { "interface": "spi" }, "provides": null, "via": null },
+    { "capability": "power.battery", "properties": { "charger": true }, "provides": null, "via": null },
+    { "capability": "sensing.imu", "properties": {}, "provides": null, "via": null },
+    { "capability": "storage.sd", "properties": { "interface": "spi" }, "provides": null, "via": null }
+  ],
+  "carries": [],
+  "pins": [
+    { "function": "display", "properties": { "cs": "GPIO3", "dc": "GPIO35", "mosi": "GPIO37", "sck": "GPIO36" } },
+    { "function": "i2c_internal", "properties": { "scl": "GPIO11", "sda": "GPIO12" } },
+    { "function": "touch", "properties": { "int": "P1_2", "reset": "P0_0", "via": "aw9523b" } }
+  ],
+  "devices": [
+    { "name": "audio_in", "properties": { "address": "0x40", "bus": "audio", "part": "ES7210" }, "role": "media.audio" },
+    { "name": "audio_out", "properties": { "address": "0x36", "bus": "audio", "part": "AW88298" }, "role": "media.audio" },
+    { "name": "camera", "properties": { "address": "0x21", "bus": "camera", "part": "GC0308" }, "role": "media.camera" },
+    { "name": "display", "properties": { "bus": "display", "part": "ILI9342C" }, "role": "media.display" },
+    { "name": "expander", "properties": { "address": "0x58", "bus": "i2c_internal", "part": "AW9523B" }, "role": "io.expander" },
+    { "name": "imu", "properties": { "address": "0x69", "bus": "i2c_internal", "part": "BMI270" }, "role": "sensing.imu" },
+    { "name": "magnetometer", "properties": { "address": "0x10", "bus": "i2c_internal", "part": "BMM150" }, "role": "sensing.magnetometer" },
+    { "name": "pmu", "properties": { "address": "0x34", "bus": "i2c_internal", "part": "AXP2101" }, "role": "power.pmu" },
+    { "name": "proximity", "properties": { "address": "0x23", "bus": "i2c_internal", "part": "LTR553" }, "role": "sensing.proximity" },
+    { "name": "rtc", "properties": { "address": "0x51", "bus": "i2c_internal", "part": "BM8563" }, "role": "timekeeping.rtc" },
+    { "name": "sd", "properties": { "bus": "sd", "part": "microSD" }, "role": "storage.sd" },
+    { "name": "touch", "properties": { "address": "0x38", "bus": "i2c_internal", "part": "FT6336" }, "role": "media.touch" }
+  ]
+}
+"""
 

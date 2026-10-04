@@ -1277,6 +1277,44 @@ final class SpireBridge {
         }
     }
 
+    /// Fetch one board's **resolved profile** — the capabilities it realizes, the companion silicon
+    /// it carries, its wiring, and the parts it declares (`devices:`) — read back from the graph.
+    ///
+    /// This is the read the experimental board/resource flow seeds a resource list from: the board's
+    /// own parts come back already named and roled, so nothing is re-derived in Swift.
+    func fetchBoardProfile(board: String) async -> BoardProfile? {
+        do {
+            let body: [String: Any] = [
+                "method": "capabilities/profile",
+                "params": ["board": board],
+            ]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: BoardProfile = try MessageSerializer.decode(reply)
+            return decoded
+        } catch {
+            return nil
+        }
+    }
+
+    /// Fetch the **capability vocabulary** — every capability path a `role` may name, grouped by
+    /// category.
+    ///
+    /// The catalogue, not a board's facts: it is what validates a device's `role:` and an
+    /// application's `resources[].role`, so a picker fed from it can never offer a name the core
+    /// would refuse.
+    func fetchVocabulary() async -> [VocabularyCategory] {
+        do {
+            let body: [String: Any] = ["method": "capabilities/vocabulary", "params": [:]]
+            let data = try JSONSerialization.data(withJSONObject: body)
+            let reply = try await backend.send(data)
+            let decoded: VocabularyReply = try MessageSerializer.decode(reply)
+            return decoded.categories
+        } catch {
+            return []
+        }
+    }
+
     /// Read a file via the in-process filesystem module (filesystem_read) and return its contents.
     func readFile(at path: String) async -> String? {
         do {
@@ -1441,6 +1479,108 @@ final class SpireBridge {
             return (nil, err)
         }
         return (json, nil)
+    }
+
+    /// **A component's recorded edits**, newest first — the `idf_component_edit` runs for one
+    /// component of a library. Read-only: the same records the edit tool echoes in its response, but
+    /// fetched on demand (and beyond the inline window) for a history pane.
+    func componentEditHistory(
+        root: String,
+        name: String,
+        limit: Int = 50
+    ) async -> [ComponentEditRecord] {
+        guard let json = await callRawMethod(
+            "idf-component/history",
+            args: ["root": root, "name": name, "limit": limit]
+        ) else { return [] }
+        if json["error"] is String { return [] }
+        guard let history = json["history"] as? [[String: Any]],
+              let data = try? JSONSerialization.data(withJSONObject: history) else { return [] }
+        return (try? JSONDecoder().decode([ComponentEditRecord].self, from: data)) ?? []
+    }
+
+    /// **Resolve the HAL contract drift** for a platform (`modify-contract`): find the interfaces that
+    /// are missing or drifted, generate their implementations, and keep a round only when the drift
+    /// fell without breaking the build.
+    ///
+    /// Needs a platform — drift without one is ambiguous (the same interface can be missing on several
+    /// boards), so the backend refuses rather than guess.
+    func modifyContract(
+        root: String,
+        platform: String
+    ) async -> (report: ModifyContractReport?, error: String?) {
+        guard let json = await callRawMethod(
+            "modify-contract",
+            args: ["path": root, "platform": platform]
+        ) else {
+            return (nil, "core unavailable")
+        }
+        // Answers in its own shape: a refusal carries `error` and a plain `output`, a run carries the
+        // drift report. The `error` key is what tells them apart.
+        if let err = json["error"] as? String {
+            return (nil, err)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json),
+              let report = try? JSONDecoder().decode(ModifyContractReport.self, from: data) else {
+            return (nil, "unreadable modify-contract report")
+        }
+        return (report, nil)
+    }
+
+    // MARK: - Knowledge graph (project/queryGraph, project/getRelationships)
+
+    /// Query the knowledge graph directly (`project/queryGraph`): nodes by type / subtype / name, and —
+    /// with `includeRelationships` — the edges between them. This is what `ProjectGraphView` renders in
+    /// knowledge mode; the graph is the core's own record, not the in-memory project tree.
+    func queryGraph(
+        nodeType: String? = nil,
+        subtype: String? = nil,
+        name: String? = nil,
+        limit: Int = 250,
+        includeRelationships: Bool = true
+    ) async -> KnowledgeGraphResult? {
+        var args: [String: Any] = ["limit": limit, "includeRelationships": includeRelationships]
+        if let nodeType { args["nodeType"] = nodeType }
+        if let subtype { args["subtype"] = subtype }
+        if let name { args["name"] = name }
+        guard let json = await callProjectTool("project/queryGraph", args: args),
+              let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(KnowledgeGraphResult.self, from: data)
+    }
+
+    /// The relationships around a node (`project/getRelationships`) — from the project node when no id
+    /// is given. Depth-limited and traversed both ways by default, so one call yields the edges the
+    /// graph view draws between the nodes it already has.
+    func graphRelationships(
+        nodeId: String? = nil,
+        depth: Int = 3,
+        direction: String = "both"
+    ) async -> GraphRelationshipsResult? {
+        var args: [String: Any] = ["depth": depth, "direction": direction]
+        if let nodeId { args["nodeId"] = nodeId }
+        guard let json = await callProjectTool("project/getRelationships", args: args),
+              let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(GraphRelationshipsResult.self, from: data)
+    }
+
+    /// Call a project-query tool over `tools/call` and unwrap the reply. The coordinator returns the
+    /// tool's payload directly; older paths wrap it in the tool-module envelope
+    /// (`{"result":{"content":[{"type":"text","text":"{…}"}]}}`), so both shapes are accepted — the
+    /// same handling `ProjectService.fetchBuildTarget` needs.
+    private func callProjectTool(_ tool: String, args: [String: Any]) async -> [String: Any]? {
+        guard let json = await callRawMethod(
+            "tools/call",
+            args: ["tool": tool, "args": args]
+        ) else { return nil }
+        if let err = json["error"] as? String, !err.isEmpty { return nil }
+        if let result = json["result"] as? [String: Any],
+           let content = result["content"] as? [[String: Any]],
+           let first = content.first,
+           let text = first["text"] as? String,
+           let inner = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] {
+            return inner
+        }
+        return json
     }
 
     /// Structural C++ syntax check on a header (`cpp_syntax_check`).
@@ -1885,6 +2025,44 @@ final class SpireBridge {
         } catch {
             Self.logScaffold("createProject/ParseComposition DECODE FAILED: \(error)")
             return (nil, spec, source, "the composition did not decode: \(error)")
+        }
+    }
+
+    /// **The design an open project states, read back for reading only** — `project/applicationDesign`.
+    ///
+    /// The companion to `designApplication` and `parseComposition`, and the only one of the three that
+    /// reads a design *off a tree* rather than out of a model or a text a person hands in: the composition
+    /// panel shows what an application in front of the user is made of. The Rust side reads it with the
+    /// same reader a unit's Write is built from (`idf_projects::read_application`), so what is shown is
+    /// what the code is written from.
+    ///
+    /// It writes nothing, and it answers `file` beside the design for the reason the panel names the
+    /// source: the file a person opens to change the design is the thing to show them. `yaml` is the
+    /// composition **as the file holds it**, shown beneath the reading.
+    ///
+    /// `design == nil` with no `error` is an answer rather than a failure: a project nobody has designed
+    /// yet states nothing, and the panel says so.
+    func fetchApplicationDesign(
+        root: String
+    ) async -> (design: ApplicationDesign?, yaml: String?, file: String?, error: String?) {
+        guard let json = await callRawMethod("project/applicationDesign", args: ["root": root]) else {
+            return (nil, nil, nil, "core unavailable")
+        }
+        if let error = json["error"] as? String { return (nil, nil, nil, error) }
+        let file = json["file"] as? String
+        let yaml = json["yaml"] as? String
+        guard let spec = json["spec"] as? [String: Any] else {
+            // Nothing stated: not an error, and nothing to show but the "not designed yet" state.
+            return (nil, yaml, file, nil)
+        }
+        do {
+            let design = try MessageSerializer.decode(Data(
+                try JSONSerialization.data(withJSONObject: spec)
+            )) as ApplicationDesign
+            return (design, yaml, file, nil)
+        } catch {
+            Self.logScaffold("project/applicationDesign DECODE FAILED: \(error)")
+            return (nil, yaml, file, "the design did not decode: \(error)")
         }
     }
 

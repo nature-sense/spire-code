@@ -31,6 +31,9 @@ use tokio::sync::mpsc;
 /// MCP servers, the plan orchestrator).
 struct System {
     coord: mpsc::Sender<CoordinatorMessage>,
+    /// The **knowledge graph** the coordinator reads platforms and capabilities from, exposed so a
+    /// test can seed it through the real `BootstrapPlatforms` writer the app uses at startup.
+    graph: mpsc::Sender<MemoryGraphMessage>,
 }
 
 impl System {
@@ -226,7 +229,10 @@ async fn system_with_llm(llm_config: LlmConfig) -> System {
         })
         .await;
 
-    System { coord: coord_tx }
+    System {
+        coord: coord_tx,
+        graph: memory_graph_tx,
+    }
 }
 
 /// The two new flows are registered in the REAL registry, which is what lets the UI (and
@@ -1432,4 +1438,84 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
             std::fs::copy(entry.path(), &target).expect("copy a file");
         }
     }
+}
+
+/// `platforms/config` carries the **parts** a board declares, read from the graph through its
+/// `Device` nodes and `devices`/`role` edges — the same facts `capabilities/profile` walks. The
+/// configuration screen and the flow must not disagree about what a board carries, so both read the
+/// one graph, and this pins the coordinator's half against the real actor.
+#[tokio::test]
+async fn platform_config_carries_the_declared_devices() {
+    let sys = system("http://127.0.0.1:1/v1/chat/completions").await;
+
+    // An in-memory store of this test's own: the harness spawns the graph but never initializes it,
+    // and a write into an uninitialized store fails. The directory is unique per test so a snapshot
+    // from a parallel run cannot be recovered.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (t, r) = tokio::sync::oneshot::channel();
+    sys.graph
+        .send(MemoryGraphMessage::InitializeInMemory {
+            data_dir: tmp.path().to_path_buf(),
+            reply_to: t,
+        })
+        .await
+        .expect("send init");
+    r.await.expect("init reply").expect("init ok");
+
+    // Seed through the real writer, with the flattened payload `seeder_input` produces.
+    let board = serde_json::json!({
+        "id": "board-with-rtc",
+        "name": "Board With RTC",
+        "properties": { "os": "esp-idf" },
+        "capability_blocks": {
+            "capabilities": ["timekeeping.rtc"],
+            "realizes": [],
+            "carries": [],
+            "pins": [],
+            "devices": [
+                { "device": "rtc", "role": "timekeeping.rtc",
+                  "properties": { "part": "BM8563", "address": "0x51" } }
+            ]
+        }
+    });
+    let (t, r) = tokio::sync::oneshot::channel();
+    sys.graph
+        .send(MemoryGraphMessage::BootstrapPlatforms {
+            platforms: vec![board],
+            reply_to: t,
+        })
+        .await
+        .expect("send bootstrap");
+    r.await.expect("bootstrap reply").expect("bootstrap ok");
+
+    let config = sys.call("platforms/config", serde_json::json!({})).await;
+    let platforms = config["platforms"].as_array().expect("platforms");
+    let listed = platforms
+        .iter()
+        .find(|p| p["id"] == "board-with-rtc")
+        .expect("the seeded board is listed");
+    let devices = listed["capability_blocks"]["devices"]
+        .as_array()
+        .expect("devices");
+    let rtc = devices
+        .iter()
+        .find(|d| d["name"] == "rtc")
+        .expect("the board's part");
+    assert_eq!(rtc["role"], "timekeeping.rtc");
+    assert_eq!(rtc["properties"]["part"], "BM8563");
+    assert_eq!(rtc["properties"]["address"], "0x51");
+
+    // The catalogue, behind the same coordinator: every path a role may name, grouped by category,
+    // and each one a path the validator would accept.
+    let vocabulary = sys
+        .call("capabilities/vocabulary", serde_json::json!({}))
+        .await;
+    let categories = vocabulary["categories"].as_array().expect("categories");
+    assert!(
+        categories.iter().any(|c| c["category"] == "media"
+            && c["capabilities"]
+                .as_array()
+                .is_some_and(|paths| paths.iter().any(|p| p == "media.display"))),
+        "the catalogue offers the paths the vocabulary knows: {vocabulary}"
+    );
 }

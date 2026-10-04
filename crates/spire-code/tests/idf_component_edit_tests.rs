@@ -561,3 +561,202 @@ async fn a_component_edit_leaves_its_instruction_in_the_project_graph() {
     assert_eq!(edges.len(), 1, "the module points at the run: {edges:#?}");
     assert_eq!(edges[0].to_id, records[0].id, "{edges:#?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// A **unit** of an application: the same tool, the same gate, a different root.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// An `idf_component_edit` run **against an application**: a scaffolded composition with actors, one of
+/// its units, and a coordinator whose LLM is the fake endpoint.
+///
+/// **No knowledge store and no embedder**, and that is the point rather than a shortcut: a unit has no
+/// device behind it, so `component_device_lookups` answers `None` and the retrieval seam returns before
+/// it ever reaches the registry. A fixture that needed a store to edit an actor would be proving the
+/// wrong thing.
+struct UnitSeam {
+    /// The application's root — the `root` the RPC is given, and the tree the unit lives in.
+    app: PathBuf,
+    unit: String,
+    coord: mpsc::Sender<CoordinatorMessage>,
+    /// Every request body the fake endpoint was sent.
+    log: Arc<Mutex<Vec<String>>>,
+    /// Held so the temp directory outlives the test.
+    _tmp: tempfile::TempDir,
+}
+
+impl UnitSeam {
+    /// Scaffold the library and the application beside it, and wire a coordinator to the fake endpoint.
+    ///
+    /// The library is written *beside* the application (`../sensors`) because the unit's host-test build
+    /// resolves the framework through that relative path — the same resolution the application's own
+    /// `CMakeLists.txt` does, so the gate this fixture runs is the gate a user's edit runs.
+    async fn build(unit: &str) -> Option<Self> {
+        use spire_code::build::application_spec::{examples, parse_spec};
+        use spire_code::build::idf_projects::{application_scaffold, library_scaffold};
+
+        let tmp = tempfile::tempdir().expect("temp root");
+        let root = tmp.path().to_path_buf();
+
+        let library = library_scaffold("sensors", &[]).expect("the library scaffolds");
+        write_scaffold_files(&root.join("sensors"), &library.files);
+
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let application = application_scaffold("pm25-meter", &[], "../sensors", Some(&spec))
+            .expect("the application scaffolds");
+        let app = root.join("pm25-meter");
+        write_scaffold_files(&app, &application.files);
+
+        let system = ActorSystem::new();
+        let (project_graph, _) = system.spawn(MemoryGraphActor::new());
+        let (chat_tx, _) = system.spawn(ChatActor::new());
+        let (tools_tx, _) = system.spawn(ToolsActor::new(mock_sender()));
+        let (mcp_tx, _) = system.spawn(McpClientActor::new());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let url = fake_llm_logging(vec!["NONE".to_string()], log.clone());
+        let (llm_tx, _) = system.spawn(LlmActor::new(LlmConfig {
+            api_url: url,
+            // The actor refuses a request with no key and never checks it against anything.
+            api_key: "test-key".to_string(),
+            ..LlmConfig::default()
+        }));
+        let (system_tx, _) = system.spawn(SystemActor::new());
+        let (coord, _) = system.spawn(CoordinatorActor::new(
+            chat_tx,
+            tools_tx,
+            mcp_tx,
+            llm_tx,
+            system_tx,
+            project_graph,
+            mock_sender(),
+            mock_sender(),
+            mock_sender(),
+            mock_sender(),
+            mock_sender(),
+        ));
+
+        // The app-only half: the router needs a registry to answer with. It holds no `rag` actor,
+        // because a unit's edit never reaches one — see the struct's note.
+        let (watcher_tx, _watcher_rx) =
+            mpsc::channel::<spire_code::actors::FileChangeNotification>(8);
+        coord
+            .send(CoordinatorMessage::SetFfiDeps {
+                registry: Arc::new(ServiceRegistry::new()),
+                state: Arc::new(FfiSharedState {
+                    project_root: Mutex::new(None),
+                    analysis: Mutex::new(None),
+                    watcher_out_tx: watcher_tx,
+                }),
+            })
+            .await
+            .expect("send SetFfiDeps");
+
+        Some(Self {
+            app,
+            unit: unit.to_string(),
+            coord,
+            log,
+            _tmp: tmp,
+        })
+    }
+
+    /// Ask for the unit to be written, as the UI does, and return the RPC result together with every
+    /// body the model was sent.
+    async fn edit(&self, instruction: &str) -> (serde_json::Value, Vec<String>) {
+        self.log.lock().expect("log").clear();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.coord
+            .send(CoordinatorMessage::HandleRequest {
+                method: "tools/call".to_string(),
+                params: serde_json::json!({
+                    "tool": "idf_component_edit",
+                    "args": {
+                        "root": self.app.to_string_lossy(),
+                        "name": self.unit,
+                        "instruction": instruction,
+                    }
+                }),
+                response_tx: reply,
+            })
+            .await
+            .expect("send HandleRequest");
+        let result = rx.await.expect("reply");
+        let bodies = self.log.lock().expect("log").clone();
+        (result, bodies)
+    }
+}
+
+/// Write a scaffold's files out under `root`, as `idf_apply_design` does — so the fixture is what the
+/// tool really produces rather than a hand-made copy.
+fn write_scaffold_files(root: &std::path::Path, files: &[spire_code::build::ScaffoldFile]) {
+    for file in files {
+        let path = root.join(&file.path);
+        std::fs::create_dir_all(path.parent().expect("a path has a parent")).expect("create dir");
+        std::fs::write(&path, &file.content).expect("write file");
+    }
+}
+
+/// **A unit of an application is edited from the design, through the tool.**
+///
+/// The `root` the caller names is the *application* rather than a library, the gate is the unit's own
+/// host test, and the request the model is asked with carries the reviewed design instead of a
+/// datasheet. The gate runs **before** the model is asked, so a request reaching every file in the
+/// unit's scope is also the proof that a unit's host test configures and builds with nothing but the
+/// tree and the library beside it — which is the assumption the edit path makes when it points at an
+/// application.
+#[tokio::test]
+async fn an_application_unit_is_edited_from_the_design() {
+    if !gate_is_runnable() {
+        eprintln!("cmake/ctest are not on PATH — the unit gate cannot run, so this is skipped");
+        return;
+    }
+    let Some(seam) = UnitSeam::build("air_quality").await else {
+        return;
+    };
+    let (result, bodies) = seam.edit("Average the PM2.5 readings over a minute.").await;
+
+    assert!(
+        !bodies.is_empty(),
+        "the gate refused before the model was asked, so a unit's host test did not build under an \
+         application root: {result}"
+    );
+    // The scope is the unit's own three files, and each gets its own turn. The reply is `NONE`, which
+    // is not a file, so each rewrite is also rejected by the structural check and retried — what
+    // matters here is that the **request** reached every ask.
+    for file in ["air_quality.hpp", "air_quality.cpp", "air_quality_test.cpp"] {
+        assert!(
+            bodies.iter().any(|body| body.contains(file)),
+            "{file} is in the unit's scope and was never put to the model: {bodies:#?}"
+        );
+    }
+    // The request is the same in every ask; the facts are read off the first.
+    let prompt = &bodies[0];
+    assert!(prompt.contains("FRAMEWORK: `actors`"), "{prompt}");
+    assert!(
+        prompt.contains("```yaml"),
+        "the composition never reached the prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains("sends to** `view`, which takes `messages::Report`"),
+        "the peer's message type — the fact that makes the edge compile — was not stated: {prompt}"
+    );
+    assert!(
+        prompt.contains("class AirQuality"),
+        "the unit's header as it stands is not in the prompt: {prompt}"
+    );
+    assert!(
+        prompt.contains("Average the PM2.5 readings over a minute."),
+        "the user's words never reached the prompt: {prompt}"
+    );
+    // Nothing is retrieved for a unit: there is no device behind one.
+    assert!(
+        !prompt.contains("## Reference material retrieved"),
+        "{prompt}"
+    );
+    assert!(
+        result["reference"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("none"),
+        "a unit's report has to say that nothing was retrieved: {result}"
+    );
+}

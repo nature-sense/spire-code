@@ -17,12 +17,6 @@ struct ContextActionPane: View {
     let selectedSubproject: SubprojectInfo?
     let selectedBuildTarget: String?
 
-    /// Presents the HAL workflow (propose → approve → add target) as a sheet.
-    @State private var showingHALWorkflow = false
-    /// HAL viewer: documentation + verification are separate floating dialogs.
-    @State private var showingHALDocs = false
-    @State private var showingHALVerify = false
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
@@ -56,12 +50,29 @@ struct ContextActionPane: View {
             .padding(12)
         }
         .background(theme.background)
-        // HAL workflow (propose → approve → add target) presented from the
-        // project-context actions.
-        .sheet(isPresented: $showingHALWorkflow) {
-            HALWorkflowView()
-                .environment(bridge)
-                .environment(theme)
+    }
+
+    /// The design's own header row: what the application is written from, and the way to look at it.
+    ///
+    /// It sits at the top of the pane, above the components and the actions, because the units below it
+    /// are *written from* this design — the thing a Write is written from is worth offering before it, not
+    /// only through a file a person has to know to open. Read-only: opening it changes nothing.
+    private func designHeader(_ project: ProjectInfo) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "ruler")
+                .font(.caption)
+                .foregroundStyle(theme.accent)
+            Text("Application design")
+                .font(.headline)
+            Spacer(minLength: 0)
+            Button {
+                CompositionViewerPortal.open(bridge: bridge, theme: theme, root: project.root)
+            } label: {
+                Label("View design", systemImage: "doc.text.magnifyingglass")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("The composition this application is written from — read-only")
         }
     }
 
@@ -87,6 +98,13 @@ struct ContextActionPane: View {
 
     @ViewBuilder
     private func projectWorkflows(_ project: ProjectInfo) -> some View {
+        // The **design**, named at the top of the pane and one click away — see `designHeader`. Gated on
+        // the project's declared structure (as the sections below are), not on the selection, so it does
+        // not appear and vanish as the user clicks around the tree.
+        if project.subprojects.contains(where: { $0.structure == "idf_application" }) {
+            designHeader(project)
+        }
+
         if let sub = selectedSubproject ?? project.subprojects.first(where: { !$0.buildSystem.isEmpty }) {
             if sub.buildSystem == "Meson" {
                 // The HAL contract-format correction plan appears ONLY when the

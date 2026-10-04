@@ -62,7 +62,9 @@ struct ComponentSheet: View {
     }
 
     enum Result {
-        case ok(String)
+        /// Kept: what was asked, **verbatim**, and the gate's summary, kept apart so the pane showing the
+        /// result can put the words back beside it. A stub add asks for nothing, so its instruction is empty.
+        case ok(instruction: String, summary: String)
         case failed(String)
     }
 
@@ -320,8 +322,9 @@ struct ComponentSheet: View {
                 let files = (result?["files"] as? [String]) ?? []
                 let kindWord = kind == .driver ? "protocol" : "code"
                 dismiss()
-                done(.ok("Added components/\(trimmedName) — \(files.count) files, its \(kindWord) "
-                         + "still a TODO. Write it when you have what it needs."))
+                done(.ok(instruction: "",
+                         summary: "Added components/\(trimmedName) — \(files.count) files, its \(kindWord) "
+                                  + "still a TODO. Write it when you have what it needs."))
             }
         }
     }
@@ -369,7 +372,8 @@ struct ComponentSheet: View {
                 let chipBuild = (result?["chip_build"] as? String) ?? ""
                 if kept {
                     dismiss()
-                    done(.ok("Wrote \(trimmedName).\n\(summary)\n\(chipBuild)"))
+                    done(.ok(instruction: described,
+                             summary: "Wrote \(trimmedName).\n\(summary)\n\(chipBuild)"))
                 } else {
                     // The gate refused the change and restored it. That is a *result*, not a failure of
                     // the tool — so it is reported as what happened, with what was checked.

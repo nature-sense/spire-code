@@ -63,13 +63,15 @@ async fn the_resolved_profile_reads_the_seeded_capability_graph() {
     )
     .unwrap();
     // The board: a display realized through its host chip (`via`), a battery it realizes itself,
-    // its wiring, and the companion silicon it carries.
+    // its wiring, the companion silicon it carries, and the parts it declares (`devices:`) — each
+    // named, roled, and given its own values.
     std::fs::write(
         boards.join("m5.yaml"),
         "id: m5\nname: M5\nos: esp-idf\nchip: esp32p4\nrealized:\n  media:\n    display: \
          { interface: mipi-dsi, via: esp32p4 }\n  power:\n    battery: { charger: true }\n\
          pins:\n  led: { pin: GPIO8, addressable: true }\n  grove:\n    a: { i2c: [GPIO2, GPIO1] }\n\
-         companions:\n  - chip: esp32c5\n    role: radio\n",
+         companions:\n  - chip: esp32c5\n    role: radio\n\
+         devices:\n  touch: { role: media.touch, part: FT6336, bus: i2c_internal, address: \"0x38\" }\n",
     )
     .unwrap();
 
@@ -143,6 +145,23 @@ async fn the_resolved_profile_reads_the_seeded_capability_graph() {
     assert_eq!(
         grove_a["properties"]["i2c"],
         serde_json::json!(["GPIO2", "GPIO1"])
+    );
+
+    // The parts the board declares: the `Device` node's name, the `devices` edge's values (`part`,
+    // `bus`, `address`), and the `role` edge to the capability the part *is* — resolved through the
+    // graph, so an application's `resources:` can name a part the board actually carries.
+    let devices = profile["devices"].as_array().expect("devices");
+    let touch = devices
+        .iter()
+        .find(|d| d["name"] == "touch")
+        .expect("the board declares a touch controller");
+    assert_eq!(touch["role"], "media.touch");
+    assert_eq!(touch["properties"]["part"], "FT6336");
+    assert_eq!(touch["properties"]["bus"], "i2c_internal");
+    assert_eq!(touch["properties"]["address"], "0x38");
+    assert!(
+        touch["properties"].get("role").is_none(),
+        "`role` is the edge's endpoint, not also a property: {touch}"
     );
 
     match previous {
