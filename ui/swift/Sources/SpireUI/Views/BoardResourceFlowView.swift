@@ -8,13 +8,14 @@ import SwiftUI
 /// 1. **Board** — the boards the core knows, filtered to what a firmware application is built *for*.
 ///    Choosing one reads its resolved profile (`capabilities/profile`), because a board's parts are
 ///    facts the graph already holds and Swift must not re-derive them.
-/// 2. **Resources** — a two-column master–detail. The left column lists the **sources**: every part
-///    the chosen board declares, then every category of the capability vocabulary
-///    (`capabilities/vocabulary`). The right pane shows the selected source's resources as
-///    checkboxes. Choosing a board part *is* selecting its one resource (the part is what the BSP
-///    reaches, so the list row is its own checkbox); choosing a category only opens it, because a
-///    category holds many paths and the application says which. Both feed one `resources:` set.
-///    Continue is **stubbed** for v1: it shows the draft a later step turns into a spec.
+/// 2. **Resources** — one table, one row per **source**: every part the chosen board declares, then
+///    every category of the capability vocabulary (`capabilities/vocabulary`). A row's first column is
+///    the source's name; its second is the resources that source offers, and it stays **empty** until
+///    the row is chosen. Choosing a **part** row is a choice — the part *is* the resource it offers,
+///    so the row's own click puts it in and shows the resource selected and read-only; choosing a
+///    **category** row only opens it, revealing its paths to tick, because a category holds many and
+///    the application says which. Both feed one `resources:` set. Continue is **stubbed** for v1: it
+///    shows the draft a later step turns into a spec.
 ///
 /// What comes out is a **draft**, not a spec: a `library`/`published` resource still needs the
 /// driver unit that only the design step knows, so nothing here claims to validate.
@@ -28,14 +29,15 @@ struct BoardResourceFlowView: View {
     @State private var isLoading = true
     @State private var isChoosing = false
     @State private var showDraft = false
-    /// Which left-column row the right pane is showing — a board part or a catalogue category.
-    /// Ephemeral: it is where the eye is, not part of the draft, so it lives in the view.
+    /// Which table row is open — a board part or a catalogue category. Ephemeral: it is where the eye
+    /// is, not part of the draft, so it lives in the view. An open **part** row is one whose part is in
+    /// the draft; a **category** row is open until it is closed.
     @State private var selectedSource: Source?
 
     private enum Step { case board, resources }
 
-    /// A row of the left column: a **part** the board declares, or a catalogue **category**. Choosing
-    /// a part *is* selecting it (one part, one resource); choosing a category only opens it, because a
+    /// A row of the table: a **part** the board declares, or a catalogue **category**. Choosing a part
+    /// row *is* selecting it (one part, one resource); choosing a category row only opens it, because a
     /// category holds many resources and the application must say which.
     private enum Source: Hashable {
         case part(String)
@@ -82,12 +84,39 @@ struct BoardResourceFlowView: View {
         Task {
             if let profile = await bridge.fetchBoardProfile(board: board.id) {
                 state.choose(boardID: board.id, profile: profile)
-                // Open on the board's first part, so the right pane is not empty — showing it, not
-                // selecting it: the draft still starts empty.
-                selectedSource = profile.devices.first.map { .part($0.name) }
+                // Open with nothing chosen: every row's resources cell is empty, because a part only
+                // goes into the draft when the application picks it.
+                selectedSource = nil
                 step = .resources
             }
             isChoosing = false
+        }
+    }
+
+    /// Choose a row of the resources table.
+    ///
+    /// A **part** row is a choice: the part *is* the resource it offers, so clicking the row puts the
+    /// part in (if it is not already) and opens it, showing its resource selected and read-only —
+    /// there is nothing on that side to change. Clicking the *open* part row again takes the part back
+    /// out, because the row is the only place the choice can be unmade.
+    ///
+    /// A **category** row only opens: a category holds many resources and the application says which, so
+    /// clicking the row reveals its resources to tick and clicking it again closes it. What was ticked
+    /// stays ticked — closing a row unchooses nothing.
+    private func choose(_ source: Source) {
+        switch source {
+        case .part(let name):
+            if selectedSource == .part(name) {
+                state.toggleBoardPart(name: name)
+                selectedSource = nil
+            } else {
+                if !state.isBoardPartSelected(name) {
+                    state.toggleBoardPart(name: name)
+                }
+                selectedSource = .part(name)
+            }
+        case .category(let name):
+            selectedSource = selectedSource == .category(name) ? nil : .category(name)
         }
     }
 
@@ -186,187 +215,173 @@ struct BoardResourceFlowView: View {
             if showDraft {
                 draftStep
             } else {
-                // Master–detail: the left column is the *source* — a part the board carries, or a
-                // catalogue category — and the right pane is the resources that source offers. The
-                // board/non-board distinction lives in the left column, so it is never inferred from
-                // a check-mark.
-                HStack(alignment: .top, spacing: 0) {
-                    ScrollView { sourceList }
-                        .frame(width: 236)
-                    Divider()
-                    ScrollView { resourcePane }
-                        .frame(maxWidth: .infinity)
+                // One table, one row per source: a part the board carries, or a catalogue category.
+                // The first column is the name; the second is that source's resources — and it
+                // stays empty until the row is chosen, so the table is quiet with nothing selected. A
+                // part row is a choice (one part is one resource, so choosing it puts the part in); a
+                // category row only opens, because a category holds many paths and the application
+                // says which.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        sourceTable
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
         }
     }
 
-    /// The left column: every part the board declares, then every category of the capability
-    /// vocabulary. A part is a **toggle** — one part is one resource, so choosing it *is* selecting
-    /// it. A category only **opens** — it holds many resources, and the application says which.
-    private var sourceList: some View {
-        VStack(alignment: .leading, spacing: ProjectListMetrics.groupSpacing) {
-            SectionHeading("Board parts")
-            let parts = state.profile?.devices ?? []
-            if parts.isEmpty {
-                Text("This board declares no parts")
+    /// The table: every part the board declares, then every category of the capability vocabulary,
+    /// on one list. Each row is the same two columns — the source's name, then the resources that
+    /// source offers — so a part and a category read the same way.
+    private var sourceTable: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if selectedSource == nil {
+                Text("Choose a board part or a category to see its resources.")
                     .font(.caption)
                     .foregroundStyle(theme.textTertiary)
-            } else {
-                ForEach(parts) { device in
-                    sourceRow(
-                        .part(device.name),
-                        title: device.name,
-                        detail: summary(for: device),
-                        check: state.isBoardPartSelected(device.name)
-                    ) {
-                        state.toggleBoardPart(name: device.name)
-                        selectedSource = .part(device.name)
-                    }
-                }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 6)
             }
-
-            SectionHeading("Categories").padding(.top, 10)
+            let parts = state.profile?.devices ?? []
+            ForEach(parts) { device in
+                sourceRow(.part(device.name), title: device.name, note: summary(for: device))
+            }
             ForEach(state.catalogue) { category in
                 sourceRow(
                     .category(category.category),
                     title: category.category,
-                    detail: "\(category.capabilities.count) capabilities",
-                    check: nil
-                ) {
-                    selectedSource = .category(category.category)
-                }
+                    note: "\(category.capabilities.count) capabilities"
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.trailing, 12)
     }
 
-    /// One left-column row. A `check` makes it a **selectable part** (its state shown); no `check`
-    /// makes it a plain **navigation** row (a category). The current source is tinted, so the right
-    /// pane always has a visible origin.
-    private func sourceRow(
-        _ source: Source,
-        title: String,
-        detail: String,
-        check: Bool?,
-        action: @escaping () -> Void
-    ) -> some View {
-        let current = selectedSource == source
-        return Button(action: action) {
-            HStack(spacing: 8) {
-                if let check {
-                    Image(systemName: check ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 13))
-                        .foregroundStyle(check ? theme.accent : theme.textTertiary)
+    /// One table row. The first column is the **name** — and clicking it is the whole gesture: a
+    /// **part** row is a choice, so clicking it opens the row and puts the part in (clicking the open
+    /// row takes it out again); a **category** row only opens and closes. The second column is the
+    /// **resources** of whatever is open, and it is empty for every row that is not.
+    private func sourceRow(_ source: Source, title: String, note: String) -> some View {
+        let open = selectedSource == source
+        return HStack(alignment: .top, spacing: 0) {
+            Button { choose(source) } label: {
+                nameCell(source, title: title, note: note, open: open)
+            }
+            .buttonStyle(.plain)
+            .frame(width: 196, alignment: .leading)
+
+            Divider().overlay(theme.divider)
+
+            Group {
+                if open {
+                    resourceCell(source)
+                } else {
+                    Color.clear.frame(height: 1)
                 }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.callout.weight(.medium))
-                    Text(detail)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 12)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(open ? theme.accentBackground : Color.clear)
+        .overlay(alignment: .bottom) { Divider().overlay(theme.divider) }
+    }
+
+    /// The first column of a row: what the source is called. A part carries a **check** here as well
+    /// as in its resources cell — a part *is* the resource it offers, so the two agree; a category
+    /// carries a chevron, because opening it is all it does.
+    private func nameCell(_ source: Source, title: String, note: String, open: Bool) -> some View {
+        HStack(spacing: 8) {
+            sourceIcon(source, title: title, open: open)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.callout.weight(.medium))
+                if !note.isEmpty {
+                    Text(note)
                         .font(.caption)
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                 }
-                Spacer(minLength: 4)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(current ? theme.accentBackground : theme.surface))
-            .contentShape(Rectangle())
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.plain)
+        .contentShape(Rectangle())
     }
 
-    /// The right pane: the resources of whatever the left column has open. A board part shows its one
-    /// resource — shown selected, because choosing the part selected it. A category shows every path
-    /// it holds, unselected, so the application picks.
+    /// A row's leading mark: a check for a part (on when the part is in the draft), a chevron for a
+    /// category (turned when the row is open).
     @ViewBuilder
-    private var resourcePane: some View {
-        switch selectedSource {
+    private func sourceIcon(_ source: Source, title: String, open: Bool) -> some View {
+        switch source {
+        case .part:
+            Image(systemName: state.isBoardPartSelected(title) ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 13))
+                .foregroundStyle(state.isBoardPartSelected(title) ? theme.accent : theme.textTertiary)
+        case .category:
+            Image(systemName: open ? "chevron.down" : "chevron.right")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(theme.textTertiary)
+                .frame(width: 13)
+        }
+    }
+
+    /// The second column of a row: the resources the source offers, and **nothing at all** until the
+    /// row is chosen — the cell is empty, which is what keeps the table quiet.
+    @ViewBuilder
+    private func resourceCell(_ source: Source) -> some View {
+        switch source {
         case .part(let name):
             if let device = state.profile?.devices.first(where: { $0.name == name }) {
-                partDetail(device)
-            } else {
-                pickHint
+                partResource(device)
             }
         case .category(let name):
             if let category = state.catalogue.first(where: { $0.category == name }) {
-                categoryDetail(category)
-            } else {
-                pickHint
+                categoryResources(category)
             }
-        case nil:
-            pickHint
         }
     }
 
-    private var pickHint: some View {
-        Text("Choose a part or category to see its resources.")
-            .font(.callout)
-            .foregroundStyle(theme.textTertiary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.top, 8)
-    }
-
-    /// A board part's one resource, shown **checked** because choosing the part chose it. Clicking the
-    /// card takes the part back out — the same toggle the left row drives.
-    private func partDetail(_ device: BoardDevice) -> some View {
-        let selected = state.isBoardPartSelected(device.name)
-        return VStack(alignment: .leading, spacing: 10) {
-            SectionHeading("Resource")
-            Button { state.toggleBoardPart(name: device.name) } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 15))
-                        .foregroundStyle(selected ? theme.accent : theme.textTertiary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(device.name).font(.callout.weight(.semibold))
-                        Text(detail(for: device))
-                            .font(.caption)
-                            .foregroundStyle(theme.textSecondary)
-                    }
-                    Spacer(minLength: 8)
-                    Text(ResourceVia.board.label)
-                        .font(.caption2)
-                        .foregroundStyle(theme.textTertiary)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 8).fill(theme.surface))
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.border, lineWidth: 1))
-                .contentShape(Rectangle())
+    /// A part's resource — the one the board reaches for it — shown **selected and read-only**:
+    /// the part *is* the resource, so there is nothing on this side to change. The row's own click is
+    /// what put it in and what takes it out.
+    private func partResource(_ device: BoardDevice) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(theme.accent)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(device.name).font(.callout)
+                Text(detail(for: device))
+                    .font(.caption)
+                    .foregroundStyle(theme.textSecondary)
+                    .lineLimit(1)
             }
-            .buttonStyle(.plain)
-            Text("A part of the board: the BSP reaches it, so no component of this project drives it.")
-                .font(.caption)
+            Spacer(minLength: 8)
+            Text(ResourceVia.board.label)
+                .font(.caption2)
                 .foregroundStyle(theme.textTertiary)
         }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.trailing, 12)
+        .contentShape(Rectangle())
     }
 
-    /// A category's resources: every path it holds, unselected unless the application chose it. The
-    /// catalogue is the *whole* vocabulary, so a path the board already carries still appears — shown
-    /// "on board" and disabled, so the same capability can never be declared twice.
-    private func categoryDetail(_ category: VocabularyCategory) -> some View {
-        VStack(alignment: .leading, spacing: ProjectListMetrics.groupSpacing) {
-            SectionHeading(category.category)
-            VStack(spacing: 6) {
-                ForEach(category.capabilities, id: \.self) { path in
-                    catalogueRow(path)
-                }
+    /// A category's resources: every path it holds, **open and tickable** — the application's to
+    /// pick. The catalogue is the *whole* vocabulary, so a path the board already carries still
+    /// appears, shown "on board" and disabled, so one capability can never be declared twice.
+    private func categoryResources(_ category: VocabularyCategory) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(category.capabilities, id: \.self) { path in
+                catalogueRow(path)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.trailing, 12)
     }
 
-    /// The one-line summary a part carries in the left column: its part number when the board named
+    /// The one-line summary a part carries in the first column: its part number when the board named
     /// one, else its role — short, because the row also shows the name.
     private func summary(for device: BoardDevice) -> String {
         if !device.part.isEmpty { return device.part }
@@ -384,7 +399,7 @@ struct BoardResourceFlowView: View {
     }
 
 
-    /// One catalogue path, as a checkbox in the right pane.
+    /// One catalogue path, as a checkbox in a category row's resources cell.
     ///
     /// Three states, told by `declaredVia`:
     /// * **not declared** — an open checkbox; choosing it adds a `library` resource, named by the
