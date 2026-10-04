@@ -4832,8 +4832,9 @@ The board/resource flow now produces the application's **resource set** — the
 `ResourceDraft` mirrors on the Rust side. The next step is to **inject** each of those resources
 into the actors that use them.
 
-Recorded before implementation, the one basic rule: **an actor owns zero or more resources**.
-Ownership is many-to-many with a floor of zero — an actor may carry no resource, and a resource is
-not obliged to have exactly one owner. This is a design constraint on the injection step, noted
-here so the step is built against it rather than rediscovering it.
+Recorded before implementation, two basic rules: **an actor owns zero or more resources**, and
+**a resource is injected into only one actor**. Together they are many-to-one: an actor may carry
+no resource (or several), and every resource is assigned to exactly one actor — it is never shared
+between two. This is a design constraint on the injection step, noted here so the step is built
+against it rather than rediscovering it.
 
