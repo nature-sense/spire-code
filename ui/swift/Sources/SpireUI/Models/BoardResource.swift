@@ -180,17 +180,28 @@ struct BoardResourceFlowState: Equatable {
         }
     }
 
+    /// Whether the board declares a part for this role — i.e. the board *carries* the capability,
+    /// whether or not the application has selected that part. A carried role is the board's own: it is
+    /// reached through the board's part row and never added as a library resource, so the two surfaces
+    /// cannot disagree about it (`power.pmu` is the board's `pmu` device, not a `power` addition).
+    func boardCarriesRole(_ role: String) -> Bool {
+        profile?.devices.contains { $0.role == role } ?? false
+    }
+
     /// Turn a catalogue path on or off — the mirror of `toggleBoardPart` for a resource the board
-    /// does not carry.
+    /// does **not** carry.
     ///
-    /// Selecting the path adds it `via: library`, named by the role's last segment (the forward-compat
-    /// hook: a later step can switch it to `published` when the component is a managed dependency).
-    /// Selecting it again takes the addition back out, because an addition was the application's own
-    /// choice. A path the board's part already carries is left alone — the board's resource is the
-    /// real one. The gate is by **role**, matching the catalogue's own "one capability once": a role
-    /// can be carried by more than one resource (`audio_in` and `audio_out` are both `media.audio`),
-    /// so a name-only check would let the same capability in twice.
+    /// A role the board carries as a part is left alone whatever the draft holds: the board's part row
+    /// is its only control, so nothing here can declare it twice or take it back — one capability is
+    /// never shown as both a board part and an addition. Otherwise selecting the path adds it
+    /// `via: library`, named by the role's last segment (the forward-compat hook: a later step can
+    /// switch it to `published` when the component is a managed dependency). Selecting it again takes
+    /// the addition back out, because an addition was the application's own choice. The gate is by
+    /// **role**, matching the catalogue's own "one capability once": a role can be carried by more than
+    /// one resource (`audio_in` and `audio_out` are both `media.audio`), so a name-only check would let
+    /// the same capability in twice.
     mutating func toggleCatalogueResource(role: String) {
+        guard !boardCarriesRole(role) else { return }
         if let existing = resources.first(where: { $0.role == role }) {
             guard existing.via != .board else { return }
             resources.removeAll { $0.via != .board && $0.role == role }

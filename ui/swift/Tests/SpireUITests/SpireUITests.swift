@@ -1469,7 +1469,8 @@ func capabilityBlocksTolerateMissingDevices() throws {
 /// The flow's state, without a view: a chip is not offered as a board, choosing a board offers its
 /// parts **unselected** — the board *can* supply each, the application decides it *uses* it — a part
 /// toggles `via: board`, an added role becomes a `library` resource named by its last segment, a
-/// duplicate is refused, and a board part displaces an added resource that took its name.
+/// duplicate is refused, a board part displaces an added resource that took its name, and a role the
+/// board carries is the board's to toggle alone — the catalogue never adds it.
 @Test("The board/resource flow toggles board parts and gates Continue")
 func boardResourceFlowTogglesParts() throws {
     let platformsJSON = "[\(platformFixture(id: "m5stack-core-s3", kind: "board", embedded: true)),"
@@ -1530,26 +1531,37 @@ func boardResourceFlowTogglesParts() throws {
     #expect(!state.resources.contains { $0.name == "particulate" })
     #expect(!state.declaresRole("sensing.particulate"))
 
-    // Choosing a board keeps an addition it does not declare; selecting the board's same-named part
-    // then displaces it — one name is one resource, and the board's is the real one.
+    // An addition made before a board is chosen survives the choice (only the board's own selected
+    // parts are dropped); selecting the board's same-named part then displaces it — one name is one
+    // resource, and the board's is the real one.
     var collided = BoardResourceFlowState()
-    collided.toggleCatalogueResource(role: "timekeeping.rtc")  // name "rtc"
+    collided.toggleCatalogueResource(role: "timekeeping.rtc")  // name "rtc", no board yet
     #expect(collided.resources.map(\.name) == ["rtc"])
     collided.choose(boardID: "m5stack-core-s3", profile: profile)
     #expect(
         collided.resources.map(\.name) == ["rtc"],
-        "a capability the board does not (yet) carry is not the board's to drop")
+        "choosing a board drops only its own selected parts, not the application's additions")
     collided.toggleBoardPart(name: "rtc")
     #expect(collided.resources.count == 1, "one name is one resource")
     #expect(
         collided.resources.first?.via == .board,
         "the board's `rtc` is the real one, so the added draft is dropped")
 
-    // Once the board's `rtc` is in, the catalogue cannot take it back: the gate is by role, so the
-    // same capability can never be declared twice.
-    collided.toggleCatalogueResource(role: "timekeeping.rtc")
-    #expect(collided.resources.count == 1, "the catalogue cannot re-declare a capability the board carries")
-    #expect(collided.resources.first?.via == .board, "the board's part is not the catalogue's to take")
+    // A role the board carries as a part is board-owned: the catalogue leaves it alone even before the
+    // part is selected, because the part row is its only control. This is what keeps the board part and
+    // the category in step — a `power.pmu` ticked in the category can never be a twin of the board's
+    // `pmu`.
+    var boardOwned = BoardResourceFlowState()
+    boardOwned.choose(boardID: "m5stack-core-s3", profile: profile)
+    #expect(boardOwned.boardCarriesRole("power.pmu"), "the board's `pmu` device carries the role")
+    boardOwned.toggleCatalogueResource(role: "power.pmu")
+    #expect(boardOwned.resources.isEmpty, "a carried role is the board's, so the catalogue cannot add it")
+    #expect(!boardOwned.declaresRole("power.pmu"), "nothing is declared until the part row is chosen")
+    boardOwned.toggleBoardPart(name: "pmu")
+    #expect(boardOwned.declaredVia(role: "power.pmu") == .board, "the part row is the only control")
+    #expect(boardOwned.resources.map(\.name) == ["pmu"], "one resource, reached through the board")
+    boardOwned.toggleCatalogueResource(role: "power.pmu")
+    #expect(boardOwned.declaredVia(role: "power.pmu") == .board, "nor can the catalogue take it back")
 
     // Switching boards drops the previous board's selected parts but keeps the application's additions.
     var switched = BoardResourceFlowState()

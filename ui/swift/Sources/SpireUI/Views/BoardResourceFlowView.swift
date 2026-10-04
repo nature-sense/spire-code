@@ -370,8 +370,10 @@ struct BoardResourceFlowView: View {
     }
 
     /// A category's resources: every path it holds, **open and tickable** — the application's to
-    /// pick. The catalogue is the *whole* vocabulary, so a path the board already carries still
-    /// appears, shown "on board" and disabled, so one capability can never be declared twice.
+    /// pick. The catalogue is the *whole* vocabulary, so a path the board carries as a part still
+    /// appears — read-only, with a `Board` badge — because the board's part row is its only control.
+    /// That is what keeps the two sections in step: one capability is never a board part *and* a
+    /// tickable addition.
     private func categoryResources(_ category: VocabularyCategory) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(category.capabilities, id: \.self) { path in
@@ -401,32 +403,37 @@ struct BoardResourceFlowView: View {
 
     /// One catalogue path, as a checkbox in a category row's resources cell.
     ///
-    /// Three states, told by `declaredVia`:
-    /// * **not declared** — an open checkbox; choosing it adds a `library` resource, named by the
-    ///   role's last segment (`sensing.particulate` → `particulate`).
+    /// Three states:
+    /// * **board-owned** — the board declares a part for this role (`power.pmu` is the CoreS3's `pmu`),
+    ///   so the path is **read-only**: a `Board` badge, an empty check until the part is selected, and
+    ///   no click. The board's part row is its only control, which keeps this section in step with it —
+    ///   one capability is never both a board part and a library addition.
     /// * **added** (`library`) — a check-mark; choosing it takes the addition back out.
-    /// * **on board** (`board`) — a check-mark, **disabled**: the board's own part already carries this
-    ///   capability, so the catalogue cannot declare it again. `timekeeping.rtc` and `power.pmu` are on
-    ///   the CoreS3, so they show that way. Inlined rather than a `Menu`/`popover` for the same reason
-    ///   the whole catalogue is: those are transient macOS panels that do not reliably scroll their
-    ///   hosted content.
+    /// * **open** — an open checkbox; choosing it adds a `library` resource, named by the role's last
+    ///   segment (`sensing.particulate` → `particulate`).
+    ///
+    /// Inlined rather than a `Menu`/`popover` for the same reason the whole catalogue is: those are
+    /// transient macOS panels that do not reliably scroll their hosted content.
     private func catalogueRow(_ path: String) -> some View {
-        let via = state.declaredVia(role: path)
-        let declared = via != nil
-        let onBoard = via == .board
+        let boardOwned = state.boardCarriesRole(path)
+        let declared = state.declaredVia(role: path) != nil
         return Button {
             state.toggleCatalogueResource(role: path)
         } label: {
             HStack(spacing: 8) {
-                Image(systemName: declared ? "checkmark.circle.fill" : "plus.circle")
+                Image(systemName: declared ? "checkmark.circle.fill" : (boardOwned ? "circle" : "plus.circle"))
                     .font(.system(size: 12))
                     .foregroundStyle(declared ? theme.accent : theme.textTertiary)
                 Text(path)
                     .font(.callout)
                     .foregroundStyle(declared ? theme.textTertiary : theme.textPrimary)
                 Spacer(minLength: 8)
-                if declared {
-                    Text(onBoard ? "on board" : ResourceVia.library.label)
+                if boardOwned {
+                    Text(ResourceVia.board.label)
+                        .font(.caption2)
+                        .foregroundStyle(theme.textTertiary)
+                } else if declared {
+                    Text(ResourceVia.library.label)
                         .font(.caption2)
                         .foregroundStyle(theme.textTertiary)
                 }
@@ -436,7 +443,7 @@ struct BoardResourceFlowView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(onBoard)
+        .disabled(boardOwned)
     }
 
     // MARK: - The stubbed Continue
