@@ -50,10 +50,11 @@
 //!
 //! # What validation can and cannot promise
 //!
-//! [`validate`] checks seven things, each one a failure that would otherwise reach the compiler or a
+//! [`validate`] checks eight things, each one a failure that would otherwise reach the compiler or a
 //! board: no mixed frameworks, a message for every actor, every edge resolving, components that are
-//! framework-agnostic, board facts that belong to a driver, nothing invented-and-unused, and a
-//! **declared resource** behind every device a unit reaches.
+//! framework-agnostic, board facts that belong to a driver, nothing invented-and-unused, a
+//! **declared resource** behind every device a unit reaches, and **exactly one owner** for each such
+//! resource — a device is held in one actor's state, and every other actor messages that owner.
 //!
 //! What it deliberately does **not** promise is the type-level half — that a message is trivially
 //! copyable and default-constructible. A spec names a message; whether that name is a type the
@@ -840,6 +841,37 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
         }
     }
 
+    // Every declared resource has exactly **one owner** — the unit whose `uses` names it, which is the
+    // actor that holds it in its state. A resource nobody owns was declared for nothing; a resource two
+    // units own is *shared*, which the actor model forbids: a device has one driver and one place its
+    // state lives, so every other unit reaches it by messaging that owner, never by using it too. A
+    // `library`/`published` resource shares its name with its driver component, so this one check covers
+    // a board part (used directly) and an added part (used through its driver) alike.
+    for resource in &spec.resources {
+        let owners: Vec<&str> = spec
+            .units
+            .iter()
+            .filter(|unit| unit.uses.iter().any(|used| used == &resource.name))
+            .map(|unit| unit.id.as_str())
+            .collect();
+        match owners.len() {
+            0 => problems.push(format!(
+                "the resource '{}' is declared but no unit uses it — a resource is owned by one actor, \
+                 which holds it in its state, so declare only the devices a unit will reach",
+                resource.name
+            )),
+            1 => {}
+            _ => problems.push(format!(
+                "the resource '{}' is used by {} units ({}) — a resource has one owner, the actor that \
+                 holds it in its state; every other unit reaches it by messaging that owner, not by \
+                 using it itself",
+                resource.name,
+                owners.len(),
+                owners.join(", ")
+            )),
+        }
+    }
+
     finish(problems)
 }
 
@@ -1023,6 +1055,9 @@ fn resources_block() -> String {
      with `\"via\": \"library\"` (a driver this project has, or writes) or `\"via\": \"published\"` (a driver \
      the registry already has). Its `name` **is** the driver component's `id`, so declare both, with one \
      name — that is the word the `uses` speaks.\n\n\
+     An application does not share a device: each declared resource has **exactly one owner** — the \
+     unit whose `uses` names it, the actor that holds the part in its state. Every other unit that needs \
+     it reaches it by **messaging that owner**, so a second `uses` of the same device is a mistake.\n\n\
      Each resource states a `role`: the capability the part **is**, as a path the vocabulary knows — \
      `sensing.particulate`, `media.touch`, `timekeeping.rtc`, `power.pmu`. Give `bus` (the wiring \
      function it sits on: `grove.a`, `i2c_internal`) and `address` when the part has them.\n"
@@ -1186,6 +1221,10 @@ is unbounded recursion on one stack, not a loop.
    `board` (a part of the board, whose name must belong to **no** unit: the word means the part, so a
    unit of that name would be reached instead of it), `library`/`published` (a part this project
    drives, whose name **must** be its driver component's id).
+8. every declared resource has **exactly one owner** — the unit whose `uses` names it, which holds the
+   device in its state. A resource no unit uses was declared for nothing, and a resource two units use
+   is *shared*, which the actor model forbids: every unit but the owner reaches the device by
+   **messaging the owner**, so a second `uses` of the same device is refused.
 
 A component's `"source"` says where its code comes from:
 
@@ -2595,7 +2634,9 @@ mod tests {
         use super::*;
 
         /// The PM2.5 meter plus a `resources` block, as the design phase writes one. Both driver
-        /// resources share their component's id, which is the rule: one device, one word.
+        /// resources share their component's id, which is the rule: one device, one word. Each declared
+        /// resource is then owned by the one actor that holds it — the board's parts by the actors that
+        /// state them, the two drivers by `sampler` — because that is what a `uses` *is*.
         fn declared() -> String {
             let with_resources = PM25_METER.replace(
                 r#""board_facts": ["#,
@@ -2615,7 +2656,27 @@ mod tests {
                 with_resources, PM25_METER,
                 "the fixture has the block to add"
             );
-            with_resources
+            // Each declared resource has exactly one owner, so the actors that hold the board's parts
+            // state it: the screen is the view's, the panel is touch's, the gauge is power's. (`sampler`
+            // already owns `sps30` and `sht20`.) Ownership is what a `uses` is, not a separate field.
+            let owned = with_resources
+                .replace(
+                    r#""state": "the LVGL screen""#,
+                    r#""state": "the LVGL screen", "uses": ["display"]"#,
+                )
+                .replace(
+                    r#""state": "menu and calibration""#,
+                    r#""state": "menu and calibration", "uses": ["touch_panel"]"#,
+                )
+                .replace(
+                    r#""state": "the battery gauge""#,
+                    r#""state": "the battery gauge", "uses": ["battery"]"#,
+                );
+            assert_ne!(
+                owned, with_resources,
+                "the fixture has the actors to extend"
+            );
+            owned
         }
 
         /// The declared set with one fault written into it, at the point the fault belongs to — the same
@@ -2638,15 +2699,15 @@ mod tests {
 
         #[test]
         fn a_unit_may_use_a_part_of_the_board_that_has_no_component() {
-            // The rule the layer exists for: `display`, `touch`, `rtc` and the battery gauge are the
-            // *board's* — reached through the BSP, with no component of this project in between — and a
-            // unit names them out of `resources`, exactly as it names a component.
-            let described = declared().replace(
-                r#""state": "the battery gauge","#,
-                r#""state": "the battery gauge", "uses": ["battery"],"#,
-            );
-            assert_ne!(described, declared(), "the fixture has the actor to extend");
-            validate(&spec(&described)).expect("a board part is reachable by name");
+            // The rule the layer exists for: `display`, `touch_panel` and `battery` are the *board's* —
+            // reached through the BSP, with no component of this project in between — and a unit names
+            // them out of `resources`, exactly as it names a component. The fixture owns each one, so
+            // this is also where ownership shows: the board part is what the actor's `uses` names.
+            let spec = spec(&declared());
+            validate(&spec).expect("a board part is reachable by name");
+            let by_id = |id: &str| spec.units.iter().find(|u| u.id == id).expect(id);
+            assert_eq!(by_id("view").uses, vec!["display".to_string()]);
+            assert_eq!(by_id("power").uses, vec!["battery".to_string()]);
         }
 
         #[test]
@@ -2725,6 +2786,42 @@ mod tests {
         }
 
         #[test]
+        fn a_resource_used_by_two_units_is_refused() {
+            // Exclusivity, the rule that makes ownership checkable: a device is held in one actor's
+            // state, so a second `uses` of it is *sharing* — and the model's answer is that the second
+            // actor messages the owner instead.
+            let problems = rewritten(
+                r#""uses": ["moving_average"], "sends_to": ["view"]"#,
+                r#""uses": ["moving_average", "sht20"], "sends_to": ["view"]"#,
+            );
+            refused(&problems, "is used by");
+        }
+
+        #[test]
+        fn a_declared_resource_nobody_uses_is_refused() {
+            // The other half: a device was selected to be driven, so *some* unit has to own it. Dropping
+            // it from the only actor that used it leaves it declared for nothing.
+            let problems = rewritten(
+                r#""uses": ["sps30", "sht20"], "sends_to": ["air_quality"]"#,
+                r#""uses": ["sps30"], "sends_to": ["air_quality"]"#,
+            );
+            refused(&problems, "is declared but no unit uses it");
+        }
+
+        #[test]
+        fn a_shared_pure_library_component_is_still_allowed() {
+            // The distinction the rule turns on: a *device* is owned, an *algorithm* is used. Two actors
+            // that both reach the same `library` component share code, not hardware, so this stays legal
+            // — `moving_average` is not a resource, only a component.
+            let shared = declared().replace(
+                r#""uses": ["sps30", "sht20"], "sends_to": ["air_quality"]"#,
+                r#""uses": ["sps30", "sht20", "moving_average"], "sends_to": ["air_quality"]"#,
+            );
+            assert_ne!(shared, declared(), "the fixture has the actor to extend");
+            validate(&spec(&shared)).expect("a library component is an algorithm, not a device");
+        }
+
+        #[test]
         fn the_design_request_states_the_resource_rule() {
             // A model that is never told about `resources` invents a sensor and is refused — so the rule
             // is in the prompt, not only in the check.
@@ -2736,6 +2833,7 @@ mod tests {
             let request = design_request(&board, "a PM2.5 meter with a touch screen", None, None);
             for expected in [
                 "does not invent hardware",
+                "exactly one owner",
                 r#""resources""#,
                 r#""via": "board""#,
                 r#""via": "library""#,

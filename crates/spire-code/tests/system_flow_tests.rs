@@ -641,8 +641,9 @@ async fn a_declared_device_reaches_the_application_and_writes_no_phantom_compone
 
     // A composition a person could have written, with the two `via` answers side by side: a display that
     // is a part of the board — the BSP drives it, so no component of this project does — and a sensor
-    // that is not, driven by a component of this project at its own address. `sampler` reaches both,
-    // which is the shape that used to emit a `REQUIRES display` naming nothing.
+    // that is not, driven by a component of this project at its own address. `view` owns the display (a
+    // board part has exactly one owner), and `sampler` reaches the sensor and messages the view; the
+    // board part is the shape that used to emit a `REQUIRES display` naming nothing.
     let text = r#"framework: actors
 board:
   chip: esp32s3
@@ -671,8 +672,8 @@ units:
   - id: sampler
     kind: actor
     message: Tick
-    state: reads the sensor and draws on the screen
-    uses: [sps30, display]
+    state: reads the sensor and reports to the view
+    uses: [sps30]
     sends_to: [view]
   - id: view
     kind: actor
@@ -768,21 +769,35 @@ wiring:
         !app_root.path().join("components/display").exists(),
         "`display` is a part of the board, so it has no component directory"
     );
-    let manifest =
+    // The actor that wraps the sensor names the component it wraps, and nothing for the board.
+    let sampler =
         std::fs::read_to_string(app_root.path().join("components/sampler/CMakeLists.txt"))
             .expect("the actor's manifest is written");
-    let requires = manifest
+    let requires = sampler
         .lines()
         .find(|line| !line.trim_start().starts_with('#') && line.contains("REQUIRES"))
         .expect("the manifest states its REQUIRES");
     assert_eq!(
         requires.trim(),
         "REQUIRES actors messages sps30)",
-        "the component it wraps is required and the part of the board is not"
+        "the component it wraps is required"
+    );
+    // The view **owns** the display, so its manifest is where the board part's absence is stated: a
+    // `REQUIRES display` there would name a component that does not exist.
+    let view = std::fs::read_to_string(app_root.path().join("components/view/CMakeLists.txt"))
+        .expect("the view's manifest is written");
+    let view_requires = view
+        .lines()
+        .find(|line| !line.trim_start().starts_with('#') && line.contains("REQUIRES"))
+        .expect("the view's manifest states its REQUIRES");
+    assert_eq!(
+        view_requires.trim(),
+        "REQUIRES actors messages)",
+        "a part of the board is no component, so it is not named in `idf_component_register`"
     );
     assert!(
-        manifest.contains("`display` is not named here on purpose"),
-        "and the omission says why, so nobody adds it back for a linker:\n{manifest}"
+        view.contains("`display` is not named here on purpose"),
+        "and the omission says why, so nobody adds it back for a linker:\n{view}"
     );
 }
 

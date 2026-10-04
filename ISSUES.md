@@ -4838,3 +4838,31 @@ no resource (or several), and every resource is assigned to exactly one actor �
 between two. This is a design constraint on the injection step, noted here so the step is built
 against it rather than rediscovering it.
 
+### Ownership is state; access is messages
+
+Sharing a resource between actors is not a supported concept. One actor **owns** a resource — it is
+part of that actor's **state** — and every other actor that needs it reaches it by **sending the owner
+a message**, never by touching it directly. This is already the model's vocabulary: `Unit::uses` is the
+ownership edge (what the actor holds), and `Unit::sends_to`/`wiring` is the access edge (who messages
+whom). The one thing `validate` does not yet say is exclusivity — today two actors may both `uses` the
+same device — so the rule to add is: **every declared `Resource.name` appears in exactly one unit's
+`uses`**. A `via: library`/`published` resource shares its name with its driver component, so one check
+covers board parts (used directly) and added parts (used through their driver) alike, while a pure
+library component stays shareable — a device is owned, an algorithm is used.
+
+### How the actors are created — a spectrum, reusing the design phase
+
+The resource step fixes the `resources` block of an `ApplicationSpec`; actor creation fills `units` and
+`wiring` around it. Three mechanisms, on the doors that already exist:
+
+- **Manual** — a third flow step where a person names each actor and assigns resources to it
+  (exclusive, enforced live);
+- **Template** — a deterministic `propose_units(resources)` that groups the chosen resources into
+  candidate actors and auto-creates one `component/driver` per added part, for the person to edit;
+- **LLM** — `design_application` seeded with the *fixed* resource list ("each owned by exactly one
+  actor; others message the owner"), the same parse/repair loop.
+
+Several actors may also form one **functional unit** (a display = panel + touch + backlight): an
+optional `group` on `Unit`, validated as wiring-connected. Build order: the ownership `validate` rule
+first, then the template proposer and the manual step, then the seeded LLM.
+

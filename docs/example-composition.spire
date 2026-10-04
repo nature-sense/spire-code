@@ -22,6 +22,11 @@ board:
 # A unit names one of them in `uses`, and a device nobody declared is a device the application does not
 # have — which is the rule that stops a composition inventing hardware.
 #
+# Each declared resource has **exactly one owner**: the unit whose `uses` names it, the actor that holds
+# the device in its state. Every other unit that needs it reaches it by **messaging that owner**, so a
+# second `uses` of the same device is refused. Ownership is state; access is messages — a device is
+# owned, an algorithm is shared (a plain `library` component may be named by several units).
+#
 # `role` is what the device *is* as a capability the vocabulary knows; `via` is where the code that talks
 # to it comes from:
 #   board     — a part of the board: the BSP reaches it, so no component of this project drives it;
@@ -116,11 +121,15 @@ units:
     kind: actor
     message: Report
     state: the LVGL screen
+    # The board's screen is the view's: it holds the display in its state. A `board` part is reached by
+    # `uses` with no component in between — and it has one owner, which is what makes ownership checkable.
+    uses: [display]
 
   - id: touch
     kind: actor
     message: Gesture
     state: menu and calibration
+    uses: [touch_panel]
     sends_to: [view, sampler]
 
   # The battery gauge. Its *unit id* is `power`; the **facet** block near the end is also called `power`.
@@ -129,6 +138,7 @@ units:
     kind: actor
     message: Tick
     state: the battery gauge
+    uses: [battery]
     sends_to: [view]
 
 # `from -> to`, by unit id. Stated rather than derived, because the edges are what a reviewer checks.
