@@ -10,12 +10,14 @@ import SwiftUI
 ///    facts the graph already holds and Swift must not re-derive them.
 /// 2. **Resources** — one table, one row per **source**: every part the chosen board declares, then
 ///    every category of the capability vocabulary (`capabilities/vocabulary`). A row's first column is
-///    the source's name; its second is the resources that source offers, and it stays **empty** until
-///    the row is chosen. Choosing a **part** row is a choice — the part *is* the resource it offers,
-///    so the row's own click puts it in and shows the resource selected and read-only; choosing a
-///    **category** row only opens it, revealing its paths to tick, because a category holds many and
-///    the application says which. Both feed one `resources:` set. Continue is **stubbed** for v1: it
-///    shows the draft a later step turns into a spec.
+///    the source's name; its second is the resources that source offers — **empty** until something is
+///    chosen from it, then it keeps showing the selections, so a chosen resource stays visible even
+///    after the eye moves to another row. Choosing a **part** row is a choice — the part *is* the
+///    resource it offers, so the row's own click puts it in and shows the resource selected and
+///    read-only; choosing a **category** row opens it, revealing its paths to tick (and, once closed,
+///    keeping the ticked ones in view), because a category holds many and the application says which.
+///    Both feed one `resources:` set. Continue is **stubbed** for v1: it shows the draft a later step
+///    turns into a spec.
 ///
 /// What comes out is a **draft**, not a spec: a `library`/`published` resource still needs the
 /// driver unit that only the design step knows, so nothing here claims to validate.
@@ -31,7 +33,8 @@ struct BoardResourceFlowView: View {
     @State private var showDraft = false
     /// Which table row is open — a board part or a catalogue category. Ephemeral: it is where the eye
     /// is, not part of the draft, so it lives in the view. An open **part** row is one whose part is in
-    /// the draft; a **category** row is open until it is closed.
+    /// the draft; a **category** row is open until it is closed. Closing a row does not hide what was
+    /// chosen from it — the second column keeps the selections in view.
     @State private var selectedSource: Source?
 
     private enum Step { case board, resources }
@@ -216,10 +219,11 @@ struct BoardResourceFlowView: View {
                 draftStep
             } else {
                 // One table, one row per source: a part the board carries, or a catalogue category.
-                // The first column is the name; the second is that source's resources — and it
-                // stays empty until the row is chosen, so the table is quiet with nothing selected. A
-                // part row is a choice (one part is one resource, so choosing it puts the part in); a
-                // category row only opens, because a category holds many paths and the application
+                // The first column is the name; the second is that source's resources — empty until
+                // something is chosen from it, then kept in view so a selection is never lost when the
+                // eye moves on. A part row is a choice (one part is one resource, so choosing it puts
+                // the part in); a category row opens to show its paths to tick, and once closed keeps
+                // the ticked ones visible, because a category holds many paths and the application
                 // says which.
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
@@ -234,10 +238,12 @@ struct BoardResourceFlowView: View {
 
     /// The table: every part the board declares, then every category of the capability vocabulary,
     /// on one list. Each row is the same two columns — the source's name, then the resources that
-    /// source offers — so a part and a category read the same way.
+    /// source offers — so a part and a category read the same way. The hint sits above it only while
+    /// the table is truly untouched — nothing open *and* nothing chosen — because a chosen resource is
+    /// itself kept in view.
     private var sourceTable: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if selectedSource == nil {
+            if selectedSource == nil && state.resources.isEmpty {
                 Text("Choose a board part or a category to see its resources.")
                     .font(.caption)
                     .foregroundStyle(theme.textTertiary)
@@ -262,7 +268,9 @@ struct BoardResourceFlowView: View {
     /// One table row. The first column is the **name** — and clicking it is the whole gesture: a
     /// **part** row is a choice, so clicking it opens the row and puts the part in (clicking the open
     /// row takes it out again); a **category** row only opens and closes. The second column is the
-    /// **resources** of whatever is open, and it is empty for every row that is not.
+    /// **resources** of the source: open shows everything it offers, and a closed row keeps showing the
+    /// resources already chosen from it, so a selection is continuously visible rather than vanishing
+    /// when the eye moves to another row.
     private func sourceRow(_ source: Source, title: String, note: String) -> some View {
         let open = selectedSource == source
         return HStack(alignment: .top, spacing: 0) {
@@ -274,15 +282,9 @@ struct BoardResourceFlowView: View {
 
             Divider().overlay(theme.divider)
 
-            Group {
-                if open {
-                    resourceCell(source)
-                } else {
-                    Color.clear.frame(height: 1)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 12)
+            resourceCell(source, open: open)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 12)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -327,18 +329,25 @@ struct BoardResourceFlowView: View {
         }
     }
 
-    /// The second column of a row: the resources the source offers, and **nothing at all** until the
-    /// row is chosen — the cell is empty, which is what keeps the table quiet.
+    /// The second column of a row: the resources the source offers — **open** shows everything it
+    /// offers (a part's one read-only resource; a category's tickable paths), and a **closed** row
+    /// keeps showing what was already chosen from it, so a selection stays continuously visible rather
+    /// than disappearing when the eye moves to another row. A row with nothing chosen stays empty.
     @ViewBuilder
-    private func resourceCell(_ source: Source) -> some View {
+    private func resourceCell(_ source: Source, open: Bool) -> some View {
         switch source {
         case .part(let name):
-            if let device = state.profile?.devices.first(where: { $0.name == name }) {
+            if state.isBoardPartSelected(name),
+                let device = state.profile?.devices.first(where: { $0.name == name }) {
                 partResource(device)
             }
         case .category(let name):
             if let category = state.catalogue.first(where: { $0.category == name }) {
-                categoryResources(category)
+                if open {
+                    categoryResources(category)
+                } else {
+                    categorySelections(category)
+                }
             }
         }
     }
@@ -381,6 +390,47 @@ struct BoardResourceFlowView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A category's **chosen** resources, shown read-only while the row is closed: just the additions
+    /// the application ticked, so a selection made in a category stays visible after it is closed. A
+    /// `via: board` resource is left out — it lives in the board's own part row, its one control — so
+    /// the two sections never both claim the same capability.
+    private func categorySelections(_ category: VocabularyCategory) -> some View {
+        let chosen = state.resources.filter {
+            $0.via != .board && category.capabilities.contains($0.role)
+        }
+        return VStack(alignment: .leading, spacing: 2) {
+            ForEach(chosen) { draft in
+                selectedResource(draft)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// One chosen resource as a read-only line — a check-mark, its name and role, and how it is
+    /// reached — the same shape a part's resource takes, so the two read alike.
+    private func selectedResource(_ draft: ResourceDraft) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(theme.accent)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(draft.name).font(.callout)
+                Text(draft.role)
+                    .font(.caption)
+                    .foregroundStyle(theme.textSecondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text(draft.via.label)
+                .font(.caption2)
+                .foregroundStyle(theme.textTertiary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     /// The one-line summary a part carries in the first column: its part number when the board named
