@@ -18,14 +18,16 @@
 //! # The taxonomy
 //!
 //! * **nodes** — [`node::ANCHOR`] (framework + justification), [`node::BOARD`] (chip/bsp/hal),
-//!   [`node::BOARD_FACT`] (a bus/device/address triple), [`node::FACET`] (a power/storage/network/
-//!   security lens), [`node::COMPONENT`]/[`node::ACTOR`]/[`node::STAGE`] (a unit, discriminated by its
-//!   kind), [`node::MESSAGE`] (a message type, deduplicated by name), and [`node::DESIGN_RECORD`] (the
-//!   decision that produced the composition);
-//! * **edges** — containment ([`edge::HAS_BOARD`], [`edge::HAS_BOARD_FACT`], [`edge::HAS_FACET`],
-//!   [`edge::HAS_UNIT`], [`edge::HAS_MESSAGE`], [`edge::HAS_DESIGN_RECORD`]) and the composition's own
-//!   wiring ([`edge::USES`], [`edge::SENDS_TO`], [`edge::WIRED_TO`]). The board's facts hang off the
-//!   **board**, not the anchor, because a fact is about a board.
+//!   [`node::BOARD_FACT`] (a bus/device/address triple), [`node::RESOURCE`] (a device the application
+//!   declares, with the capability it *is* and how it is reached), [`node::FACET`] (a
+//!   power/storage/network/security lens), [`node::COMPONENT`]/[`node::ACTOR`]/[`node::STAGE`] (a unit,
+//!   discriminated by its kind), [`node::MESSAGE`] (a message type, deduplicated by name), and
+//!   [`node::DESIGN_RECORD`] (the decision that produced the composition);
+//! * **edges** — containment ([`edge::HAS_BOARD`], [`edge::HAS_BOARD_FACT`], [`edge::HAS_RESOURCE`],
+//!   [`edge::HAS_FACET`], [`edge::HAS_UNIT`], [`edge::HAS_MESSAGE`], [`edge::HAS_DESIGN_RECORD`]) and
+//!   the composition's own wiring ([`edge::USES`], [`edge::SENDS_TO`], [`edge::WIRED_TO`]). The board's
+//!   facts hang off the **board**, not the anchor, because a fact is about a board; the **resources**
+//!   hang off the anchor, because a device the application added is no part of the board.
 //!
 //! # The design record, and staleness
 //!
@@ -50,14 +52,16 @@
 //! `spec_graph` keeps an actor's `uses` — and the store round-trips it verbatim. The `USES`/`SENDS_TO`/
 //! `WIRED_TO` edges are a **derived, traversable projection** of those properties (so "what does
 //! `air_quality` use?" is one hop), rebuilt on every store and never read back: the property is
-//! authoritative. Port names (`pulls`/`pushes`) are labels, not entities, so they too are scalars.
+//! authoritative. A `uses` that names a **board part** has no unit to point at, so its edge points at
+//! that part's resource node instead — the projection answers for the devices too. Port names
+//! (`pulls`/`pushes`) are labels, not entities, so they too are scalars.
 
 use serde_json::{json, Value};
 
 use crate::build::application_spec::{
     framework_from_name, ApplicationFramework, ApplicationSpec, BoardChoice, BoardFact,
-    ComponentRole, NetworkFacet, PowerFacet, SecurityFacet, StorageFacet, Unit, UnitKind,
-    UnitSource,
+    ComponentRole, NetworkFacet, PowerFacet, Resource, ResourceVia, SecurityFacet, StorageFacet,
+    Unit, UnitKind, UnitSource,
 };
 
 /// Node-type discriminators for the decomposed composition graph (stored as the `subtype` of an
@@ -66,6 +70,8 @@ pub mod node {
     pub const ANCHOR: &str = "anchor";
     pub const BOARD: &str = "board";
     pub const BOARD_FACT: &str = "board_fact";
+    /// A device the **application** declares it composes against (see `Resource`).
+    pub const RESOURCE: &str = "resource";
     pub const FACET: &str = "facet";
     pub const COMPONENT: &str = "component";
     pub const ACTOR: &str = "actor";
@@ -79,6 +85,9 @@ pub mod node {
 pub mod edge {
     pub const HAS_BOARD: &str = "HAS_BOARD";
     pub const HAS_BOARD_FACT: &str = "HAS_BOARD_FACT";
+    /// Anchor → a [`node::RESOURCE`] the application declares. Off the **anchor**, not the board: a
+    /// resource is the application's claim, and a part the application added is no part of the board.
+    pub const HAS_RESOURCE: &str = "HAS_RESOURCE";
     pub const HAS_FACET: &str = "HAS_FACET";
     pub const HAS_UNIT: &str = "HAS_UNIT";
     pub const HAS_MESSAGE: &str = "HAS_MESSAGE";
@@ -96,6 +105,19 @@ pub const ROOT: &str = "composition";
 
 /// Logical name of the single board node.
 const BOARD_NAME: &str = "board";
+
+/// The prefix a **resource** node's key carries: the declaration's own name, namespaced.
+///
+/// A node's `name` is the graph's identity, and a resource deliberately shares its name with the driver
+/// component that drives it — one device, one word, because that is what a `uses` speaks. So the key
+/// cannot *be* that word, and the name is recovered from the key instead. ([`node::BOARD_FACT`] does the
+/// same with an index, for the same reason: a key is not always a name.)
+const RESOURCE_PREFIX: &str = "resource.";
+
+/// The graph key of the resource node declared as `name`.
+fn resource_node(name: &str) -> String {
+    format!("{RESOURCE_PREFIX}{name}")
+}
 
 /// Logical name of the single design-record node. The store scopes it `{project}::{this}`, so a
 /// project's record is one query away and never collides with another project's.
@@ -115,6 +137,7 @@ const P_DEVICE: &str = "device";
 const P_ADDRESS: &str = "address";
 const P_FACET: &str = "facet";
 const P_ROLE: &str = "role";
+const P_VIA: &str = "via";
 const P_SOURCE: &str = "source";
 const P_REGISTRY: &str = "registry";
 const P_PROVIDES: &str = "provides";
@@ -265,6 +288,11 @@ fn unit_source(s: &str) -> Option<UnitSource> {
     serde_json::from_value(Value::String(s.to_string())).ok()
 }
 
+/// The [`ResourceVia`] a `via` property states, or `None` when it states none this knows.
+fn resource_via(s: &str) -> Option<ResourceVia> {
+    serde_json::from_value(Value::String(s.to_string())).ok()
+}
+
 /// `from -> to`, as `wiring` and `validate` write it.
 fn parse_wiring(entry: &str) -> Option<(&str, &str)> {
     let (from, to) = entry.split_once("->")?;
@@ -307,6 +335,24 @@ pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
         g.edges.push(edge(edge::HAS_BOARD_FACT, BOARD_NAME, &name));
     }
 
+    // Resources: the devices the application declares it composes against, in declaration order.
+    for (i, r) in spec.resources.iter().enumerate() {
+        let key = resource_node(&r.name);
+        let mut n = CompositionNode::new(node::RESOURCE, &key)
+            .with(P_ROLE, json!(r.role))
+            .with(PROP_ORDER, json!(i));
+        if let Some(v) = r.via {
+            n = n.with(P_VIA, json!(v));
+        }
+        for (key, value) in [(P_BUS, &r.bus), (P_ADDRESS, &r.address)] {
+            if !value.is_empty() {
+                n = n.with(key, json!(value));
+            }
+        }
+        g.nodes.push(n);
+        g.edges.push(edge(edge::HAS_RESOURCE, ROOT, &key));
+    }
+
     push_facets(&mut g, spec);
 
     // Messages first (deduped, first-seen order) so units can point at them.
@@ -321,6 +367,13 @@ pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
     for m in &messages {
         g.nodes.push(CompositionNode::new(node::MESSAGE, m));
     }
+
+    // What a `uses` can reach: a unit, or a declared resource with no unit of its own (a part of the
+    // board). The `USES` edges exist as a one-hop projection, so they point at whichever node actually
+    // exists — the store skips an edge to a node nobody wrote, and a skipped edge is a traversal that
+    // silently answers nothing.
+    let unit_names: Vec<&str> = spec.units.iter().map(|u| u.id.as_str()).collect();
+    let resource_names: Vec<&str> = spec.resources.iter().map(|r| r.name.as_str()).collect();
 
     for (i, u) in spec.units.iter().enumerate() {
         let mut n = CompositionNode::new(kind_str(u.kind), &u.id)
@@ -353,7 +406,16 @@ pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
 
         g.edges.push(edge(edge::HAS_UNIT, ROOT, &u.id));
         for target in &u.uses {
-            g.edges.push(edge(edge::USES, &u.id, target));
+            // A unit is reached by its own id; a board part has no unit, so the edge reaches its resource
+            // node. A name that is both (a driver's resource shares the component's id) is the unit.
+            let to = if !unit_names.contains(&target.as_str())
+                && resource_names.contains(&target.as_str())
+            {
+                resource_node(target)
+            } else {
+                target.clone()
+            };
+            g.edges.push(edge(edge::USES, &u.id, &to));
         }
         for target in &u.sends_to {
             g.edges.push(edge(edge::SENDS_TO, &u.id, target));
@@ -453,6 +515,23 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
         None => Vec::new(),
     };
 
+    let resources = children(g, &anchor.name, edge::HAS_RESOURCE)
+        .into_iter()
+        .map(|n| Resource {
+            // The key is namespaced because a resource shares its name with the driver that drives it;
+            // the declaration's own name is the rest of it.
+            name: n
+                .name
+                .strip_prefix(RESOURCE_PREFIX)
+                .unwrap_or(n.name.as_str())
+                .to_string(),
+            role: prop_str(n, P_ROLE).unwrap_or_default(),
+            via: prop_str(n, P_VIA).as_deref().and_then(resource_via),
+            bus: prop_str(n, P_BUS).unwrap_or_default(),
+            address: prop_str(n, P_ADDRESS).unwrap_or_default(),
+        })
+        .collect();
+
     let (mut power, mut storage, mut network, mut security) = (None, None, None, None);
     for f in children(g, &anchor.name, edge::HAS_FACET) {
         match prop_str(f, P_FACET).as_deref() {
@@ -526,6 +605,7 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
         justification,
         board,
         board_facts,
+        resources,
         units,
         wiring,
         power,
@@ -880,6 +960,65 @@ mod tests {
                 "there is a '{kind}' facet node"
             );
         }
+        assert_eq!(reconstruct(&g).expect("reconstruct"), spec);
+    }
+
+    /// **The resources layer survives the graph.** `reconstruct(decompose(spec)) == spec` is a hard
+    /// property of this module, and the devices an application *declares* are part of its spec — a graph
+    /// that dropped them would re-render `composition.spire` without the application's own hardware, and
+    /// take the rule that a `uses` reaches a declared device with it.
+    #[test]
+    fn declared_resources_roundtrip_through_the_graph() {
+        let spec = parse_spec(
+            r#"{
+              "framework": "actors",
+              "justification": "a PM2.5 meter whose sensor the application adds",
+              "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3", "hal": "m5unified" },
+              "board_facts": [ { "bus": "i2c", "device": "sps30", "address": "0x69" } ],
+              "resources": [
+                { "name": "display", "role": "media.display", "via": "board" },
+                { "name": "pmu", "role": "power.pmu", "via": "board", "address": "0x34" },
+                { "name": "sps30", "role": "sensing.particulate", "via": "library",
+                  "bus": "grove.a", "address": "0x69" }
+              ],
+              "units": [
+                { "id": "sps30", "kind": "component", "role": "driver", "source": "stub",
+                  "bus": "i2c", "provides": "PM1/2.5/4/10 readings" },
+                { "id": "sampler", "kind": "actor", "message": "Tick", "uses": ["sps30", "display"],
+                  "state": "the last reading", "sends_to": ["uplink"] },
+                { "id": "uplink", "kind": "actor", "message": "Batch", "state": "the last batch" }
+              ],
+              "wiring": [ "sampler -> uplink" ]
+            }"#,
+        )
+        .expect("the resources example parses");
+
+        let g = decompose(&spec);
+        assert_eq!(count(&g, node::RESOURCE), 3);
+        assert_eq!(edge_count(&g, edge::HAS_RESOURCE), 3);
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| n.node_type == node::RESOURCE && n.name == resource_node("sps30")),
+            "a resource hangs off the anchor under a namespaced key, so a `uses` of a board part resolves"
+        );
+        // The two devices with no component of their own are reached through their resource nodes:
+        // `display` is a board part, and the traversal has to land somewhere.
+        assert!(
+            g.edges.iter().any(|e| e.predicate == edge::USES
+                && e.from_name == "sampler"
+                && e.to_name == resource_node("display")),
+            "a `uses` of a board part points at the part's node, not at a name nobody wrote"
+        );
+        // `sps30` is both a declared resource and the component that drives it. The unit wins — the same
+        // order `validate` resolves a `uses` in — so the projection lands on the component, not on the
+        // resource node next to it.
+        assert!(
+            g.edges.iter().any(|e| e.predicate == edge::USES
+                && e.from_name == "sampler"
+                && e.to_name == "sps30"),
+            "a name that is a unit and a resource is the unit"
+        );
         assert_eq!(reconstruct(&g).expect("reconstruct"), spec);
     }
 

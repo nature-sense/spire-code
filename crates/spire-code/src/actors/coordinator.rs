@@ -6132,7 +6132,8 @@ impl CoordinatorActor {
         if text.trim().is_empty() {
             return serde_json::json!({
                 "error": "createProject/ParseComposition needs 'text': the contents of a \
-                          composition.spire — YAML of the form {framework, board, units, wiring}"
+                          composition.spire — YAML of the form {framework, board, board_facts, \
+                          resources, units, wiring}"
             });
         }
 

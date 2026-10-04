@@ -18,6 +18,47 @@ board:
   bsp: m5stack_core_s3
   hal: m5unified
 
+# The **resources** this application composes against: the devices it has, declared rather than assumed.
+# A unit names one of them in `uses`, and a device nobody declared is a device the application does not
+# have — which is the rule that stops a composition inventing hardware.
+#
+# `role` is what the device *is* as a capability the vocabulary knows; `via` is where the code that talks
+# to it comes from:
+#   board     — a part of the board: the BSP reaches it, so no component of this project drives it;
+#   library   — driven by a component of this project, whose `id` *is* the resource name;
+#   published — driven by a managed dependency the manifest resolves from the registry.
+#
+# `bus`/`address` are written when the part has them: the wiring function its literal in `main/` is
+# written from, and the address a board fact may state as well — one device has one address.
+resources:
+  - name: display
+    role: media.display
+    via: board
+
+  - name: touch_panel
+    role: media.touch
+    via: board
+    bus: i2c_internal
+    address: "0x38"
+
+  - name: battery
+    role: power.battery
+    via: board
+
+  # A driver-backed device shares its name with its driver on purpose — one device, one word: `sps30` and
+  # `sht20` are the two components below, and the addresses here are the same literals as the board facts.
+  - name: sps30
+    role: sensing.particulate
+    via: library
+    bus: i2c
+    address: "0x69"
+
+  - name: sht20
+    role: sensing.temperature
+    via: library
+    bus: i2c
+    address: "0x40"
+
 # Board facts are the *application's*: a bus and an address belong to the product, never to a component.
 # Addresses are quoted as a house rule: this reader keeps a scalar's text in a string field either way,
 # but a quoted address means the same thing in every YAML parser and reads as text, not as a number.

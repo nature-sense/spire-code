@@ -19,6 +19,9 @@
 //! * **units** — a `component` (a driver on a bus, or a pure library), an `actor` (a `Message` and the
 //!   state behind it), or a ramen `stage` (a pair of ports);
 //! * **wiring** — which unit talks to which, stated rather than implied;
+//! * **resources** — the devices the application declares it composes against, each with the
+//!   capability it *is* and how it is reached (a part of the board, or a driver this project has,
+//!   writes, or depends on);
 //! * **board facts** — the pins, buses and addresses, which belong to the **application** and never to
 //!   a component (the rule the whole component library rests on);
 //! * the **board** itself, and the **framework** the above is written for.
@@ -47,9 +50,10 @@
 //!
 //! # What validation can and cannot promise
 //!
-//! [`validate`] checks six things, each one a failure that would otherwise reach the compiler or a
+//! [`validate`] checks seven things, each one a failure that would otherwise reach the compiler or a
 //! board: no mixed frameworks, a message for every actor, every edge resolving, components that are
-//! framework-agnostic, board facts that belong to a driver, and nothing invented-and-unused.
+//! framework-agnostic, board facts that belong to a driver, nothing invented-and-unused, and a
+//! **declared resource** behind every device a unit reaches.
 //!
 //! What it deliberately does **not** promise is the type-level half — that a message is trivially
 //! copyable and default-constructible. A spec names a message; whether that name is a type the
@@ -255,6 +259,63 @@ pub struct BoardFact {
     pub address: String,
 }
 
+/// How a declared [`Resource`] is reached by the composition.
+///
+/// The three answers are the three places the *code that talks to the part* can be, and they are not
+/// interchangeable downstream: a `board` part is reached through the BSP or the board abstraction and
+/// generates no component of its own; a `library` part is driven by a component of this project
+/// (already in the library, or a stub the design asks to be written); a `published` one is driven by a
+/// **managed dependency** the manifest resolves from the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceVia {
+    /// A part **of the board** — the BSP or the board abstraction above is what reaches it, so no
+    /// component of this project drives it.
+    Board,
+    /// A part driven by a **component of the library** the application is built against: the one the
+    /// design names, or the stub it asks to be written.
+    Library,
+    /// A part driven by a **published** component — a managed dependency of the application.
+    Published,
+}
+
+/// One **resource**: a device the composition may reach, **declared** rather than invented.
+///
+/// This is the application's contribution to the layer between a board's capabilities and the units
+/// that use them. An application does not invent hardware: it says which devices it composes against
+/// (`name`), what each one **is** as a capability the vocabulary knows (`role`), and where the code
+/// that talks to it comes from ([`ResourceVia`], with the `bus`/`address` when it has them). Every
+/// unit's `uses` then reaches a resource *declared here* — so a model that invents a sensor is refused
+/// by the check rather than by the board, and the set a person reviews is the set the application has.
+///
+/// A resource is not a unit. A board's own part (`via: board`) has no component at all, and a part the
+/// application adds (`via: library`/`published`) shares its name with the driver that drives it: one
+/// device, one word, because that is what a `uses` speaks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resource {
+    /// The word the composition speaks, and what a unit's `uses` names. Lower_snake, and the same word
+    /// as its driver component's id when it has one.
+    pub name: String,
+    /// What the part **is**, as a capability path the vocabulary knows (`sensing.particulate`,
+    /// `media.touch`, `timekeeping.rtc`). A name the vocabulary does not know is refused rather than
+    /// read as "this application has none" — which is the whole reason the vocabulary exists.
+    pub role: String,
+    /// Where the code that talks to it comes from — see [`ResourceVia`]. Absent is a problem
+    /// [`validate`] states rather than a default, because the choice decides whether a component is
+    /// designed at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<ResourceVia>,
+    /// The **wiring function** it is reached on (`grove.a`, `i2c_internal`) — a function of the board's
+    /// `pins:`, not a protocol. A driver's own `bus` is the protocol it speaks; this is where the wires
+    /// are, which is why the two are different fields that never disagree.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bus: String,
+    /// Its I²C address, when it has one. A resource and the board fact for the same driver state one
+    /// address, so when both are present they have to agree — see [`validate`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub address: String,
+}
+
 /// The **facets**: power, storage, networking and security, as *lenses* over the composition.
 ///
 /// The composition is one body; a facet is a way of looking at it, not a second artifact. Power is
@@ -319,6 +380,11 @@ pub struct ApplicationSpec {
     pub board: BoardChoice,
     #[serde(default)]
     pub board_facts: Vec<BoardFact>,
+    /// The **resources** this application declares: the devices it may reach. Every unit's `uses`
+    /// reaches one of these, so a device nobody declared is a device this application does not have —
+    /// which is the rule that makes "nothing invented" checkable rather than a hope. See [`Resource`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<Resource>,
     pub units: Vec<Unit>,
     /// `from -> to`, by unit id. Stated rather than derived from `sends_to`, because the edges *are*
     /// what a reviewer checks — and because a stage has no `sends_to` to derive them from.
@@ -347,6 +413,11 @@ impl ApplicationSpec {
     /// A unit's id as a key — the identity a wiring edge and a board fact refer to.
     fn ids(&self) -> BTreeSet<&str> {
         self.units.iter().map(|u| u.id.as_str()).collect()
+    }
+
+    /// The resource with this name, if the spec declares one — what a `uses` is checked against.
+    fn resource(&self, name: &str) -> Option<&Resource> {
+        self.resources.iter().find(|r| r.name == name)
     }
 }
 
@@ -406,7 +477,7 @@ pub fn parse_composition(text: &str) -> Result<ApplicationSpec, String> {
     })
 }
 
-/// The six rules — every one of them a failure that would otherwise reach the compiler or a board.
+/// The seven rules — every one of them a failure that would otherwise reach the compiler or a board.
 ///
 /// Returns every problem rather than the first, because a spec is repaired in one pass: a model (or a
 /// person) told all of them at once fixes them together, and one told a rule at a time spends six
@@ -489,7 +560,8 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
         }
     }
 
-    // 3. Every edge resolves; wiring connects *composition*, and `uses` reaches a component.
+    // 3. Every edge resolves; wiring connects *composition*, and `uses` reaches a component — or a
+    // resource this spec declares, which is how a unit names a part of the board.
     for edge in &spec.wiring {
         match parse_edge(edge) {
             Some((from, to)) => {
@@ -534,8 +606,15 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
                      framework-agnostic parts and talks to the others through the wiring",
                     unit.id
                 )),
+                // A `uses` that names no unit may still name a **declared resource**: a part of the
+                // board (`display`, `touch`, `rtc`) has no component of this project, and reaching it
+                // is a `uses` like any other. Naming a device nobody declared is the refusal — an
+                // application composes against the hardware it has, not the hardware it wishes for.
+                None if spec.resource(used).is_some() => {}
                 None => problems.push(format!(
-                    "'{}' uses '{used}', which is not a unit in this spec",
+                    "'{}' uses '{used}', which is neither a component in this spec nor a resource it \
+                     declares — declare the device in `resources` first (its `name` is what a `uses` \
+                     speaks), because a unit cannot reach hardware this application does not have",
                     unit.id
                 )),
             }
@@ -672,6 +751,92 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
                  an invented unit nobody uses is either a mistake or work that belongs to another spec",
                 unit.id
             ));
+        }
+    }
+
+    // 7. The declared resources hold together: one name for one part, a capability the vocabulary
+    // knows, a source that agrees with the composition, and nothing invented.
+    let mut declared: BTreeSet<&str> = BTreeSet::new();
+    for resource in &spec.resources {
+        if !is_identifier(resource.name.trim()) {
+            problems.push(format!(
+                "'{}' is not a resource name — it is the word a unit's `uses` speaks, so it is a bare \
+                 lower_snake identifier (`sps30`, `rtc`)",
+                resource.name
+            ));
+        }
+        // A name is what a `uses` resolves *by*, so two resources sharing one would make every `uses`
+        // of it ambiguous — and `resource(name)` would answer with the first, so the second would read
+        // as though it were not declared.
+        if !declared.insert(resource.name.as_str()) {
+            problems.push(format!(
+                "'{}' is declared twice — a resource name is what a `uses` refers to, so two resources \
+                 cannot share one",
+                resource.name
+            ));
+        }
+        // The role is the declaration's whole point: an application says what it needs *by capability*,
+        // and a name the vocabulary does not know is a **misspelling** here exactly as it is on a
+        // board — the difference between a new thing and a typo is that someone named the former.
+        if !crate::capability_vocabulary::is_known_path(resource.role.trim()) {
+            problems.push(format!(
+                "the resource '{}' claims the capability '{}', which is not one the vocabulary knows \
+                 — a role is a capability path (`sensing.particulate`, `timekeeping.rtc`), and one \
+                 nobody named is a typo rather than a new thing",
+                resource.name, resource.role
+            ));
+        }
+        // The driver, if the application drives this part itself: the component whose `id` *is* the
+        // resource name, and whose role has to be `driver` because a device is reached through a bus.
+        let driver = spec.units.iter().any(|unit| {
+            unit.id == resource.name
+                && unit.kind == UnitKind::Component
+                && unit.role == Some(ComponentRole::Driver)
+        });
+        // Any unit at all sharing the name — which a `board` resource may not have: the word then means
+        // two things, and because a `uses` resolves a unit before a resource, the *unit* is what it
+        // would reach, silently shadowing the part.
+        let shadowing = spec.units.iter().any(|unit| unit.id == resource.name);
+        match resource.via {
+            None => problems.push(format!(
+                "the resource '{}' does not say how it is reached — `\"via\"` is `board` (a part of the \
+                 board), `library` (a driver this project has or writes) or `published` (a managed \
+                 dependency), and the choice decides whether a component is designed at all",
+                resource.name
+            )),
+            // The board reaches it, so the word belongs to the part: a unit of the same name would be
+            // reached instead of it, and a part the board already drives needs no component of ours.
+            Some(ResourceVia::Board) if shadowing => problems.push(format!(
+                "the resource '{}' is `via: board` and the spec also has a unit of that name — the word \
+                 means the board's part, and since a `uses` resolves a unit before a resource, '{}' \
+                 would reach the unit and never the part. Name the unit after what it does — or declare \
+                 this resource `library`/`published` if that unit really is its driver",
+                resource.name, resource.name
+            )),
+            // A part this application drives needs the driver that drives it: the component is where
+            // the protocol lives, and its id is the name the resource is declared by.
+            Some(ResourceVia::Library | ResourceVia::Published) if !driver => problems.push(format!(
+                "the resource '{}' is `via: {}` but no driver component of that name is in the spec — \
+                 a `library`/`published` resource *is* its driver's id, so that component has to be \
+                 designed too",
+                resource.name,
+                if resource.via == Some(ResourceVia::Published) { "published" } else { "library" }
+            )),
+            _ => {}
+        }
+        // The one place the older `board_facts` and these resources overlap: the address of one
+        // device. Stating it twice is fine; disagreeing is not, because one of the two would be a lie.
+        if let Some(fact) = spec.board_facts.iter().find(|f| f.device == resource.name) {
+            if !fact.address.trim().is_empty()
+                && !resource.address.trim().is_empty()
+                && fact.address != resource.address
+            {
+                problems.push(format!(
+                    "the resource '{}' is at {} and its board fact says {} — one device has one \
+                     address",
+                    resource.name, resource.address, fact.address
+                ));
+            }
         }
     }
 
@@ -838,6 +1003,32 @@ fn library_block(library: Option<&LibraryFacts>) -> String {
     text
 }
 
+/// The **resources** block of the prompt: the rule that sits between the hardware and the units.
+///
+/// Stated in the prompt because it is the rule a model most naturally breaks — asked for a PM2.5 meter
+/// it will happily invent a sensor — and because the *board* is the wrong place to catch that: the board
+/// is a different file, and a part the application adds belongs to the application. So the prompt says
+/// what `resources` is and how each `via` is earned, and [`validate`] refuses a `uses` that reaches a
+/// device nobody declared.
+fn resources_block() -> String {
+    "## The resources this application composes against\n\n\
+     An application does not invent hardware. Before a unit may reach a device, the device is \
+     **declared** in the spec's `resources`, and every `uses` names one of those declarations — a device \
+     you do not declare is a device this application does not have.\n\n\
+     * a part **of the board** — a display, a touch panel, an RTC, an IMU, a battery gauge — is declared \
+     with `\"via\": \"board\"`. There is no component behind it: the BSP, or the board abstraction above, \
+     is what reaches it, and a unit `uses` its `name` directly. The name means the part, so no unit may \
+     share it — name an actor after what it *does* (`touch_input`, not `touch`);\n\
+     * a part the **application adds** — a sensor on a grove port, a module on the header — is declared \
+     with `\"via\": \"library\"` (a driver this project has, or writes) or `\"via\": \"published\"` (a driver \
+     the registry already has). Its `name` **is** the driver component's `id`, so declare both, with one \
+     name — that is the word the `uses` speaks.\n\n\
+     Each resource states a `role`: the capability the part **is**, as a path the vocabulary knows — \
+     `sensing.particulate`, `media.touch`, `timekeeping.rtc`, `power.pmu`. Give `bus` (the wiring \
+     function it sits on: `grove.a`, `i2c_internal`) and `address` when the part has them.\n"
+        .to_string()
+}
+
 /// The **design request**: what the model is asked, with the board and the description in it.
 ///
 /// `description` is the user's answers to the design form — the six questions below, in their own
@@ -894,6 +1085,8 @@ not a design choice — it is an application built for a board nobody has.
 
 {library}
 
+{resources}
+
 ## What the application has to do
 
 {description}
@@ -920,6 +1113,11 @@ device, an address, a pin or a protocol:
   "justification": "one line for the person confirming this",
   "board": {{ "chip": "...", "bsp": "...", "hal": "..." }},
   "board_facts": [ {{ "bus": "i2c", "device": "<a driver unit id>", "address": "0x69" }} ],
+  "resources": [
+    {{ "name": "display", "role": "media.display", "via": "board" }},
+    {{ "name": "rtc", "role": "timekeeping.rtc", "via": "board", "bus": "i2c_internal", "address": "0x51" }},
+    {{ "name": "sps30", "role": "sensing.particulate", "via": "library", "bus": "grove.a", "address": "0x69" }}
+  ],
   "units": [
     {{ "id": "sps30", "kind": "component", "role": "driver", "source": "stub",
        "provides": "PM1/2.5/4/10 readings", "bus": "i2c" }},
@@ -950,7 +1148,9 @@ A unit is exactly one of three kinds:
   synchronously — so the chain is a **DAG**, never a cycle.
 
 `uses` is how the composition reaches the framework-agnostic parts: `sampler` sampling `sps30`, a
-`detector` stage using `esp_dl`. It is also what tells a reviewer which component a unit wraps.
+`detector` stage using `esp_dl`. It is also what tells a reviewer which component a unit wraps. It
+reaches a **component**, or a **declared resource** — a part of the board, which has no component of its
+own (`resources` above).
 
 **An edge carries the receiver's message, not the sender's.** In an `actors` application every edge
 `a -> b` means `a` posts a message of **`b`'s** type — `a` holds `ActorRef<b::Message>`, and that is the
@@ -981,6 +1181,11 @@ is unbounded recursion on one stack, not a loop.
    reached. An onboard device is not a fact — it comes from the board.
 6. nothing invented and unused: every unit is referenced by the wiring, by a `sends_to`, by a `uses`,
    or by a board fact.
+7. every device a unit reaches is **declared** in `resources`, and every declaration holds together:
+   one name per part, a `role` the vocabulary knows, and a `via` that agrees with the composition —
+   `board` (a part of the board, whose name must belong to **no** unit: the word means the part, so a
+   unit of that name would be reached instead of it), `library`/`published` (a part this project
+   drives, whose name **must** be its driver component's id).
 
 A component's `"source"` says where its code comes from:
 
@@ -997,6 +1202,7 @@ A component's `"source"` says where its code comes from:
 Respond with **only the JSON object**, and nothing else."#,
         board = board_block(board),
         library = library_block(library),
+        resources = resources_block(),
         description = description.trim(),
         framework_rule = framework_rule,
     )
@@ -2238,6 +2444,19 @@ mod tests {
         );
         // A quoted address is the string the driver wants, not the integer YAML would read.
         assert_eq!(spec.board_facts[0].address, "0x69");
+        // And the **resources** layer is in the file a person opens, not only in the prompt: the example
+        // is what teaches the format, so a layer missing from it is a layer nobody writes.
+        let display = spec
+            .resource("display")
+            .expect("the board's own display is declared");
+        assert_eq!(display.role, "media.display");
+        assert_eq!(display.via, Some(ResourceVia::Board));
+        let sps30 = spec
+            .resource("sps30")
+            .expect("the added sensor is declared");
+        assert_eq!(sps30.via, Some(ResourceVia::Library));
+        assert_eq!(sps30.address, "0x69", "the same literal as its board fact");
+        assert_eq!(spec.resources.len(), 5, "the example shows the layer whole");
         // The facet annotations converge into the units, not into a block of their own.
         assert!(by_id("sampler").sleeps);
         assert_eq!(by_id("sampler").wake.as_deref(), Some("timer@1s"));
@@ -2366,5 +2585,164 @@ mod tests {
             "the refusal names the parse: {err}"
         );
         assert!(err.contains("line"), "and where it is: {err}");
+    }
+
+    /// **The `resources` layer**: the devices an application declares, and the rule that a `uses`
+    /// reaches one of them. The two halves of one idea — the set a person reviews is the set the
+    /// application has — so every case here starts from the PM2.5 example with the block the design
+    /// phase writes added to it: the board's own parts first, then the two drivers this application adds.
+    mod resources {
+        use super::*;
+
+        /// The PM2.5 meter plus a `resources` block, as the design phase writes one. Both driver
+        /// resources share their component's id, which is the rule: one device, one word.
+        fn declared() -> String {
+            let with_resources = PM25_METER.replace(
+                r#""board_facts": ["#,
+                r#""resources": [
+                     { "name": "display", "role": "media.display", "via": "board" },
+                     { "name": "touch_panel", "role": "media.touch", "via": "board",
+                       "bus": "i2c_internal", "address": "0x38" },
+                     { "name": "battery", "role": "power.battery", "via": "board" },
+                     { "name": "sps30", "role": "sensing.particulate", "via": "library",
+                       "bus": "grove.a", "address": "0x69" },
+                     { "name": "sht20", "role": "sensing.temperature", "via": "library",
+                       "bus": "grove.a", "address": "0x40" }
+                   ],
+                   "board_facts": ["#,
+            );
+            assert_ne!(
+                with_resources, PM25_METER,
+                "the fixture has the block to add"
+            );
+            with_resources
+        }
+
+        /// The declared set with one fault written into it, at the point the fault belongs to — the same
+        /// shape [`refusal`] uses, against the spec that has the block.
+        fn rewritten(from: &str, to: &str) -> Vec<String> {
+            refusal(&declared(), from, to)
+        }
+
+        #[test]
+        fn the_declared_resources_are_the_devices_the_application_has() {
+            let spec = spec(&declared());
+            assert_eq!(spec.resources.len(), 5);
+            validate(&spec).expect("a declared set validates");
+            assert_eq!(
+                spec.resource("sps30").expect("declared").role,
+                "sensing.particulate",
+                "a driver's resource and its component carry one name, and the resource says what it is"
+            );
+        }
+
+        #[test]
+        fn a_unit_may_use_a_part_of_the_board_that_has_no_component() {
+            // The rule the layer exists for: `display`, `touch`, `rtc` and the battery gauge are the
+            // *board's* — reached through the BSP, with no component of this project in between — and a
+            // unit names them out of `resources`, exactly as it names a component.
+            let described = declared().replace(
+                r#""state": "the battery gauge","#,
+                r#""state": "the battery gauge", "uses": ["battery"],"#,
+            );
+            assert_ne!(described, declared(), "the fixture has the actor to extend");
+            validate(&spec(&described)).expect("a board part is reachable by name");
+        }
+
+        #[test]
+        fn a_device_nobody_declared_is_refused() {
+            // The refusal that makes "nothing invented" checkable: a unit cannot reach hardware this
+            // application does not have, however plausible the part.
+            let problems = rewritten(
+                r#""uses": ["sps30", "sht20"]"#,
+                r#""uses": ["sps30", "sht20", "bme680"]"#,
+            );
+            refused(&problems, "nor a resource it declares");
+        }
+
+        #[test]
+        fn a_resource_role_the_vocabulary_does_not_know_is_refused() {
+            // A capability path is the vocabulary's, so a name nobody named is a *misspelling* — the
+            // same refusal a board gets, because the alternative is reading a typo as "no such device".
+            let problems = rewritten(
+                r#""role": "sensing.particulate", "via": "library""#,
+                r#""role": "sensing.particles", "via": "library""#,
+            );
+            refused(&problems, "not one the vocabulary knows");
+        }
+
+        #[test]
+        fn a_resource_that_does_not_say_how_it_is_reached_is_refused() {
+            let problems = rewritten(
+                r#"{ "name": "battery", "role": "power.battery", "via": "board" }"#,
+                r#"{ "name": "battery", "role": "power.battery" }"#,
+            );
+            refused(&problems, "does not say how it is reached");
+        }
+
+        #[test]
+        fn a_resource_declared_twice_is_refused() {
+            // A name is what a `uses` resolves *by*, so two resources sharing one would make every
+            // `uses` of it ambiguous.
+            let problems = rewritten(
+                r#"{ "name": "battery", "role": "power.battery", "via": "board" }"#,
+                r#"{ "name": "display", "role": "power.battery", "via": "board" }"#,
+            );
+            refused(&problems, "is declared twice");
+        }
+
+        #[test]
+        fn a_driver_resource_without_its_driver_component_is_refused() {
+            // A part the application drives needs the component that drives it: the resource *is* its
+            // driver's id, so a design that declares the device and forgets the driver has a hole in it.
+            let problems = rewritten(
+                r#""name": "sps30", "role": "sensing.particulate", "via": "library""#,
+                r#""name": "sps30x", "role": "sensing.particulate", "via": "library""#,
+            );
+            refused(&problems, "no driver component of that name");
+        }
+
+        #[test]
+        fn a_board_resource_shadowing_a_unit_is_refused() {
+            // The word belongs to the board's part, and a `uses` resolves a unit *before* a resource — so
+            // a unit of the same name would be reached instead of the part, silently.
+            let problems = rewritten(
+                r#"{ "name": "battery", "role": "power.battery", "via": "board" }"#,
+                r#"{ "name": "moving_average", "role": "power.battery", "via": "board" }"#,
+            );
+            refused(&problems, "also has a unit of that name");
+        }
+
+        #[test]
+        fn a_resources_address_has_to_agree_with_its_board_fact() {
+            // The one place these resources and the older board facts overlap: one device has one
+            // address, so stating it twice is fine and disagreeing is not.
+            let problems = rewritten(
+                r#""bus": "grove.a", "address": "0x69""#,
+                r#""bus": "grove.a", "address": "0x6a""#,
+            );
+            refused(&problems, "one device has one address");
+        }
+
+        #[test]
+        fn the_design_request_states_the_resource_rule() {
+            // A model that is never told about `resources` invents a sensor and is refused — so the rule
+            // is in the prompt, not only in the check.
+            let board = BoardChoice {
+                chip: "esp32s3".into(),
+                bsp: "m5stack_core_s3".into(),
+                hal: "m5unified".into(),
+            };
+            let request = design_request(&board, "a PM2.5 meter with a touch screen", None, None);
+            for expected in [
+                "does not invent hardware",
+                r#""resources""#,
+                r#""via": "board""#,
+                r#""via": "library""#,
+                "sensing.particulate",
+            ] {
+                assert!(request.contains(expected), "the prompt states {expected}");
+            }
+        }
     }
 }

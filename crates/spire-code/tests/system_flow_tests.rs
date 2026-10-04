@@ -613,6 +613,173 @@ async fn modify_code_rolls_back_a_change_that_breaks_the_build() {
     );
 }
 
+/// **A composition that declares its devices reaches the application written from it.**
+///
+/// The `resources` layer is the design's claim about its own hardware, and the build layer is where that
+/// claim becomes files: `createProject/Scaffold` writes the composition twice — `composition.spire` for
+/// the person, `SPIRE.application.json` for the fill — and one component directory per unit. Two things
+/// have to hold at the end, and a unit test cannot show either, because both are about the *wiring*
+/// through the registry rather than any one function:
+///
+///   * the declared devices survive the trip. A device lost between the design and the tree is a
+///     composition built against hardware the application does not state, and the fill would invent it.
+///   * a unit that `uses` a **part of the board** (`display`) gets **no** component for it. Such a part
+///     is reached through the BSP, so `components/display/` does not exist and `REQUIRES display` names
+///     nothing — the build would stop at a line that names neither the device nor the design.
+#[tokio::test]
+async fn a_declared_device_reaches_the_application_and_writes_no_phantom_component() {
+    use spire_code::build::application_spec::{parse_spec, ApplicationSpec, ResourceVia};
+    use spire_code::build::idf_projects::{APPLICATION_FILE, COMPOSITION_FILE};
+
+    let sys = system(&fake_llm(vec![])).await;
+
+    // A composition a person could have written, with the two `via` answers side by side: a display that
+    // is a part of the board — the BSP drives it, so no component of this project does — and a sensor
+    // that is not, driven by a component of this project at its own address. `sampler` reaches both,
+    // which is the shape that used to emit a `REQUIRES display` naming nothing.
+    let text = r#"framework: actors
+board:
+  chip: esp32s3
+  bsp: m5stack_core_s3
+  hal: m5unified
+resources:
+  - name: display
+    role: media.display
+    via: board
+  - name: sps30
+    role: sensing.particulate
+    via: library
+    bus: i2c
+    address: "0x69"
+board_facts:
+  - bus: i2c
+    device: sps30
+    address: "0x69"
+units:
+  - id: sps30
+    kind: component
+    role: driver
+    source: stub
+    provides: PM1/2.5/4/10 readings
+    bus: i2c
+  - id: sampler
+    kind: actor
+    message: Tick
+    state: reads the sensor and draws on the screen
+    uses: [sps30, display]
+    sends_to: [view]
+  - id: view
+    kind: actor
+    message: Report
+    state: the screen
+    uses: [display]
+wiring:
+  - sampler -> view
+"#;
+
+    // ── 1. The design arrives through the door a person's own file uses ──
+    let parsed = sys
+        .call(
+            "createProject/ParseComposition",
+            serde_json::json!({ "text": text }),
+        )
+        .await;
+    assert!(
+        parsed.get("error").is_none(),
+        "the composition did not parse: {parsed}"
+    );
+    let spec: ApplicationSpec = serde_json::from_value(parsed["spec"].clone())
+        .unwrap_or_else(|e| panic!("the parse did not return a spec: {e}\n{parsed}"));
+    let display = spec
+        .resources
+        .iter()
+        .find(|resource| resource.name == "display")
+        .expect("the board's display is a declared device");
+    assert_eq!(display.via, Some(ResourceVia::Board));
+    let sps30 = spec
+        .resources
+        .iter()
+        .find(|resource| resource.name == "sps30")
+        .expect("the sensor is a declared device");
+    assert_eq!(sps30.via, Some(ResourceVia::Library));
+    assert_eq!(sps30.bus, "i2c");
+    assert_eq!(sps30.address, "0x69");
+
+    // ── 2. The application is written from it ──
+    let app_root = tempfile::tempdir().unwrap();
+    let scaffolded = sys
+        .call(
+            "createProject/Scaffold",
+            serde_json::json!({
+                "projectName": "pm25-meter",
+                "rootDir": app_root.path().to_string_lossy(),
+                "language": "C++",
+                "structure": "idf_application",
+                "embedded": true,
+                "application": spec,
+                // The loop, not the toolchain: a board build here would be about this machine.
+                "verifyBackends": false,
+            }),
+        )
+        .await;
+    assert!(
+        scaffolded.get("error").is_none(),
+        "the application did not scaffold: {scaffolded}"
+    );
+
+    // ── 3. The devices are in the composition the tree carries, in both forms ──
+    let record = app_root.path().join(APPLICATION_FILE);
+    assert!(record.is_file(), "the scaffold wrote the design's record");
+    let written: ApplicationSpec = parse_spec(&std::fs::read_to_string(&record).unwrap())
+        .expect("the record is a composition");
+    let round_tripped = written
+        .resources
+        .iter()
+        .find(|resource| resource.name == "sps30")
+        .expect("the sensor reached the record");
+    assert_eq!(
+        (round_tripped.bus.as_str(), round_tripped.address.as_str()),
+        ("i2c", "0x69"),
+        "the wiring function and the address are the design's, not re-derived"
+    );
+    assert!(
+        written.resources.iter().any(|resource| {
+            resource.name == "display" && resource.via == Some(ResourceVia::Board)
+        }),
+        "and the board's part is still a part of the board: {:?}",
+        written.resources
+    );
+    // The file a person opens says the same thing.
+    let composition = std::fs::read_to_string(app_root.path().join(COMPOSITION_FILE))
+        .expect("the scaffold wrote the composition a person reads");
+    assert!(
+        composition.contains("via: board") && composition.contains("0x69"),
+        "the composition states how the display is reached and where the sensor is:\n{composition}"
+    );
+
+    // ── 4. No phantom component: a part of the board is not a component of this project ──
+    assert!(
+        !app_root.path().join("components/display").exists(),
+        "`display` is a part of the board, so it has no component directory"
+    );
+    let manifest =
+        std::fs::read_to_string(app_root.path().join("components/sampler/CMakeLists.txt"))
+            .expect("the actor's manifest is written");
+    let requires = manifest
+        .lines()
+        .find(|line| !line.trim_start().starts_with('#') && line.contains("REQUIRES"))
+        .expect("the manifest states its REQUIRES");
+    assert_eq!(
+        requires.trim(),
+        "REQUIRES actors messages sps30)",
+        "the component it wraps is required and the part of the board is not"
+    );
+    assert!(
+        manifest.contains("`display` is not named here on purpose"),
+        "and the omission says why, so nobody adds it back for a linker:\n{manifest}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────────────
 // The one question the eight above cannot answer: does a REAL model fix a real defect?
 //

@@ -847,9 +847,9 @@ impl ProjectCreationActor {
             }
             _ => String::new(),
         };
-        // The composition itself: the components, the units, the wiring and the board facts that were
-        // reviewed. Without it the model writes a *different* application from the one that was
-        // agreed, and nothing in the round trip says so.
+        // The composition itself: the components, the devices it declares, the units, the wiring and the
+        // board facts that were reviewed. Without it the model writes a *different* application from the
+        // one that was agreed, and nothing in the round trip says so.
         let composition_block = match &designed {
             Some(application)
                 if planned_structure
@@ -3409,6 +3409,32 @@ mod tests {
 {actors}"
             );
         }
+
+        // **And the devices it declares.** The `resources` layer is the application's claim about its
+        // hardware, and the fill prompt is where the claim becomes code: the part is named so the model
+        // frames against *it* rather than inventing one, and `via` says whether a component of this
+        // project drives it at all — the display is the board's, and its driver is already there.
+        let with_devices =
+            crate::build::application_spec::parse_spec(&examples::PM25_METER.replace(
+                r#""board_facts": ["#,
+                r#""resources": [
+                     { "name": "display", "role": "media.display", "via": "board" },
+                     { "name": "sps30", "role": "sensing.particulate", "via": "library",
+                       "bus": "grove.a", "address": "0x69" }
+                   ],
+                   "board_facts": ["#,
+            ))
+            .expect("the design with devices parses");
+        let devices = prompt_for(&spec, None, Some(with_devices), unborn.path());
+        assert!(
+            devices.contains("- `display` — media.display (a part of the board:")
+                && devices.contains("write **no** component for it"),
+            "a declared part of the board reaches the fill prompt:\n{devices}"
+        );
+        assert!(
+            devices.contains("- `sps30` — sensing.particulate on grove.a at 0x69"),
+            "and a device the application adds, with its wiring function and address:\n{devices}"
+        );
 
         // And the two prohibitions the composition rules carry — the two things a live run did without
         // them: it wrote one flat FreeRTOS poll loop, and its own `class Sps30` in `main/`.

@@ -34,7 +34,7 @@
 //! caught it.) Only `project()` and the log tag carry the project's own name.
 
 use crate::build::application_spec::{
-    ApplicationFramework, ApplicationSpec, ComponentRole, Unit, UnitKind, UnitSource,
+    ApplicationFramework, ApplicationSpec, ComponentRole, ResourceVia, Unit, UnitKind, UnitSource,
 };
 use crate::build::generic_helpers::run_cmd;
 use crate::build::{ScaffoldFile, ScaffoldOutput};
@@ -1259,7 +1259,7 @@ fn actor_component_manifest(application: &ApplicationSpec, unit: &Unit) -> Strin
 # `REQUIRES` is named here from the reviewed design and is **structural**: `actors` for the framework,
 # `messages` for the types this actor receives and posts, then every library component it wraps — this
 # actor's dependencies are its component's to state, not `main/`'s.
-set(SPIRE_COMPONENT_KIND actor)
+{board_note}set(SPIRE_COMPONENT_KIND actor)
 
 # Every source in `src/` is compiled, so a file added to this component needs no build change — an
 # actor whose task and board handling outgrow its header simply gains one.
@@ -1271,6 +1271,7 @@ idf_component_register(
     REQUIRES {requires})
 "#,
         id = component_ident(&unit.id),
+        board_note = board_part_note(application, unit),
         requires = requires.join(" ")
     )
 }
@@ -1295,7 +1296,7 @@ fn stage_component_manifest(application: &ApplicationSpec, unit: &Unit) -> Strin
 #
 # `REQUIRES` is named here from the reviewed design and is **structural**: `ramen` for the framework,
 # `messages` for the values that cross this stage's edges, then every library component it wraps.
-set(SPIRE_COMPONENT_KIND stage)
+{board_note}set(SPIRE_COMPONENT_KIND stage)
 
 # Every source in `src/` is compiled, so a file added to this component needs no build change.
 file(GLOB_RECURSE SPIRE_STAGE_SOURCES "${{CMAKE_CURRENT_LIST_DIR}}/src/*.cpp")
@@ -1306,26 +1307,83 @@ idf_component_register(
     REQUIRES {requires})
 "#,
         id = component_ident(&unit.id),
+        board_note = board_part_note(application, unit),
         requires = requires.join(" ")
     )
 }
 
-/// The library components a unit **wraps**, as `REQUIRES` names them.
+/// The **components** a unit wraps, as its manifest's `REQUIRES` names them.
 ///
 /// Shared by the actor and the stage manifest, because it is one question in both: which of the design's
 /// components are this unit's to depend on. A `published` one is skipped — it is a managed dependency
 /// the component manager injects, under a build name this file has no business guessing — and a name
 /// already present stays where it is, so the framework's own components come first.
+///
+/// A `uses` that names **no component at all** is skipped too, and that is the `resources` layer's one
+/// consequence here: a part of the board (`display`, `touch_panel`) is declared as a resource because a
+/// unit reaches it, and it deliberately has no component of this project — the BSP is what drives it, and
+/// the BSP is `main/`'s dependency. `REQUIRES display` would name a component neither this project nor
+/// the library has, so the build would stop at a line that names neither the device nor the design.
 fn push_used_components(application: &ApplicationSpec, unit: &Unit, requires: &mut Vec<String>) {
-    for used in &unit.uses {
-        let published = application.units.iter().any(|candidate| {
-            candidate.id == *used && candidate.source == Some(UnitSource::Published)
-        });
-        let ident = component_ident(used);
-        if !published && !requires.contains(&ident) {
+    for component in used_components(application, unit) {
+        let ident = component_ident(&component.id);
+        if !requires.contains(&ident) {
             requires.push(ident);
         }
     }
+}
+
+/// The `uses` of a unit that name a **component** — of this project or of the library it is built
+/// against — which is the set that has a directory, a manifest and an include path.
+///
+/// Two names are deliberately *not* here, and they are the two the `resources` layer made distinct:
+/// a **published** component, which is a managed dependency the component manager resolves rather than a
+/// directory beside this one, and a **part of the board** (`display`, `touch_panel`), which the design
+/// declares as a resource precisely because it has no component of this project — the BSP drives it. A
+/// unit's own manifest and its host test build both ask this one question, so both ask it here: a
+/// `REQUIRES` for a component that does not exist, or an include path into a directory that does not
+/// exist, is a build failing at a line that names neither the device nor the design.
+fn used_components<'a>(application: &'a ApplicationSpec, unit: &'a Unit) -> Vec<&'a Unit> {
+    unit.uses
+        .iter()
+        .filter_map(|used| {
+            application
+                .units
+                .iter()
+                .find(|candidate| candidate.id == *used)
+        })
+        .filter(|component| component.source != Some(UnitSource::Published))
+        .collect()
+}
+
+/// The lines a unit's manifest carries when a `uses` of it names **no component** — the board part that
+/// is deliberately absent from `REQUIRES`.
+///
+/// Stated rather than left to be discovered, because the omission has an obvious-looking repair: a unit
+/// whose code reaches the display calls the board support's API, and a `REQUIRES display` added back to
+/// satisfy a linker names a component that does not exist. The part is reached through the BSP, which is
+/// a managed dependency of the **application** (`main/idf_component.yml`), not of this component.
+fn board_part_note(application: &ApplicationSpec, unit: &Unit) -> String {
+    let parts: Vec<&str> = unit
+        .uses
+        .iter()
+        .filter(|used| {
+            !application
+                .units
+                .iter()
+                .any(|candidate| candidate.id == used.as_str())
+        })
+        .map(String::as_str)
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "#\n# `{}` is not named here on purpose: a part of the board has **no component of this project** —\n\
+         # the board's own support package drives it, and that is `main/`'s dependency rather than this\n\
+         # component's. A `REQUIRES` for the device's own name would be a component that does not exist.\n",
+        parts.join("`, `")
+    )
 }
 
 /// The **component kind** a unit of the composition is: an actor, or a ramen stage.
@@ -1883,18 +1941,12 @@ fn unit_test_manifest(application: &ApplicationSpec, unit: &Unit, library: &str)
     };
     let ident = component_ident(&unit.id);
     let library = library.trim();
-    // The components the **library** owns and this unit wraps. A `published` one is a managed dependency with
-    // no directory here, so there is nothing to compile and nothing to put on an include path.
-    let uses: Vec<String> = unit
-        .uses
+    // The components the **library** owns and this unit wraps: a `published` one is a managed dependency
+    // with no directory here, and a part of the board has no component at all — so neither has anything to
+    // compile or to put on an include path. Both are settled by `used_components`.
+    let uses: Vec<String> = used_components(application, unit)
         .iter()
-        .filter(|used| {
-            !application.units.iter().any(|candidate| {
-                candidate.id.as_str() == used.as_str()
-                    && candidate.source == Some(UnitSource::Published)
-            })
-        })
-        .map(|used| component_ident(used))
+        .map(|component| component_ident(&component.id))
         .collect();
 
     let component_dir = |path: &str| format!("    ${{SPIRE_LIBRARY_DIR}}/components/{path}\n");
@@ -2485,6 +2537,11 @@ pub fn component_apis(root: &Path, application: &ApplicationSpec) -> String {
 /// invents the components, the units, their messages and the board's addresses — so what lands in
 /// `main/` is a different application from the one that was reviewed, and nothing says so.
 ///
+/// The **devices** are stated for the same reason: a design declares the parts it composes against, and
+/// a model asked for a PM2.5 meter writes a sensor class of its own unless it is told which device is
+/// the one the design reached for — and which of them the board's own support package already reaches,
+/// so that it writes no driver for a part that already has one.
+///
 /// It is rendered rather than dumped as JSON on purpose: a model following a design wants the lines a
 /// person would read, and the `id`/`kind`/`role` vocabulary of the file is not what it has to write.
 pub fn composition_block(application: &ApplicationSpec) -> String {
@@ -2577,6 +2634,53 @@ pub fn composition_block(application: &ApplicationSpec) -> String {
                 stubs.join(", ")
             ));
         }
+    }
+
+    // The devices this composition may reach — the application's own claim, and the half of a design a
+    // model most readily invents: asked for a PM2.5 meter it writes a sensor of its own rather than
+    // reaching the declared one. So the *set* is stated (a device not named is a device the application
+    // does not have), and each device carries the decision that follows from it: `via` is what says
+    // whether a component of this project drives the part at all, and the wiring function and address are
+    // what its literal in `main/` is written from.
+    text.push_str(
+        "\nDevices (the whole set this composition may reach — a device not named here is a device this \
+         application does not have):\n",
+    );
+    if application.resources.is_empty() {
+        text.push_str(
+            "- none: no device is declared, so every `uses` above reaches a component.\n",
+        );
+    }
+    for resource in &application.resources {
+        let reached = match resource.via {
+            // The BSP already reaches a board's own part — its headers are on this application's include
+            // path — so a component written for one would be the same driver twice, free to disagree.
+            Some(ResourceVia::Board) => "a part of the board: the BSP reaches it, so write **no** \
+                                          component for it and call it through the board's own API \
+                                          (`bsp_*`)"
+                .to_string(),
+            Some(ResourceVia::Published) => format!(
+                "reached through the `{name}` component above, a managed dependency",
+                name = resource.name
+            ),
+            Some(ResourceVia::Library) => format!(
+                "reached through the `{name}` component above",
+                name = resource.name
+            ),
+            // `validate` refuses a resource that states no origin, so this is a spec that never went
+            // through the check — named as such rather than silently reading as one of the three.
+            None => "of no stated origin".to_string(),
+        };
+        let on = match (resource.bus.trim(), resource.address.trim()) {
+            ("", "") => String::new(),
+            (bus, "") => format!(" on {bus}"),
+            ("", address) => format!(" at {address}"),
+            (bus, address) => format!(" on {bus} at {address}"),
+        };
+        text.push_str(&format!(
+            "- `{}` — {}{on} ({reached})\n",
+            resource.name, resource.role
+        ));
     }
 
     text.push_str(
@@ -2684,7 +2788,8 @@ pub fn composition_block(application: &ApplicationSpec) -> String {
     text.push_str(
         "\nBoard facts — the application's own, never a component's. Write each literal into `main/` \
          (a `board.hpp` is the usual place), and use it from there: a board fact that reaches no line \
-         in `main/` is a fact the application does not have.\n",
+         in `main/` is a fact the application does not have. A device above that states an address \
+         states **this** one — one device, one address, written once.\n",
     );
     if application.board_facts.is_empty() {
         text.push_str("- none\n");
@@ -3589,7 +3694,9 @@ fn component_header_relpath(_kind: ComponentKind, ident: &str) -> String {
 /// files do not say:
 ///
 ///  * what the library says about how its components are meant to be used (`SPIRE.md`) — the
-///    architecture, and the only place one exists;
+///    architecture, and the only place one exists. A **unit** of an application has no `SPIRE.md`
+///    behind it: its architecture is the design the application carries, and a unit never reaches here
+///    — [`unit_edit_request`] answers it first;
 ///  * the component's **public header as it stands** — the contract its sources and its test have to
 ///    match while one of them is being rewritten;
 ///  * the invariants of the shape, which are **the kind's**: a driver owns a handle and returns false;
@@ -3604,9 +3711,12 @@ fn component_header_relpath(_kind: ComponentKind, ident: &str) -> String {
 ///    distinction to headings a model would have to infer;
 ///  * how the answer will be checked.
 ///
-/// What differs between the two kinds is almost all of it: a driver is told about the **seam** and the
-/// register read, a library about purity and edge cases. What does not differ is the frame around
-/// them and the gate at the end — which is the point of the two kinds sharing one path.
+/// The two kinds that reach the request built here differ in almost all of it: a driver is told about
+/// the **seam** and the register read, a library about purity and edge cases. What does not differ is
+/// the frame around them and the gate at the end — which is the point of the kinds sharing one path. A
+/// third kind of component exists — an application's **unit**, an actor or a stage — and it takes a
+/// different route out of this function ([`unit_edit_request`]), because what it is written from is a
+/// *design* rather than a datasheet.
 ///
 /// It deliberately does **not** carry the source or the test: `modify_code_prompt` supplies those
 /// when their turn comes, and the same file twice in one prompt is a prompt the model has to
@@ -3629,15 +3739,6 @@ pub fn component_edit_request(
         ));
     }
     let kind = component_kind_for_prompt(root, &ident);
-    // An application's **unit** — an actor, a ramen stage — is not a component this path edits, and the
-    // distinction is [`ComponentKind::is_library_component`]'s. A unit is written by the *application's* fill,
-    // from the design a person reviewed; what a model would need here is that design (its message, its ports,
-    // its peers) rather than a device's datasheet. Refused **by name, before a header is read**, because a
-    // unit's header is not where this path looks for one and the answer should be the reason rather than a
-    // path that does not resolve.
-    if !kind.is_library_component() {
-        return Err(unit_component_refusal(kind));
-    }
     // The framework is not a component to fill in: it is what the library *is*, and a model that
     // rewrote it would change one project and no other.
     if FRAMEWORK_COMPONENTS.contains(&ident.as_str()) {
@@ -3647,6 +3748,16 @@ pub fn component_edit_request(
              upgrading it means replacing it in the template, so an edit here would live in this one \
              project and nowhere else."
         ));
+    }
+    // An application's **unit** — an actor, a ramen stage — is written from the **reviewed design** the
+    // application carries, not from a device's datasheet: its message (or the values on its edges), its
+    // state and the peers it names are all in the composition, and the types it shares with the rest of
+    // the composition are shared because the edge owns them. So it is answered by [`unit_edit_request`]
+    // and never reaches the device-shaped request below — `library_hints` is a *library's* architecture,
+    // and a unit's architecture is the design. This is the same distinction `add_component` draws, made
+    // for a *different* question: a unit is not installed by hand, but it **is** editable.
+    if matches!(kind, ComponentKind::Actor | ComponentKind::Stage) {
+        return unit_edit_request(root, &ident, kind, instruction);
     }
 
     let what_the_library_says = match library_hints(root) {
@@ -3687,9 +3798,11 @@ pub fn component_edit_request(
                  written: leave the `TODO`s in place, choose no algorithm, no unit and no constant you \
                  were not given — and do not invent a use case to fill the gap."
             }
-            // A unit is refused above, before a header is read: what it needs is the reviewed design rather
-            // than anything the user typed here.
-            ComponentKind::Actor | ComponentKind::Stage => return Err(unit_component_refusal(kind)),
+            // A unit is answered above, by `unit_edit_request`, before a library's hints or a device's
+            // facts were read: what it needs is the reviewed design rather than anything reachable here.
+            ComponentKind::Actor | ComponentKind::Stage => {
+                unreachable!("a unit is answered by `unit_edit_request` before this point")
+            }
         }
         .to_string()
     };
@@ -3741,9 +3854,11 @@ pub fn component_edit_request(
             &what_the_user_knows,
             &reference_block,
         ),
-        // Refused at the top of this function: a unit of an application is not a component this path edits.
-        // The arm is here rather than an `_`, so the two kinds it *does* edit stay the only names below.
-        ComponentKind::Actor | ComponentKind::Stage => return Err(unit_component_refusal(kind)),
+        // Answered at the top of this function, by `unit_edit_request`. The arm is here rather than an
+        // `_`, so the two kinds this arm *does* edit stay the only names below.
+        ComponentKind::Actor | ComponentKind::Stage => {
+            unreachable!("a unit is answered by `unit_edit_request` at the top of this function")
+        }
     })
 }
 
@@ -3891,6 +4006,475 @@ fn component_kind_for_prompt(root: &Path, ident: &str) -> ComponentKind {
             ComponentKind::Library
         }
     })
+}
+
+/// The request a **unit** of an application — an actor or a ramen stage — is written from.
+///
+/// A unit's request is not a device's. Everything a model needs to write one is the **reviewed design**
+/// the application carries, the user's words, and the shape the framework fixes — so this reads the design
+/// back out of the tree ([`read_application`]), finds the unit in it, and hands over:
+///
+///  * the **composition** as a whole, rendered as YAML — the units, the wiring and the board facts, so
+///    the peers this unit names and the values on its edges are stated rather than guessed;
+///  * **this unit's slice** of it, in the framework's own terms — the message it receives (or the values
+///    it pulls and pushes), the state it holds, and the peers it sends to *with the message type each of
+///    them takes*. That last one is looked up here because it is the single most common way a composition
+///    fails to compile: a sender posting its **own** message type at a receiver that takes another;
+///  * the **framework's** rules ([`framework_prompt_block`]) — the same block the application's fill was
+///    given — so an edit decides nothing the design already decided;
+///  * the component's **header as it stands** — the contract its source and its host test have to match;
+///  * what the user says, which is the part no design can supply: a design says what a unit **is**, and
+///    says nothing about what it **does**;
+///  * how the answer will be checked.
+///
+/// The design is **required**, not optional. A unit with no composition around it is a class naming a
+/// message type nothing declares, so a tree that states no design is refused by name rather than written
+/// into — the same refusal [`unit_component_refusal`] gives the paths that would *install* one, made here
+/// for the one path that *edits* one.
+fn unit_edit_request(
+    root: &Path,
+    ident: &str,
+    kind: ComponentKind,
+    instruction: &str,
+) -> Result<String, String> {
+    let Some(design) = read_application(root)? else {
+        return Err(format!(
+            "components/{ident} is a unit of an application's composition, and {root} states no design \
+             (`{APPLICATION_FILE}` and `{COMPOSITION_FILE}` are both absent): a {kind} is its message (or \
+             the values on its edges), its state and the peers it names, and all of those come from that \
+             design — so there is nothing here to write it from.",
+            root = root.display(),
+            kind = kind.as_str(),
+        ));
+    };
+    let Some(unit) = design
+        .units
+        .iter()
+        .find(|unit| component_ident(unit.id.as_str()) == ident)
+    else {
+        return Err(format!(
+            "components/{ident} is not a unit of the design in {root}: the composition names no unit \
+             '{ident}', so there is nothing for this component to be written from.",
+            root = root.display(),
+        ));
+    };
+
+    let header_path = component_header_relpath(kind, ident);
+    let header = std::fs::read_to_string(root.join("components").join(ident).join(&header_path))
+        .map_err(|e| format!("cannot read components/{ident}/{header_path}: {e}"))?;
+    let composition = render_composition(&design)?;
+    let framework = framework_prompt_block(Some(design.framework));
+    let what_the_user_says = if instruction.trim().is_empty() {
+        format!(
+            "The user has said nothing beyond this unit's name. That means its behaviour cannot be \
+             written: the design says what `{ident}` **is** — its message and the peers it sends to, or the \
+             values it pulls and pushes — and it says nothing about what the unit **does** with them. Leave \
+             the `TODO`s in place, change no declaration the design fixed, and invent no algorithm, no \
+             constant and no policy you were not given."
+        )
+    } else {
+        instruction.trim().to_string()
+    };
+    let unit_block = unit_design_block(&design, unit, kind);
+
+    Ok(match kind {
+        ComponentKind::Actor => actor_unit_edit_request(
+            root,
+            ident,
+            &header,
+            &composition,
+            &unit_block,
+            &framework,
+            &what_the_user_says,
+        ),
+        ComponentKind::Stage => stage_unit_edit_request(
+            root,
+            ident,
+            &header,
+            &composition,
+            &unit_block,
+            &framework,
+            &what_the_user_says,
+        ),
+        // Only a unit reaches this function: a caller that routed a driver or a library here is a bug in
+        // the dispatch above, not a component to write with the wrong invariants.
+        ComponentKind::Driver | ComponentKind::Library => {
+            return Err(format!(
+                "components/{ident} is a {}, not a unit of an application: `unit_edit_request` writes a \
+                 unit.",
+                kind.as_str()
+            ))
+        }
+    })
+}
+
+/// One unit's **slice of the design**, as the prompt's own reading of it.
+///
+/// The whole composition is in the prompt as YAML, but YAML is a file's shape; this is the answer to the
+/// question a model actually has while writing one unit — *what is fixed about this one* — stated in the
+/// framework's terms. An actor's `sends_to` names the **receiver's** message type, which is the fact that
+/// makes an edge compile or not, and it is resolved here rather than left for the model to rediscover
+/// from the YAML and get wrong.
+fn unit_design_block(design: &ApplicationSpec, unit: &Unit, kind: ComponentKind) -> String {
+    let mut lines = vec![
+        format!("- **id**: `{}`", unit.id),
+        format!("- **kind**: {}", kind.as_str()),
+    ];
+    if let Some(provides) = unit
+        .provides
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        lines.push(format!("- **what it is for**: {provides}"));
+    }
+    match kind {
+        ComponentKind::Actor => {
+            let message = message_type_name(unit.message.as_deref().unwrap_or_default());
+            lines.push(format!("- **receives**: `messages::{message}`"));
+            if let Some(state) = unit
+                .state
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                lines.push(format!("- **state it holds between messages**: {state}"));
+            }
+            for peer in &unit.sends_to {
+                let peer_message = design
+                    .units
+                    .iter()
+                    .find(|candidate| candidate.id.as_str() == peer.as_str())
+                    .and_then(|candidate| candidate.message.as_deref())
+                    .map(message_type_name)
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "- **sends to** `{peer}`, which takes `messages::{peer_message}` — so this actor \
+                     holds `spire::ActorRef<messages::{peer_message}>` and posts a \
+                     `messages::{peer_message}`"
+                ));
+            }
+        }
+        ComponentKind::Stage => {
+            if let Some(pulls) = unit
+                .pulls
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                lines.push(format!("- **pulls**: {pulls}"));
+            }
+            if let Some(pushes) = unit
+                .pushes
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                lines.push(format!("- **pushes**: {pushes}"));
+            }
+        }
+        ComponentKind::Driver | ComponentKind::Library => {}
+    }
+    // A unit's `uses` reaches one of **two** things: a component it wraps — already written and linked
+    // into its own test build — or, since the `resources` layer, a part of the board, which has no
+    // component at all. They are stated apart because the mistake differs: told to call the component
+    // `display` a model writes against a class that does not exist, and told nothing about the part it
+    // writes a driver for hardware the BSP already drives.
+    let mut wrapped: Vec<&str> = Vec::new();
+    let mut reached: Vec<&str> = Vec::new();
+    for used in &unit.uses {
+        if design.units.iter().any(|candidate| candidate.id == *used) {
+            wrapped.push(used.as_str());
+        } else {
+            reached.push(used.as_str());
+        }
+    }
+    if !wrapped.is_empty() {
+        lines.push(format!(
+            "- **wraps** (the components it `uses` — already written and linked into its own test \
+             build, so call them and do not re-implement them): {}",
+            wrapped.join(", ")
+        ));
+    }
+    if !reached.is_empty() {
+        // The device as the design declares it: its capability, and the address where it has one — so
+        // the unit's own code can name the device it reaches rather than describe it vaguely.
+        let parts: Vec<String> = reached
+            .iter()
+            .map(|name| {
+                let resource = design
+                    .resources
+                    .iter()
+                    .find(|candidate| candidate.name == *name);
+                let role = resource
+                    .map(|resource| resource.role.trim())
+                    .filter(|role| !role.is_empty());
+                let address = resource
+                    .map(|resource| resource.address.trim())
+                    .filter(|address| !address.is_empty());
+                match (role, address) {
+                    (Some(role), Some(address)) => format!("`{name}` ({role} at {address})"),
+                    (Some(role), None) => format!("`{name}` ({role})"),
+                    (None, Some(address)) => format!("`{name}` (at {address})"),
+                    (None, None) => format!("`{name}`"),
+                }
+            })
+            .collect();
+        lines.push(format!(
+            "- **reaches** (the parts of the board this unit reaches — declared in the design and \
+             driven by the board's own support package, so there is **no component of this project to \
+             call and no class to write**: use the board support's API, and leave the pins and the \
+             address where `main/` holds them): {}",
+            parts.join(", ")
+        ));
+    }
+    if unit.sleeps {
+        let wake = unit
+            .wake
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("(the design states none)");
+        lines.push(format!("- **sleeps** between messages, woken by `{wake}`"));
+    }
+    let edges: Vec<&str> = design
+        .wiring
+        .iter()
+        .map(String::as_str)
+        .filter(|edge| edge.split("->").any(|side| side.trim() == unit.id.as_str()))
+        .collect();
+    if !edges.is_empty() {
+        lines.push(format!(
+            "- **wiring** this unit is on: {}",
+            edges.join("; ")
+        ));
+    }
+    lines.join("\n")
+}
+
+/// An **actor**'s request: the message it receives, the state it holds, and the peers it sends to.
+fn actor_unit_edit_request(
+    root: &Path,
+    ident: &str,
+    header: &str,
+    composition: &str,
+    unit_block: &str,
+    framework: &str,
+    what_the_user_says: &str,
+) -> String {
+    let type_name = type_name(ident);
+    format!(
+        r#"Write `{ident}`, the **actor** `{type_name}`, one unit of the ESP-IDF application at {root}.
+
+## What this component is
+
+`{ident}` is an **actor**: the message type it receives, the state it holds between messages, and the refs
+it sends to. Its product is what it *does* with a message — not a board, not a device protocol, not the
+composition's wiring, and not the components it wraps.
+
+{framework}
+## The design this unit belongs to
+
+The application states its design in `SPIRE.application.json` (or `composition.spire`), and the composition
+below **is** that design: the units, the wiring and the board facts, as the phase that produced it wrote
+them. Everything about `{ident}` that is not its own code is fixed there — the message it receives, the
+peers it sends to, and the components it wraps — and an edit to this component does not get to
+re-decide any of it. If the user asks for something the design forbids, write what the design allows and
+say what you could not do.
+
+```yaml
+{composition}
+```
+
+This unit, as the design states it:
+
+{unit_block}
+
+## The component as it stands
+
+`{ident}` is a header/source pair: the contract is in the header below, and its definitions belong in
+`components/{ident}/src/{ident}.cpp` — a separate file you are given on its own turn.
+
+### `components/{ident}/include/{ident}.hpp`
+
+```cpp
+{header}
+```
+
+## What the user says this actor should do
+
+{what_the_user_says}
+
+## The shape this component has to keep
+
+* it is a `spire::Actor` over the message **the design named** — never a type it invents. A sender
+  elsewhere holds `ActorRef` of that same type and posts it, so the declaration in the header is the
+  boundary between the two and is not this edit's to move;
+* `on_message` runs on the **actor's own task**: it may take as long as this actor needs and holds nobody
+  else up. Nothing here polls and nothing here is a loop — the mailbox and the task are what the framework
+  gives this class, so `on_message` is a *reaction*, not a `while`;
+* the component it wraps stays **framework-agnostic**: it holds a device or an algorithm and knows no task,
+  no mailbox and no framework. This actor is the layer allowed to know those;
+* the refs it **sends to** are `spire::ActorRef<Peer::Message>` **constructor arguments** — an actor is
+  *constructed* with the peers it reaches, and `main/` spawns each receiver **before** this actor and
+  passes its ref at `spawn`. This class therefore never fetches a peer by name except for the one case the
+  framework's rules above spell out: a **cycle**, resolved in `init()` through the scheduler's registry;
+* **the constructor's parameters are already fixed by `main/`, which is not this edit's to move**:
+  `main/main.cpp` already calls `scheduler.spawn<..., {ident}::{type_name}>(..., <the refs the header
+  below declares>)`, so the declaration you were handed *is* the other half of that call. Keep
+  its parameter list **exactly** as the header states it — do **not** add, remove, reorder or retype a
+  parameter, do **not** add a default or a second constructor, and do **not** swap a peer ref for a
+  registry lookup (this actor is not on a cycle). What may change is only where the constructor *lives*:
+  its body moves to the source under the rule below, never its signature. A changed signature does not
+  compile — `main/` is out of scope for this edit and still calls it the way the header declares;
+* it reports a refusal by **returning `false`** — from `init()`, or by not posting — rather than by
+  logging, and it blocks its own task for nobody;
+* **the header is the contract, the source is the code**: `components/{ident}/include/{ident}.hpp` carries
+  **declarations only** — the class and its method signatures, with their doc comments — and every
+  **definition** (a constructor's *body*, the body of `on_message`) goes in `components/{ident}/src/{ident}.cpp`,
+  which `#include`s the header. Do **not** inline an implementation in the header: a header that holds the
+  bodies leaves the source with nothing to be, and the two files stop agreeing;
+* **do not edit** `components/{ident}/CMakeLists.txt` or the test build beside it: those are the
+  scaffold's, they name `REQUIRES` from the design, and they are structural;
+* delete a `TODO` you have answered; **leave one you have not**, and make it say what is missing.
+
+## How this will be checked
+
+`components/{ident}/test/{ident}_test.cpp` is built and run on this machine by CMake and ctest, against the
+framework and the fakes the test build already names. The change is kept only if the component still
+compiles and that test passes; otherwise every file is restored byte-for-byte.
+
+So the cases are part of the work, not an extra — and an actor's cases are about **what it does with a
+message** and the state it holds across them:
+
+* the scaffold test's `spawn<...>(...)` call passes **no constructor arguments** — it predates this actor's
+  peers and stops compiling the moment the actor takes them. Update it as part of this edit: write a fake
+  peer (a `spire::Actor<Peer::Message>` test double whose `on_message` *records* what it is sent), `spawn`
+  it first, and pass its ref into this actor's `spawn`, exactly as the library's
+  `components/actors/test/actors_test.cpp` does in `an_actor_can_send_to_another` (`sink` before
+  `sampler`). The signature the header declares does not change — the test is what moves to match it;
+* **a case observes, it does not reach in**: `spire::ActorRef<M>` exposes only `valid()`,
+  `send(message, wait = 0)` and `waiting()` — there is no accessor into the actor (no `.ptr`, no `get()`,
+  no member beyond those), so you see what an actor does only through what it *posts* to a ref you handed
+  it, or what a double you handed it *recorded*. Reach for a member that is not in `actor_ref.hpp` and the
+  host test does not compile;
+* **poll for the effect; do not check straight after `send`**: the fake FreeRTOS runs a `std::thread` per
+  actor, so `on_message` lands on **another** task and a bare check right after `send` races. Wait the way
+  `components/actors/test/actors_test.cpp` does — its `wait_for` helper polls a predicate for about two
+  seconds with `std::this_thread::sleep_for`, then asks once more. Copy that helper in (it is a local
+  template in that file, not a shared header) and add `<atomic>`, `<chrono>`, `<thread>` as you need them;
+* **do not call FreeRTOS from a case**: no `vTaskDelay`, no `xTaskCreate`, no task handle, no tick. The
+  fake FreeRTOS underneath exists so the framework's own `spawn`/`start`/`stop` are runnable — nothing in a
+  case waits on ticks, and `wait_for` is what a case waits with. Keep the scaffold's includes
+  (`<actor.hpp>`, `<scheduler.hpp>`, `<freertos_fake.hpp>`, `<messages.hpp>` and this actor's header);
+* end each case the way the scaffold does: `scheduler.stop();` then `spire_fake_join_tasks();`, in that
+  order — `stop()` releases the actors and the join reaps the threads;
+* the ordinary message, on a fresh actor: the state it should leave behind, and the posts it should make;
+* a second message, after the first: what the held state changes about the answer;
+* the message a real caller sends when it wants nothing done, and the one it sends when it wants a
+  refusal;
+* an actor that wraps a library component, driven through the fake that component's own test build
+  provides."#,
+        root = root.display(),
+    )
+}
+
+/// A **ramen stage**'s request: what it pulls, what it pushes, and the shape a stage keeps.
+fn stage_unit_edit_request(
+    root: &Path,
+    ident: &str,
+    header: &str,
+    composition: &str,
+    unit_block: &str,
+    framework: &str,
+    what_the_user_says: &str,
+) -> String {
+    let type_name = type_name(ident);
+    format!(
+        r#"Write `{ident}`, the **ramen stage** `{type_name}`, one unit of the ESP-IDF application at {root}.
+
+## What this component is
+
+`{ident}` is a **stage**: what it pulls, what it pushes, and the code in between. Its product is what it
+*computes* between its two ports — not a board, not a task, not the composition's wiring, and not the
+components it wraps.
+
+{framework}
+## The design this unit belongs to
+
+The application states its design in `SPIRE.application.json` (or `composition.spire`), and the composition
+below **is** that design: the units, the wiring and the board facts, as the phase that produced it wrote
+them. Everything about `{ident}` that is not its own code is fixed there — the value it pulls, the value it
+pushes, and the components it wraps — and an edit to this component does not get to re-decide any of
+it. If the user asks for something the design forbids, write what the design allows and say what you could
+not do.
+
+```yaml
+{composition}
+```
+
+This unit, as the design states it:
+
+{unit_block}
+
+## The component as it stands
+
+`{ident}` is a header/source pair: the contract is in the header below, and its definitions belong in
+`components/{ident}/src/{ident}.cpp` — a separate file you are given on its own turn.
+
+### `components/{ident}/include/{ident}.hpp`
+
+```cpp
+{header}
+```
+
+## What the user says this stage should do
+
+{what_the_user_says}
+
+## The shape this component has to keep
+
+* it is a **stage** — a class the framework calls **inline**, on the producer's own stack, when a value is
+  pushed to it. The chain is synchronous, so the body must be **bounded**: no blocking, no waiting for
+  another task, and nothing that can recurse back into the chain. The wiring above is a DAG; a cycle is not
+  slower, it is unbounded recursion on one stack;
+* **the ports are the design's**: the value this stage pulls and the value it pushes are the ones named
+  above, and so are their types. This edit writes what happens *between* them, never what crosses them;
+* it names **no task, no mailbox and no framework type** — the stage is called by whoever pushes to it, so
+  there is nothing for it to own or to wait on. A library component it wraps stays framework-agnostic;
+* it is **pure** where it can be: the same value in gives the same value out, and any state it keeps is the
+  design's — never a hidden cache two callers could share, and never a one-shot initialisation;
+* **the signatures are already fixed**: keep every declaration in the header exactly as it stands — do not
+  add, remove, reorder or retype a parameter — and move only the *bodies* to the source under the rule
+  below. What the tests construct the stage with matches that header, so a changed signature breaks both;
+* it reports failure by **returning `false`** (or a status value), never by logging: only the caller knows
+  whether a failure is a refusal or a value worth retrying;
+* **the header is the contract, the source is the code**: `components/{ident}/include/{ident}.hpp` carries
+  **declarations only** — the class and its method signatures, with their doc comments — and every
+  **definition** (the body of `push`, `pull`, or whatever the header promises) goes in
+  `components/{ident}/src/{ident}.cpp`, which `#include`s the header. Do **not** inline an implementation in
+  the header: a header that holds the bodies leaves the source with nothing to be, and the two files stop
+  agreeing;
+* **do not edit** `components/{ident}/CMakeLists.txt` or the test build beside it: those are the
+  scaffold's, they name `REQUIRES` from the design, and they are structural;
+* delete a `TODO` you have answered; **leave one you have not**, and make it say what is missing.
+
+## How this will be checked
+
+`components/{ident}/test/{ident}_test.cpp` is built and run on this machine by CMake and ctest, against the
+framework and the fakes the test build already names. The change is kept only if the component still
+compiles and that test passes; otherwise every file is restored byte-for-byte.
+
+So the cases are part of the work, not an extra — and a stage's cases are a table of values in and values
+out:
+
+* an ordinary value at the input port: what the output port should then carry;
+* the edges — an empty buffer, a zero size, a value at the top of its range;
+* the refusals — the input it must reject, and the fact that it says so rather than guessing;
+* a stage that wraps a library component, driven through the fake that component's own test build
+  provides."#,
+        root = root.display(),
+    )
 }
 
 /// A **driver**'s request: the seam, the register read, and the shape a protocol keeps.
@@ -4638,6 +5222,250 @@ mod tests {
             "the source belongs to its own turn"
         );
     }
+    /// A **unit** of an application — an actor — is written from the **reviewed design**, and the
+    /// request says so: the composition, the framework's rules, this one unit's slice of the design, and
+    /// its header as it stands.
+    ///
+    /// This is the request `component_edit_request` builds for a kind it used to refuse outright. A
+    /// driver's request is written from a datasheet; an actor's can only be written from the design, so
+    /// what has to be pinned is that the design *reaches* it — the composition, the peers it sends to
+    /// **with the receiver's message type**, and the framework's own rules — and that nothing a library's
+    /// request would carry (its `SPIRE.md`, its two device corpora) leaks in.
+    #[test]
+    fn an_actor_unit_is_written_from_the_design() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_scaffold(
+            root,
+            &application_scaffold("pm25-meter", &[], "../sensors", Some(&spec))
+                .expect("the application scaffolds"),
+        );
+
+        let request =
+            component_edit_request(root, "air_quality", "Average the PM2.5 readings.", "")
+                .expect("a unit of an application is editable");
+
+        // The **framework's rules** — the same block the fill was given, so an edit re-decides nothing.
+        assert!(request.contains("FRAMEWORK: `actors`"), "{request}");
+        assert!(
+            request.contains("the receiver's message, not the sender's"),
+            "{request}"
+        );
+        // The **composition itself**, so the peers and the wiring are stated rather than guessed.
+        assert!(request.contains("```yaml"), "{request}");
+        assert!(request.contains("touch -> view"), "{request}");
+        // This unit's slice: the message it receives, and — the fact that makes an edge compile — the
+        // type its peer takes. `air_quality -> view`, and `view` takes `Report`.
+        assert!(
+            request.contains("receives**: `messages::Reading`"),
+            "{request}"
+        );
+        assert!(
+            request.contains("sends to** `view`, which takes `messages::Report`"),
+            "{request}"
+        );
+        assert!(
+            request.contains("wraps** (the components it `uses`")
+                && request.contains("): moving_average"),
+            "{request}"
+        );
+        // The header as it stands — the contract the source and the test have to match.
+        assert!(request.contains("class AirQuality"), "{request}");
+        // The constructor's signature is pinned to `main/`'s call — this edit may move its *body* to the
+        // source, never its parameters — and the scaffold test's no-argument `spawn` is named as the thing
+        // that has to move to match. This is the failure the build gate used to catch only at compile time.
+        assert!(
+            request.contains("the constructor's parameters are already fixed by `main/`"),
+            "{request}"
+        );
+        assert!(
+            request.contains("passes **no constructor arguments**"),
+            "{request}"
+        );
+        // What a case may and may not do once the actor has peers: `ActorRef` has no accessor into the
+        // actor, the effect lands on another thread so a case polls, and nothing in a case calls FreeRTOS.
+        // These are the three mistakes the host test build caught only after the fact.
+        assert!(
+            request.contains("no accessor into the actor (no `.ptr`"),
+            "{request}"
+        );
+        assert!(
+            request.contains("do not check straight after `send`"),
+            "{request}"
+        );
+        assert!(request.contains("no `vTaskDelay`"), "{request}");
+        // What the user says, and how it will be checked.
+        assert!(request.contains("Average the PM2.5 readings."), "{request}");
+        assert!(request.contains("CMake and ctest"), "{request}");
+        assert!(request.contains("restored byte-for-byte"), "{request}");
+        // Its own kind's invariants, not a library's and not a driver's.
+        assert!(request.contains("actor's own task"), "{request}");
+        // A library's request carries `SPIRE.md` and the device corpora; a unit has neither.
+        assert!(
+            !request.contains("## Reference material retrieved"),
+            "{request}"
+        );
+        assert!(
+            !request.contains("how its components are meant to be used"),
+            "{request}"
+        );
+    }
+
+    /// **A unit that reaches a part of the board** — the `resources` layer's second half. Such a part has
+    /// no component of this project, so two things have to hold: the unit's manifest must not name it in
+    /// `REQUIRES` (there is no component by that name, and the build would stop at a line naming neither
+    /// the device nor the design), and the request must not tell the model to call a class that does not
+    /// exist — it states the part, its capability and its address, and points at the board's own support.
+    #[test]
+    fn a_unit_that_reaches_a_part_of_the_board_gets_no_component_for_it() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        // The PM2.5 meter with the board's display declared as a device, and `view` reaching it — the
+        // shape a UI unit has: it draws on a display the BSP already drives.
+        let spec = parse_spec(
+            &examples::PM25_METER
+                .replace(
+                    r#""board_facts": ["#,
+                    r#""resources": [
+                         { "name": "display", "role": "media.display", "via": "board",
+                           "bus": "i2c_internal", "address": "0x3c" }
+                       ],
+                       "board_facts": ["#,
+                )
+                .replace(
+                    r#""state": "the LVGL screen","#,
+                    r#""state": "the LVGL screen", "uses": ["display"],"#,
+                ),
+        )
+        .expect("the design with a board display parses");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_scaffold(
+            root,
+            &application_scaffold("pm25-meter", &[], "../sensors", Some(&spec))
+                .expect("the application scaffolds"),
+        );
+
+        // The manifest: the framework and the shared types, and **not** the display.
+        let manifest = std::fs::read_to_string(root.join("components/view/CMakeLists.txt"))
+            .expect("the unit's manifest is written");
+        let requires = manifest
+            .lines()
+            .find(|line| !line.trim_start().starts_with('#') && line.contains("REQUIRES"))
+            .expect("the manifest states its REQUIRES");
+        assert_eq!(
+            requires.trim(),
+            "REQUIRES actors messages)",
+            "a part of the board is no component, so it is not named in `idf_component_register`"
+        );
+        assert!(
+            manifest.contains("`display` is not named here on purpose"),
+            "and the omission says why, so nobody adds it back for a linker:\n{manifest}"
+        );
+        // The unit's **host test** build asks the same question: there is no component directory for the
+        // display to glob, or to put ahead on the include path.
+        let test_manifest =
+            std::fs::read_to_string(root.join("components/view/test/CMakeLists.txt"))
+                .expect("the unit's host test manifest is written");
+        assert!(
+            !test_manifest.contains("components/display"),
+            "a part of the board has no directory in the library:\n{test_manifest}"
+        );
+
+        // The request: the part is stated **as a device**, not as a component to call.
+        let request = component_edit_request(root, "view", "Show the reading.", "")
+            .expect("a unit of an application is editable");
+        assert!(
+            request.contains("reaches** (the parts of the board this unit reaches")
+                && request.contains("`display` (media.display at 0x3c)")
+                && request.contains("no class to write"),
+            "the part, its capability and its address reach the unit's own request:\n{request}"
+        );
+        assert!(
+            !request.contains("wraps**"),
+            "and nothing here is a component to wrap:\n{request}"
+        );
+    }
+
+    /// A **stage** of a ramen application is written from the same kind of design — the values on its
+    /// edges — and the framework's dataflow rules, not the actor's.
+    ///
+    /// The two frameworks' blocks are deliberately different (a stage has ports and a synchronous chain;
+    /// an actor has a mailbox and a task), so this also pins that the *right* one is chosen: a stage
+    /// written with the actor rules would be a class with a mailbox and no ports.
+    #[test]
+    fn a_stage_unit_is_written_from_the_design() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        let spec = parse_spec(examples::INSECT_TRAP).expect("the worked example parses");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_scaffold(
+            root,
+            &application_scaffold("insect-trap", &[], "../spire-idf", Some(&spec))
+                .expect("the application scaffolds"),
+        );
+
+        let request =
+            component_edit_request(root, "detector", "Reject a frame with no detections.", "")
+                .expect("a stage of an application is editable");
+
+        assert!(request.contains("FRAMEWORK: `ramen`"), "{request}");
+        assert!(
+            request.contains("Pushing is **synchronous and inline**"),
+            "{request}"
+        );
+        // The edges: what it pulls and what it pushes, which is what a stage *is*.
+        assert!(request.contains("pulls**: tensors"), "{request}");
+        assert!(request.contains("pushes**: detections"), "{request}");
+        // The component it wraps: named by the design, already linked into this stage's own test build.
+        assert!(
+            request.contains("wraps** (the components it `uses`") && request.contains("): esp_dl"),
+            "{request}"
+        );
+        assert!(request.contains("detector -> classifier"), "{request}");
+        // The header as it stands — the class the scaffold wrote for this stage.
+        assert!(request.contains("class Detector"), "{request}");
+        assert!(
+            request.contains("Reject a frame with no detections."),
+            "{request}"
+        );
+        // A unit has no device behind it, so nothing is retrieved for one.
+        assert!(
+            !request.contains("## Reference material retrieved"),
+            "{request}"
+        );
+    }
+
+    /// A unit whose tree states **no design** is refused by name, not written into.
+    ///
+    /// A unit is its message and its peers (or the values on its edges), and all of those come from the
+    /// composition. A tree that carries no `SPIRE.application.json` therefore has nothing to write a unit
+    /// *from*, and the refusal says which file is missing rather than failing later on a header.
+    #[test]
+    fn a_unit_with_no_design_is_refused_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("components/sampler/include")).unwrap();
+        std::fs::write(
+            root.join("components/sampler/CMakeLists.txt"),
+            component_kind_line(ComponentKind::Actor),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("components/sampler/include/sampler.hpp"),
+            "// stub\n",
+        )
+        .unwrap();
+
+        let err = component_edit_request(root, "sampler", "", "").expect_err("refused");
+        assert!(err.contains(APPLICATION_FILE), "{err}");
+        assert!(err.contains("states no design"), "{err}");
+    }
+
     /// The request says **where the code goes**, for both kinds of component.
     ///
     /// A scaffold puts a declaration in the header and the definition in the source, and the request
@@ -5936,6 +6764,15 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         );
         assert!(text.contains("Wiring: sampler -> air_quality"), "{text}");
         assert!(text.contains("- `sht20` on i2c at 0x40"), "{text}");
+        // The **devices**: this design declares none — its components are its own and `uses` reaches
+        // them — and the block says so in one line rather than rendering an empty section.
+        assert!(
+            text.contains("Devices (the whole set this composition may reach")
+                && text.contains(
+                    "- none: no device is declared, so every `uses` above reaches a component."
+                ),
+            "a design that declares no device says so:\n{text}"
+        );
         // **Where each unit is written**: each one is a component of its own, and the shared types are a
         // component beside them. The units above name their headers; this says it once, and as the whole file
         // set, because the layout `main/` alone does not show it and the units are already there as stubs.
@@ -5990,6 +6827,10 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
             "{text}"
         );
         assert!(text.contains("- none\n"), "its board facts too: {text}");
+        assert!(
+            text.contains("- none: no device is declared"),
+            "and no device either: {text}"
+        );
         assert!(!text.contains("driver on i2c"), "{text}");
         assert!(
             !text.contains("include path"),
@@ -6013,6 +6854,73 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
                 && text.contains("**wires the chain with `>>` and pumps it** only"),
             "a ramen composition states the same layout for its stages:\n{text}"
         );
+    }
+
+    /// **A declared device reaches the fill prompt, with the decision it carries.** The `resources`
+    /// layer is the application's claim about its hardware; this is where that claim becomes code — the
+    /// device the design reached for is named, so the model frames against *it* rather than writing a
+    /// part of its own, and `via` says whether a component of this project drives it at all.
+    ///
+    /// Both halves matter and they fail differently: a `board` part gets a **second** driver written for
+    /// it (the BSP already drives the display), and an added part gets a **different** one (the model's
+    /// own sensor rather than the declared `sps30`).
+    #[test]
+    fn a_declared_device_reaches_the_fill_prompt_with_how_it_is_reached() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        // PM2.5's own two drivers, declared as devices, plus the board's display and touch panel —
+        // which no unit reaches, and which are the application's all the same.
+        let declared = parse_spec(&examples::PM25_METER.replace(
+            r#""board_facts": ["#,
+            r#""resources": [
+                 { "name": "display", "role": "media.display", "via": "board" },
+                 { "name": "touch_panel", "role": "media.touch", "via": "board",
+                   "bus": "i2c_internal", "address": "0x38" },
+                 { "name": "sps30", "role": "sensing.particulate", "via": "library",
+                   "bus": "grove.a", "address": "0x69" }
+               ],
+               "board_facts": ["#,
+        ))
+        .expect("the design with devices parses");
+        let text = composition_block(&declared);
+
+        // A part of the board: reached through the BSP, so no component is written for it.
+        assert!(
+            text.contains("- `display` — media.display (a part of the board:")
+                && text.contains("write **no** component for it")
+                && text.contains("`bsp_*`"),
+            "a board part is reached through the BSP, and nobody writes a driver for it:\n{text}"
+        );
+        // Its wiring function and address, which is what its literal in `main/` is written from.
+        assert!(
+            text.contains("- `touch_panel` — media.touch on i2c_internal at 0x38"),
+            "a device's wiring function and address reach the block:\n{text}"
+        );
+        // A device the application adds names the component that drives it, so the model reaches the
+        // declared driver instead of writing one of its own.
+        assert!(
+            text.contains("- `sps30` — sensing.particulate on grove.a at 0x69")
+                && text.contains("(reached through the `sps30` component above)"),
+            "an added device is reached through the component the design named:\n{text}"
+        );
+        // The board facts admit the overlap: one device, one address, written once.
+        assert!(
+            text.contains("one device, one address, written once"),
+            "an address stated twice is one literal:\n{text}"
+        );
+
+        // And this is the case in the fixture: `display` and `touch_panel` are reached by no unit — the
+        // application's claim is not narrowed to what its units happen to use.
+        for device in ["display", "touch_panel"] {
+            assert!(
+                !declared
+                    .units
+                    .iter()
+                    .any(|unit| unit.uses.iter().any(|used| used == device)),
+                "the fixture leaves `{device}` to `main/`, which is the case under test"
+            );
+            assert!(text.contains(device), "and it is stated anyway:\n{text}");
+        }
     }
 
     /// **A cycle says *how* to wire it, not only *that* there is one.** The DAG case is the whole rest of

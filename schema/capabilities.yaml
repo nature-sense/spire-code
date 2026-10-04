@@ -44,6 +44,9 @@ categories:
   media:
     camera:      { interface: "enum[mipi-csi, parallel, usb]" }
     display:     { interface: "enum[mipi-dsi, rgb, spi, hdmi]" }
+    # A touch controller is its own part, not a property of the panel: the FT6336 sits at its own I2C
+    # address, and a board can have a display without touch - or touch on a bus the panel never sees.
+    touch:       { interface: "enum[i2c, spi]" }
     video:
       encode:    { codec: "enum[h264, hevc, jpeg]", max: str }
       decode:    { codec: "enum[h264, hevc, jpeg]", max: str }
@@ -88,6 +91,10 @@ categories:
     # directly; a header's lines are discovered at runtime on a `gpiochip`. `header` is the
     # physical form (e.g. 40 for a Raspberry Pi's header); `lines` the usable GPIO count.
     gpio:        { header: int, lines: int }
+    # A GPIO expander (the AW9523) - an I2C part that lends the host ports it lacks. Its own name
+    # because it is its own device at its own address, not the host's `gpio`, which is the silicon's
+    # own lines.
+    expander:    { interface: "enum[i2c, spi]", lines: int }
 
   storage:
     sd:          { interface: "enum[spi, sdio]" }
@@ -97,7 +104,25 @@ categories:
   power:
     battery:     { charger: bool }
     poe:         { standard: str }
+    # The power-management IC (the AXP2101) - the rails, the charging, the gauge. Distinct from
+    # `battery`, which says the board *can* run on a cell; `pmu` names the part that manages it, so a
+    # board may realize `power.battery` and carry a `power.pmu` device that makes it true.
+    pmu:         {}
 
   sensing:
     imu:         {}
     temperature: {}
+    # The BMM150 beside the BMI270: its own I2C address, a separate part, so its own name. Presence
+    # is the claim; there is no shape to state yet.
+    magnetometer: {}
+    # The LTR553's proximity half - again its own part with its own job, beside its ambient-light one.
+    proximity:   {}
+    # Counting particles (the SPS30). On a board it means built in; added to an application it is the
+    # first resource the board did not supply, which is why the device is written with the application.
+    particulate: {}
+
+  # A real-time clock (the BM8563) - a wall clock that survives sleep. Its own category rather than a
+  # `sensing` or `io` claim: it measures nothing and moves no bytes, and this is the home for the
+  # next part of that shape.
+  timekeeping:
+    rtc:         {}
