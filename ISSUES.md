@@ -4825,3 +4825,15 @@ in spire-code are `[A-Z][A-Z_]*`, so neither is affected today. A property **key
 way, so it has to spell an identifier too (`domain` and `relation`, the two `rag_ingest` writes, do), which
 `edge_props_parts`' own doc comment now records.
 
+## Each resource is injected into an actor, and an actor owns zero or more (2026-10-04)
+
+The board/resource flow now produces the application's **resource set** — the
+`resources:` draft the UI assembles (`BoardResource.swift` / `BoardResourceFlowView.swift`) and
+`ResourceDraft` mirrors on the Rust side. The next step is to **inject** each of those resources
+into the actors that use them.
+
+Recorded before implementation, the one basic rule: **an actor owns zero or more resources**.
+Ownership is many-to-many with a floor of zero — an actor may carry no resource, and a resource is
+not obliged to have exactly one owner. This is a design constraint on the injection step, noted
+here so the step is built against it rather than rediscovering it.
+
