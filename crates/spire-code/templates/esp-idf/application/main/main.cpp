@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
 
-// The application's entry point — and the one file in this project that is not a component.
+__DESCRIPTION_BLOCK__// The application's entry point — and the one file in this project that is not a component.
 //
 // ESP-IDF calls `app_main` once, on the main task, after the scheduler is running. What belongs here is
 // the composition's **wiring**: the board facts (pins, buses, addresses), the units spawned with what

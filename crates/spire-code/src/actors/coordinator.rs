@@ -1870,24 +1870,6 @@ impl CoordinatorActor {
             return self.handle_idf_component_history(&args).await;
         }
 
-        // `idf-design/application` — the design phase, before any component exists. It lives here for
-        // the same reason `idf-component/edit` does: the leg that decides needs the planning model, and
-        // the spec it returns is a thing a person approves before anything is written.
-        if method == "idf-design/application"
-            || (method == "tools/call"
-                && params.get("tool").and_then(|v| v.as_str()) == Some("idf_design_application"))
-        {
-            let args = if method == "tools/call" {
-                params
-                    .get("args")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null)
-            } else {
-                params.clone()
-            };
-            return self.handle_idf_design_application(&args).await;
-        }
-
         // `idf-env/check` and `idf-env/fix` — test and then repair this machine's ESP-IDF. They are
         // named here only so the dashed method names have a home beside the other `idf-*` verbs;
         // there is no model in the loop, so both forward straight through the ToolRouter to the build
@@ -1951,15 +1933,17 @@ impl CoordinatorActor {
             "createProject/GenerateSpec" => {
                 return self.handle_create_project_generate_spec(&params).await;
             }
-            "createProject/DesignApplication" => {
-                return self.handle_create_project_design_application(&params).await;
+            // **The description-first flow's first step.** A description in, a design brief out —
+            // before a board is chosen and long before anything is decomposed. The brief says what
+            // the application has to do and stops exactly where the board step begins: it names the
+            // capabilities and the units, and never a board, a resource, a driver or a wiring edge.
+            "createProject/BriefApplication" => {
+                return self.handle_create_project_brief_application(&params).await;
             }
-            // **A composition a person already wrote.** The design phase's other door: instead of
-            // asking a model for a decomposition, read one out of a `composition.spire` — the same
-            // file the scaffold writes and a person edits. It answers in the same shape as
-            // `createProject/DesignApplication`, so the wizard's review step and everything after it
-            // are unchanged: what a person approves is what is scaffolded, whichever door it came
-            // through.
+            // **A composition a person already wrote.** The design's one door: read a decomposition
+            // out of a `composition.spire` — the same file the scaffold writes and a person edits.
+            // What comes back is the spec the wizard's review step and everything after it already
+            // handle: what a person approves is what is scaffolded.
             "createProject/ParseComposition" => {
                 Self::handle_create_project_parse_composition(&params)
             }
@@ -3262,7 +3246,7 @@ impl CoordinatorActor {
             }
 
             // ── Capability vocabulary ──
-            // The **catalogue**, not a board's facts: every capability path a device `role:` may name,
+            // The **catalogue**, not a board's facts: every capability path a device `roles:` may name,
             // grouped by category. Read straight from the embedded vocabulary, which is also what
             // validates a board's `devices:` and an application's `resources[].role`, so the picker
             // and the validator are one source and cannot offer a name the writer would refuse.
@@ -5502,10 +5486,11 @@ impl CoordinatorActor {
 
     /// The **decomposition** a creation request carries, when it carries one.
     ///
-    /// Parsed and **checked** before anything is created — the same six rules the design phase ran — so
-    /// a spec that was edited by hand (or by a later UI) is held to them too. A project scaffolded from
-    /// a decomposition that does not hold together is a project whose stated design is wrong, and its
-    /// `SPIRE.application.json` would be the lie; the refusal lists the problems instead.
+    /// Parsed and **checked** before anything is created — the same six rules a composition is held
+    /// to — so a spec that was edited by hand (or by a later UI) is held to them too. A project
+    /// scaffolded from a decomposition that does not hold together is a project whose stated design is
+    /// wrong, and its `SPIRE.application.json` would be the lie; the refusal lists the problems
+    /// instead.
     fn params_application(
         params: &serde_json::Value,
     ) -> Result<Option<crate::build::application_spec::ApplicationSpec>, String> {
@@ -5563,7 +5548,8 @@ impl CoordinatorActor {
     }
 
     /// `designSource` — **the door a reviewed design came through**, when the caller says it:
-    /// `answers`, `composition_file` or `model` (see [`DesignSource`]).
+    /// `composition_file`, and — for a graph written while the design form existed — `answers` or
+    /// `model` (see [`DesignSource`]).
     ///
     /// Optional, and an unknown name is refused rather than ignored. What this field is for is the one
     /// thing about a design that does not survive into the spec — *who decided it* — and the scaffold
@@ -5580,40 +5566,6 @@ impl CoordinatorActor {
             Some(name) => DesignSource::from_name(name)
                 .map(Some)
                 .map_err(|e| format!("`designSource`: {e}")),
-        }
-    }
-
-    /// **The door a design form request came through**, from whether the caller pinned the framework.
-    ///
-    /// One door, two different facts about the design — see [`DesignSource`]. A pinned framework is the
-    /// caller's decision, with the model filling the decomposition in around it; an open one is the
-    /// model's to choose and justify, which a person then accepts at review.
-    fn design_source_for_request(
-        framework: Option<crate::build::application_spec::ApplicationFramework>,
-    ) -> DesignSource {
-        match framework {
-            Some(_) => DesignSource::Answers,
-            None => DesignSource::Model,
-        }
-    }
-
-    /// The **framework** a design request pinned, when it pinned one.
-    ///
-    /// An unknown name is refused here rather than reaching a scaffold or a design: a project
-    /// scaffolded under a framework nobody knows is a tree that lies about itself, and the refusal
-    /// says the name back so the caller can see what it asked for. An absent or empty field means the
-    /// choice is left to the design phase.
-    fn params_framework(
-        params: &serde_json::Value,
-    ) -> Result<Option<crate::build::application_spec::ApplicationFramework>, String> {
-        match params
-            .get("framework")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
-            None => Ok(None),
-            Some(name) => crate::build::application_spec::framework_from_name(name).map(Some),
         }
     }
 
@@ -6131,34 +6083,23 @@ impl CoordinatorActor {
         }
     }
 
-    /// `createProject/DesignApplication` — the **design phase**: a board and the design form's
-    /// answers in, a validated application spec out, for a person to review and approve.
+    /// `createProject/BriefApplication` — the **design brief**: a description in, a
+    /// [`DesignBrief`](crate::build::application_spec::DesignBrief) out, for the description-first
+    /// flow's first step.
     ///
-    /// Nothing is written to disk, and nothing has to exist yet: the spec is designed *before* the
-    /// tree it describes, which is what makes it reviewable — a person says yes to a decomposition
-    /// rather than to a pile of generated code. The response carries the spec plus the exact line the
-    /// application will state its framework with, because that line is how the choice reaches the
-    /// build — and the **door** this design came through, which the scaffold records as the decision
-    /// behind the composition it writes.
+    /// Deliberately earlier and much smaller than a composition: no board, no library and no
+    /// decomposition — only what the description says the application has to do. A brief and a spec
+    /// are different answers to different questions, and the brief stops exactly where the board step
+    /// begins: it names the capabilities the application needs and the units it expects, and never a
+    /// board, a resource, a driver or a wiring edge.
     ///
-    /// The board is required rather than defaulted: a guessed chip or BSP is a build that fails on
-    /// hardware, and whoever asks this already knows the board.
-    async fn handle_create_project_design_application(
+    /// Nothing is written, and the only thing required is `description` — the person's own words. The
+    /// answer is `{ "brief": … }`; every capability in the brief's `requires` has been checked against
+    /// the vocabulary, so a path the caller receives is one the rest of the system knows.
+    async fn handle_create_project_brief_application(
         &self,
         params: &serde_json::Value,
     ) -> serde_json::Value {
-        use crate::build::application_spec::board_from_json;
-
-        let Some(board_value) = params.get("board").cloned() else {
-            return serde_json::json!({
-                "error": "`board` is required: { \"chip\": \"esp32s3\", \"bsp\": \"…\", \"hal\": \"…\" }"
-            });
-        };
-        let board = match board_from_json(&board_value) {
-            Ok(board) => board,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-
         let description = params
             .get("description")
             .and_then(|v| v.as_str())
@@ -6167,84 +6108,29 @@ impl CoordinatorActor {
             .to_string();
         if description.is_empty() {
             return serde_json::json!({
-                "error": "`description` is required — the design form's answers are what the \
-                          decomposition is derived from"
+                "error": "`description` is required — the brief is read out of the person's own words"
             });
         }
 
-        // Pinned up front, or left to the model to choose and justify in the spec.
-        let framework = match Self::params_framework(params) {
-            Ok(framework) => framework,
+        let brief = match self.brief_application(&description).await {
+            Ok(brief) => brief,
             Err(e) => return serde_json::json!({ "error": e }),
         };
 
-        // The **library** the application is built against, when one was named: its components are what
-        // makes the design's `"source": "existing"` a fact instead of a guess. A path that is not a
-        // component library is refused by name rather than read as an empty one — a design built on
-        // facts read from the wrong directory is worse than no design at all.
-        let library = match params
-            .get("libraryRoot")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-        {
-            None => None,
-            Some(path) => {
-                let root = std::path::Path::new(path);
-                match std::fs::read_to_string(root.join("CMakeLists.txt")) {
-                    Ok(cmake) if crate::build::idf_projects::declares_library(&cmake) => {
-                        Some(crate::build::idf_projects::library_facts(root))
-                    }
-                    _ => {
-                        return serde_json::json!({
-                            "error": format!(
-                                "`libraryRoot` is not a component library — '{path}' has no \
-                                 CMakeLists.txt stating `set(SPIRE_PROJECT_STRUCTURE idf_library)`, so \
-                                 the design cannot be told which components already exist"
-                            )
-                        })
-                    }
-                }
-            }
-        };
-
-        // **The door this design came through**, decided here because it is the one thing about a design
-        // that does not survive into the spec: a framework the caller **pinned** means the design form's
-        // answers decided and the model filled the decomposition in around them, while a framework left
-        // open is the model's own choice, made and justified for the person to accept at review. Both
-        // are this one door, and neither is the other — see `DesignSource`.
-        let source = Self::design_source_for_request(framework);
-
-        let spec = match self
-            .design_application(&board, &description, framework, library.as_ref())
-            .await
-        {
-            Ok(spec) => spec,
-            Err(e) => return serde_json::json!({ "error": e }),
-        };
-
-        // The marker is shown at review because it is the *whole* of what the choice becomes in the
-        // tree: one stated line, which the scaffold writes. `source` travels with it for the same
-        // reason: the scaffold records the decision, and the door is the caller's to hand back.
-        let marker = spec.framework.marker_line();
-        match serde_json::to_value(&spec) {
-            Ok(spec) => {
-                serde_json::json!({ "spec": spec, "marker": marker, "source": source.as_str() })
-            }
+        match serde_json::to_value(&brief) {
+            Ok(brief) => serde_json::json!({ "brief": brief }),
             Err(e) => {
-                serde_json::json!({ "error": format!("the spec could not be serialized: {e}") })
+                serde_json::json!({ "error": format!("the brief could not be serialized: {e}") })
             }
         }
     }
 
     /// `createProject/ParseComposition` — a **composition a person already wrote**, read into the
-    /// design phase by the same rules a project's own file is read by.
+    /// design by the same rules a project's own file is read by.
     ///
-    /// The design phase had one door: ask a model for a decomposition
-    /// ([`handle_create_project_design_application`]). This is the other one. A `composition.spire` is
-    /// the file the scaffold writes and a person edits, so someone who already has one — or who wants
-    /// to start from the worked example — should not have to describe it again in six answers and hope
-    /// a model reproduces it.
+    /// A `composition.spire` is the file the scaffold writes and a person edits, so someone who has
+    /// one — or who wants to start from the worked example — hands it to this door rather than
+    /// describing it again in prose.
     ///
     /// Nothing here re-implements the reading: [`application_spec::parse_composition`] is the same
     /// parser [`idf_projects::read_application`](crate::build::idf_projects::read_application) reads a
@@ -6254,9 +6140,9 @@ impl CoordinatorActor {
     /// is refused **by name** with every broken rule at once, before any tree exists.
     ///
     /// Nothing is written, and no board, library or description is needed: a composition *states* its
-    /// board. The answer carries the spec and the marker line, exactly as the design phase's does, so
-    /// the caller has one shape to handle whichever door the design came through — and the door itself
-    /// (`composition_file`), which is the one thing about it a spec cannot say.
+    /// board. The answer carries the spec, the marker line the application will state its framework
+    /// with, and the door itself (`composition_file`), which is the one thing about a design a spec
+    /// cannot say.
     fn handle_create_project_parse_composition(params: &serde_json::Value) -> serde_json::Value {
         use crate::build::application_spec::parse_composition;
         use crate::build::idf_projects::{design_that_holds_together, COMPOSITION_FILE};
@@ -6269,7 +6155,7 @@ impl CoordinatorActor {
             return serde_json::json!({
                 "error": "createProject/ParseComposition needs 'text': the contents of a \
                           composition.spire — YAML of the form {framework, board, board_facts, \
-                          resources, units, wiring}"
+                          resources, messages, units, wiring}"
             });
         }
 
@@ -6294,9 +6180,10 @@ impl CoordinatorActor {
             Err(e) => return serde_json::json!({ "error": e }),
         };
 
-        // The marker and the door, exactly as the design phase answers with them: the caller has one
-        // shape to handle whichever door the design came through, and the scaffold records the door it
-        // was handed. Nothing is written here — the decision is recorded where the design is accepted.
+        // The marker and the door travel with the spec: the marker is the exact CMake line the
+        // scaffold writes, and the door is what the scaffold records as the decision behind the
+        // composition. Nothing is written here — the decision is recorded where the design is
+        // accepted.
         let marker = spec.framework.marker_line();
         match serde_json::to_value(&spec) {
             Ok(spec) => serde_json::json!({
@@ -6825,88 +6712,45 @@ impl CoordinatorActor {
         )
     }
 
-    /// Ask the **planning** model for a decomposition, and check the answer.
+    /// The **brief phase's LLM leg** — the one step of the description-first flow that needs a model
+    /// and nothing else: no board, no library, no project, which is why the brief is read *before* any
+    /// of the things a tree needs exists.
     ///
-    /// The LLM leg lives here rather than in the creation actor for the reason `idf_component_edit`
-    /// does: it needs the model and nothing else — no project, no files, no graph — and the design
-    /// phase deliberately happens *before* the tree it describes exists. Everything decided behind
-    /// this call (the request, the six rules, the repair turn, the attempt limit) is in
-    /// [`crate::build::application_spec`], which is where it is tested without an LLM at all.
-    async fn design_application(
+    /// Everything decided behind this call (the request, the capability check, the repair turn, the
+    /// attempt limit) is in [`crate::build::application_spec::brief_application`], which is where it
+    /// is tested without an LLM at all.
+    async fn brief_application(
         &self,
-        board: &crate::build::application_spec::BoardChoice,
         description: &str,
-        framework: Option<crate::build::application_spec::ApplicationFramework>,
-        library: Option<&crate::build::application_spec::LibraryFacts>,
-    ) -> Result<crate::build::application_spec::ApplicationSpec, String> {
-        // Route through the LLM actor's mailbox, so every LLM call in the app shares one
-        // actor-owned config and client.
-        let llm_tx = self.llm_tx.clone();
-        crate::build::application_spec::design_application(
-            board,
-            description,
-            framework,
-            library,
-            |prompt| {
-                let tx = llm_tx.clone();
-                async move {
-                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    if tx
-                        .send(crate::actors::LlmMessage::Complete {
-                            prompt,
-                            role: spire_core::subsystems::llm::llm::LlmModelRole::Planning,
-                            reply_to: reply_tx,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return Err("LLM actor unavailable".to_string());
-                    }
-                    match reply_rx.await {
-                        Ok(Ok(text)) => Ok(text),
-                        Ok(Err(e)) => Err(format!("LLM error: {e}")),
-                        Err(e) => Err(format!("LLM reply lost: {e}")),
-                    }
-                }
-            },
-        )
+    ) -> Result<crate::build::application_spec::DesignBrief, String> {
+        crate::build::application_spec::brief_application(description, |prompt| async move {
+            self.plan_completion(prompt).await
+        })
         .await
     }
 
-    /// `idf_design_application` — the design phase, as the **model** calls it.
-    ///
-    /// The tool's arguments are flat (`chip`, `bsp`, `hal`, `description`, `framework`, `library`)
-    /// because that is what a model writes; the request behind it takes a `board` object because that is
-    /// what the wizard has. This normalizes the first into the second and delegates, so the design phase
-    /// has one implementation and two callers rather than two of everything.
-    async fn handle_idf_design_application(&self, args: &serde_json::Value) -> serde_json::Value {
-        let mut board = serde_json::Map::new();
-        for key in ["chip", "bsp", "hal"] {
-            if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
-                board.insert(key.to_string(), value.clone());
-            }
-        }
-        if board.is_empty() {
-            return serde_json::json!({
-                "error": "idf_design_application needs 'chip' and 'bsp' — the board the application \
-                          is designed for is part of the design, not a default"
-            });
-        }
-
-        let mut params = serde_json::Map::new();
-        params.insert("board".to_string(), serde_json::Value::Object(board));
-        for (from, to) in [
-            ("description", "description"),
-            ("framework", "framework"),
-            // The tool says `library`; the request says `libraryRoot`, as the create family does.
-            ("library", "libraryRoot"),
-        ] {
-            if let Some(value) = args.get(from).filter(|v| !v.is_null()) {
-                params.insert(to.to_string(), value.clone());
-            }
-        }
-        self.handle_create_project_design_application(&serde_json::Value::Object(params))
+    /// One round trip to the **planning** model, through the LLM actor's mailbox, so every LLM call in
+    /// the app shares one actor-owned config and client. The single place the design and brief legs
+    /// reach the model.
+    async fn plan_completion(&self, prompt: String) -> Result<String, String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self
+            .llm_tx
+            .send(crate::actors::LlmMessage::Complete {
+                prompt,
+                role: spire_core::subsystems::llm::llm::LlmModelRole::Planning,
+                reply_to: reply_tx,
+            })
             .await
+            .is_err()
+        {
+            return Err("LLM actor unavailable".to_string());
+        }
+        match reply_rx.await {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(e)) => Err(format!("LLM error: {e}")),
+            Err(e) => Err(format!("LLM reply lost: {e}")),
+        }
     }
 
     /// `createProject/GenerateCode` — deterministic skeleton steps from a
@@ -7719,20 +7563,20 @@ mod fix_loop_tests {
 }
 
 #[cfg(test)]
-mod design_request_params_tests {
+mod composition_params_tests {
     use super::*;
 
     /// A decomposition handed to a **creation** request is checked, not trusted.
     ///
-    /// The wizard hands back whatever was reviewed — and possibly edited — so the same six rules the
-    /// design phase ran are run again here. It matters because the project *writes the spec down*: a
-    /// tree carrying `SPIRE.application.json` is a tree claiming that composition, so a project
-    /// scaffolded from one that does not hold together carries the lie in its own files.
+    /// The wizard hands back whatever was reviewed — and possibly edited — so the same six rules a
+    /// composition is held to are run again here. It matters because the project *writes the spec
+    /// down*: a tree carrying `SPIRE.application.json` is a tree claiming that composition, so a
+    /// project scaffolded from one that does not hold together carries the lie in its own files.
     #[test]
     fn a_decomposition_that_does_not_hold_together_is_refused_with_its_problems() {
         use crate::build::application_spec::{examples, parse_spec};
 
-        // Nothing asked: the ordinary case for a project made without a design phase.
+        // Nothing asked: the ordinary case for a project made without a stated design.
         assert_eq!(
             CoordinatorActor::params_application(&serde_json::json!({})),
             Ok(None)
@@ -7772,27 +7616,13 @@ mod design_request_params_tests {
         assert!(error.contains("`application`"), "{error}");
     }
 
-    /// **The door a design came through is answered with the design**, because it is the one thing about
-    /// it that a composition cannot say: nothing in a spec records who chose it. The scaffold records the
-    /// decision, so the door has to travel with the spec to reach it.
+    /// **A composition handed in is answered with the door it came through**, because that door is the
+    /// one thing about a design a spec cannot say: nothing in a composition records who wrote it. The
+    /// scaffold records the decision, so the door travels with the spec to reach it.
     #[test]
     fn a_design_answer_names_the_door_it_came_through() {
-        use crate::build::application_spec::framework_from_name;
-
-        // A caller that pins the framework has decided it; the model filled the decomposition in around
-        // the answer.
-        assert_eq!(
-            CoordinatorActor::design_source_for_request(framework_from_name("actors").ok()),
-            DesignSource::Answers
-        );
-        // Left open, the choice is the model's to make and justify — which is the wizard's own door: it
-        // deliberately does not pin one, so that the choice is confirmed at review rather than assumed.
-        assert_eq!(
-            CoordinatorActor::design_source_for_request(None),
-            DesignSource::Model
-        );
-
-        // The other door is a file a person wrote, and it says so — in the answer the caller hands back.
+        // A composition a person wrote is read through `createProject/ParseComposition`, and the answer
+        // says so — in the same shape the wizard's review step already handles.
         let answer =
             CoordinatorActor::handle_create_project_parse_composition(&serde_json::json!({
                 "text": crate::build::application_spec::examples::PM25_METER,
@@ -7821,7 +7651,8 @@ mod design_request_params_tests {
             "an empty field is nothing said, not a name"
         );
 
-        // The three doors are the three names, and each reads back as itself.
+        // Every name the record can hold reads back as itself — two of them are names a graph written
+        // while the design form existed may carry, and a caller handing one back is believed.
         for (name, source) in [
             ("answers", DesignSource::Answers),
             ("composition_file", DesignSource::CompositionFile),

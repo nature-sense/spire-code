@@ -1300,8 +1300,8 @@ final class SpireBridge {
     /// Fetch the **capability vocabulary** — every capability path a `role` may name, grouped by
     /// category.
     ///
-    /// The catalogue, not a board's facts: it is what validates a device's `role:` and an
-    /// application's `resources[].role`, so a picker fed from it can never offer a name the core
+    /// The catalogue, not a board's facts: it is what validates a device's `roles:` and an
+    /// application's `resources[].roles`, so a picker fed from it can never offer a name the core
     /// would refuse.
     func fetchVocabulary() async -> [VocabularyCategory] {
         do {
@@ -1931,74 +1931,55 @@ final class SpireBridge {
         )
     }
 
-    /// **The design phase**, over `createProject/DesignApplication`: a board and the design form's
-    /// answers in, a validated decomposition out, for a person to review before any tree exists.
+    /// **The design brief**, over `createProject/BriefApplication`: a description in, the brief the
+    /// board and actor steps are built from out — long before a board is chosen.
     ///
-    /// The raw spec JSON is returned beside the decoded one on purpose. The wizard sends *that* value to
-    /// `createProject/Scaffold` and to `idf_apply_design` when the design is approved, so the thing
-    /// scaffolded is the thing that was reviewed — the decoded type is for reading, never for the trip
-    /// back.
-    ///
-    /// The raw spec JSON is returned beside the decoded one on purpose. The wizard sends *that* value to
-    /// `createProject/Scaffold` and to `idf_apply_design` when the design is approved, so the thing
-    /// scaffolded is the thing that was reviewed — the decoded type is for reading, never for the trip
-    /// back.
-    ///
-    /// `source` travels the same way for the same reason: it is the **door** this design came through
-    /// (`answers` — the framework pinned by the caller; `model` — the model chose and justified it), and
-    /// the scaffold records it as the decision behind the composition it writes. Nothing in a
-    /// composition says who chose it, so the wizard hands it back rather than leaving the core to guess.
-    ///
-    /// `framework` is passed only when the form pinned it; otherwise the model chooses and justifies,
-    /// which is the derived-and-confirmed shape: chosen where it can be informed, confirmed where it can
-    /// be overridden.
-    func designApplication(
-        board: [String: Any],
-        description: String,
-        framework: String? = nil,
-        libraryRoot: String? = nil
-    ) async -> (design: ApplicationDesign?, spec: [String: Any]?, source: String?, error: String?) {
-        var params: [String: Any] = ["board": board, "description": description]
-        if let framework, !framework.isEmpty { params["framework"] = framework }
-        if let libraryRoot, !libraryRoot.trimmingCharacters(in: .whitespaces).isEmpty {
-            params["libraryRoot"] = libraryRoot
+    /// One parameter, deliberately: the brief is about what the application *has to do*, and naming a
+    /// board here would move a later step's decision onto the first screen. The refusal is returned
+    /// as-is (the core names what was wrong), and a decoded brief carries only capability paths the
+    /// core already checked against the vocabulary — so the badges it drives cannot point at a
+    /// misspelling.
+    func briefApplication(
+        description: String
+    ) async -> (brief: DesignBrief?, error: String?) {
+        guard
+            let json = await callRawMethod(
+                "createProject/BriefApplication", args: ["description": description])
+        else {
+            return (nil, "core unavailable")
         }
-        guard let json = await callRawMethod("createProject/DesignApplication", args: params) else {
-            return (nil, nil, nil, "core unavailable")
+        if let error = json["error"] as? String { return (nil, error) }
+        guard let brief = json["brief"] as? [String: Any] else {
+            return (nil, "the brief came back without a brief")
         }
-        if let error = json["error"] as? String { return (nil, nil, nil, error) }
-        guard let spec = json["spec"] as? [String: Any] else {
-            return (nil, nil, nil, "the design came back without a spec")
-        }
-        let source = json["source"] as? String
         do {
-            let design = try MessageSerializer.decode(Data(
-                try JSONSerialization.data(withJSONObject: spec)
-            )) as ApplicationDesign
+            let decoded = try MessageSerializer.decode(Data(
+                try JSONSerialization.data(withJSONObject: brief)
+            )) as DesignBrief
             Self.logScaffold(
-                "createProject/DesignApplication OK: framework=\(design.framework), "
-                    + "\(design.units.count) units, source=\(source ?? "?")"
+                "createProject/BriefApplication OK: framework=\(decoded.framework ?? "?"), "
+                    + "\(decoded.requires.count) required, \(decoded.suggests.count) suggested"
             )
-            return (design, spec, source, nil)
+            return (decoded, nil)
         } catch {
-            Self.logScaffold("createProject/DesignApplication DECODE FAILED: \(error)")
-            return (nil, spec, source, "the design did not decode: \(error)")
+            Self.logScaffold("createProject/BriefApplication DECODE FAILED: \(error)")
+            return (nil, "the brief did not decode: \(error)")
         }
     }
 
-    /// **The design phase's other door**, over `createProject/ParseComposition`: the contents of a
-    /// `composition.spire` in, the same validated spec `designApplication` answers with out.
+    /// **The design**, over `createProject/ParseComposition`: the contents of a `composition.spire` in,
+    /// the validated spec a review starts from out.
     ///
     /// A person holding a composition — the file the scaffold writes and a project is edited through —
-    /// should not have to answer the six questions again and hope a model reproduces what they already
-    /// have. The Rust side parses it with the same parser and the same six rules it reads a project's
-    /// own file with, so what is reviewed here is held to exactly what a file on a tree is.
+    /// hands it over rather than describing it again in prose. The Rust side parses it with the same
+    /// parser and the same six rules it reads a project's own file with, so what is reviewed here is
+    /// held to exactly what a file on a tree is.
     ///
-    /// The return shape is deliberately `designApplication`'s, down to the raw `spec` that goes back
-    /// untouched to `createProject/Scaffold` — and the `source` the core names for this door
-    /// (`composition_file`), so the wizard handles one thing whichever door the design came through and
-    /// the scaffold records the right one. `name` is the file's own name, so a refusal names the file to
-    /// open rather than the step that read it.
+    /// The raw `spec` is returned beside the decoded one on purpose: the wizard sends *that* value to
+    /// `createProject/Scaffold`, so the thing scaffolded is the thing that was reviewed — the decoded
+    /// type is for reading, never for the trip back. `source` is the door the core names for this leg
+    /// (`composition_file`), which the scaffold records, and `name` is the file's own name, so a refusal
+    /// names the file to open rather than the step that read it.
     func parseComposition(
         text: String,
         name: String? = nil
@@ -2030,11 +2011,10 @@ final class SpireBridge {
 
     /// **The design an open project states, read back for reading only** — `project/applicationDesign`.
     ///
-    /// The companion to `designApplication` and `parseComposition`, and the only one of the three that
-    /// reads a design *off a tree* rather than out of a model or a text a person hands in: the composition
-    /// panel shows what an application in front of the user is made of. The Rust side reads it with the
-    /// same reader a unit's Write is built from (`idf_projects::read_application`), so what is shown is
-    /// what the code is written from.
+    /// The companion to `parseComposition`, and the one that reads a design *off a tree* rather than out
+    /// of a text a person hands in: the composition panel shows what an application in front of the user
+    /// is made of. The Rust side reads it with the same reader a unit's Write is built from
+    /// (`idf_projects::read_application`), so what is shown is what the code is written from.
     ///
     /// It writes nothing, and it answers `file` beside the design for the reason the panel names the
     /// source: the file a person opens to change the design is the thing to show them. `yaml` is the
@@ -2176,11 +2156,12 @@ final class SpireBridge {
     /// `embeddedRoot` is the container an `EmbeddedApp` depends on. It travels only for that structure
     /// — the core refuses an application without it — and is omitted entirely otherwise, so every
     /// other request is byte-for-byte what it was.
-    /// `designSource` is the **door the reviewed design came through** (`answers`, `model` or
-    /// `composition_file`) — see `designApplication`/`parseComposition`, which answer with it. The core
-    /// records it as the decision behind the composition the scaffold writes, and it cannot be derived
-    /// from the spec, so it is omitted entirely when there is nothing to say: the core then stores the
-    /// composition with no decision attached, rather than inventing one.
+    /// `designSource` is the **door the reviewed design came through** — `composition_file` for a file a
+    /// person wrote, which is the name `parseComposition` answers with, and `answers`/`model` for a graph
+    /// written while the design form existed. The core records it as the decision behind the composition
+    /// the scaffold writes, and it cannot be derived from the spec, so it is omitted entirely when there
+    /// is nothing to say: the core then stores the composition with no decision attached, rather than
+    /// inventing one.
     func scaffoldProject(buildSystem: String, projectName: String, root: String,
                          platforms: [String] = [], structure: String = "native",
                          embedded: Bool = false, embeddedRoot: String? = nil,
@@ -2198,7 +2179,7 @@ final class SpireBridge {
             if let embeddedRoot, !embeddedRoot.trimmingCharacters(in: .whitespaces).isEmpty {
                 params["embeddedRoot"] = embeddedRoot
             }
-            // The **reviewed design**, when there is one. It is the spec the design phase returned,
+            // The **reviewed design**, when there is one. It is the spec the design was read as,
             // handed back untouched: the scaffold states the framework, carries the decomposition as
             // `SPIRE.application.json`, names the design's components in the application's own
             // `REQUIRES`, and hands the fill phase the units, the wiring and the board facts. An

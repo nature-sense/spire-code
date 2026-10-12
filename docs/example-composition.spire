@@ -9,6 +9,23 @@
 #
 # Read it with `application_spec::parse_composition`. It is *strict*: a field of the wrong type or a
 # block that is not syntactically correct is refused, with the line and column that caused it.
+#
+# The field-by-field reference is `docs/composition-format.md`; this file is that format filled in, with
+# the reasoning beside the lines it explains.
+
+# The application **in English**: what it is for and what it does, in the person's own words.
+#
+# This is the half of a composition that is not a graph, and it is here rather than in a separate document
+# so the structure and the sentence explaining it cannot drift apart. It is *prose* — no rule reads it,
+# and it carries no computation (a guard, an arithmetic step, a page transition belongs in the unit's
+# code, in the language that has to run it). It travels into the generated tree **verbatim**: the whole
+# thing becomes the header of `main/`, and each unit's own `description` (below) becomes that unit's class
+# doc-comment, so the code is written against the same words the design was reviewed against.
+description: |
+  A room air-quality monitor. It samples particulate matter and temperature/humidity once a second, keeps
+  a short rolling average and shows it on the board's screen. A tap pages between the live reading, a
+  trend and an about screen; a long press re-baselines the average. It runs from the battery and holds the
+  last reading across a power cycle.
 
 framework: actors
 justification: a touch UI, a reading a second and a battery gauge — interactive, human timescale
@@ -27,7 +44,9 @@ board:
 # second `uses` of the same device is refused. Ownership is state; access is messages — a device is
 # owned, an algorithm is shared (a plain `library` component may be named by several units).
 #
-# `role` is what the device *is* as a capability the vocabulary knows; `via` is where the code that talks
+# `roles` is what the device *is*, as the capabilities the vocabulary knows — a **list**, because a part
+# may be more than one at once (the SHT20 below is temperature *and* humidity). `via` is where the code
+# that talks
 # to it comes from:
 #   board     — a part of the board: the BSP reaches it, so no component of this project drives it;
 #   library   — driven by a component of this project, whose `id` *is* the resource name;
@@ -37,29 +56,29 @@ board:
 # written from, and the address a board fact may state as well — one device has one address.
 resources:
   - name: display
-    role: media.display
+    roles: [media.display]
     via: board
 
   - name: touch_panel
-    role: media.touch
+    roles: [media.touch]
     via: board
     bus: i2c_internal
     address: "0x38"
 
   - name: battery
-    role: power.battery
+    roles: [power.battery]
     via: board
 
   # A driver-backed device shares its name with its driver on purpose — one device, one word: `sps30` and
   # `sht20` are the two components below, and the addresses here are the same literals as the board facts.
   - name: sps30
-    role: sensing.particulate
+    roles: [sensing.particulate]
     via: library
     bus: i2c
     address: "0x69"
 
   - name: sht20
-    role: sensing.temperature
+    roles: [sensing.temperature, sensing.humidity]
     via: library
     bus: i2c
     address: "0x40"
@@ -76,6 +95,12 @@ board_facts:
     address: "0x40"
 
 units:
+  # A **unit**'s `description` is the slice of the application's English that belongs to it — what this
+  # actor (or driver, or stage) does, in the same voice as the whole-application prose above. It becomes
+  # that unit's generated class doc-comment, so each file carries the sentence that explains it. Optional:
+  # a driver's `provides` line is usually enough, but an actor almost always has one, because "what does
+  # this actor do on receiving X" is a question its message type and state hint cannot answer.
+  #
   # A component is framework-agnostic — a driver on a bus, or pure code. It carries no message and no
   # state, which is what keeps it usable under either framework.
   - id: sps30
@@ -104,6 +129,7 @@ units:
   - id: sampler
     kind: actor
     message: Tick
+    description: wakes on the timer, reads both sensors and posts the reading on.
     state: reads both sensors
     uses: [sps30, sht20]
     sends_to: [air_quality]
@@ -113,6 +139,7 @@ units:
   - id: air_quality
     kind: actor
     message: Reading
+    description: folds each reading into the rolling average and posts it to the view.
     state: the rolling average
     uses: [moving_average]
     sends_to: [view]
@@ -120,6 +147,7 @@ units:
   - id: view
     kind: actor
     message: Report
+    description: paints the reading and pages between the three screens on a gesture.
     state: the LVGL screen
     # The board's screen is the view's: it holds the display in its state. A `board` part is reached by
     # `uses` with no component in between — and it has one owner, which is what makes ownership checkable.
@@ -128,6 +156,7 @@ units:
   - id: touch
     kind: actor
     message: Gesture
+    description: turns a tap into a page and a long press into a re-baseline.
     state: menu and calibration
     uses: [touch_panel]
     sends_to: [view, sampler]
@@ -137,6 +166,7 @@ units:
   - id: power
     kind: actor
     message: Tick
+    description: reads the battery gauge and reports it to the view.
     state: the battery gauge
     uses: [battery]
     sends_to: [view]

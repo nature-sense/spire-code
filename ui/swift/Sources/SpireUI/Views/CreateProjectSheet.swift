@@ -7,9 +7,10 @@ import UniformTypeIdentifiers
 /// Not a wizard. The type was decided by the row that opened this, and asking again would be the
 /// tree of questions the flat list replaced. What is left is a name and a location — and the location
 /// is not even asked when the folder is already open, because an empty project being given a shape
-/// knows where it lives. An ESP-IDF **application** gets one optional field more: the component
-/// library it is built against. It is the one type whose product is a composition, and the one field
-/// no other type has.
+/// knows where it lives. An ESP-IDF **application** gets a step more, because its product is a
+/// **composition**: name it, choose where it goes and which library it builds against, then hand it
+/// the `composition.spire` that *is* the design — reviewed before any of it is written. There is no
+/// model in that step: a design is a file a person writes or edits.
 struct CreateProjectSheet: View {
     @Environment(SpireBridge.self) private var bridge
     @Environment(AppTheme.self) private var theme
@@ -48,13 +49,13 @@ struct CreateProjectSheet: View {
     @State private var library: String?
 
     /// Where the wizard is. Every other type goes form → created; an ESP-IDF **application** goes
-    /// form → designing → review → created, because its decomposition is decided *before* the tree it
-    /// describes exists, and a person confirms it. That ordering is the whole point: a person says yes
-    /// to a decomposition rather than to a pile of generated code.
+    /// form → review → created, because its composition is read and confirmed *before* the tree it
+    /// describes exists. That ordering is the whole point: a person says yes to a decomposition rather
+    /// than to a pile of generated code.
     ///
     /// Not `private`: the primary button's rule is a pure function of the stage, and it is pinned by a
     /// test — see [`primaryEnabled`], which is where the rule that used to be missing lives.
-    enum Stage { case form, designing, review, creating }
+    enum Stage { case form, review, creating }
 
     @State private var stage: Stage = .form
 
@@ -89,44 +90,29 @@ struct CreateProjectSheet: View {
     /// view state without bound. The file log is the unbounded one.
     static let logLimit = 400
 
-    /// The design form: the board, and the six answers the decomposition is derived from.
-    @State private var board = BoardChoice()
-    @State private var designForm = ApplicationDesignForm()
-
-    /// The board catalogue, as the board section presents it: the processors, and the boards each carries.
-    ///
-    /// Loaded once when the form appears (`platforms/list`, the same list the platforms screen reads).
-    /// Empty means the fetch failed or the core is older than the `kind`/`chip` fields — and then the text
-    /// fields are the only way in, because a picker with nothing in it is worse than a form.
-    @State private var platforms: [Platform] = []
-    /// The chosen board's catalogue id (`""` = none). Its BSP and its chip come from the row it names.
-    @State private var selectedBoard = ""
-    /// Whether the board is typed by hand rather than picked — for a board the catalogue does not have.
-    @State private var boardIsCustom = false
-
     /// The design as it came back — for reading — and the spec as it must go back, **untouched**: what
     /// was reviewed is what gets scaffolded, with no round trip through the decoded type in between.
     @State private var design: ApplicationDesign?
     @State private var designSpec: [String: Any]?
 
     /// **The door the reviewed design came through**, named by the core and carried back with the spec
-    /// it decided (`source`: `answers` when the form's answers pinned the framework, `model` when the
-    /// model chose it, `composition_file` for a file a person wrote). The scaffold records it as the
-    /// decision behind the composition it writes, and nothing in a composition says who chose it — so it
-    /// travels beside the spec rather than being re-derived from it.
+    /// it decided (`composition_file` — the name for a file a person wrote, which is now the only door
+    /// there is; `answers` and `model` are names a graph written while the design form existed may
+    /// carry). The scaffold records it as the decision behind the composition it writes, and nothing in
+    /// a composition says who chose it — so it travels beside the spec rather than being re-derived.
     @State private var designSource: String?
 
-    /// Where a design came from, when it did not come from the six answers: the `composition.spire` a
-    /// person opened. Shown **at review** — the step where the design is read, and so where it matters
-    /// which file it came from — and cleared by `backToForm`, alongside the design itself.
+    /// The `composition.spire` a person opened. Shown **at review** — the step where the design is
+    /// read, and so where it matters which file it came from — and cleared by `backToForm`, alongside
+    /// the design itself.
     @State private var loadedComposition: String?
 
-    /// The **goal** the fill is handed, when the design did not come from the form.
+    /// The **goal** the fill is handed: the composition's own `justification`.
     ///
-    /// The fill is told *why* this application exists beside the composition it is filling, and on the
-    /// designed path that sentence is the form's own answers. A loaded file was never answered in this
-    /// sheet, so it gives the file's own `justification` — which is exactly the sentence the composition
-    /// states about itself — rather than the empty string a form nobody filled would.
+    /// The fill is told *why* this application exists beside the composition it is filling, and the
+    /// file states it — which is exactly the sentence to pass on, rather than an empty string nothing
+    /// would back. `nil` when the composition justifies nothing, and [`create`] then hands the fill a
+    /// plain instruction instead of an empty string.
     @State private var loadedGoal: String?
 
     /// What the creation pipeline is doing, as one word for the current phase. The phases are worth
@@ -197,25 +183,10 @@ struct CreateProjectSheet: View {
                         .lineLimit(2)
                         .truncationMode(.middle)
                 }
-                if isApplication { designFormFields }
-                // The design phase's other door, set under the six questions it is the alternative to:
-                // a composition that already exists is a design already decided.
                 if isApplication { loadCompositionField }
-            case .designing:
-                HStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text(progress ?? "Designing…")
-                        .font(.caption)
-                        .foregroundStyle(theme.textSecondary)
-                }
-                // The design is one model round trip, and it is the longest wait before anything is
-                // written. The log is the only thing that says so while it runs.
-                creationLogView
             case .review:
-                // **Where the design came from**, when it was not designed here. The review is the same
-                // review either way, and a person confirming a decomposition should be told which door
-                // it arrived through — the file they opened is the thing to edit if they disagree with
-                // any of it.
+                // **Where the design came from.** A person confirming a decomposition is told which file
+                // it arrived through — that file is the thing to edit if they disagree with any of it.
                 if let loadedComposition {
                     Text("Opened from \(loadedComposition) — the design below is that file's.")
                         .font(.caption2)
@@ -313,10 +284,10 @@ struct CreateProjectSheet: View {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                     .disabled(isCreating)
-                // A design is a proposal, not a commitment: sending it back is a first-class action
-                // rather than a cancel-and-start-over, because the form's answers are still there.
+                // A design is a proposal, not a commitment: going back to the form is a first-class
+                // action rather than a cancel-and-start-over, so another composition can be opened.
                 if stage == .review {
-                    Button("Design again") { backToForm() }
+                    Button("Open another…") { backToForm() }
                         .disabled(isCreating)
                 }
                 Button(primaryLabel) { primaryAction() }
@@ -374,193 +345,21 @@ struct CreateProjectSheet: View {
         }
     }
 
-    // MARK: - The form
 
-    /// The board: **chosen from the catalogue**, not typed.
+    /// **The design**: the `composition.spire` a person wrote.
     ///
-    /// Three free-text fields with no validation is how three runs in a row went wrong — a BSP the model
-    /// rewrote, a wrong chip, and a stray comma that became a dependency key the component manager could
-    /// not resolve. Everything those fields asked for is already known: `chips/` and `boards/` hold the
-    /// processors and the boards that carry them (each board declares its `chip:`), and the app already
-    /// reads them as `Platform`s — `platforms/list`, the same list the platforms screen shows.
-    ///
-    /// So it is a selection — **processor → board** — and the board brings its chip and its BSP with it.
-    /// A board with no published BSP is an ordinary answer: the row says so, and the core generates its
-    /// own backend for it. There is deliberately **no HAL level**: the HAL was chip-scoped and is retired,
-    /// and under ESP-IDF the HAL *is* IDF, so there is nothing to enumerate.
-    ///
-    /// "Custom board…" keeps the three fields for a board the catalogue does not have — and every one of
-    /// them is still checked where it is used, by `board_from_json`, which refuses what cannot be a name.
-    private var boardFields: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if catalogueAvailable && !boardIsCustom {
-                labelledPicker("Processor", selection: $board.chip) {
-                    Text("Choose…").tag("")
-                    ForEach(chips) { chip in Text(chip.name).tag(chip.id) }
-                }
-                labelledPicker("Board", selection: $selectedBoard) {
-                    Text("Choose…").tag("")
-                    ForEach(boardsForChip) { candidate in Text(candidate.name).tag(candidate.id) }
-                }
-                .disabled(board.chip.isEmpty)
-                Text(boardSummary)
-                    .font(.caption2)
-                    .foregroundStyle(theme.textTertiary)
-                    .textSelection(.enabled)
-            } else {
-                HStack(spacing: 8) {
-                    TextField("esp32s3", text: $board.chip)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 110)
-                    TextField("espressif/m5stack_core_s3", text: $board.bsp)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("hal (optional)", text: $board.hal)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 130)
-                }
-            }
-            Toggle("Custom board…", isOn: $boardIsCustom)
-                .toggleStyle(.checkbox)
-                .font(.caption)
-                .disabled(!catalogueAvailable)
-            Text(boardHint)
-                .font(.caption2)
-                .foregroundStyle(theme.textTertiary)
-        }
-        .task {
-            if platforms.isEmpty { platforms = await bridge.fetchPlatforms() }
-        }
-        .onChange(of: board.chip) { _, _ in
-            // A different processor is a different set of boards, so the board selection cannot survive it.
-            guard !boardIsCustom else { return }
-            selectedBoard = ""
-            board.bsp = ""
-            board.hal = ""
-        }
-        .onChange(of: selectedBoard) { _, _ in
-            guard !boardIsCustom, let picked = boardsForChip.first(where: { $0.id == selectedBoard })
-            else { return }
-            // The board brings its own facts: the chip it carries, and its BSP when it has one.
-            board.chip = picked.chip ?? board.chip
-            board.bsp = picked.bsp ?? ""
-            board.hal = ""
-        }
-    }
-
-    /// One row of the cascade: a label, then the picker.
-    private func labelledPicker<Content: View>(
-        _ label: String,
-        selection: Binding<String>,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        HStack(spacing: 8) {
-            Text(label)
-                .font(.caption)
-                .frame(width: 68, alignment: .leading)
-            Picker("", selection: selection, content: content)
-                .labelsHidden()
-                .frame(maxWidth: 260, alignment: .leading)
-        }
-    }
-
-    /// The **processors** an application can be designed for: the catalogue's chips, filtered to the SDK
-    /// this wizard's applications are in — a Linux SBC's processor is not one an ESP-IDF application runs
-    /// on.
-    private var chips: [Platform] {
-        platforms
-            .filter { $0.kind == "chip" && $0.os == "esp-idf" }
-            .sorted { $0.name < $1.name }
-    }
-
-    /// The boards carrying the selected processor. A board's own `chip:` is the link, and it is the same
-    /// spelling as the chip's `id`, so the filter is the join.
-    private var boardsForChip: [Platform] {
-        platforms
-            .filter { $0.kind == "board" && ($0.chip ?? "") == board.chip }
-            .sorted { $0.name < $1.name }
-    }
-
-    /// Whether the catalogue arrived. If it did not, the text fields are the only way in — a picker with
-    /// nothing in it is worse than a form.
-    private var catalogueAvailable: Bool { !chips.isEmpty }
-
-    /// What the chosen board carries — its BSP, or the fact that it has none, which is a real answer.
-    private var boardSummary: String {
-        guard let picked = boardsForChip.first(where: { $0.id == selectedBoard }) else {
-            return board.chip.isEmpty
-                ? "Pick a processor, then the board it carries."
-                : "\(boardsForChip.count) board(s) for this processor."
-        }
-        let carries: String
-        if let bsp = picked.bsp, !bsp.isEmpty {
-            carries = "BSP `\(bsp)` — a managed dependency"
-        } else {
-            carries = "no published BSP — Spire generates its own backend"
-        }
-        return "\(picked.name): \(carries)"
-    }
-
-    private var boardHint: String {
-        catalogueAvailable && !boardIsCustom
-            ? "Chosen from the board catalogue. A board with no BSP is fine — Spire generates its own "
-                + "backend for it."
-            : "A chip is required; a BSP only when the board has one. Both are checked before the design "
-                + "runs."
-    }
-
-    /// The board, and the six questions the decomposition is derived from.
-    ///
-    /// The questions are asked here rather than left to a free-text box because the design request puts
-    /// them to the model by name: a model handed six labelled answers can *see* which one is missing and
-    /// say so, instead of inventing a device, an address or a protocol to fill the gap. Empty answers are
-    /// simply not sent.
-    private var designFormFields: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionHeading("Board")
-            boardFields
-
-            SectionHeading("What it does")
-            TextEditor(text: $designForm.purpose)
-                .font(.caption)
-                .frame(height: 52)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(theme.textTertiary.opacity(0.3)))
-
-            SectionHeading("What it senses")
-            TextField("sensors, buttons, network, time — and roughly how fast", text: $designForm.senses)
-                .textFieldStyle(.roundedBorder)
-
-            SectionHeading("What it acts on")
-            TextField("display, audio, motor, actuator, network", text: $designForm.actsOn)
-                .textFieldStyle(.roundedBorder)
-
-            SectionHeading("What it reacts to over time")
-            TextField("periodic? on-command? on-threshold? on-event?", text: $designForm.reactsTo)
-                .textFieldStyle(.roundedBorder)
-
-            SectionHeading("Timing")
-            TextField("what is parallel, what is human-rate, what is machine-rate", text: $designForm.timing)
-                .textFieldStyle(.roundedBorder)
-
-            SectionHeading("When something is missing")
-            TextField("a sensor absent, WiFi down, battery low", text: $designForm.missing)
-                .textFieldStyle(.roundedBorder)
-        }
-    }
-
-    /// **The design phase's other door**: a composition a person already has.
-    ///
-    /// The six answers above are one way to arrive at a decomposition; a `composition.spire` is the
-    /// other, and the better one when it already exists — it *is* the file the scaffold writes and a
-    /// project is edited through, so opening it and reviewing it is the same review, by the same rules.
-    /// It skips the model entirely: nothing is designed, because the design is already written down.
+    /// This is the only door into an application's design, and it is a *file* — the same file the
+    /// scaffold writes and a project is edited through, so opening it and reviewing it is the same
+    /// review, by the same rules the core reads a project's own file by. There is no model in this
+    /// step: nothing is designed, because the design is written down.
     ///
     /// The library field above still applies: a composition that writes components writes them into a
     /// library, and this is where it is named.
     private var loadCompositionField: some View {
         VStack(alignment: .leading, spacing: 6) {
-            SectionHeading("Or load a composition")
+            SectionHeading("Composition")
             HStack(spacing: 8) {
-                Text("None opened — answer the six questions, or open one you already have")
+                Text("None opened — open the `composition.spire` that states this application's design")
                     .font(.caption)
                     .foregroundStyle(theme.textTertiary)
                     .lineLimit(1)
@@ -575,7 +374,7 @@ struct CreateProjectSheet: View {
             Text(
                 canCreate
                     ? "A `composition.spire` — the file the scaffold writes and a person edits. "
-                        + "Opening one skips the design call and goes straight to its review."
+                        + "Opening one goes straight to its review, before any of it is written."
                     : "Name the project and choose where it goes first: the review step has no "
                         + "location field."
             )
@@ -682,65 +481,6 @@ struct CreateProjectSheet: View {
         appendLogLine(text, kind: .ok)
     }
 
-    // MARK: - The design phase
-
-    /// Ask for a design, from the board and the six answers.
-    ///
-    /// Nothing is written: the design phase happens **before** the tree it describes, which is what
-    /// makes it reviewable — a person says yes to a decomposition rather than to a pile of generated
-    /// code. The call is one model round trip; the six rules and the repair turn are the core's.
-    /// The framework is **not** pinned from the form, deliberately: the model chooses it after reading
-    /// the answers and has to justify the choice, and the person confirms it at review. That is the
-    /// derived-and-confirmed shape — chosen where it can be informed, overridable where it is read.
-    private func askForDesign() {
-        failure = nil
-        designWarning = nil
-        // A design asked for here **replaces** a composition that was opened: the six answers are the
-        // design now, so the goal the fill is handed is theirs rather than a file's justification.
-        loadedComposition = nil
-        loadedGoal = nil
-        stage = .designing
-        // A design is a new run: the log starts here, so a person reads this attempt's phases rather
-        // than a previous one's. It is the longest wait before anything is written, which is exactly
-        // why it has to say what it is doing.
-        creationLog = []
-        let description = designForm.description
-        let boardJSON = board.json
-        let libraryRoot = library
-        let started = open("Designing the composition…")
-        Task {
-            let (design, spec, source, error) = await bridge.designApplication(
-                board: boardJSON,
-                description: description,
-                framework: nil,
-                libraryRoot: libraryRoot
-            )
-            await MainActor.run {
-                if let design, let spec {
-                    self.design = design
-                    self.designSpec = spec
-                    // The door the core named for a design asked for here: the form pins no framework,
-                    // so the model chose and justified one. Handed back to the scaffold, which records
-                    // it as the decision behind the composition.
-                    self.designSource = source
-                    finish(
-                        "Designed: \(design.framework), \(design.units.count) unit(s), "
-                            + "\(design.componentsToWrite.count) to write",
-                        since: started
-                    )
-                    stage = .review
-                } else {
-                    // The design phase leaves the wizard where it was: nothing was written, so nothing
-                    // has to be undone, and the form's answers are still there to adjust.
-                    let why = error ?? "the design came back empty"
-                    finish("Design failed: \(why)", since: started, kind: .failed)
-                    failure = why
-                    stage = .form
-                }
-            }
-        }
-    }
-
     /// The one project type whose product is a *composition*: an ESP-IDF application is built
     /// against a component library, and naming it is what lets the library's `SPIRE.md` reach the
     /// model when the project is filled. Every other type is complete on its own.
@@ -781,40 +521,33 @@ struct CreateProjectSheet: View {
     private var canCreate: Bool { resolvedRoot != nil && nameIsValid && !isCreating }
 
     /// Whether this sheet is creating a *composition* — the one type whose product is decided before
-    /// its tree exists, and so the one type that gets a design phase.
+    /// its tree exists, and so the one type whose design is a file a person hands in.
     private var isApplication: Bool { structure == Self.applicationStructure }
 
-    /// What the primary button says. An application is **designed** first; the design is what a person
-    /// approves, and creating is what follows a yes.
+    /// What the primary button says. An application's design is a **file** a person opens and approves;
+    /// creating is what follows a yes.
     private var primaryLabel: String {
         if !isApplication { return "Create" }
-        return stage == .review ? "Create" : "Design"
+        return stage == .review ? "Create" : "Open a composition…"
     }
 
     /// The primary button's rule, as a **pure function** — `false` disables it.
     ///
-    /// The form needs **a place to put the project**, not only a board and the answers, and that is the
-    /// half that was missing: a design ran happily with no location chosen, and then the *review*
-    /// screen — which has no location field — offered a Create button that could never enable. Naming
-    /// the rule here and requiring the root *before* designing makes the two screens agree, instead of
-    /// leaving a person to discover the difference with a greyed-out button.
+    /// The form needs **somewhere to put the project**, not only a composition to open, and that is
+    /// the half that was missing: a composition opened with no location chosen landed on the *review*
+    /// screen — which has no location field — whose Create button could never enable. Naming the rule
+    /// here and requiring the root *before* reviewing makes the two screens agree, instead of leaving a
+    /// person to discover the difference with a greyed-out button.
     static func primaryEnabled(
         stage: Stage,
         isApplication: Bool,
         isCreating: Bool,
-        boardComplete: Bool,
-        formUsable: Bool,
         canCreate: Bool
     ) -> Bool {
         if isCreating { return false }
         if !isApplication { return canCreate }
         switch stage {
-        case .form:
-            // A board, something to design from, **and somewhere to put the result**: the core refuses
-            // a design without the first two, and the third is what the review screen would otherwise
-            // silently require.
-            return canCreate && boardComplete && formUsable
-        case .review:
+        case .form, .review:
             return canCreate
         default:
             return false
@@ -826,15 +559,13 @@ struct CreateProjectSheet: View {
             stage: stage,
             isApplication: isApplication,
             isCreating: isCreating,
-            boardComplete: board.isComplete,
-            formUsable: designForm.isUsable,
             canCreate: canCreate
         )
     }
 
     private func primaryAction() {
         guard isApplication else { return create() }
-        if stage == .review { create() } else { askForDesign() }
+        if stage == .review { create() } else { loadComposition() }
     }
 
     private func backToForm() {
@@ -887,7 +618,7 @@ struct CreateProjectSheet: View {
         }
     }
 
-    /// **Open a `composition.spire`** and take it to review — the design phase, without the design call.
+    /// **Open a `composition.spire`** and take it to review — the design, without a design call.
     ///
     /// The parse and the six rules are the **core's** (`createProject/ParseComposition`), deliberately:
     /// a second YAML reader in Swift would be a second, drifting answer to what a composition is, and
@@ -895,8 +626,7 @@ struct CreateProjectSheet: View {
     /// is. A file that does not parse, or does not hold together, is refused by name and the wizard
     /// stays on the form — nothing was written, and the file is the thing to fix.
     ///
-    /// A successful open lands on the **review** step, which is the same review either door leads to:
-    /// what a person approves is what gets scaffolded.
+    /// A successful open lands on the **review** step: what a person approves is what gets scaffolded.
     private func loadComposition() {
         NSApp.activate(ignoringOtherApps: true)
 
@@ -964,8 +694,8 @@ struct CreateProjectSheet: View {
     }
 
     /// Create it. For a native project that is the scaffold itself; for an **application** it is the
-    /// pipeline the design phase earns: apply the design to the library, scaffold the application with
-    /// the spec that was approved, fill it from that spec, and execute the fill.
+    /// pipeline the reviewed composition earns: apply the design to the library, scaffold the
+    /// application with the spec that was approved, fill it from that spec, and execute the fill.
     private func create() {
         guard let root = resolvedRoot else { return }
         failure = nil
@@ -984,22 +714,21 @@ struct CreateProjectSheet: View {
         // not name a door for) sends nothing, and the core records no decision rather than a guessed one.
         let designSource = designSource
         let libraryRoot = library
-        // The platform the scaffold and the build both run for: the **design's** chip, since a
-        // composition opened from a file left the form's picker empty. One rule, so the scaffold's
-        // recorded targets and the build's module cannot disagree.
-        let chip = Self.buildPlatform(designChip: design?.board.chip, formChip: board.chip)
+        // The platform the scaffold and the build both run for: the **composition's** chip, which is
+        // the only board there is — a composition states its own. One rule, so the scaffold's recorded
+        // targets and the build's module cannot disagree.
+        let chip = Self.buildPlatform(designChip: design?.board.chip)
         let scaffoldPlatforms = chip.map { [$0] } ?? []
         // The decision, written down. Two binaries can disagree about this — a create run inside a
         // process launched before a fix was linked reads the old rule — and the only way to tell the
         // two apart from the logs is to state the inputs and what they resolved to. `nil` here with a
         // chip visible in the tree means the *build* is stale, not the rule.
-        SpireBridge.logScaffold(
-            Self.buildPlatformLogLine(designChip: design?.board.chip, formChip: board.chip)
-        )
-        // The goal the fill is handed: the form's answers on the designed path, and the composition's
-        // own `justification` when the design was **opened** from a file — a form nobody filled in has
-        // nothing to say about an application that is already written down.
-        let goal = loadedGoal ?? designForm.description
+        SpireBridge.logScaffold(Self.buildPlatformLogLine(designChip: design?.board.chip))
+        // The goal the fill is handed: the composition's own `justification`, which is exactly the
+        // sentence the file states about itself — or, for a composition that justifies nothing, a plain
+        // instruction rather than an empty string: the fill is told *why* this application exists, and
+        // "nothing said" is not a reason.
+        let goal = loadedGoal ?? "Fill the composition the reviewed design states."
         Task {
             // **The design reaches the library first.** A stub the design asked for has to exist — with
             // its manifest, so the application's `REQUIRES` resolves — before the application's tree is
@@ -1283,11 +1012,10 @@ struct CreateProjectSheet: View {
     /// log is a loop with no exit. What is left over is reported and the sheet **stays** — a project that
     /// does not build is a fact its owner needs, not a detail to discover later.
     private func buildAndRepair(root: String, spec: ScaffoldSpec) async {
-        // The platform the **design** names, not the form's picker — see [`buildPlatform`]. A
-        // composition opened from a file never filled the form, and no platform sends a
-        // `CMakeLists.txt` tree to the CMake module (`cmake --build build`) instead of the ESP-IDF
-        // one (`idf.py build`) — the wrong command for a tree that has never been configured.
-        let platform = Self.buildPlatform(designChip: design?.board.chip, formChip: board.chip)
+        // The platform the **composition** names — see [`buildPlatform`]. No platform sends a
+        // `CMakeLists.txt` tree to the CMake module (`cmake --build build`) instead of the ESP-IDF one
+        // (`idf.py build`), which is the wrong command for a tree that has never been configured.
+        let platform = Self.buildPlatform(designChip: design?.board.chip)
         let service = bridge.makeBuildService()
         lastBuildLogAt = nil
 
@@ -1465,41 +1193,37 @@ struct CreateProjectSheet: View {
         failure == nil
     }
 
-    /// The chip both the scaffold and the build run for: the **design's**, falling back to the form's
-    /// picker.
+    /// The chip both the scaffold and the build run for: the **composition's**.
     ///
-    /// The design is the authority. On the designed path the form *is* the design, so the two agree;
-    /// on the load path — a composition opened from a file — the form was never filled, so
-    /// `board.chip` is empty while the design's own `board.chip` carries the file's board. Reading the
-    /// form first leaves the build with no platform, and no platform routes a `CMakeLists.txt` tree to
-    /// the CMake module (`cmake --build build`) rather than the ESP-IDF one (`idf.py build`) — the
-    /// wrong command for a tree that has never been configured, which is how a real ESP-IDF project
-    /// failed with "`build` is not a directory".
+    /// The composition is the authority and it is the only one there is: it states its own board, so
+    /// there is no form picker to fall back to. A chip it does not name is no chip at all — and no
+    /// platform routes a `CMakeLists.txt` tree to the CMake module (`cmake --build build`) rather than
+    /// the ESP-IDF one (`idf.py build`), the wrong command for a tree that has never been configured,
+    /// which is how a real ESP-IDF project failed with "`build` is not a directory".
     ///
-    /// `nil` when neither names a chip — a host build, which is what a scaffold without a board means.
+    /// `nil` when the composition names no chip — a host build, which is what a scaffold without a
+    /// board means.
     ///
     /// Not `private`: the rule is pure and it is pinned by a test.
-    static func buildPlatform(designChip: String?, formChip: String) -> String? {
-        let designChip = designChip ?? ""
-        let chip = designChip.isEmpty ? formChip : designChip
+    static func buildPlatform(designChip: String?) -> String? {
+        let chip = designChip ?? ""
         return chip.isEmpty ? nil : chip
     }
 
-    /// The one-line record of the platform decision, for `spire-scaffold.log`: both inputs and what
-    /// they resolved to.
+    /// The one-line record of the platform decision, for `spire-scaffold.log`: the input and what it
+    /// resolved to.
     ///
     /// It exists because a create run can happen inside a process launched *before* a fix was linked,
-    /// and the only thing that tells that apart from a broken rule is the inputs written down. A line
-    /// reading `design.chip=nil form.chip=nil -> nil` for a composition whose tree names a chip means
-    /// the binary is stale, not that [`buildPlatform`] chose wrong.
+    /// and the only thing that tells that apart from a broken rule is the input written down. A line
+    /// reading `design.chip=nil -> nil` for a composition whose tree names a chip means the binary is
+    /// stale, not that [`buildPlatform`] chose wrong.
     ///
-    /// Not `private`: the line is a pure function of the two chips and it is pinned by a test.
-    static func buildPlatformLogLine(designChip: String?, formChip: String) -> String {
-        let chip = buildPlatform(designChip: designChip, formChip: formChip)
+    /// Not `private`: the line is a pure function of the chip and it is pinned by a test.
+    static func buildPlatformLogLine(designChip: String?) -> String {
+        let chip = buildPlatform(designChip: designChip)
         let platforms = chip.map { [$0] } ?? []
         return "CreateProjectSheet.create() platform: design.chip=\(designChip ?? "nil") "
-            + "form.chip=\(formChip.isEmpty ? "nil" : formChip) -> \(chip ?? "nil") "
-            + "platforms=\(platforms)"
+            + "-> \(chip ?? "nil") platforms=\(platforms)"
     }
 
     /// **The design and the library disagree**, as the sheet states it — or `nil` when they agree.

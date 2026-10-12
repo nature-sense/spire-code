@@ -979,9 +979,13 @@ async fn a_real_model_designs_builds_and_fills_an_application() {
 
     let sys = system_with_llm(llm_config).await;
 
-    // ── 1. Design ──
-    // The design form's six answers, in the words a person would use, and the real library: the
-    // components it names as `existing` are the ones this library actually has.
+    // ── 1. The design ──
+    // The composition a person wrote, read through the door a `composition.spire` uses: the worked
+    // example, which names the SPS30 and the SHT20 as components this application has to grow and
+    // `moving_average` as one the library already carries. What this run exercises live is the loop
+    // *after* the design — apply, scaffold, fill, verify, build — against the real library and the real
+    // model; the `description` below is carried through as the fill's goal, the words the units are
+    // written from.
     let description = "A desktop air-quality meter on an M5Stack Core S3. It reads particulates \
                        (PM1/2.5/4/10) from an SPS30 and temperature/humidity from an SHT20, both on \
                        the internal I2C bus. It shows the current reading and a rolling average on the \
@@ -989,19 +993,18 @@ async fn a_real_model_designs_builds_and_fills_an_application() {
                        once a second and keeps working, with a warning, if one sensor is missing.";
     let designed = sys
         .call(
-            "createProject/DesignApplication",
+            "createProject/ParseComposition",
             serde_json::json!({
-                "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3", "hal": "m5unified" },
-                "description": description,
-                "libraryRoot": library.to_string_lossy(),
+                "text": spire_code::build::application_spec::examples::PM25_METER,
+                "name": "composition.spire",
             }),
         )
         .await;
     let spec: ApplicationSpec = serde_json::from_value(designed["spec"].clone())
-        .unwrap_or_else(|e| panic!("the design did not come back as a spec: {e}\n{designed}"));
-    validate(&spec).expect("the design phase only returns a spec that passed the checks");
+        .unwrap_or_else(|e| panic!("the composition did not come back as a spec: {e}\n{designed}"));
+    validate(&spec).expect("the parse door only returns a spec that passed the checks");
     eprintln!(
-        "\n══ THE DESIGN (for review) ══\n{}\n",
+        "\n══ THE DESIGN READ FROM THE COMPOSITION ══\n{}\n",
         serde_json::to_string_pretty(&spec).unwrap_or_default()
     );
 

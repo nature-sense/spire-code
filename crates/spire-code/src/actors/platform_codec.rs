@@ -272,14 +272,19 @@ mod capability_block_tests {
         assert_eq!(blocks["realizes"][0]["capability"], "media.camera");
         assert_eq!(blocks["realizes"][0]["properties"]["via"], "esp32p4");
         assert_eq!(blocks["carries"][0]["chip"], "esp32c5");
-        // A device travels flattened too: the name, the `role` capability it is, and the rest as
+        // A device travels flattened too: the name, the `roles` capabilities it is, and the rest as
         // edge properties — never the raw mapping with `role` still inside it.
         assert_eq!(blocks["devices"][0]["device"], "display");
-        assert_eq!(blocks["devices"][0]["role"], "media.camera");
+        assert_eq!(
+            blocks["devices"][0]["roles"],
+            serde_json::json!(["media.camera"]),
+            "a bare `role:` is normalized to a one-role list, the shape the seeder iterates"
+        );
         assert_eq!(blocks["devices"][0]["properties"]["part"], "GC0308");
         assert!(
-            blocks["devices"][0]["properties"].get("role").is_none(),
-            "`role` is the edge's endpoint, not also a property: {blocks}"
+            blocks["devices"][0]["properties"].get("role").is_none()
+                && blocks["devices"][0]["properties"].get("roles").is_none(),
+            "the role is the edge's endpoint, not also a property: {blocks}"
         );
         assert!(
             blocks.get("realized").is_none() && blocks.get("companions").is_none(),

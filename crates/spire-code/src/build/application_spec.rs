@@ -6,9 +6,10 @@
 //! An application is not assembled out of parts whose shape somebody already knows. It is a
 //! **composition**: a few units of work — drivers and pure algorithms, which are framework-agnostic —
 //! arranged into loops, messages and wiring, which is the application's own. Deciding that
-//! arrangement is the **design phase**, and this module is its artifact: a typed spec a model can
-//! write and a tool can *check*, because an arrangement nobody checks is an arrangement nobody can
-//! review.
+//! arrangement is the **composition**, and this module is its artifact: a typed spec a person writes
+//! and a tool can *check*, because an arrangement nobody checks is an arrangement nobody can review.
+//! Its sibling here is the **design brief** ([`DesignBrief`]) — a description read into capabilities
+//! and units, one step earlier and deliberately smaller.
 //!
 //! # Why a spec and not a paragraph
 //!
@@ -20,8 +21,8 @@
 //!   state behind it), or a ramen `stage` (a pair of ports);
 //! * **wiring** — which unit talks to which, stated rather than implied;
 //! * **resources** — the devices the application declares it composes against, each with the
-//!   capability it *is* and how it is reached (a part of the board, or a driver this project has,
-//!   writes, or depends on);
+//!   capability — or capabilities — it *is* and how it is reached (a part of the board, or a driver
+//!   this project has, writes, or depends on);
 //! * **board facts** — the pins, buses and addresses, which belong to the **application** and never to
 //!   a component (the rule the whole component library rests on);
 //! * the **board** itself, and the **framework** the above is written for.
@@ -45,8 +46,8 @@
 //!
 //! A *stream* is a component's job either way — a Klipper status channel and a sensor bus are both
 //! drivers — so what decides the framework is whether the application **reacts** to the data or
-//! **pumps** it through stages. [`design_request`] says exactly this to the model, and the model
-//! returns its choice with a one-line justification for a person to confirm or override.
+//! **pumps** it through stages. The framework is stated in the composition a person writes, and the
+//! rule is kept here because [`validate`] is what holds a composition to it.
 //!
 //! # What validation can and cannot promise
 //!
@@ -138,7 +139,7 @@ pub enum ComponentRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnitSource {
-    /// Already in the library the application is built against — the design phase names it.
+    /// Already in the library the application is built against — the composition names it.
     Existing,
     /// Not written yet: a stub to generate and fill, from a datasheet or a description.
     Stub,
@@ -159,6 +160,15 @@ pub struct Unit {
     /// directory or the class name, so it is lower_snake.
     pub id: String,
     pub kind: UnitKind,
+    /// The unit in **English**: what this actor (or stage, or driver) does, in the person's own words.
+    ///
+    /// The per-unit half of [`ApplicationSpec::description`]: the slice of the design that belongs to
+    /// this one unit, carried verbatim into the unit's generated header as its doc comment. Optional
+    /// because a driver's `provides` line is usually all it needs; an actor almost always has one, since
+    /// "what does this actor do on receiving X" is a question the fields — a message type and a state
+    /// hint — cannot answer. Prose only: no guard, no arithmetic, no rendering, no page transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Components only: driver or library.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<ComponentRole>,
@@ -284,8 +294,8 @@ pub enum ResourceVia {
 ///
 /// This is the application's contribution to the layer between a board's capabilities and the units
 /// that use them. An application does not invent hardware: it says which devices it composes against
-/// (`name`), what each one **is** as a capability the vocabulary knows (`role`), and where the code
-/// that talks to it comes from ([`ResourceVia`], with the `bus`/`address` when it has them). Every
+/// (`name`), what each one **is** as the capabilities the vocabulary knows (`roles`), and where the
+/// code that talks to it comes from ([`ResourceVia`], with the `bus`/`address` when it has them). Every
 /// unit's `uses` then reaches a resource *declared here* — so a model that invents a sensor is refused
 /// by the check rather than by the board, and the set a person reviews is the set the application has.
 ///
@@ -297,10 +307,17 @@ pub struct Resource {
     /// The word the composition speaks, and what a unit's `uses` names. Lower_snake, and the same word
     /// as its driver component's id when it has one.
     pub name: String,
-    /// What the part **is**, as a capability path the vocabulary knows (`sensing.particulate`,
-    /// `media.touch`, `timekeeping.rtc`). A name the vocabulary does not know is refused rather than
-    /// read as "this application has none" — which is the whole reason the vocabulary exists.
-    pub role: String,
+    /// What the part **is**, as the capability paths the vocabulary knows (`sensing.particulate`,
+    /// `media.touch`, `timekeeping.rtc`). A device may be more than one capability at once — the
+    /// SHT20 is `sensing.temperature` *and* `sensing.humidity` — which is why this is a **list**: one
+    /// device, one resource, every capability it provides. A name the vocabulary does not know is
+    /// refused rather than read as "this application has none" — which is the whole reason the
+    /// vocabulary exists.
+    ///
+    /// The wire shape is `roles: [...]`. A bare `role: "sensing.temperature"` is accepted as **sugar**
+    /// for a one-element list, so a spec written before multi-role parts still parses.
+    #[serde(alias = "role", default, deserialize_with = "de_roles")]
+    pub roles: Vec<String>,
     /// Where the code that talks to it comes from — see [`ResourceVia`]. Absent is a problem
     /// [`validate`] states rather than a default, because the choice decides whether a component is
     /// designed at all.
@@ -315,6 +332,29 @@ pub struct Resource {
     /// address, so when both are present they have to agree — see [`validate`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub address: String,
+}
+
+/// Read a resource's `roles` from either wire shape: the canonical `roles: [a, b]` list, or a bare
+/// `role: "a"` — the older, single-capability form — as sugar for `[a]`.
+///
+/// The two are *one* field, not two: a device that is one capability is the common case, and reading
+/// the scalar as a one-element list keeps every spec and fixture written before multi-role parts
+/// valid, while the canonical output is always the list. A missing key is handled by `default`
+/// (an empty list), which [`validate`] then refuses — a resource that names no capability.
+fn de_roles<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(role) => vec![role],
+        OneOrMany::Many(roles) => roles,
+    })
 }
 
 /// The **facets**: power, storage, networking and security, as *lenses* over the composition.
@@ -374,6 +414,17 @@ pub struct SecurityFacet {
 /// The application, decided.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationSpec {
+    /// The application in **English**: what it is for and what it does, in the person's own words.
+    ///
+    /// This is the half of a composition that is not a graph: a `composition.spire` a person hand-authors
+    /// carries both, so the structure and the sentence that explains it cannot drift apart in two files.
+    /// It is **prose, not machinery** — carried verbatim into the generated code (the header of `main/`
+    /// and of each unit) so a person codes against their own sentence rather than a paraphrase, and
+    /// deliberately **not read by [`validate`]**: a rule over free text would be a rule over nothing.
+    /// What must *not* live here is computation — a guard, an arithmetic step, a page transition — which
+    /// belongs in the unit's code in the language that has to run it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     pub framework: ApplicationFramework,
     /// One line, for the person confirming the choice.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -776,16 +827,27 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
                 resource.name
             ));
         }
-        // The role is the declaration's whole point: an application says what it needs *by capability*,
-        // and a name the vocabulary does not know is a **misspelling** here exactly as it is on a
-        // board — the difference between a new thing and a typo is that someone named the former.
-        if !crate::capability_vocabulary::is_known_path(resource.role.trim()) {
+        // The roles are the declaration's whole point: an application says what it needs *by
+        // capability*, and each role names one. A resource with none names nothing; a name the
+        // vocabulary does not know is a **misspelling** here exactly as it is on a board — the
+        // difference between a new thing and a typo is that someone named the former.
+        if resource.roles.is_empty() {
             problems.push(format!(
-                "the resource '{}' claims the capability '{}', which is not one the vocabulary knows \
-                 — a role is a capability path (`sensing.particulate`, `timekeeping.rtc`), and one \
-                 nobody named is a typo rather than a new thing",
-                resource.name, resource.role
+                "the resource '{}' names no capability — `\"roles\"` is what the device *is* \
+                 (`sensing.temperature`, `timekeeping.rtc`, and both for a part that is more than one), \
+                 and a device nobody can reach by requirement is one no unit can use",
+                resource.name
             ));
+        }
+        for role in &resource.roles {
+            if !crate::capability_vocabulary::is_known_path(role.trim()) {
+                problems.push(format!(
+                    "the resource '{}' claims the capability '{}', which is not one the vocabulary \
+                     knows — a role is a capability path (`sensing.particulate`, `timekeeping.rtc`), \
+                     and one nobody named is a typo rather than a new thing",
+                    resource.name, role
+                ));
+            }
         }
         // The driver, if the application drives this part itself: the component whose `id` *is* the
         // resource name, and whose role has to be `driver` because a device is reached through a bus.
@@ -992,98 +1054,13 @@ pub struct LibraryFacts {
     pub hints: Option<String>,
 }
 
-/// The library a design request names, rendered into the prompt.
+/// The framework rule, as the **brief request** states it.
 ///
-/// The **no-library** case is stated rather than left out, and it is not the same as an empty one: with
-/// no library named there is nothing for a component to already be in, so every component the design
-/// names has to be written. Silence here would leave that to be inferred, and a model that infers
-/// "the library probably has this" writes an application that cannot build.
-fn library_block(library: Option<&LibraryFacts>) -> String {
-    let Some(library) = library else {
-        return "## The library this application is built against\n\n\
-                None named. Nothing exists for a component to already be in, so **every component you \
-                design has to be written**: mark them all `\"source\": \"stub\"`.\n"
-            .to_string();
-    };
-
-    let mut text = format!(
-        "## The library this application is built against\n\n`{}`, and the components it already \
-         has:\n",
-        library.root
-    );
-    if library.components.is_empty() {
-        text.push_str("- none of its own\n");
-    }
-    for component in &library.components {
-        let what = match component.kind {
-            Some(kind) => kind.as_str(),
-            None => "no kind stated",
-        };
-        text.push_str(&format!("- `{}` — {what}\n", component.name));
-    }
-    text.push_str(
-        "\nThose are `\"source\": \"existing\"` — they are here. Anything else you design has to be \
-         written, so mark it `\"source\": \"stub\"`, and do not design a component this library \
-         already has.\n",
-    );
-    if let Some(hints) = &library.hints {
-        text.push_str(&format!(
-            "\nLIBRARY HINTS — how the author of this library says it is meant to be used. It is the \
-             architecture, it is not in the code, and the design has to respect it:\n\n{hints}\n"
-        ));
-    }
-    text
-}
-
-/// The **resources** block of the prompt: the rule that sits between the hardware and the units.
-///
-/// Stated in the prompt because it is the rule a model most naturally breaks — asked for a PM2.5 meter
-/// it will happily invent a sensor — and because the *board* is the wrong place to catch that: the board
-/// is a different file, and a part the application adds belongs to the application. So the prompt says
-/// what `resources` is and how each `via` is earned, and [`validate`] refuses a `uses` that reaches a
-/// device nobody declared.
-fn resources_block() -> String {
-    "## The resources this application composes against\n\n\
-     An application does not invent hardware. Before a unit may reach a device, the device is \
-     **declared** in the spec's `resources`, and every `uses` names one of those declarations — a device \
-     you do not declare is a device this application does not have.\n\n\
-     * a part **of the board** — a display, a touch panel, an RTC, an IMU, a battery gauge — is declared \
-     with `\"via\": \"board\"`. There is no component behind it: the BSP, or the board abstraction above, \
-     is what reaches it, and a unit `uses` its `name` directly. The name means the part, so no unit may \
-     share it — name an actor after what it *does* (`touch_input`, not `touch`);\n\
-     * a part the **application adds** — a sensor on a grove port, a module on the header — is declared \
-     with `\"via\": \"library\"` (a driver this project has, or writes) or `\"via\": \"published\"` (a driver \
-     the registry already has). Its `name` **is** the driver component's `id`, so declare both, with one \
-     name — that is the word the `uses` speaks.\n\n\
-     An application does not share a device: each declared resource has **exactly one owner** — the \
-     unit whose `uses` names it, the actor that holds the part in its state. Every other unit that needs \
-     it reaches it by **messaging that owner**, so a second `uses` of the same device is a mistake.\n\n\
-     Each resource states a `role`: the capability the part **is**, as a path the vocabulary knows — \
-     `sensing.particulate`, `media.touch`, `timekeeping.rtc`, `power.pmu`. Give `bus` (the wiring \
-     function it sits on: `grove.a`, `i2c_internal`) and `address` when the part has them.\n"
-        .to_string()
-}
-
-/// The **design request**: what the model is asked, with the board and the description in it.
-///
-/// `description` is the user's answers to the design form — the six questions below, in their own
-/// words. `framework` is `Some` when the user pinned the choice up front; otherwise the model chooses
-/// it and has to justify it, which is the *derived-and-confirmed* shape: the choice is made where it
-/// can be informed (after reading the description) and confirmed where it can be overridden (by the
-/// person reading the spec).
-///
-/// The six questions are in the prompt on purpose. A model handed a thin description should be able to
-/// see *which* question went unanswered and say so, rather than filling the gap — the same rule the
-/// component prompts work under: nothing is invented, and a gap left open is reported.
-pub fn design_request(
-    board: &BoardChoice,
-    description: &str,
-    framework: Option<ApplicationFramework>,
-    // The **component library** the application is built against, when the caller named one. It is what
-    // makes `"source": "existing"` a fact rather than a guess — see [`LibraryFacts`].
-    library: Option<&LibraryFacts>,
-) -> String {
-    let framework_rule = match framework {
+/// `Some(chosen)` is the pinned case (the caller already decided); `None` is the derived one — which is
+/// what the brief asks for, because the person confirms the choice at the board step. A composition
+/// states its framework outright, so this rule is only ever spoken to the brief.
+fn framework_rule(framework: Option<ApplicationFramework>) -> String {
+    match framework {
         Some(chosen) => format!(
             "The framework is **{}** — the user chose it, so it is not yours to reconsider. Design \
              the composition for it.",
@@ -1102,244 +1079,20 @@ pub fn design_request(
                  drivers): what decides the framework is whether the application **reacts** to the data\n\
                  or **pumps** it through stages."
             .to_string(),
-    };
-
-    format!(
-        r#"You are designing the **composition** of an ESP-IDF application, before any of it is
-written. The output is a JSON **application spec** that a person will review and a tool will check.
-
-## The board
-
-{board}
-
-(Onboard devices — a display, a touch panel, a camera, a battery gauge, an IMU — are the *board's*, reached
-through the BSP or the board abstraction above. They are not units and they are not board facts.)
-
-The board above is **given**: echo it in `board` exactly. Substituting a different BSP or abstraction is
-not a design choice — it is an application built for a board nobody has.
-
-{library}
-
-{resources}
-
-## What the application has to do
-
-{description}
-
-If this leaves one of these unanswered, **say so and leave the field empty** — do not invent a
-device, an address, a pin or a protocol:
-
-1. what it does, in a paragraph;
-2. what it **senses** (sensors, buttons, network, time — and roughly how fast);
-3. what it **acts on** (display, audio, motor, actuator, network);
-4. what it **reacts to over time** (periodic? on-command? on-threshold? on-event?);
-5. **timing** — what is parallel, what is a human-rate UI, what is a machine-rate stream;
-6. what happens **when something is missing** (a sensor absent, WiFi down, battery low).
-
-## The framework
-
-{framework_rule}
-
-## The spec
-
-```json
-{{
-  "framework": "actors" | "ramen",
-  "justification": "one line for the person confirming this",
-  "board": {{ "chip": "...", "bsp": "...", "hal": "..." }},
-  "board_facts": [ {{ "bus": "i2c", "device": "<a driver unit id>", "address": "0x69" }} ],
-  "resources": [
-    {{ "name": "display", "role": "media.display", "via": "board" }},
-    {{ "name": "rtc", "role": "timekeeping.rtc", "via": "board", "bus": "i2c_internal", "address": "0x51" }},
-    {{ "name": "sps30", "role": "sensing.particulate", "via": "library", "bus": "grove.a", "address": "0x69" }}
-  ],
-  "units": [
-    {{ "id": "sps30", "kind": "component", "role": "driver", "source": "stub",
-       "provides": "PM1/2.5/4/10 readings", "bus": "i2c" }},
-    {{ "id": "moving_average", "kind": "component", "role": "library", "source": "existing",
-       "provides": "rolling window" }},
-    {{ "id": "esp_dl", "kind": "component", "role": "library", "source": "published",
-       "registry": "espressif/esp-dl", "provides": "a pre-trained detector the registry already has" }},
-    {{ "id": "sampler", "kind": "actor", "message": "Tick", "state": "reads both sensors",
-       "uses": ["sps30"], "sends_to": ["air_quality"] }},
-    {{ "id": "preprocess", "kind": "stage", "pulls": "frames", "pushes": "tensors" }}
-  ],
-  "wiring": ["sampler -> air_quality", "air_quality -> view"]
-}}
-```
-
-A unit is exactly one of three kinds:
-
-* `component` — a **driver** (one device on one bus) or a **library** (pure code). It knows no pins, no
-  address, no task, no mailbox and no framework: that is what makes it reusable in an application that
-  chose the other framework, and it is why a component carries **no** `message`, `state`, `pulls`,
-  `pushes`, `sends_to` or `uses`. Components are **never in the wiring** — a unit *uses* one.
-* `actor` — a classical actor: a `Message` type it receives, the `state` it holds between messages, the
-  components it `uses`, and the units it `sends_to`. The framework's scheduler owns its mailbox and its
-  task; you do not write a loop.
-* `stage` — a ramen dataflow stage: what it `pulls` and what it `pushes` (a **source** stage has only
-  `pushes` — a frame pump reading a camera; a **sink** has only `pulls` — the stage that acts on the
-  flow's last value: storing an image, driving a pin). One task runs a whole chain, pushing
-  synchronously — so the chain is a **DAG**, never a cycle.
-
-`uses` is how the composition reaches the framework-agnostic parts: `sampler` sampling `sps30`, a
-`detector` stage using `esp_dl`. It is also what tells a reviewer which component a unit wraps. It
-reaches a **component**, or a **declared resource** — a part of the board, which has no component of its
-own (`resources` above).
-
-**An edge carries the receiver's message, not the sender's.** In an `actors` application every edge
-`a -> b` means `a` posts a message of **`b`'s** type — `a` holds `ActorRef<b::Message>`, and that is the
-only thing `b` can receive. So an actor sending *into* a unit is posting that unit's own message type
-however differently the two units are named; two units pointing at one actor post the same type, and a
-unit whose own message differs (a `TouchEvent` posted at an actor that takes `Reading`) does not compile.
-
-**A cycle is legal for `actors`, and it is why the framework has a registry.** Two actors that must
-reach each other — a menu and the screen it drives, a sampler and the view it reports to — state **both**
-edges (`a -> b` and `b -> a`), because each is the other's peer. The framework resolves such a pair by
-**name** when the application starts rather than by handing one the other's ref at construction, and the
-actor's `id` is that name. A `ramen` chain, pushed synchronously, has no cycles at all — a cycle there
-is unbounded recursion on one stack, not a loop.
-
-## The rules the tool checks
-
-1. one framework per application, and **one unit per id**: an `actors` application has `component` and
-   `actor` units, a `ramen` application has `component` and `stage` units. No mixing, and no two units
-   sharing an id.
-2. every `actor` states a `message`; every `stage` states at least one of `pulls`/`pushes`.
-3. every reference resolves — both ends of a `wiring` edge, every `sends_to` and every `uses` name a
-   unit that exists — the wiring connects only **actors and stages** (never a component), `uses`
-   names only **components**, and a ramen dataflow has no cycles.
-4. every component has a `role`; a `driver` states a `bus` (a `published` one need not — it is not
-   written here) and a `library` states none; a `published` component states its `registry` name and
-   no other source does; no component carries composition.
-5. every board fact's `device` is a **driver component in this spec**: a fact is how a driver is
-   reached. An onboard device is not a fact — it comes from the board.
-6. nothing invented and unused: every unit is referenced by the wiring, by a `sends_to`, by a `uses`,
-   or by a board fact.
-7. every device a unit reaches is **declared** in `resources`, and every declaration holds together:
-   one name per part, a `role` the vocabulary knows, and a `via` that agrees with the composition —
-   `board` (a part of the board, whose name must belong to **no** unit: the word means the part, so a
-   unit of that name would be reached instead of it), `library`/`published` (a part this project
-   drives, whose name **must** be its driver component's id).
-8. every declared resource has **exactly one owner** — the unit whose `uses` names it, which holds the
-   device in its state. A resource no unit uses was declared for nothing, and a resource two units use
-   is *shared*, which the actor model forbids: every unit but the owner reaches the device by
-   **messaging the owner**, so a second `uses` of the same device is refused.
-
-A component's `"source"` says where its code comes from:
-
-* `"existing"` — the library already has it (the list above);
-* `"stub"` — it has to be written, from a datasheet or a description; the design generates the stub,
-  so name it rather than avoiding it;
-* `"published"` — it already exists on the ESP Component Registry (`components.espressif.com`). **Look
-  it up** with the `registry/*` tools rather than designing a second copy of a driver somebody has
-  already published, and put the registry's own `namespace/name` in the unit's `"registry"` field. A
-  published component is a **managed dependency** of this application, not a component of the
-  library: the scaffold writes it into `main/idf_component.yml`, so it needs no `bus` and is never
-  stubbed.
-
-Respond with **only the JSON object**, and nothing else."#,
-        board = board_block(board),
-        library = library_block(library),
-        resources = resources_block(),
-        description = description.trim(),
-        framework_rule = framework_rule,
-    )
-}
-
-/// The board, as a prompt block.
-fn board_block(board: &BoardChoice) -> String {
-    let mut lines = vec![
-        format!("* chip: `{}`", board.chip),
-        format!(
-            "* BSP: `{}` (carries the pins and the dependency set)",
-            board.bsp
-        ),
-    ];
-    if !board.hal.trim().is_empty() {
-        lines.push(format!(
-            "* board abstraction: `{}` (the API the application is written against)",
-            board.hal
-        ));
     }
-    lines.join("\n")
 }
 
-/// Total LLM rounds — the first answer plus its repairs — before the design phase gives up.
+/// How many times a leg will ask the model before giving up.
 ///
 /// Three, like the AppSpec requirements pass: enough for a model to fix a real mistake it made (a
-/// forgotten field, a wiring edge that names nothing, a component it gave a mailbox), and few enough
-/// that a model which *cannot* produce a decomposition is reported rather than asked forever.
+/// forgotten field, a wiring edge that names nothing), and few enough that a model which *cannot*
+/// produce an answer is reported rather than asked forever. Shared by the brief leg and the AppSpec
+/// requirements pass so the two cannot drift.
 pub const MAX_DESIGN_ATTEMPTS: usize = 3;
-
-/// The spec with the **caller's board**, not the model's.
-///
-/// The board is a *given*: the wizard collected it — a chip and a BSP a build can be made for — and the
-/// design request states it. A model that answers with a different one has the application depend on a
-/// board nobody chose, and one did: `espressif/m5stack_core_s3` came back as `m5stack/cores3`, which the
-/// scaffold then wrote into `main/idf_component.yml` and the build could not resolve. So the answer's
-/// board is **overwritten rather than trusted** — the six rules are about the *composition*, which is
-/// the part the model is actually being asked to decide, and the board is the part it is not.
-fn with_the_callers_board(mut spec: ApplicationSpec, board: &BoardChoice) -> ApplicationSpec {
-    spec.board = board.clone();
-    spec
-}
-
-/// The **design phase's LLM stage**: ask, parse, check against the six rules, and repair.
-///
-/// The LLM is injected as a plain async `call`, exactly as the AppSpec requirements pass injects it,
-/// so the tests run on canned answers — no live actor, no network, and the repair path is exercised
-/// rather than assumed.
-///
-/// A refusal is the whole answer rather than a draft plus problems, and that is a decision about what
-/// a person reviews: a decomposition that does not hold together is not something to approve, so the
-/// reviewer is shown a spec that *passed*. When every attempt fails, the error names what was wrong
-/// with the last answer, so the caller can say which rule the model could not satisfy rather than
-/// "invalid spec".
-pub async fn design_application<F, Fut>(
-    board: &BoardChoice,
-    description: &str,
-    framework: Option<ApplicationFramework>,
-    library: Option<&LibraryFacts>,
-    call: F,
-) -> Result<ApplicationSpec, String>
-where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<String, String>>,
-{
-    let request = design_request(board, description, framework, library);
-    let mut prompt = request.clone();
-    let mut last_problems: Vec<String> = Vec::new();
-
-    for attempt in 1..=MAX_DESIGN_ATTEMPTS {
-        let answer = call(prompt.clone()).await.map_err(|e| {
-            format!("the design request was not answered (attempt {attempt} of {MAX_DESIGN_ATTEMPTS}): {e}")
-        })?;
-        let problems = match parse_spec(&answer) {
-            // A parse failure is a problem like any other, and stating it that way is what lets the
-            // repair turn exist for it: a model that emitted YAML or prose gets told so and answers in
-            // JSON, instead of the whole design phase failing on a formatting habit.
-            Err(parse_problem) => vec![parse_problem],
-            Ok(spec) => match validate(&spec) {
-                // The **caller's** board, not the model's: see [`with_the_callers_board`].
-                Ok(()) => return Ok(with_the_callers_board(spec, board)),
-                Err(problems) => problems,
-            },
-        };
-        prompt = repair_request(&request, &answer, &problems);
-        last_problems = problems;
-    }
-
-    Err(format!(
-        "the design phase produced no valid spec in {MAX_DESIGN_ATTEMPTS} attempts. The last \
-         answer's problems were:\n  - {}",
-        last_problems.join("\n  - ")
-    ))
-}
 
 /// The repair turn: the same request, the answer that came back, and what is wrong with it.
 ///
-/// Deliberately a whole new message rather than a conversation: the design phase keeps no chat state,
+/// Deliberately a whole new message rather than a conversation: the brief keeps no chat state,
 /// so a prompt that carries the answer it is asking to fix is self-contained — which is what makes it
 /// reproducible, testable, and independent of whatever the LLM service remembers.
 fn repair_request(request: &str, previous: &str, problems: &[String]) -> String {
@@ -1353,6 +1106,600 @@ fn repair_request(request: &str, previous: &str, problems: &[String]) -> String 
          corrected JSON object, and nothing else.\n\n## What you answered\n\n{previous}\n\n## What is \
          wrong with it\n\n{problems}\n"
     )
+}
+
+/// The **six points** every description is read against — the fixed shape of a brief's `points`.
+///
+/// One entry per point: the `id` a `points` entry carries, and the question the request asks about it.
+/// Named here, rendered into [`brief_request`] and checked by [`validate_brief`], so the six questions
+/// the model is asked, the six entries a brief carries and the six rows a person sees are the same six —
+/// the prompt, the check and the screen cannot drift apart.
+///
+/// It replaces the old `BRIEF_GAP_CEILING`, and the difference is the whole change. That constant capped
+/// a **count** — how many questions a brief may ask — and a cap leaves the count the model's judgement
+/// about how much a description left open, which live runs measured at 0, 1, 3, 6 and 10 questions for
+/// one unchanged text. Six points remove the judgement instead of bounding it: every description is read
+/// against all six, so what is *open* is no longer a number the model picks — it is which of the six
+/// `decided` cells are filled.
+pub const BRIEF_POINTS: [BriefPointSpec; 6] = [
+    BriefPointSpec {
+        id: "purpose",
+        question: "what it does, in a paragraph",
+    },
+    BriefPointSpec {
+        id: "senses",
+        question: "what it **senses** (sensors, buttons, network, time — and roughly how fast)",
+    },
+    BriefPointSpec {
+        id: "acts_on",
+        question: "what it **acts on** (display, audio, motor, actuator, network)",
+    },
+    BriefPointSpec {
+        id: "reacts_to",
+        question: "what it **reacts to over time** (periodic? on-command? on-threshold? on-event?)",
+    },
+    BriefPointSpec {
+        id: "timing",
+        question:
+            "**timing** — what is parallel, what is a human-rate UI, what is a machine-rate stream",
+    },
+    BriefPointSpec {
+        id: "missing",
+        question:
+            "what happens **when something is missing** (a sensor absent, WiFi down, battery low)",
+    },
+];
+
+/// One of [`BRIEF_POINTS`]: the `id` a `points` entry carries, and the question the request asks about
+/// it. A struct rather than two parallel arrays, so an id and its question are read — and edited —
+/// together.
+pub struct BriefPointSpec {
+    pub id: &'static str,
+    pub question: &'static str,
+}
+
+/// Whether `id` is one of the six points — the check that makes an invented id (`purpose2`) a
+/// misspelling to correct rather than an eighth point.
+pub fn is_known_point(id: &str) -> bool {
+    BRIEF_POINTS.iter().any(|point| point.id == id)
+}
+
+/// The **ceiling on `forks`**: the genuine either/or decisions a brief may hand back unanswered.
+///
+/// The successor to `BRIEF_GAP_CEILING`, and small on purpose. A fork is the one place a question
+/// survives in a brief, and it survives only where the answer would change which capability or unit the
+/// application is given **and** the description cannot settle it — so a brief handing back five has not
+/// read the text, it has interviewed the person. Two is enough for the forks that are real (log to an SD
+/// card or stream it over WiFi) and tight enough that the model must *decide* the rest and show the
+/// decision in `decided`, which is a reading a person can correct by picking rather than by rewriting.
+pub const BRIEF_FORK_CEILING: usize = 2;
+
+/// The **design brief** — what a description says the application has to do, before a board is chosen
+/// or any of it is decomposed.
+///
+/// This is the first step of the description-first flow, and it stops deliberately short of the
+/// [application spec](ApplicationSpec). It reads a description into five things and no more:
+///
+/// * a `summary` — the application in a paragraph, for the person to confirm;
+/// * a `framework` — derived from the description, and
+///   confirmed by the person when they choose a board;
+/// * `requires` — the **capabilities** the application needs, as paths the vocabulary knows
+///   (`sensing.temperature`, `media.display`). Board-agnostic on purpose: this is what the application
+///   has to do, never what a particular board happens to carry, which is the board step's question;
+/// * `suggests` — the units the description implies, as bare names for the actor step to start from,
+///   naming what it senses **and** what it acts on (a display and a touch screen are units);
+/// * `points` — the description read against **each of the six questions** ([`BRIEF_POINTS`]): what the
+///   description **said** about the point, and what was **decided** where it said nothing;
+///
+/// It also carries `forks`: the rare either/or decision the description cannot settle *and* the brief
+/// will not settle alone, because the answer changes which capabilities or units the application is
+/// given. A fork is a pick between named alternatives ([`BriefFork`]) that carry what they add, never an
+/// open question — **the model drafts and the person edits, so the brief never asks the person to
+/// enumerate what is missing.**
+///
+/// What the brief never does is name a board, a resource, a driver or a wiring edge. Those are steps
+/// two and three's to decide, and a brief that guessed them would be a decomposition nobody asked for
+/// — the exact collision the brief exists to avoid.
+///
+/// The brief is a **guide, not a gate**. Its `requires` produces badges, a board-fit readout and soft
+/// warnings; a capability nothing in the composition covers is reported, not refused, because the
+/// person is mid-design and the rule the core enforces is the *spec's*, not the brief's. The one thing
+/// checked here is that each `requires` path is a capability the vocabulary knows — an unknown path is
+/// a misspelling rather than a new capability, exactly as a device's `roles` and a resource's `roles`
+/// are checked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesignBrief {
+    /// The application in a paragraph, in the model's words, for the person to confirm.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    /// The framework the description points at. Derived rather than pinned — the person confirms it at
+    /// the board step, which is where it stops being a suggestion. `None` when the description is too
+    /// thin to tell, which is an answer rather than a gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<ApplicationFramework>,
+    /// The **capabilities** the application needs, as paths the vocabulary knows. Board-agnostic:
+    /// `sensing.particulate` is what the application must do, not a claim that any board carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// The **units** the description implies, as advisory lower_snake names (`sampler`,
+    /// `air_quality`). **One per thing the application senses and one per thing it acts on** — a display
+    /// (`view`) and a touch screen (`touch`) are units, not one — because a suggestion that named only
+    /// the sensing side would leave half the application undesigned. Names only — no kind, no message,
+    /// no wiring — because the composition is not designed yet and a suggestion is not a decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggests: Vec<String>,
+    /// The description **read against each of the six points** ([`BRIEF_POINTS`]), one entry per point,
+    /// each naming the point it answers. This is what replaced `gaps`.
+    ///
+    /// A `gaps` entry was a question the person had to answer by rewriting their description — coding in
+    /// English — which is both the slowest way to answer a question and the only one the old brief
+    /// offered. A reading is the opposite shape: the model answers the point, names the sentence it
+    /// answered from in `said`, and where it had to supply the answer itself it says what it supplied in
+    /// `decided`. Nothing here is a count, so nothing here can be counted differently twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<BriefPointRead>,
+    /// The decisions the description cannot settle and the brief will not settle alone — **at most
+    /// [`BRIEF_FORK_CEILING`]**, each a pick between named alternatives that carry the `requires` and
+    /// `suggests` they would add.
+    ///
+    /// Empty is the ordinary answer. A fork exists only where a guess would change what the application
+    /// *needs* (log to an SD card or stream it over WiFi), where the person's answer is one click and the
+    /// model's guess would be a capability they did not ask for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forks: Vec<BriefFork>,
+}
+
+/// One point of a brief's reading: **what the description said** about it, and **what was decided** where
+/// it said nothing.
+///
+/// This is a brief's `points` entry and the replacement for a `gaps` line. It is deliberately two cells
+/// rather than one: `said` is the model's *reading* of the person's words — the part a person can check
+/// against their own text — and `decided` is the model's *draft*, the answer it supplied so that the
+/// design could carry on. A brief full of `said` and empty `decided` is a description that said
+/// everything; a brief of empty `said` and full `decided` is a thin description the model carried by
+/// guessing, and both read the same way on screen because both are prose attached to the point they
+/// answer rather than a number attached to the whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefPointRead {
+    /// Which of [`BRIEF_POINTS`] this is — one of the six ids, spelled exactly. Checked against the
+    /// constant, so an invented id is a misspelling to correct rather than an eighth point.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub point: String,
+    /// What the description says about the point, in the model's words. Empty when it says nothing —
+    /// which is visible on screen as a blank reading and is the honest answer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub said: String,
+    /// What was **decided** for the point where the description says nothing: the answer the model
+    /// supplied, including the proposals a brief was already allowed to make (a screen's look, a
+    /// message's shape). Empty exactly when the description answered the point.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub decided: String,
+}
+
+/// A decision the brief could not settle from the description **and** could not settle alone: the answer
+/// would change which capabilities or units the application is given.
+///
+/// This is the only question left in a brief, and it is a *pick* rather than a prompt. Each choice
+/// carries the `requires` and `suggests` it would add, so answering a fork is choosing the capabilities —
+/// the person edits the structure, and no wording reaches the model that could read three gaps where
+/// they meant one.
+///
+/// Capped by [`BRIEF_FORK_CEILING`] and checked by [`validate_brief`]: a fork needs a known point, a
+/// question, at least two choices, and choices that actually differ in what they bring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefFork {
+    /// Which of [`BRIEF_POINTS`] the decision belongs to — one of the six ids.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub point: String,
+    /// The decision as the **choice** it is ("log to a card, or stream it over WiFi?"), because a fork
+    /// the person cannot answer by picking is not a fork but a question in disguise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub question: String,
+    /// The named alternatives — at least two, and at least two of them differing in `requires` or
+    /// `suggests`, because a choice whose answers bring the same thing decides nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<BriefChoice>,
+}
+
+/// One answer to a [`BriefFork`]: a short name for the alternative and **what it would add** — the
+/// capability paths and unit names true of this answer and not of the others.
+///
+/// The paths are what make a fork answerable in one click instead of in prose, so they are checked
+/// against the vocabulary exactly as a brief's own `requires` are: a path nobody knows is a misspelling
+/// here too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefChoice {
+    /// The alternative, in a word or three, for a button.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// The **capabilities** this answer needs, as paths the vocabulary knows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// The **units** this answer implies, as advisory lower_snake names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggests: Vec<String>,
+}
+
+/// The **brief request**: what the model is asked to read out of a description, before a board exists.
+///
+/// No board and no library are named, and that is the point: the brief is about what the application
+/// *has to do*, and a brief written against a board would smuggle the board step's decision onto the
+/// first screen. The six questions are in the prompt for the same reason they are in the design
+/// request — a thin description should be reported as thin, question by question, rather than filled
+/// with an invented device, address or protocol.
+///
+/// It also **reads the description against the six points** ([`BRIEF_POINTS`]) and tells the model what
+/// to do with each: answer it, showing both the sentence it answered from and the decision it supplied
+/// where there is none. That is the change from the brief that asked — a *reporting* brief handed the
+/// person a variable number of questions, and live runs measured one unchanged description at 0, 1, 3, 6
+/// and 10 of them, because "how much did this leave open" is a judgement and not a fact a request can pin
+/// down. Six fixed points take the judgement out: the model reads all six every time, and what is open
+/// falls out of which `decided` cells it filled rather than out of how many questions it thought of.
+///
+/// `forks` is the one place a question survives, and it is stated as a **ceiling the model can count** —
+/// [`BRIEF_FORK_CEILING`], and only for a decision that would change what the application is given — so
+/// the prompt, [`validate_brief`]'s check and the person's screen all read from the same constant.
+pub fn brief_request(description: &str) -> String {
+    format!(
+        r#"You are reading the **description** of an ESP-IDF application, before a board is chosen
+and before any decomposition is designed. The output is a JSON **design brief** that a person reviews
+and the board and actor steps are built from.
+
+## What the application has to do
+
+{description}
+
+**Read it against these six points and answer every one — a brief is a reading, not an interview:**
+
+{points}
+
+Each of the six gets one entry in `points`, and each entry has two cells:
+
+* `said` — **what the description says about the point**, in your words. `""` when it says nothing about
+  it;
+* `decided` — **what you decided for the point** where the description left it open. Decide it yourself:
+  the rest of the design is built on this reading, so a decision you can defend is worth more to the
+  person than a question they have to answer. Your own proposals belong here too — the look of a screen,
+  the shape of a message, the numbers a display shows — so the person reviews a concrete decision rather
+  than being asked for one. `decided` is `""` exactly when the description answered the point.
+
+**Never hand the person a question to answer in their own words.** A question here means they edit their
+description, you read it again, and the answer may differ the next time — the slowest loop there is, and
+the one that made this brief ask 0, then 1, then 6 things about the same text. You draft; they edit your
+draft. So **decide the point**, and let the person see the decision and correct it if it is wrong.
+
+`forks` is the one exception, and it is a **pick, not a question**: use it only where a decision would
+change which capabilities or units the application is given (log to an SD card, or stream it over WiFi)
+and the description does not settle it. Each fork has a `question` and at least two named `choices`, and
+each choice carries the `requires` and `suggests` it would add — so answering it is choosing the
+capabilities in one click. **At most {fork_ceiling}.** If you cannot name the alternatives it is not a
+fork: decide it and put the decision in `decided`. Two questions about one point are one fork, and a
+point the description already answers is never a fork at all.
+
+A **fork is a requirement decision, never a hardware one.** A hardware fact is never something to ask
+for: never ask the person for an I²C address, a pin number, a bus or a protocol — not in `forks`, and
+not in `decided` either. A device is **named rather than addressed**: how it is wired and at what
+address is resolved from the board and the device-facts store at the board and resource steps, so an
+address is a **hardware fact** this step cannot act on. Where the description leaves a hardware fact
+open, decide it the way you decide everything else — pick the obvious answer and say so in `decided`.
+
+A **fork is a decision about behaviour, never about appearance.** The one thing you decide *for* the
+person about a display is its **function** — how many screens, what each must **show** (which readings or
+values) — and what the user can **do** and what it causes; decide those and put them in `decided` or
+`summary`. How the UI *looks* is **yours to propose**, never a question for the person: an icon, a
+colour, a font, a spacing, a layout, an animation — "how it looks" — belongs in your own words, so the
+person reviews a concrete look instead of answering for one. Appearance is **never a fork**, and it is not
+a `decided` the person has to supply either — propose it.
+
+## The framework
+
+{framework_rule}
+
+## The capability vocabulary
+
+A `requires` path must be one of these, spelled exactly as written — never a paraphrase, and never a
+name that is not on the list (an SD card is `storage.sd`, a real-time clock is `timekeeping.rtc`):
+
+{vocabulary}
+
+## The brief
+
+```json
+{{
+  "summary": "what this application does, in one paragraph",
+  "framework": "actors" | "ramen",
+  "requires": ["sensing.temperature", "media.display"],
+  "suggests": ["sampler", "air_quality", "view", "touch"],
+  "points": [
+    {{ "point": "purpose",   "said": "what the description says about it", "decided": "what you decided where it says nothing, or empty" }},
+    {{ "point": "senses",    "said": "…", "decided": "…" }},
+    {{ "point": "acts_on",   "said": "…", "decided": "…" }},
+    {{ "point": "reacts_to", "said": "…", "decided": "…" }},
+    {{ "point": "timing",    "said": "…", "decided": "…" }},
+    {{ "point": "missing",   "said": "…", "decided": "…" }}
+  ],
+  "forks": [
+    {{ "point": "acts_on",
+       "question": "the decision you cannot settle, phrased as the choice it is",
+       "choices": [
+         {{ "label": "a short name for one answer", "requires": ["capability.path"], "suggests": ["unit"] }},
+         {{ "label": "the other answer", "requires": ["other.path"], "suggests": ["other_unit"] }}
+       ] }}
+  ]
+}}
+```
+
+* `summary` — the application in a paragraph, in your words, for the person to confirm;
+* `framework` — the choice from the rule above, derived from the description; the person confirms or
+  overrides it when they choose a board;
+* `requires` — the **capabilities** the application needs, as paths chosen **exactly** from the
+  vocabulary below. Board-agnostic: what the application has to do, never what any particular board
+  carries — which board satisfies it is the next step's question;
+* `suggests` — the **units** the description implies, as plain lower_snake names (`sampler`,
+  `air_quality`), for the actor step to start from. Suggest **one name for each thing the application
+  senses and each thing it acts on**: a display is a unit (`view`), a touch screen is a unit (`touch`),
+  a speaker is a unit (`audio`) — naming only what it senses leaves half the application undesigned.
+  Names only: no kind, no message and no wiring, because the composition is not designed yet;
+* `points` — **one entry for each of the six points above, and all six of them**, each
+  `{{ "point": "<id>", "said": "…", "decided": "…" }}`. The ids are `purpose`, `senses`, `acts_on`,
+  `reacts_to`, `timing` and `missing`, each **exactly once**. `said` is what the description says about
+  the point — empty when it says nothing, which is the honest answer and not a failure. `decided` is
+  what you decided where it says nothing, empty when the description answered it. A point whose `said`
+  is empty is a point the description left open, and the decision you put in `decided` is what carries
+  the design forward;
+* `forks` — **at most {fork_ceiling}**, and only for a decision that would change which capabilities or
+  units the application is given. Each is `{{ "point": "<id>", "question": "…", "choices": [ … ] }}` with
+  **at least two choices**, each `{{ "label": "…", "requires": […], "suggests": […] }}`, and at least two
+  of the choices must differ in what they bring — a choice whose answers add the same thing decides
+  nothing. Every `requires` path inside a choice is checked against the vocabulary exactly as the brief's
+  own are, so a path a choice names must be on the list too.
+
+Nothing in a brief is a question the person answers in prose: a **fork is a decision about behaviour**
+(points 1–6), and where behaviour is unclear you **decide** it. A **hardware fact** is never a fork,
+because **a device is named rather than addressed** — an address, a pin, a bus or a protocol is resolved
+from the board and the device-facts store later, not asked here. And an **appearance** fact — an icon, a
+colour, a font, a layout — is never a fork either: the look is yours to propose, not the person's to
+specify.
+
+Do **not** name a board, a resource, a driver component or a wiring edge: none of those is decided here.
+
+Respond with **only the JSON object**, and nothing else."#,
+        fork_ceiling = BRIEF_FORK_CEILING,
+        description = description.trim(),
+        points = brief_points_for_prompt(),
+        framework_rule = framework_rule(None),
+        vocabulary = vocabulary_for_prompt(),
+    )
+}
+
+/// The six points rendered for the brief prompt: the numbered list a description is read against, built
+/// from [`BRIEF_POINTS`] so the questions the model is asked and the ids its `points` must carry are the
+/// same six. Each line leads with the **id**, because the id is what an answer is keyed by — the one on
+/// the screen, the one [`validate_brief`] checks, and the one a person's edit is recorded against.
+fn brief_points_for_prompt() -> String {
+    BRIEF_POINTS
+        .iter()
+        .enumerate()
+        .map(|(index, point)| format!("{}. `{}` — {}", index + 1, point.id, point.question))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The capability vocabulary, rendered for the brief prompt: every known path grouped by its
+/// category, so the model picks an exact name (`storage.sd`, `timekeeping.rtc`) instead of
+/// paraphrasing one (`storage.sdcard`, `time.rtc`).
+fn vocabulary_for_prompt() -> String {
+    crate::capability_vocabulary::categorized_paths()
+        .into_iter()
+        .map(|(category, paths)| format!("- {category}: {}", paths.join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Read a brief out of the model's answer — the same fence-forgiving JSON reader the spec uses, for the
+/// same reason: a fence is a formatting habit rather than a different answer.
+pub fn parse_brief(text: &str) -> Result<DesignBrief, String> {
+    let trimmed = text.trim();
+    let body = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|rest| rest.trim_end_matches("```").trim())
+        .unwrap_or(trimmed);
+    serde_json::from_str(body).map_err(|e| {
+        format!(
+            "the design brief did not parse: {e}. It is JSON of the form {{summary, framework, \
+             requires, suggests, points, forks}} — see the brief request for the exact fields."
+        )
+    })
+}
+
+/// The rules a brief is held to: every `requires` path — the brief's own and the ones its forks offer —
+/// is a capability the **vocabulary** knows; every `points` entry names one of the six points
+/// ([`BRIEF_POINTS`]) and names it once; and `forks` keeps to its ceiling ([`BRIEF_FORK_CEILING`]) with
+/// choices that actually differ.
+///
+/// Returns every problem rather than the first, exactly as [`validate`] does, so a repair round can fix
+/// as much as it can in one turn. The rest of a brief is prose — a `summary`, a `said`, a `decided`, a
+/// name — and **prose is not checked**: the brief guides a person, it does not gate them.
+///
+/// What *is* checked is what a person **cannot see from the screen**. A misspelled capability reads as a
+/// capability. An entry pointing at `purpose2` reads as a reading that simply never appeared beside the
+/// point it belongs to. Two entries for `timing` read as one point with two answers and no way to tell
+/// which the design used. A fork offering the same capabilities twice reads as a choice where there is
+/// none. Each is a mistake to correct rather than a reading to show.
+///
+/// What is deliberately **not** checked is a point the model left out. Under the old `gaps` a missing
+/// question was invisible — the count moved and nothing on screen said which reading was short — which is
+/// why the count itself had to be checked. A missing point is now a **blank row among six labelled
+/// ones**: the label is on the screen, the reading is not, and the person sees exactly which question
+/// went unread. A check a person can perform by looking is not the code's to perform, and failing a brief
+/// over a visible gap would turn a reading into a dead step.
+pub fn validate_brief(brief: &DesignBrief) -> Result<(), Vec<String>> {
+    let mut problems: Vec<String> = Vec::new();
+
+    // The brief's own capabilities and the ones its forks offer: the same check, because an unknown path
+    // is a misspelling wherever it is written.
+    for path in brief.requires.iter().chain(
+        brief
+            .forks
+            .iter()
+            .flat_map(|fork| &fork.choices)
+            .flat_map(|choice| &choice.requires),
+    ) {
+        if !crate::capability_vocabulary::is_known_path(path) {
+            problems.push(format!(
+                "'{path}' is not a capability the vocabulary knows — a `requires` entry is a \
+                 capability path like `sensing.particulate` or `media.display`, and a name nobody \
+                 named is a misspelling rather than a new capability"
+            ));
+        }
+    }
+
+    // **The six points, once each.** An id nobody knows is a seventh point no row on screen can show,
+    // and a repeated id is two readings of one point with nothing to say which the design used.
+    let mut seen: Vec<&str> = Vec::new();
+    for read in &brief.points {
+        if !is_known_point(&read.point) {
+            problems.push(format!(
+                "`points` names '{}', which is not one of the six points — the ids are {}",
+                read.point,
+                point_ids()
+            ));
+        } else if seen.contains(&read.point.as_str()) {
+            problems.push(format!(
+                "`points` reads '{}' twice — the six points are one entry each, and two entries about \
+                 one point are one point asked twice",
+                read.point
+            ));
+        } else {
+            seen.push(&read.point);
+        }
+        // A listed point with nothing in either cell is a point claimed and not read: the row would be
+        // blank under a label that promises a reading.
+        if read.said.trim().is_empty() && read.decided.trim().is_empty() {
+            problems.push(format!(
+                "`points` lists '{}' with nothing in `said` or `decided` — a point is read by saying \
+                 what the description says about it (`said`) or by deciding it (`decided`), and an \
+                 entry with neither has read nothing",
+                read.point
+            ));
+        }
+    }
+
+    // **The forks.** The ceiling is stated in the request from this same constant, and the rest is what
+    // makes a fork answerable in one click: two alternatives that bring different things.
+    if brief.forks.len() > BRIEF_FORK_CEILING {
+        problems.push(format!(
+            "`forks` has {} entries, but a fork is kept for a decision that changes what the \
+             application is given: keep at most {BRIEF_FORK_CEILING} and decide the rest yourself, \
+             stating each decision in `decided`",
+            brief.forks.len()
+        ));
+    }
+    for (index, fork) in brief.forks.iter().enumerate() {
+        let position = index + 1;
+        if !is_known_point(&fork.point) {
+            problems.push(format!(
+                "fork {position} names '{}', which is not one of the six points — the ids are {}",
+                fork.point,
+                point_ids()
+            ));
+        }
+        if fork.question.trim().is_empty() {
+            problems.push(format!(
+                "fork {position} has no `question` — the decision, phrased as the choice it is"
+            ));
+        }
+        if fork.choices.len() < 2 {
+            problems.push(format!(
+                "fork {position} offers {} choice(s) — a fork is a pick between at least two named \
+                 alternatives, and one answer is not a choice",
+                fork.choices.len()
+            ));
+        }
+        if fork
+            .choices
+            .iter()
+            .any(|choice| choice.label.trim().is_empty())
+        {
+            problems.push(format!(
+                "fork {position} has a choice with no `label` — each alternative needs the short name \
+                 its button carries"
+            ));
+        }
+        // Two choices that bring the same capabilities and units are one answer written twice: the person
+        // would be picking between identical outcomes, and nothing about the application would change.
+        let distinct = fork
+            .choices
+            .iter()
+            .map(|choice| (&choice.requires, &choice.suggests))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if !fork.choices.is_empty() && distinct < 2 {
+            problems.push(format!(
+                "fork {position} offers choices that bring the same capabilities and units — a fork \
+                 exists because the answer changes what the application is given, and identical \
+                 answers change nothing"
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems)
+    }
+}
+
+/// The six point ids, rendered for a refusal — `purpose`, `senses`, … — so a repair turn can name the
+/// vocabulary rather than say "not one of the six" and leave the model to guess which one it invented.
+fn point_ids() -> String {
+    BRIEF_POINTS
+        .iter()
+        .map(|point| format!("`{}`", point.id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The **brief phase's LLM stage**: ask, parse, check `requires` against the vocabulary, and repair.
+///
+/// Shaped like the AppSpec requirements pass — the LLM is an injected async `call`, the repair turn is
+/// a whole self-contained message, and the attempts are bounded — so the brief is tested on canned
+/// answers with no live actor and no network, and a model that cannot produce one is reported rather
+/// than asked forever.
+pub async fn brief_application<F, Fut>(description: &str, call: F) -> Result<DesignBrief, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let request = brief_request(description);
+    let mut prompt = request.clone();
+    let mut last_problems: Vec<String> = Vec::new();
+
+    for attempt in 1..=MAX_DESIGN_ATTEMPTS {
+        let answer = call(prompt.clone()).await.map_err(|e| {
+            format!(
+                "the brief request was not answered (attempt {attempt} of {MAX_DESIGN_ATTEMPTS}): {e}"
+            )
+        })?;
+        let problems = match parse_brief(&answer) {
+            // A parse failure is a problem like any other, so a model that answered in prose gets told
+            // so and asked again rather than failing the whole brief phase on a formatting habit.
+            Err(parse_problem) => vec![parse_problem],
+            Ok(brief) => match validate_brief(&brief) {
+                Ok(()) => return Ok(brief),
+                Err(problems) => problems,
+            },
+        };
+        prompt = repair_request(&request, &answer, &problems);
+        last_problems = problems;
+    }
+
+    Err(format!(
+        "the brief phase produced no valid brief in {MAX_DESIGN_ATTEMPTS} attempts. The last \
+         answer's problems were:\n  - {}",
+        last_problems.join("\n  - ")
+    ))
 }
 
 /// The board a design request names, from the `board` object a caller passed.
@@ -1668,11 +2015,70 @@ pub mod examples {
       ]
     }
     "#;
+    /// **The PM2.5 meter's brief**: the same application as [`PM25_METER`], read out of the description
+    /// *before* the board and the decomposition are chosen. It names the capabilities the application
+    /// needs, the units it expects, and the description **read against each of the six points** — five
+    /// answered by the text (`said`), the sixth decided by the model (`decided`), and **no forks**,
+    /// because nothing in this description leaves a decision that would change what the application is
+    /// given. It never names a board, a resource or a wiring edge, which is exactly the line the brief is
+    /// drawn along.
+    ///
+    /// [`LOGGER_BRIEF`] is its counterpart: the same shape with one genuine decision left open, which is
+    /// what a `forks` entry is for.
+    pub const PM25_BRIEF: &str = r#"
+    {
+      "summary": "A PM2.5 meter with a touch screen: it samples particulate, temperature and humidity, shows the reading and a rolling average, and reports the battery.",
+      "framework": "actors",
+      "requires": ["sensing.particulate", "sensing.temperature", "sensing.humidity", "media.display", "media.touch", "power.battery"],
+      "suggests": ["sampler", "air_quality", "view", "touch", "power"],
+      "points": [
+        { "point": "purpose",   "said": "reads particulate, temperature and humidity and shows them on a touch screen" },
+        { "point": "senses",    "said": "particulate, temperature and humidity, about once a second" },
+        { "point": "acts_on",   "said": "the display, and the touch screen it is driven by" },
+        { "point": "reacts_to", "said": "a periodic tick, and a tap on the screen" },
+        { "point": "timing",    "said": "a reading a second on one side, a human-rate UI on the other" },
+        { "point": "missing",   "said": "", "decided": "a screen that says the reading is unavailable, keeping the last value" }
+      ]
+    }
+    "#;
+
+    /// **The data logger's brief**: a description that leaves one real decision open — **where the
+    /// readings go** — so it is the shape a `forks` entry exists for. The two answers need different
+    /// capabilities (`storage.sd` against `radio.wifi`) and different units, which is exactly the test a
+    /// fork has to pass: if the answer would not change what the application is given, the brief decides
+    /// it and says so in `decided` instead of offering it.
+    ///
+    /// Note what it does **not** do: it never asks the person anything in prose. The fork is two buttons,
+    /// and picking one adds the paths that answer brings.
+    pub const LOGGER_BRIEF: &str = r#"
+    {
+      "summary": "A temperature logger: it reads a sensor every minute and keeps the readings for later.",
+      "framework": "actors",
+      "requires": ["sensing.temperature"],
+      "suggests": ["sampler"],
+      "points": [
+        { "point": "purpose",   "said": "reads a temperature every minute and keeps the readings" },
+        { "point": "senses",    "said": "temperature, once a minute" },
+        { "point": "acts_on",   "said": "", "decided": "a status LED, and the log itself" },
+        { "point": "reacts_to", "said": "a periodic tick" },
+        { "point": "timing",    "said": "one reading a minute, far below any UI rate" },
+        { "point": "missing",   "said": "", "decided": "a missed read is skipped rather than queued" }
+      ],
+      "forks": [
+        { "point": "purpose",
+          "question": "Where do the readings go?",
+          "choices": [
+            { "label": "SD card", "requires": ["storage.sd"], "suggests": ["logger"] },
+            { "label": "WiFi upload", "requires": ["radio.wifi"], "suggests": ["uploader"] }
+          ] }
+      ]
+    }
+    "#;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::examples::{INSECT_TRAP, PM25_METER};
+    use super::examples::{INSECT_TRAP, LOGGER_BRIEF, PM25_BRIEF, PM25_METER};
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1936,83 +2342,6 @@ mod tests {
     }
 
     #[test]
-    fn the_design_request_carries_the_form_the_rule_and_the_schema() {
-        let board = BoardChoice {
-            chip: "esp32s3".into(),
-            bsp: "m5stack_core_s3".into(),
-            hal: "m5unified".into(),
-        };
-        let request = design_request(&board, "A PM2.5 meter with a touch screen.", None, None);
-        for expected in [
-            "esp32s3", // the board is in it
-            "m5stack_core_s3",
-            "m5unified",
-            "A PM2.5 meter with a touch screen.", // the user's words are in it
-            "human timescale",                    // the framework rule
-            "machine timescale",
-            "Choose the framework", // not pinned, so the model must choose and justify
-            "what it **senses**",   // the form, so a thin answer is visible as thin
-            "board_facts",          // the schema
-            "no cycles",            // the rules it is checked against
-            // No library named, which is stated rather than left to be inferred: nothing exists for a
-            // component to already be in, so nothing can be `existing`.
-            "None named",
-            "every component you design has to be written",
-        ] {
-            assert!(
-                request.contains(expected),
-                "the request is missing {expected:?}"
-            );
-        }
-
-        // Pinned: the model is told the choice is not its to reconsider.
-        let pinned = design_request(&board, "...", Some(ApplicationFramework::Ramen), None);
-        assert!(pinned.contains("The framework is **ramen**"), "{pinned}");
-        assert!(!pinned.contains("Choose the framework"));
-
-        // A library names what it has, which is what makes `"source": "existing"` a fact rather than a
-        // guess — and carries its hints, the architecture the design has to respect.
-        let facts = LibraryFacts {
-            root: "/work/sensors".to_string(),
-            components: vec![
-                LibraryComponent {
-                    name: "sps30".to_string(),
-                    kind: Some(crate::build::idf_projects::ComponentKind::Driver),
-                },
-                LibraryComponent {
-                    name: "moving_average".to_string(),
-                    kind: Some(crate::build::idf_projects::ComponentKind::Library),
-                },
-                LibraryComponent {
-                    name: "written_by_hand".to_string(),
-                    kind: None,
-                },
-            ],
-            hints: Some("Call `sensors::begin()` once.".to_string()),
-        };
-        let with_library = design_request(
-            &board,
-            "A PM2.5 meter with a touch screen.",
-            None,
-            Some(&facts),
-        );
-        for expected in [
-            "/work/sensors",
-            "- `sps30` — driver",
-            "- `moving_average` — library",
-            "- `written_by_hand` — no kind stated", // said as unknown, not assumed
-            "Those are `\"source\": \"existing\"`",
-            "Call `sensors::begin()` once.", // the library's architecture
-        ] {
-            assert!(
-                with_library.contains(expected),
-                "the request is missing {expected:?}:\n{with_library}"
-            );
-        }
-        assert!(!with_library.contains("None named"));
-    }
-
-    #[test]
     fn the_marker_line_is_what_a_cmakefile_states() {
         assert_eq!(
             ApplicationFramework::Actors.marker_line(),
@@ -2253,7 +2582,7 @@ mod tests {
     /// A fake LLM service: canned answers in order (the last one repeats), and the prompts it was
     /// asked.
     ///
-    /// Not a mock of the transport — it is the closed `call` the design phase is written against,
+    /// Not a mock of the transport — it is the closed `call` the brief is written against,
     /// which is what the injection is for: the repair path is tested by *answering badly once*, not by
     /// pretending to be an HTTP client.
     #[derive(Clone)]
@@ -2288,21 +2617,15 @@ mod tests {
         }
     }
 
-    /// The board every design test uses, and one run of the design phase against a fake LLM.
-    fn design_with(llm: &FakeLlm) -> Result<ApplicationSpec, String> {
-        let board = BoardChoice {
-            chip: "esp32s3".into(),
-            bsp: "m5stack_core_s3".into(),
-            hal: "m5unified".into(),
-        };
+    // --- the design brief: a description read before a board is chosen -----------------------------
+
+    /// One run of the brief phase against a fake LLM, over the PM2.5 meter's description.
+    fn brief_with(llm: &FakeLlm) -> Result<DesignBrief, String> {
         let llm = llm.clone();
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(design_application(
-                &board,
+            .block_on(brief_application(
                 "a PM2.5 meter with a touch screen",
-                None,
-                None,
                 move |prompt| {
                     let llm = llm.clone();
                     async move { llm.call(prompt).await }
@@ -2311,144 +2634,572 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_answer_is_a_spec_and_needs_no_repair() {
-        let llm = FakeLlm::new(vec![Ok(PM25_METER.to_string())]);
-        let spec = design_with(&llm).expect("a valid answer is the spec");
-        assert_eq!(spec.framework, ApplicationFramework::Actors);
+    fn a_valid_brief_is_read_without_repair() {
+        let llm = FakeLlm::new(vec![Ok(PM25_BRIEF.to_string())]);
+        let brief = brief_with(&llm).expect("a valid answer is the brief");
+
+        assert_eq!(brief.framework, Some(ApplicationFramework::Actors));
+        // The capabilities are the point: board-agnostic paths the vocabulary knows.
+        assert!(brief.requires.contains(&"sensing.particulate".to_string()));
         assert_eq!(llm.prompts().len(), 1, "one round trip, no repair");
+
+        // The reading: all six points, once each, and the one the description left open decided rather
+        // than asked.
+        assert_eq!(brief.points.len(), BRIEF_POINTS.len());
+        for point in BRIEF_POINTS {
+            assert!(
+                brief.points.iter().any(|read| read.point == point.id),
+                "the brief reads `{}`",
+                point.id
+            );
+        }
+        let decided: Vec<&str> = brief
+            .points
+            .iter()
+            .filter(|read| !read.decided.is_empty())
+            .map(|read| read.point.as_str())
+            .collect();
+        assert_eq!(
+            decided,
+            vec!["missing"],
+            "the description said everything but what happens when something is missing, and that one is \
+             decided rather than asked"
+        );
         assert!(
-            llm.prompts()[0].contains("esp32s3"),
-            "the first prompt is the design request, board and all"
+            brief.forks.is_empty(),
+            "and nothing here needs the person to pick"
+        );
+    }
+
+    /// The other half of the shape: a description that leaves one real decision open comes back with a
+    /// **fork** whose alternatives carry the capabilities they would add — and it is a valid brief as it
+    /// stands, because a fork is an answer rather than a failure to answer.
+    #[test]
+    fn a_brief_with_a_fork_is_read_without_repair() {
+        let llm = FakeLlm::new(vec![Ok(LOGGER_BRIEF.to_string())]);
+        let brief = brief_with(&llm).expect("a valid answer is the brief");
+        assert_eq!(llm.prompts().len(), 1, "one round trip, no repair");
+
+        assert_eq!(
+            brief.forks.len(),
+            1,
+            "one decision, and it is a pick: {brief:?}"
+        );
+        let fork = &brief.forks[0];
+        assert_eq!(fork.point, "purpose");
+        assert_eq!(fork.choices.len(), 2, "two named alternatives: {fork:?}");
+        assert_eq!(
+            fork.choices[0].requires,
+            vec!["storage.sd".to_string()],
+            "and each carries the capability it would add"
+        );
+        assert_eq!(fork.choices[1].requires, vec!["radio.wifi".to_string()]);
+
+        // The reading is complete as well: six points, the two open ones decided rather than asked.
+        assert_eq!(brief.points.len(), BRIEF_POINTS.len());
+        assert_eq!(
+            brief
+                .points
+                .iter()
+                .filter(|read| !read.decided.is_empty())
+                .count(),
+            2,
+            "the model decided what it could and left only the real either/or standing: {brief:?}"
         );
     }
 
     #[test]
-    fn the_design_request_names_the_three_sources_and_the_registry_field() {
-        // The prompt is where the third source is *learned*: a model that is never told about
-        // `published` designs a second copy of a driver somebody already published.
-        let request = design_request(
-            &BoardChoice {
-                chip: "esp32p4".into(),
-                bsp: "waveshare/esp32_p4_nano".into(),
-                hal: "bsp".into(),
-            },
-            "an AI insect trap that detects and traps insects",
-            Some(ApplicationFramework::Ramen),
-            None,
-        );
-        for expected in [
-            r#""source": "published""#,
-            r#""registry""#,
-            "components.espressif.com",
-            "managed dependency",
-            "`registry/*`",
-            "main/idf_component.yml",
+    fn the_brief_request_asks_for_a_brief_and_not_a_board() {
+        // The whole reason the brief exists: it decides *what the application has to do* and nothing
+        // about the hardware. A prompt that named a board would move the board step onto step one.
+        let request = brief_request("a PM2.5 meter with a touch screen");
+        for question in [
+            "what it does",
+            "what it **senses**",
+            "what it **acts on**",
+            "what it **reacts to over time**",
+            "**timing**",
+            "when something is missing",
         ] {
             assert!(
-                request.contains(expected),
-                "the design request does not mention {expected:?}:\n{request}"
+                request.contains(question),
+                "the brief request carries the six questions: missing {question}"
+            );
+        }
+        assert!(
+            request.contains("Do **not** name a board"),
+            "and says the board is not the brief's to decide"
+        );
+        assert!(
+            request.contains("capabilit"),
+            "and names what `requires` is: capability paths"
+        );
+        // The six points are the code's list, not the model's invention: the request names each id,
+        // because the id is what a `points` entry is keyed by and what `validate_brief` checks.
+        for point in BRIEF_POINTS {
+            assert!(
+                request.contains(&format!("`{}`", point.id)),
+                "the brief request names the point `{}`",
+                point.id
             );
         }
     }
 
     #[test]
-    fn the_design_keeps_the_callers_board_and_not_the_models() {
-        // A live run replaced `espressif/m5stack_core_s3` with `m5stack/cores3` — which the scaffold then
-        // wrote into `main/idf_component.yml`, where it did not resolve. The board is a *given*, so the
-        // answer's is overwritten rather than trusted.
-        let swapped = PM25_METER.replace(
-            r#""bsp": "m5stack_core_s3", "hal": "m5unified""#,
-            r#""bsp": "m5stack/cores3", "hal": "esp-idf""#,
+    fn the_brief_request_never_asks_for_a_hardware_fact() {
+        // The failure this rule exists for: given a description that names a part but no address, the
+        // model asked the person for the I²C address. That answer comes from the board and
+        // device-facts stores at a later step, so the brief is told, in as many words, not to ask.
+        let request = brief_request("a PM2.5 meter with a touch screen");
+        assert!(
+            request.contains("never ask the person for an I²C address"),
+            "the brief request refuses to ask for an address:\n{request}"
         );
-        assert_ne!(swapped, PM25_METER, "the fixture's board was rewritten");
-        let llm = FakeLlm::new(vec![Ok(swapped)]);
-        let spec = design_with(&llm).expect("the answer is the spec");
-
-        assert_eq!(spec.board.chip, "esp32s3");
-        assert_eq!(
-            spec.board.bsp, "m5stack_core_s3",
-            "the caller's BSP, never the model's"
+        assert!(
+            request.contains("a device is named rather than addressed"),
+            "and says why: a device is named, not addressed:\n{request}"
         );
-        assert_eq!(spec.board.hal, "m5unified");
-        // The composition the model *did* decide is untouched: only the board is pinned.
-        assert_eq!(spec.units.len(), 8, "{:?}", spec.units.len());
+        assert!(
+            request.contains("hardware fact"),
+            "and names the class: a hardware fact is never a fork:\n{request}"
+        );
     }
 
     #[test]
-    fn a_spec_that_breaks_a_rule_is_repaired_with_the_problem_named() {
-        // One bad answer, then the good one: the second prompt has to say what was wrong, or the
-        // model has nothing to fix.
-        let broken = PM25_METER.replace(r#""message": "Reading", "#, "");
-        let llm = FakeLlm::new(vec![Ok(broken), Ok(PM25_METER.to_string())]);
-        let spec = design_with(&llm).expect("the repaired answer is the spec");
+    fn the_brief_request_never_asks_for_an_appearance() {
+        // The next failure after the hardware one, and the same shape: given a description that names a
+        // screen, the model asked the person how the UI should look and which icons to use. A look is
+        // the model's to propose, not a requirement to extract, so the brief is told to decide it.
+        let request = brief_request("a PM2.5 meter with a touch screen");
+        assert!(
+            request.contains("never about appearance"),
+            "the brief request names appearance as never a fork:\n{request}"
+        );
+        assert!(
+            request.contains("yours to propose"),
+            "and says the look is the model's to propose:\n{request}"
+        );
+        for requirement in ["how many screens", "never a fork"] {
+            assert!(
+                request.contains(requirement),
+                "and keeps the display's function the model's to decide, and appearance out of \
+                 `forks`: missing {requirement:?}:\n{request}"
+            );
+        }
+    }
 
-        assert_eq!(spec.framework, ApplicationFramework::Actors);
+    #[test]
+    fn the_brief_request_names_the_vocabulary_exactly() {
+        // The failure this fixes: a model asked only for "capabilities" guessed `storage.sdcard` and
+        // `time.rtc` when the vocabulary spells them `storage.sd` and `timekeeping.rtc`. Naming the exact
+        // paths is what lets a brief pick one instead of paraphrasing it.
+        let request = brief_request("a data logger on an SD card with a real-time clock");
+        for path in ["storage.sd", "timekeeping.rtc", "sensing.temperature"] {
+            assert!(
+                request.contains(path),
+                "the brief request names the vocabulary, including {path}:\n{request}"
+            );
+        }
+        assert!(
+            request.contains("## The capability vocabulary"),
+            "and calls it out as the list to choose from:\n{request}"
+        );
+    }
+
+    #[test]
+    fn the_brief_request_asks_for_a_reading_and_not_an_interview() {
+        // The failure this fixes, measured live: told to *report* gaps, the model asked 0, then 1, then 3,
+        // then 6, then 10 questions about one unchanged description — a count nobody can reproduce,
+        // because "how much did this leave open" is a judgement and not a fact. The request no longer asks
+        // for that judgement: it asks for **a reading of all six points**, with a decision wherever the
+        // description is silent, so the person edits the decision instead of answering the question.
+        let request = brief_request("a PM2.5 meter with a touch screen");
+        for phrase in [
+            "answer every one",
+            "a brief is a reading, not an interview",
+            "Never hand the person a question",
+            "You draft; they edit your",
+            "decide the point",
+        ] {
+            assert!(
+                request.contains(phrase),
+                "the brief request asks for a reading, missing {phrase:?}:\n{request}"
+            );
+        }
+
+        // And the one question that survives is bounded and countable, from the same constant
+        // `validate_brief` checks: a fork is a pick between named alternatives that carry what they add.
+        let ceiling = format!("At most {BRIEF_FORK_CEILING}");
+        assert!(
+            request.contains(&ceiling),
+            "the brief request states the fork ceiling as a number ({ceiling}):\n{request}"
+        );
+        for phrase in ["pick, not a question", "never a fork", "carries the"] {
+            assert!(
+                request.contains(phrase),
+                "and says what a fork is and is not, missing {phrase:?}:\n{request}"
+            );
+        }
+
+        // Nothing in the request offers the old shape: no `gaps` key, and so no count for a person to
+        // read as a score.
+        assert!(
+            !request.contains("\"gaps\""),
+            "the request no longer offers `gaps` as a field:\n{request}"
+        );
+    }
+
+    #[test]
+    fn the_forks_a_brief_may_hand_back_are_capped() {
+        // A fork is the one question left in a brief, so it keeps to the request's own number, from the
+        // same constant: a brief handing back five has not read the text, it has interviewed the person.
+        let fork = |n: usize| BriefFork {
+            point: "purpose".to_string(),
+            question: format!("decision {n}"),
+            choices: vec![
+                BriefChoice {
+                    label: "one".to_string(),
+                    suggests: vec![format!("unit_{n}_one")],
+                    ..BriefChoice::default()
+                },
+                BriefChoice {
+                    label: "the other".to_string(),
+                    suggests: vec![format!("unit_{n}_other")],
+                    ..BriefChoice::default()
+                },
+            ],
+        };
+        let over: Vec<BriefFork> = (1..=BRIEF_FORK_CEILING + 1).map(fork).collect();
+        let problems = validate_brief(&DesignBrief {
+            forks: over,
+            ..DesignBrief::default()
+        })
+        .expect_err("more forks than the ceiling allows");
+        assert_eq!(problems.len(), 1, "one problem, named once: {problems:?}");
+        assert!(
+            problems[0].contains(&format!("has {} entries", BRIEF_FORK_CEILING + 1)),
+            "the problem says how many came back: {:?}",
+            problems[0]
+        );
+        assert!(
+            problems[0].contains(&format!("at most {BRIEF_FORK_CEILING}")),
+            "and what the ceiling is: {:?}",
+            problems[0]
+        );
+
+        // At the ceiling is fine.
+        let at: Vec<BriefFork> = (1..=BRIEF_FORK_CEILING).map(fork).collect();
+        assert!(
+            validate_brief(&DesignBrief {
+                forks: at,
+                ..DesignBrief::default()
+            })
+            .is_ok(),
+            "a fork per real decision is allowed"
+        );
+    }
+
+    #[test]
+    fn a_brief_that_asks_too_much_is_repaired_into_a_reading() {
+        // What the repair is *for*: the person never sees the brief that asked three questions, and the
+        // questions are not silently dropped either — the model is told what a fork is for and asked
+        // again, so what reaches the screen is the model's own reading with the one decision it could not
+        // settle on its own.
+        let interviewing = r#"
+        {
+          "summary": "a temperature logger",
+          "requires": ["sensing.temperature"],
+          "forks": [
+            { "point": "purpose", "question": "SD card or WiFi?", "choices": [
+                { "label": "SD card", "requires": ["storage.sd"] },
+                { "label": "WiFi", "requires": ["radio.wifi"] } ] },
+            { "point": "senses", "question": "how often?", "choices": [
+                { "label": "every minute", "suggests": ["fast_sampler"] },
+                { "label": "every hour", "suggests": ["slow_sampler"] } ] },
+            { "point": "acts_on", "question": "LED or buzzer?", "choices": [
+                { "label": "LED", "suggests": ["led"] },
+                { "label": "buzzer", "suggests": ["buzzer"] } ] }
+          ]
+        }
+        "#;
+        let llm = FakeLlm::new(vec![
+            Ok(interviewing.to_string()),
+            Ok(LOGGER_BRIEF.to_string()),
+        ]);
+        let brief = brief_with(&llm).expect("the repaired answer is the brief");
+
         let prompts = llm.prompts();
         assert_eq!(prompts.len(), 2, "the answer was repaired once");
         assert!(
-            prompts[1].contains("is an actor with no message"),
-            "the repair turn names the problem:\n{}",
+            prompts[1].contains("`forks` has 3 entries"),
+            "the repair turn names the count:\n{}",
             prompts[1]
         );
         assert!(
-            prompts[1].contains("What you answered"),
-            "and carries the answer it is asking to fix"
+            prompts[1].contains("a fork is kept for a decision that changes"),
+            "and says what a fork is for, so the model decides the rest:\n{}",
+            prompts[1]
         );
-        assert!(
-            prompts[1].contains("esp32s3"),
-            "the request is repeated in full, so a repair is a self-contained question"
+        assert_eq!(
+            brief.forks.len(),
+            1,
+            "the person is handed the repaired brief, not three choices: {:?}",
+            brief.forks
         );
     }
 
     #[test]
-    fn an_answer_that_is_not_json_is_repaired_too() {
-        // A formatting habit is not a design failure: a model that answers in prose is told so and
-        // asked again, rather than the whole design phase failing on a backtick.
-        let llm = FakeLlm::new(vec![
-            Ok("Sure! Here is the decomposition you asked for...".to_string()),
-            Ok(PM25_METER.to_string()),
-        ]);
-        design_with(&llm).expect("the repaired answer is the spec");
+    fn a_brief_that_names_a_point_nobody_knows_is_a_problem() {
+        // The ids are the code's, not the model's. An invented one (`purpose2`) is a reading no row on
+        // screen can show, and a repeated one is two answers to one point with nothing to say which the
+        // design used — both invisible to the person looking at the card, which is why both are checked.
+        let read = |point: &str| BriefPointRead {
+            point: point.to_string(),
+            said: format!("what the description says about {point}"),
+            ..BriefPointRead::default()
+        };
+        let problems = validate_brief(&DesignBrief {
+            points: vec![read("purpose2")],
+            ..DesignBrief::default()
+        })
+        .expect_err("an id nobody knows");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("purpose2"), "{:?}", problems[0]);
+        assert!(
+            problems[0].contains("`missing`"),
+            "the refusal names the six ids rather than only refusing: {:?}",
+            problems[0]
+        );
+
+        let problems = validate_brief(&DesignBrief {
+            points: vec![read("timing"), read("timing")],
+            ..DesignBrief::default()
+        })
+        .expect_err("one point read twice");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("twice"), "{:?}", problems[0]);
+
+        // A point listed with nothing read and nothing decided is a point claimed, not read.
+        let problems = validate_brief(&DesignBrief {
+            points: vec![BriefPointRead {
+                point: "senses".to_string(),
+                ..BriefPointRead::default()
+            }],
+            ..DesignBrief::default()
+        })
+        .expect_err("a blank reading");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("has read nothing"),
+            "{:?}",
+            problems[0]
+        );
+
+        // The six, read, are fine.
+        let all: Vec<BriefPointRead> = BRIEF_POINTS.iter().map(|point| read(point.id)).collect();
+        assert!(
+            validate_brief(&DesignBrief {
+                points: all,
+                ..DesignBrief::default()
+            })
+            .is_ok(),
+            "six points, once each"
+        );
+
+        // A point the model left out is **not** a problem: it is a blank row under a label the person can
+        // read, and a check a person can perform by looking is not the code's to perform.
+        assert!(
+            validate_brief(&DesignBrief {
+                points: vec![read("purpose")],
+                ..DesignBrief::default()
+            })
+            .is_ok(),
+            "an unread point is visible on screen, not a dead step"
+        );
+    }
+
+    #[test]
+    fn a_fork_that_offers_one_answer_or_two_identical_ones_is_a_problem() {
+        // A fork is answerable because its alternatives bring different things. One choice is not a
+        // choice, and two choices that add the same capabilities change nothing whichever is picked —
+        // both are forks that would sit on screen as a decision with no decision in it.
+        let one = BriefFork {
+            point: "purpose".to_string(),
+            question: "where do the readings go?".to_string(),
+            choices: vec![BriefChoice {
+                label: "SD card".to_string(),
+                requires: vec!["storage.sd".to_string()],
+                ..BriefChoice::default()
+            }],
+        };
+        let problems = validate_brief(&DesignBrief {
+            forks: vec![one],
+            ..DesignBrief::default()
+        })
+        .expect_err("one choice is not a choice");
+        assert_eq!(
+            problems.len(),
+            2,
+            "no second alternative, and nothing for it to differ from: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("at least two")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("same capabilities")),
+            "{problems:?}"
+        );
+
+        let identical = BriefFork {
+            point: "purpose".to_string(),
+            question: "where do the readings go?".to_string(),
+            choices: vec![
+                BriefChoice {
+                    label: "SD card".to_string(),
+                    requires: vec!["storage.sd".to_string()],
+                    suggests: vec!["logger".to_string()],
+                },
+                BriefChoice {
+                    label: "on the card".to_string(),
+                    requires: vec!["storage.sd".to_string()],
+                    suggests: vec!["logger".to_string()],
+                },
+            ],
+        };
+        let problems = validate_brief(&DesignBrief {
+            forks: vec![identical.clone()],
+            ..DesignBrief::default()
+        })
+        .expect_err("two answers that change nothing");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("change nothing"), "{:?}", problems[0]);
+
+        // A capability a choice names is checked exactly as the brief's own are: a misspelling inside a
+        // fork is the same mistake, and it is just as invisible on a button.
+        let spelled_wrong = BriefFork {
+            choices: vec![
+                BriefChoice {
+                    label: "SD card".to_string(),
+                    requires: vec!["storage.sdcard".to_string()],
+                    ..BriefChoice::default()
+                },
+                BriefChoice {
+                    label: "WiFi".to_string(),
+                    requires: vec!["radio.wifi".to_string()],
+                    ..BriefChoice::default()
+                },
+            ],
+            ..identical.clone()
+        };
+        let problems = validate_brief(&DesignBrief {
+            forks: vec![spelled_wrong],
+            ..DesignBrief::default()
+        })
+        .expect_err("a misspelled path inside a choice");
+        assert!(
+            problems.iter().any(|p| p.contains("storage.sdcard")),
+            "{problems:?}"
+        );
+
+        // And the real one is fine: two answers that bring two different capabilities.
+        let real = validate_brief(&DesignBrief {
+            forks: vec![BriefFork {
+                choices: vec![
+                    BriefChoice {
+                        label: "SD card".to_string(),
+                        requires: vec!["storage.sd".to_string()],
+                        suggests: vec!["logger".to_string()],
+                    },
+                    BriefChoice {
+                        label: "WiFi upload".to_string(),
+                        requires: vec!["radio.wifi".to_string()],
+                        suggests: vec!["uploader".to_string()],
+                    },
+                ],
+                ..identical
+            }],
+            ..DesignBrief::default()
+        });
+        assert!(real.is_ok(), "{real:?}");
+    }
+
+    #[test]
+    fn the_brief_request_asks_for_a_unit_for_each_thing_it_acts_on() {
+        // The failure this fixes: a PM2.5 meter with a touch screen was read as units for the sensing
+        // side only (`sampler`, `air_quality`), so the actor step opened with nothing that manages the
+        // display or the touch — half the application, undesigned until the person noticed by hand. The
+        // brief is told to suggest one unit for each thing the application senses *and* each thing it
+        // acts on, so the decomposition arrives complete enough to only correct.
+        let request = brief_request("a PM2.5 meter with a touch screen");
+        for phrase in [
+            "each thing it acts on",
+            "(`view`)",
+            "(`touch`)",
+            "undesigned",
+        ] {
+            assert!(
+                request.contains(phrase),
+                "the brief request asks for a unit per thing it acts on, missing {phrase:?}:\n{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_brief_that_names_a_capability_nobody_knows_is_repaired() {
+        // A misspelled capability is the failure the brief phase can catch: an unknown path is a typo,
+        // not a new capability, so it is fixed in a repair round rather than reaching the person.
+        let broken = PM25_BRIEF.replace("sensing.particulate", "sensing.particle");
+        let llm = FakeLlm::new(vec![Ok(broken), Ok(PM25_BRIEF.to_string())]);
+        let brief = brief_with(&llm).expect("the repaired answer is the brief");
+
+        assert_eq!(brief.framework, Some(ApplicationFramework::Actors));
         let prompts = llm.prompts();
-        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts.len(), 2, "the answer was repaired once");
         assert!(
-            prompts[1].contains("did not parse"),
-            "the repair turn names the parse failure:\n{}",
+            prompts[1].contains("sensing.particle"),
+            "the repair turn names the bad path:\n{}",
             prompts[1]
         );
     }
 
     #[test]
-    fn the_design_phase_gives_up_naming_what_was_wrong() {
-        // The same bad answer every time: bounded attempts, and an error that says which rule the
-        // model could not satisfy rather than "invalid spec".
-        let broken = PM25_METER.replace(r#""message": "Reading", "#, "");
+    fn a_brief_with_no_framework_is_still_a_brief() {
+        // A description too thin to place on either side of the rule is an answer, not a blank row: the
+        // person chooses the framework at the board step anyway, so an absent one is fine here — and so is
+        // a brief with no readings at all, because every point it did not read is a row the person can see
+        // is empty rather than a count they cannot account for.
+        let thin = r#"{ "summary": "something that reads a sensor", "requires": ["sensing.temperature"] }"#;
+        let llm = FakeLlm::new(vec![Ok(thin.to_string())]);
+        let brief = brief_with(&llm).expect("a framework is optional in a brief");
+        assert_eq!(brief.framework, None);
+        assert_eq!(brief.requires, vec!["sensing.temperature".to_string()]);
+        assert!(brief.points.is_empty() && brief.forks.is_empty());
+    }
+
+    #[test]
+    fn the_brief_phase_gives_up_naming_what_was_wrong() {
+        let broken = PM25_BRIEF.replace("sensing.particulate", "sensing.particle");
         let llm = FakeLlm::new(vec![Ok(broken)]);
-        let err = design_with(&llm).expect_err("no valid spec, so a refusal");
+        let err = brief_with(&llm).expect_err("no valid brief, so a refusal");
         assert!(
-            err.contains("no valid spec in 3 attempts"),
+            err.contains("no valid brief in 3 attempts"),
             "the attempts are bounded: {err}"
         );
         assert!(
-            err.contains("is an actor with no message"),
-            "and the refusal names the problem: {err}"
+            err.contains("sensing.particle"),
+            "and the refusal names the bad path: {err}"
         );
         assert_eq!(llm.prompts().len(), MAX_DESIGN_ATTEMPTS);
     }
 
     #[test]
-    fn an_llm_that_cannot_be_reached_is_reported_as_that() {
-        // Not a bad spec — no answer at all. The distinction matters to the caller: one is worth
-        // rephrasing, the other is worth fixing the wiring.
+    fn an_unreachable_llm_is_reported_for_the_brief_too() {
         let llm = FakeLlm::new(vec![Err("no API key configured".to_string())]);
-        let err = design_with(&llm).expect_err("no answer, so a refusal");
+        let err = brief_with(&llm).expect_err("no answer, so a refusal");
         assert!(err.contains("was not answered"), "{err}");
         assert!(err.contains("no API key configured"), "{err}");
-        assert_eq!(
-            llm.prompts().len(),
-            1,
-            "an unreachable LLM is not retried as a repair"
-        );
+        assert_eq!(llm.prompts().len(), 1, "an unreachable LLM is not retried");
     }
 
     // --- the composition file: `composition.spire`, the source a person opens ---------------------
@@ -2488,7 +3239,7 @@ mod tests {
         let display = spec
             .resource("display")
             .expect("the board's own display is declared");
-        assert_eq!(display.role, "media.display");
+        assert_eq!(display.roles, vec!["media.display".to_string()]);
         assert_eq!(display.via, Some(ResourceVia::Board));
         let sps30 = spec
             .resource("sps30")
@@ -2512,6 +3263,68 @@ mod tests {
         assert_eq!(
             spec.security.as_ref().unwrap().requires,
             vec!["tls".to_string()]
+        );
+
+        // The **English** rides in the file a person opens, at both levels: the whole application's prose
+        // and each actor's own sentence. No rule read it — the `validate` call above passed — which is the
+        // point: the words are the person's, and the structure is what is checked.
+        assert!(
+            spec.description.contains("air-quality monitor"),
+            "the whole-application prose is read: {:?}",
+            spec.description
+        );
+        assert_eq!(
+            by_id("view").description.as_deref(),
+            Some("paints the reading and pages between the three screens on a gesture.")
+        );
+        // A unit that states none is honestly absent, not an empty string.
+        assert!(by_id("sps30").description.is_none());
+    }
+
+    #[test]
+    fn the_description_survives_a_render_and_reparse() {
+        // The prose is part of the spec, so rendering the composition writes it and reading it back yields
+        // it again — the same round trip the structural fields take. Without this, a person's words would
+        // be silently dropped the moment a scaffold re-rendered the file from the parsed spec.
+        use crate::build::idf_projects::render_composition;
+        let spec = parse_composition(&composition_file()).expect("the composition parses");
+        let rendered = render_composition(&spec).expect("the composition renders");
+        let again = parse_composition(&rendered).expect("the rendered composition parses");
+        assert_eq!(
+            spec.description, again.description,
+            "the whole-application prose survives the render"
+        );
+        assert_eq!(
+            spec.units[0].description, again.units[0].description,
+            "a unit's prose survives the render"
+        );
+        assert_eq!(spec, again, "a render and reparse is the identity");
+    }
+
+    #[test]
+    fn the_description_is_not_read_by_validate() {
+        // Prose is not a rule. A description that is nonsense — a bare colon, a URL, punctuation — is
+        // accepted, because a rule over free text would be a rule over nothing. What is checked is the
+        // structure; what the person *meant* is the person's to know.
+        let mut spec = spec(PM25_METER);
+        spec.description =
+            "!!!: not: a: sentence, and not one this or any validator reads".to_string();
+        spec.units[0].description = Some("...".to_string());
+        validate(&spec).expect("prose is not what validate reads");
+    }
+
+    #[test]
+    fn a_composition_without_a_description_still_parses() {
+        // The field is additive and optional: the PM2.5 fixture predates it and must keep parsing, with
+        // the absence read as an empty description rather than a failure.
+        let spec = spec(PM25_METER);
+        assert!(
+            spec.description.is_empty(),
+            "no description is an empty one"
+        );
+        assert!(
+            spec.units.iter().all(|u| u.description.is_none()),
+            "and no unit carries one either"
         );
     }
 
@@ -2633,7 +3446,7 @@ mod tests {
     mod resources {
         use super::*;
 
-        /// The PM2.5 meter plus a `resources` block, as the design phase writes one. Both driver
+        /// The PM2.5 meter plus a `resources` block, as a composition writes one. Both driver
         /// resources share their component's id, which is the rule: one device, one word. Each declared
         /// resource is then owned by the one actor that holds it — the board's parts by the actors that
         /// state them, the two drivers by `sampler` — because that is what a `uses` *is*.
@@ -2691,9 +3504,64 @@ mod tests {
             assert_eq!(spec.resources.len(), 5);
             validate(&spec).expect("a declared set validates");
             assert_eq!(
-                spec.resource("sps30").expect("declared").role,
-                "sensing.particulate",
+                spec.resource("sps30").expect("declared").roles,
+                vec!["sensing.particulate".to_string()],
                 "a driver's resource and its component carry one name, and the resource says what it is"
+            );
+        }
+
+        /// A **multi-role** resource: one device (the SHT20), two capabilities. The spec carries both
+        /// roles, the driver is one component found by name, and a `uses` of `sht20` reaches a device
+        /// that answers two requirements at once — which is the whole of Phase 0.
+        #[test]
+        fn a_resource_may_name_several_roles() {
+            let text = r#"
+            {
+              "framework": "actors",
+              "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3", "hal": "m5unified" },
+              "resources": [
+                { "name": "sht20", "roles": ["sensing.temperature", "sensing.humidity"],
+                  "via": "library", "bus": "grove.a", "address": "0x40" }
+              ],
+              "units": [
+                { "id": "sht20", "kind": "component", "role": "driver", "source": "stub",
+                  "provides": "temperature and humidity", "bus": "i2c" },
+                { "id": "sampler", "kind": "actor", "message": "Tick", "uses": ["sht20"],
+                  "sends_to": ["view"] },
+                { "id": "view", "kind": "actor", "message": "Report" }
+              ],
+              "wiring": ["sampler -> view"]
+            }"#;
+            let spec = parse_spec(text).expect("a multi-role resource parses");
+            assert_eq!(
+                spec.resource("sht20").expect("declared").roles,
+                vec![
+                    "sensing.temperature".to_string(),
+                    "sensing.humidity".to_string()
+                ],
+                "one device, both capabilities"
+            );
+            validate(&spec).expect("a part that is two capabilities validates");
+
+            // The scalar form is the same field, read as a one-element list — the back-compat sugar.
+            let sugared = parse_spec(&text.replace(
+                r#""roles": ["sensing.temperature", "sensing.humidity"]"#,
+                r#""role": "sensing.temperature""#,
+            ))
+            .expect("the scalar `role` still parses");
+            assert_eq!(
+                sugared.resource("sht20").expect("declared").roles,
+                vec!["sensing.temperature".to_string()],
+                "`role: a` is sugar for `roles: [a]`"
+            );
+
+            // One bad name in the list is refused — per role, naming which one.
+            let broken = parse_spec(&text.replace(r#""sensing.humidity""#, r#""sensing.humidty""#))
+                .expect("the spec still parses; the typo is caught by validate, not the reader");
+            let problems = validate(&broken).expect_err("a bad role in the list is refused");
+            assert!(
+                problems.iter().any(|p| p.contains("sensing.humidty")),
+                "the typo is named: {problems:?}"
             );
         }
 
@@ -2820,27 +3688,54 @@ mod tests {
             assert_ne!(shared, declared(), "the fixture has the actor to extend");
             validate(&spec(&shared)).expect("a library component is an algorithm, not a device");
         }
+    }
 
-        #[test]
-        fn the_design_request_states_the_resource_rule() {
-            // A model that is never told about `resources` invents a sensor and is refused — so the rule
-            // is in the prompt, not only in the check.
-            let board = BoardChoice {
-                chip: "esp32s3".into(),
-                bsp: "m5stack_core_s3".into(),
-                hal: "m5unified".into(),
-            };
-            let request = design_request(&board, "a PM2.5 meter with a touch screen", None, None);
-            for expected in [
-                "does not invent hardware",
-                "exactly one owner",
-                r#""resources""#,
-                r#""via": "board""#,
-                r#""via": "library""#,
-                "sensing.particulate",
-            ] {
-                assert!(request.contains(expected), "the prompt states {expected}");
-            }
+    /// The **assigned composition** the Swift actor-assignment step writes — an `actors` spec with the
+    /// driver components the declared resources imply. It is a fixture because it is the *contract*:
+    /// the step is only allowed to emit this shape, so a spec it would produce has to validate here.
+    fn assigned_composition() -> &'static str {
+        r#"
+        {
+          "framework": "actors",
+          "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3", "hal": "m5unified" },
+          "resources": [
+            { "name": "display", "role": "media.display", "via": "board", "bus": "display" },
+            { "name": "sps30", "role": "sensing.particulate", "via": "library", "bus": "i2c", "address": "0x69" }
+          ],
+          "board_facts": [ { "bus": "i2c", "device": "sps30", "address": "0x69" } ],
+          "units": [
+            { "id": "sps30", "kind": "component", "role": "driver", "source": "stub", "provides": "sensing.particulate", "bus": "i2c" },
+            { "id": "sampler", "kind": "actor", "message": "Tick", "state": "reads the sensor", "uses": ["sps30"], "sends_to": ["view"] },
+            { "id": "view", "kind": "actor", "message": "Report", "uses": ["display"] }
+          ],
+          "wiring": ["sampler -> view"]
         }
+        "#
+    }
+
+    /// The shape the Swift actor step writes — board, the resources and the drivers they imply, the
+    /// actors that own them, and the edges "sends to" states — validates with no complaints. This is
+    /// the seam the UI's live rules mirror: if the two ever disagree, this fixture is the one the core
+    /// actually reads.
+    #[test]
+    fn the_actor_assignment_step_produces_a_valid_spec() {
+        let spec = spec(assigned_composition());
+        assert_eq!(spec.framework, ApplicationFramework::Actors);
+        validate(&spec).expect("the assigned composition validates");
+
+        let by_id = |id: &str| spec.units.iter().find(|u| u.id == id).expect(id);
+        // The `library` resource *is* its driver's id — the rule the step builds the driver around.
+        assert_eq!(by_id("sps30").kind, UnitKind::Component);
+        assert_eq!(by_id("sps30").role, Some(ComponentRole::Driver));
+        assert_eq!(by_id("sps30").source, Some(UnitSource::Stub));
+        assert_eq!(by_id("sps30").bus.as_deref(), Some("i2c"));
+        // The board's own part has no component of this project: the BSP reaches it.
+        assert!(spec.units.iter().all(|u| u.id != "display"));
+        // Ownership: each resource is `uses`-ed by exactly the one actor the step assigned it to.
+        assert_eq!(by_id("sampler").uses, vec!["sps30".to_string()]);
+        assert_eq!(by_id("view").uses, vec!["display".to_string()]);
+        // "sends to" is the source of truth, and the wiring is its rendering.
+        assert_eq!(spec.wiring, vec!["sampler -> view".to_string()]);
+        assert_eq!(spec.board_facts[0].device, "sps30");
     }
 }

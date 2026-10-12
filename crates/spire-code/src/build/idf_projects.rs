@@ -132,6 +132,14 @@ const LIBRARY_BLOCK_TOKEN: &str = "__LIBRARY_BLOCK__";
 /// was there regardless. A real `idf.py build` is what read the file rather than the marker.
 const FRAMEWORK_BLOCK_TOKEN: &str = "__FRAMEWORK_BLOCK__";
 
+/// Where `main/main.cpp` carries the **composition's own English** — the whole-application
+/// `description`, as a comment block.
+///
+/// Substituted by name, like [`FRAMEWORK_BLOCK_TOKEN`]: the entry point is the file a person opens first,
+/// so the design's own sentence about the whole product belongs at its top. An application with no
+/// description (or a scaffold run without one) leaves the token empty, which is the ordinary state.
+const DESCRIPTION_BLOCK_TOKEN: &str = "__DESCRIPTION_BLOCK__";
+
 /// What every component library has — the shell, and nothing that is a component.
 ///
 /// Five files, and the components themselves arrive separately: the **framework** comes from
@@ -371,9 +379,9 @@ pub fn library_scaffold(
 /// into the `EXTRA_COMPONENT_DIRS` block. Empty is allowed and means "no library": the application's
 /// components are then its own, which is a legitimate but unusual start.
 ///
-/// `framework` is what the design phase decided and a person reviewed, and it is **stated in the
-/// file** rather than kept in the caller's head — see [`framework_block`] for why. `None` is honest:
-/// the application states that it has not chosen yet.
+/// `framework` is what the composition states and a person reviewed, and it is **stated in the file**
+/// rather than kept in the caller's head — see [`framework_block`] for why. `None` is honest: the
+/// application states that it has not chosen yet.
 ///
 /// `application` is the whole **reviewed decomposition** the framework came from. When it is given,
 /// the application carries it **twice**: as [`COMPOSITION_FILE`], the file a person edits, and as
@@ -381,7 +389,7 @@ pub fn library_scaffold(
 /// phase write the composition that was reviewed instead of inventing one, and what keeps the design
 /// in the tree rather than in a caller's memory.
 ///
-/// A design reaches this from either side of the tree — the caller that ran the design phase, or the
+/// A design reaches this from either side of the tree — the caller that read a composition, or the
 /// composition a person left in the directory the scaffold was pointed at (see
 /// [`design_for_scaffold`], which decides between them and says why). It is the same decomposition
 /// either way, and the `REQUIRES` below is written from it either way.
@@ -404,11 +412,37 @@ pub fn application_scaffold(
     let framework = framework_block(application.map(|application| application.framework));
     let library_section = library_block(library);
     let requires = requires_block(application);
+    // The composition's own English, as a comment block at the top of `main/main.cpp` — the one file a
+    // person opens first. Empty when the design states none (or the scaffold ran without one), which is
+    // the ordinary state and leaves the token with nothing to say.
+    let description_block = match application {
+        Some(spec) if !spec.description.trim().is_empty() => {
+            let body = spec
+                .description
+                .trim()
+                .lines()
+                .map(|line| {
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        "//".to_string()
+                    } else {
+                        format!("// {line}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "// The application, in the words of its own `composition.spire`:\n//\n{body}\n\n"
+            )
+        }
+        _ => String::new(),
+    };
     let rename = |text: &str| {
         text.replace(TEMPLATE_APPLICATION, name)
             .replace(FRAMEWORK_BLOCK_TOKEN, &framework)
             .replace(LIBRARY_BLOCK_TOKEN, &library_section)
             .replace(REQUIRES_BLOCK_TOKEN, &requires)
+            .replace(DESCRIPTION_BLOCK_TOKEN, &description_block)
     };
 
     let templates: [(&str, &str); 4] = [
@@ -436,7 +470,7 @@ pub fn application_scaffold(
             path: path.to_string(),
             content: rename(template),
             // **`main/main.cpp` is the product, not the scaffold.** The composition — the units, the
-            // wiring and the board facts the design phase decided — is written there, so it is the one
+            // wiring and the board facts the composition states — is written there, so it is the one
             // file here that the fill phase must be able to write. Everything else in this list is the
             // build's (`CMakeLists.txt`, `sdkconfig.defaults`, `main/CMakeLists.txt`) or the record's
             // (`README.md`, `SPIRE.application.json`), and stays locked.
@@ -538,7 +572,7 @@ pub fn application_scaffold(
 /// The composition, rendered as the file a person opens — what the scaffold writes as
 /// [`COMPOSITION_FILE`].
 ///
-/// Rendered from the spec rather than echoed from whatever text the design phase read, because the
+/// Rendered from the spec rather than echoed from whatever text the design was read from, because the
 /// spec is what was *validated*: a file written from unvalidated text could differ from the
 /// composition that was approved. The one thing rendering cannot carry is a comment, so a comment a
 /// person adds to the file is theirs from then on — this is the **first** writing of it, not a
@@ -558,7 +592,7 @@ pub fn render_composition(spec: &ApplicationSpec) -> Result<String, String> {
 /// whole reason the composition is a file rather than a value in a wizard.
 ///
 /// `Ok(None)` is honest rather than an error: a tree that has not been designed states nothing, which
-/// is the ordinary state of a project before the design phase.
+/// is the ordinary state of a project before a design is stated.
 ///
 /// Nothing here writes, which is what the **planning** phase needs: it resolves a structure in memory
 /// and puts nothing on disk until the caller confirms. A caller that is about to write the tree wants
@@ -875,7 +909,7 @@ fn fill_component_template(template: &str, substitutions: &[(&str, String)]) -> 
 /// normalising here is what makes the two agree by construction; it also turns a name a design wrote in
 /// prose into an identifier a compiler accepts. And it de-duplicates through the same door: `Tick` and
 /// `tick` are one type, so a design that wrote both means one.
-fn message_type_name(raw: &str) -> String {
+pub(crate) fn message_type_name(raw: &str) -> String {
     type_name(&ident_of(raw))
 }
 
@@ -1503,6 +1537,26 @@ fn unit_header(unit: &Unit, kind: ComponentKind) -> String {
     }
 }
 
+/// `text`, as a C++ doc-comment block — every line prefixed with `///`, a blank line kept as a bare `///`.
+///
+/// The description a person wrote in `composition.spire` travels into the generated header **verbatim**
+/// (bar the comment markers), so the person codes against their own sentence rather than a scaffold's
+/// paraphrase of it. Used for a unit's `description` and for a message-set's; the same shape writes the
+/// application-wide one into `main/`.
+pub fn doc_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() {
+                "///".to_string()
+            } else {
+                format!("/// {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// An **actor**'s header: a `spire::Actor<Message>` and an empty `on_message`.
 ///
 /// The lines that are not a stub are the framework's own: the message type is fixed by the design, and
@@ -1514,6 +1568,16 @@ fn actor_unit_header(unit: &Unit) -> String {
     let type_name = type_name(&ident);
     let message = message_type_name(unit.message.as_deref().unwrap_or_default());
     let state = unit.state.as_deref().unwrap_or("(the design states none)");
+    // The person's own sentence, when the composition gave one: it leads the class doc, verbatim, so the
+    // code is written against the design's words rather than this scaffold's paraphrase. Absent, the
+    // scaffold's TODO stands in — the same stub a design that said nothing about this actor gets.
+    let intent = match unit.description.as_deref().map(str::trim) {
+        Some(description) if !description.is_empty() => doc_lines(description),
+        _ => format!(
+            "/// TODO: what the actor `{id}` is for, in the terms a person reading `main/` thinks in — and\n\
+             /// what it is not."
+        ),
+    };
     format!(
         r#"// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
@@ -1526,8 +1590,7 @@ fn actor_unit_header(unit: &Unit) -> String {
 
 namespace {ident} {{
 
-/// TODO: what the actor `{id}` is for, in the terms a person reading `main/` thinks in — and what it is
-/// not.
+{intent}
 ///
 /// **This is a stub.** An actor is the message type it receives, the state it holds between messages and
 /// the refs it sends to. The message and the peers are the composition's — the reviewed design, and the
@@ -1607,6 +1670,13 @@ fn stage_unit_header(unit: &Unit) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let intent = match unit.description.as_deref().map(str::trim) {
+        Some(description) if !description.is_empty() => doc_lines(description),
+        _ => format!(
+            "/// TODO: what the stage `{id}` is for, in the terms a person reading `main/` thinks in — and\n\
+             /// what it is not."
+        ),
+    };
     let mut text = format!(
         r#"// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
@@ -1619,8 +1689,7 @@ fn stage_unit_header(unit: &Unit) -> String {
 
 namespace {ident} {{
 
-/// TODO: what the stage `{id}` is for, in the terms a person reading `main/` thinks in — and what it is
-/// not.
+{intent}
 ///
 /// **This is a stub.** A stage is what it pulls, what it pushes and the code between them. The values and
 /// the peers are the composition's — the reviewed design states this stage's ports:
@@ -2331,24 +2400,24 @@ fn collect_source_text(dir: &Path, into: &mut String) {
     }
 }
 
-/// The application skeleton writes this in place of the framework block when the design phase named
+/// The application skeleton writes this in place of the framework block when the composition named
 /// one — the *statement* the fill phase, a person and another tool all read back.
 ///
 /// `set(...)` rather than a comment, deliberately, and for the reason the project type is stated the
 /// same way: the composition this application will contain is one framework's idiom, and a reader that
 /// had to *infer* which one from the shape of `main/` would be guessing at exactly the thing the
-/// design phase decided.
+/// composition states.
 fn framework_block(framework: Option<ApplicationFramework>) -> String {
     match framework {
         Some(framework) => format!(
-            "# The framework this application is written in, **stated rather than guessed** — chosen in\n\
-             # the design phase and reviewed before any of it was written. A component stays\n\
-             # framework-agnostic; the composition in `main/` is this one's.\n\
+            "# The framework this application is written in, **stated rather than guessed** — chosen\n\
+             # when the composition was written, and reviewed before any of it existed. A component\n\
+             # stays framework-agnostic; the composition in `main/` is this one's.\n\
              {}\n",
             framework.marker_line()
         ),
-        None => "# No framework stated: this application was made without a design phase, so the library's\n\
-                 # rule for choosing one applies, and whatever is chosen belongs here — as\n\
+        None => "# No framework stated: this application was made without a stated composition, so the\n\
+                 # library's rule for choosing one applies, and whatever is chosen belongs here — as\n\
                  # `set(SPIRE_APPLICATION_FRAMEWORK actors)`, or `ramen`.\n"
             .to_string(),
     }
@@ -2356,7 +2425,7 @@ fn framework_block(framework: Option<ApplicationFramework>) -> String {
 
 /// The **framework** an application's fill prompt is given a block for.
 ///
-/// This is the design phase reaching the model that writes the composition, and it is the whole reason
+/// This is the recorded choice reaching the model that writes the composition, and it is the whole reason
 /// the choice is recorded: a fill prompt otherwise hands the model a library's hints — which describe
 /// *both* frameworks and how to choose between them — and the model chooses again, differently, per
 /// run. What the model is told here is that the choice is already made and reviewed, what it means in
@@ -2679,7 +2748,8 @@ pub fn composition_block(application: &ApplicationSpec) -> String {
         };
         text.push_str(&format!(
             "- `{}` — {}{on} ({reached})\n",
-            resource.name, resource.role
+            resource.name,
+            resource.roles.join(", ")
         ));
     }
 
@@ -2950,7 +3020,7 @@ component library rather than being written again here.
 
 ```
 CMakeLists.txt            the idf.py project root, and `set(SPIRE_PROJECT_STRUCTURE idf_application)`
-                          — plus `set(SPIRE_APPLICATION_FRAMEWORK …)` when the design phase has chosen
+                          — plus `set(SPIRE_APPLICATION_FRAMEWORK …)` when the composition states one
                           one, so the shape of the composition is stated rather than inferred
 sdkconfig.defaults        what this product itself decides
 main/main.cpp             the entry point: spawn, wire, start — and the board facts, which belong to
@@ -4207,7 +4277,7 @@ fn unit_design_block(design: &ApplicationSpec, unit: &Unit, kind: ComponentKind)
                     .iter()
                     .find(|candidate| candidate.name == *name);
                 let role = resource
-                    .map(|resource| resource.role.trim())
+                    .map(|resource| resource.roles.join(", "))
                     .filter(|role| !role.is_empty());
                 let address = resource
                     .map(|resource| resource.address.trim())
@@ -5222,6 +5292,86 @@ mod tests {
             "the source belongs to its own turn"
         );
     }
+    /// The composition's **English reaches the code**: the whole-application `description` becomes a
+    /// comment block at the top of `main/main.cpp`, and each unit's own `description` becomes that unit's
+    /// class doc-comment — verbatim, so a person codes against the sentence they wrote rather than the
+    /// scaffold's paraphrase of it. This is the join between the hand-authored `composition.spire` and the
+    /// code: the prose is not a report *about* the generated tree, it is the header of it.
+    #[test]
+    fn the_compositions_description_reaches_the_generated_code() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        let mut spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        spec.description = "A particulate monitor: sample, average, show.".to_string();
+        spec.units
+            .iter_mut()
+            .find(|u| u.id == "air_quality")
+            .expect("the fixture has air_quality")
+            .description =
+            Some("folds each reading into the rolling average and posts it on.".to_string());
+
+        let out = application_scaffold("pm25-meter", &[], "../sensors", Some(&spec))
+            .expect("the application scaffolds");
+
+        // `main/main.cpp` — the whole application, in the design's own words.
+        assert!(
+            out.source_content
+                .contains("// A particulate monitor: sample, average, show."),
+            "the whole-application description reaches main.cpp:\n{}",
+            out.source_content
+        );
+        assert!(
+            !out.source_content.contains("__DESCRIPTION_BLOCK__"),
+            "and the token is substituted, not left behind"
+        );
+
+        // The actor's header — its own sentence, verbatim, above the class.
+        let air_quality = &out
+            .files
+            .iter()
+            .find(|f| f.path == "components/air_quality/include/air_quality.hpp")
+            .expect("the actor has a header")
+            .content;
+        assert!(
+            air_quality
+                .contains("/// folds each reading into the rolling average and posts it on."),
+            "the unit description reaches its class doc:\n{air_quality}"
+        );
+
+        // A unit that stated none keeps the scaffold's own TODO, rather than an empty doc line.
+        let sampler = &out
+            .files
+            .iter()
+            .find(|f| f.path == "components/sampler/include/sampler.hpp")
+            .expect("the sampler has a header")
+            .content;
+        assert!(
+            sampler.contains("/// TODO: what the actor `sampler` is for"),
+            "a unit with no description keeps the TODO:\n{sampler}"
+        );
+    }
+
+    /// A scaffold **without** a description leaves no trace of the mechanism: no token, and no empty
+    /// comment block. The block is a real line in the template, so an application that was never designed
+    /// (or was designed before prose was part of one) must render `main/main.cpp` exactly as it always did.
+    #[test]
+    fn a_description_free_scaffold_leaves_no_stray_comment() {
+        use crate::build::application_spec::{examples, parse_spec};
+
+        let spec = parse_spec(examples::PM25_METER).expect("the worked example parses");
+        let out = application_scaffold("pm25-meter", &[], "../sensors", Some(&spec))
+            .expect("the application scaffolds");
+        assert!(!out.source_content.contains("__DESCRIPTION_BLOCK__"));
+        assert!(
+            !out.source_content.contains("in the words of its own"),
+            "an absent description writes no block:\n{}",
+            out.source_content
+        );
+
+        let none = application_scaffold("pm25-meter", &[], "../sensors", None).expect("scaffolds");
+        assert!(!none.source_content.contains("__DESCRIPTION_BLOCK__"));
+    }
+
     /// A **unit** of an application — an actor — is written from the **reviewed design**, and the
     /// request says so: the composition, the framework's rules, this one unit's slice of the design, and
     /// its header as it stands.
@@ -6361,7 +6511,7 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         // With no design there are no units, so the application has no components of its own *yet* —
         // and naming one would be inventing an architecture. The roots to write in exist either way,
         // because the fill phase is where a composition (and so its components) comes from when no
-        // design phase ran.
+        // composition was stated.
         for file in &out.files {
             assert!(
                 !file.path.starts_with("components/"),
@@ -7444,9 +7594,9 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         );
     }
 
-    /// The framework block is what an application is told even when **no design phase ran** — the wizard
-    /// chose the framework and the line is in its `CMakeLists.txt` — so the rule that a unit is an actor
-    /// and *not* a poll loop has to live here, and not only in the composition block a design produces.
+    /// The framework block is what an application is told even when **no composition block** was
+    /// produced — the framework is stated in the tree's `CMakeLists.txt` — so the rule that a unit is an
+    /// actor and *not* a poll loop has to live here, and not only in the composition block.
     #[test]
     fn the_actors_framework_block_forbids_a_bare_poll_loop() {
         use crate::build::application_spec::ApplicationFramework;

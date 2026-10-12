@@ -117,8 +117,10 @@ pub async fn resolved_profile(
             }
             // A part the board carries: the `Device` node is the name an application's `resources:`
             // refers to, the `devices` edge carries the board's values for it (`part`, `bus`,
-            // `address`), and the part's `role` — the capability it *is* — is a second edge out of the
-            // device node, so it is read from there and never duplicates the vocabulary.
+            // `address`), and the part's **roles** — the capabilities it *is* — are second edges out of
+            // the device node, so they are read from there and never duplicate the vocabulary. A part
+            // may be several capabilities at once (the SHT20 is temperature *and* humidity), so every
+            // `role` edge is collected.
             RelationshipType::Devices if edge.from_id == board_id => {
                 let name = edge
                     .to_id
@@ -126,13 +128,16 @@ pub async fn resolved_profile(
                     .unwrap_or(&edge.to_id)
                     .to_string();
                 let device_edges = edges_of(graph, &edge.to_id).await?;
-                let role = device_edges
+                let mut roles: Vec<String> = device_edges
                     .iter()
-                    .find(|e| e.edge_type == RelationshipType::Role && e.from_id == edge.to_id)
-                    .map(|e| e.to_id.clone());
+                    .filter(|e| e.edge_type == RelationshipType::Role && e.from_id == edge.to_id)
+                    .map(|e| e.to_id.clone())
+                    .collect();
+                roles.sort();
+                roles.dedup();
                 devices.push(json!({
                     "name": name,
-                    "role": role,
+                    "roles": roles,
                     "properties": values(edge),
                 }));
             }

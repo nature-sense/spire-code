@@ -128,6 +128,7 @@ pub const PROP_ORDER: &str = "order";
 
 const P_FRAMEWORK: &str = "framework";
 const P_JUSTIFICATION: &str = "justification";
+const P_DESCRIPTION: &str = "description";
 const P_WIRING: &str = "wiring";
 const P_CHIP: &str = "chip";
 const P_BSP: &str = "bsp";
@@ -305,14 +306,18 @@ fn parse_wiring(entry: &str) -> Option<(&str, &str)> {
 pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
     let mut g = CompositionGraph::default();
 
-    // Anchor: the framework, its justification and the wiring — the product-wide facts.
-    g.nodes.push(
-        CompositionNode::new(node::ANCHOR, ROOT)
-            .described(&spec.justification)
-            .with(P_FRAMEWORK, json!(spec.framework.as_str()))
-            .with(P_JUSTIFICATION, json!(spec.justification))
-            .with(P_WIRING, json!(spec.wiring)),
-    );
+    // Anchor: the framework, its justification and the wiring — the product-wide facts. `description`
+    // is the composition's own English (the whole-application prose of `composition.spire`), carried
+    // as a property so it survives the graph round trip rather than being a field with no reader.
+    let mut anchor = CompositionNode::new(node::ANCHOR, ROOT)
+        .described(&spec.justification)
+        .with(P_FRAMEWORK, json!(spec.framework.as_str()))
+        .with(P_JUSTIFICATION, json!(spec.justification))
+        .with(P_WIRING, json!(spec.wiring));
+    if !spec.description.is_empty() {
+        anchor = anchor.with(P_DESCRIPTION, json!(spec.description));
+    }
+    g.nodes.push(anchor);
 
     // Board: chip/bsp/hal — the silicon and the support package the application is written against.
     g.nodes.push(
@@ -339,7 +344,7 @@ pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
     for (i, r) in spec.resources.iter().enumerate() {
         let key = resource_node(&r.name);
         let mut n = CompositionNode::new(node::RESOURCE, &key)
-            .with(P_ROLE, json!(r.role))
+            .with(P_ROLE, json!(r.roles))
             .with(PROP_ORDER, json!(i));
         if let Some(v) = r.via {
             n = n.with(P_VIA, json!(v));
@@ -388,6 +393,7 @@ pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
             n = n.with(P_SOURCE, json!(v));
         }
         for (key, value) in [
+            (P_DESCRIPTION, &u.description),
             (P_REGISTRY, &u.registry),
             (P_PROVIDES, &u.provides),
             (P_BUS, &u.bus),
@@ -492,6 +498,7 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
         .ok_or("the composition anchor is missing its 'framework' property")?;
     let framework = framework_from_name(&framework)?;
     let justification = prop_str(anchor, P_JUSTIFICATION).unwrap_or_default();
+    let description = prop_str(anchor, P_DESCRIPTION).unwrap_or_default();
     let wiring = prop_list(anchor, P_WIRING);
 
     let board_node = g.nodes.iter().find(|n| n.node_type == node::BOARD);
@@ -525,7 +532,7 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
                 .strip_prefix(RESOURCE_PREFIX)
                 .unwrap_or(n.name.as_str())
                 .to_string(),
-            role: prop_str(n, P_ROLE).unwrap_or_default(),
+            roles: prop_list(n, P_ROLE),
             via: prop_str(n, P_VIA).as_deref().and_then(resource_via),
             bus: prop_str(n, P_BUS).unwrap_or_default(),
             address: prop_str(n, P_ADDRESS).unwrap_or_default(),
@@ -582,6 +589,7 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
         units.push(Unit {
             id: n.name.clone(),
             kind,
+            description: prop_str(n, P_DESCRIPTION),
             role: prop_str(n, P_ROLE).as_deref().and_then(unit_role),
             source: prop_str(n, P_SOURCE).as_deref().and_then(unit_source),
             registry: prop_str(n, P_REGISTRY),
@@ -601,6 +609,7 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
     }
 
     Ok(ApplicationSpec {
+        description,
         framework,
         justification,
         board,
@@ -617,26 +626,28 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
 
 /// **How a design came to be** — the door the composition arrived through.
 ///
-/// Recorded rather than inferred, because the three doors are not interchangeable to a reader: a
-/// decomposition a person *wrote* in `composition.spire` and one a *model* proposed from six answers
-/// carry different confidence, and a record that did not say which is a record that cannot say "a
-/// person reviewed this" and mean anything by it.
+/// Recorded rather than inferred, because the doors are not interchangeable to a reader: a
+/// decomposition a person *wrote* in `composition.spire` carries different confidence than one a
+/// *model* proposed from a description, and a record that did not say which is a record that cannot say
+/// "a person reviewed this" and mean anything by it.
 ///
-/// The axis is **who decided** — the only division the doors actually make. The design form
-/// (`createProject/DesignApplication`) is one door with two readings: a caller that pins the framework
-/// has decided, and the model fills the decomposition in around that choice; a caller that pins
-/// nothing is asking the model to *choose and justify* one. Both are one model round trip, and they
-/// are not the same fact about the design — which is what [`Self::Answers`] and [`Self::Model`] say.
+/// The axis is **who decided**. Only [`Self::CompositionFile`] is a door a request can come through
+/// now: a `composition.spire` is the one way a design is stated, so it is the one name a current
+/// caller hands back. [`Self::Answers`] and [`Self::Model`] survive because they were **recorded** —
+/// a graph written while the design form existed still says which of the two its owner went through,
+/// and a reader of that graph has to be able to read what it says. They are read, never written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesignSource {
-    /// The **caller's answers** decided: `createProject/DesignApplication` with the framework pinned,
-    /// so the decomposition was filled in around a choice that was already made.
+    /// The **caller's answers** decided: a `createProject/DesignApplication` with the framework pinned,
+    /// so the decomposition was filled in around a choice that was already made. Read from a graph
+    /// written while that door existed; never written now.
     Answers,
     /// A `composition.spire` a person handed in (`createProject/ParseComposition`) — or the one a tree
     /// already carried, which is the same file by a different road.
     CompositionFile,
-    /// The **model** decided: `createProject/DesignApplication` with no framework pinned, where the
-    /// choice is the model's to make and justify and a person accepts it at review.
+    /// The **model** decided: a `createProject/DesignApplication` with no framework pinned, where the
+    /// choice was the model's to make and justify and a person accepted it at review. Read from a graph
+    /// written while that door existed; never written now.
     Model,
 }
 
@@ -676,8 +687,8 @@ impl DesignSource {
     ///
     /// `None` — neither stated nor readable — records **nothing**: the composition is stored and no
     /// decision is attached to it, so [`freshness`] answers [`DesignFreshness::Absent`]. Guessing here
-    /// would mean choosing between "the caller's answers" and "the model's choice", which is precisely
-    /// the distinction the record exists to keep, over a request that declined to make it.
+    /// would mean asserting a decision a request declined to make, which is exactly what the record
+    /// exists not to do.
     pub fn accepted(
         stated: Option<DesignSource>,
         caller_design_dropped: bool,
@@ -703,7 +714,8 @@ pub struct DesignRecord {
     pub framework: ApplicationFramework,
     pub justification: String,
     pub source: DesignSource,
-    /// The design version this decision accepted (the design phase counts the specs it has decided).
+    /// The design version this decision accepted (the leg that accepted it counts the specs it has
+    /// decided).
     pub version: u32,
     pub decided_at: chrono::DateTime<chrono::Utc>,
     /// [`fingerprint`] of the composition **as decided**. The basis of staleness: the composition may
@@ -717,8 +729,8 @@ impl DesignRecord {
         Self::at(spec, source, version, chrono::Utc::now())
     }
 
-    /// [`Self::now`] with the clock passed in, so a caller that already stamped the decision — the
-    /// design phase does — records *that* instant rather than a second one microseconds later.
+    /// [`Self::now`] with the clock passed in, so a caller that already stamped the decision — the leg
+    /// that accepted it does — records *that* instant rather than a second one microseconds later.
     pub fn at(
         spec: &ApplicationSpec,
         source: DesignSource,

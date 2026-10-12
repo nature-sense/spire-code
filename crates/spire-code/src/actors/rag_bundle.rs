@@ -111,14 +111,19 @@ pub const DEVICE_FACTS_CORPUS: &str = "device-facts";
 /// corpus is asked with: a component's edit looks its device up as `sht20`, and a document named
 /// `sht20.md` is what makes that a keyed lookup rather than a similarity search.
 ///
-/// More than one document ships, and the ones that do are deliberately **near misses** of each
-/// other: `sht20.md` and `sht30.md` are one family measuring without clock stretching with the same
+/// More than one document ships, and the pairs that share a family are deliberately **near misses** of
+/// each other: `sht20.md` and `sht30.md` are one family measuring without clock stretching with the same
 /// CRC polynomial, and they disagree about the address, the command words, the framing and the
 /// checksum's seed. A corpus of unrelated documents would be answered correctly by accident and
 /// prove nothing; a near-miss pair is what the key has to separate, and
 /// `tests/rag_fill_tests.rs` pins that a query for one part answers with that part's document rather
 /// than its neighbour's — by a small margin, which is exactly why the seam labels every chunk with
 /// its source path rather than trusting the ranking alone.
+///
+/// `sps30.md` ships for a **different question**, so it is no near-miss of the Sensirion humidity pair:
+/// the design step has no part number yet and queries the corpus with a *description* ("a PM2.5 meter"),
+/// so this document is what a semantic match has to reach to supply an external part's address instead
+/// of the model asking a person for it.
 pub const FACTS_DOCS: &[(&str, &str)] = &[
     (
         "sht20.md",
@@ -127,6 +132,10 @@ pub const FACTS_DOCS: &[(&str, &str)] = &[
     (
         "sht30.md",
         include_str!("../../resources/device-facts/sht30.md"),
+    ),
+    (
+        "sps30.md",
+        include_str!("../../resources/device-facts/sps30.md"),
     ),
 ];
 

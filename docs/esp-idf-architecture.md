@@ -1,4 +1,4 @@
-# ESP32 architecture: from a form's answers to a flashed board
+# ESP32 architecture: from a description and a composition to a flashed board
 
 <!--
   How spire-code takes an ESP32 product from a person's answers to a board that runs it — the
@@ -65,11 +65,11 @@ template by re-materializing it **from the scaffold itself** rather than by copy
 ## The pipeline in one picture
 
 ```
-  form answers ──▶ ┌───────────────────┐   spec (JSON)   ┌────────────┐
-  + board          │ createProject/    │ ──────────────▶ │  a person  │
-                   │ DesignApplication │                 │  reviews   │
-                   └───────────────────┘                 └─────┬──────┘
-                          ▲ Planning role                     │ approved
+  composition.spire ─▶ ┌──────────────────┐  spec (JSON)  ┌────────────┐
+  (a file a person     │ createProject/   │ ────────────▶ │  a person  │
+   wrote or edited)    │ ParseComposition │               │  reviews   │
+                       └──────────────────┘               └─────┬──────┘
+                          no model in this step                 │ approved
                           │                                   ▼
                      ┌────┴─────┐                    ┌──────────────────┐
                      │ LlmActor │                    │ createProject/   │  deterministic:
@@ -89,7 +89,8 @@ template by re-materializing it **from the scaffold itself** rather than by copy
 ```
 
 The tools a caller (the wizard, or the model itself) drives, in order:
-`createProject/DesignApplication` (`idf_design_application`), `createProject/Scaffold`,
+`createProject/BriefApplication` (the description-first flow's own first step), then
+`createProject/ParseComposition` (a `composition.spire` in — a file, not a model), `createProject/Scaffold`,
 `createProject/GeneratePlan`, `createProject/ExecutePlan` (or `createProject/Fill`),
 `createProject/VerifyApplication`, `createProject/FinalizeManifest`, `createProject/RepairFromBuild`;
 then the three editing entries — `idf_apply_design` (write the design's components as stubs),
@@ -232,72 +233,84 @@ ingest path needs a **real embedder** — `NoopEmbedder` **fails every call on p
 (`tests/rag_fill_tests.rs:68`), so there is no keyword fallback to degrade to
 (`tests/idf_component_edit_tests.rs:74`).
 
-## 3. The form's answers become a decomposition, then a skeleton
+## 3. A description becomes a brief; a composition becomes a skeleton
 
-### 3a. `createProject/DesignApplication` — the design phase
+### 3a. `createProject/BriefApplication` — the design brief
 
-The handler is `handle_create_project_design_application` (`src/actors/coordinator.rs:5765`), also
-exposed to the model as the tool `idf_design_application` (`:6190`). Three things are refused **before**
-the model is ever asked, and each refusal is deliberate:
+The **description-first** flow (`BoardResourceFlowView`) opens on the person's own words rather than a
+board, and this is the handler behind its first step: `handle_create_project_brief_application`
+(`src/actors/coordinator.rs`), whose LLM leg reaches the model through `plan_completion` — the one
+place in the coordinator a leg asks the Planning model for anything.
 
-- **No board → refuse.** `board` is required and never defaulted: "a guessed chip or BSP is a build
-  that fails on hardware, and whoever asks this already knows the board" (`:5771`). A chip-less board
-  is refused by `board_from_json` (`src/build/application_spec.rs:987`).
-- **No answers → refuse.** `description` — the design form's answers — is what the decomposition is
-  derived from, so an empty one is an error (`src/actors/coordinator.rs:5787`).
-- **A `libraryRoot` that is not a component library → refuse *by name*.** `declares_library`
-  (`src/build/idf_projects.rs:1406`) must pass. "A design built on facts read from the wrong directory
-  is worse than no design at all" (`src/actors/coordinator.rs:5813`), and the fake-endpoint test
-  `a_library_root_that_is_not_a_library_is_refused` asserts the model was **not asked at all**.
+A description goes in and a **`DesignBrief`** comes out — `summary` (the application in a paragraph),
+`framework` (derived, confirmed later at the board step), `requires` (the **capabilities** the
+application needs, as paths `capability_vocabulary::is_known_path` accepts), `suggests` (advisory unit
+names), **`points`** (the description read against the six fixed points — `BRIEF_POINTS` — each carrying
+what the text **said** and what was **decided** where it said nothing) and **`forks`** (at most
+`BRIEF_FORK_CEILING` — two — decisions whose answer would change which capabilities the application is
+given, each a pick between named alternatives that carry the `requires`/`suggests` they would add). It
+names **no** board, resource, driver or wiring edge: those are the board and resources steps' to decide,
+and a brief that guessed them would be a decomposition nobody asked for.
 
-Nothing is written to disk and nothing needs to exist yet: the spec is designed *before* the tree it
-describes, which is what makes it reviewable — a person says yes to a decomposition rather than to a
-pile of generated code (`src/actors/coordinator.rs:5757`).
+**The model drafts; the person edits.** A brief does not report what is missing — that is a judgement
+about how much a description left open, and eight live reads of one unchanged 11 KB text returned 0, 1,
+1, 0, 3, 1 `gaps` entries (and 0–6 again under greedy sampling), where `requires`, `suggests` and
+`summary` were identical every run. So the *count* is gone rather than bounded: every description is read
+against the same six points, what is open is **which `decided` cells are filled**, and the one thing left
+as a question is a fork — answered by **picking**, which merges the choice's capability paths into the
+brief the later steps read (`BoardResourceFlowState.resolvedBrief`, so the model's own reading is never
+overwritten). `tests/brief_repeatability_live_tests.rs` is the harness that measures this against the
+real model.
 
-### 3b. What goes into the design prompt
+The checks are on what a person **cannot see** on screen: every `requires` path — the brief's own and the
+ones its choices carry — against `capability_vocabulary::is_known_path`, because an unknown path is a
+**misspelling** rather than a new capability; each `points` entry naming one of the six ids, once; and
+each fork keeping to the ceiling with at least two choices that differ in what they bring. Everything
+else is prose, so the phase is **ask, parse, check, repair** — `brief_application` in
+`src/build/application_spec.rs`, with a canned `call` and no live model, so the leg is provable without an
+endpoint at all. A point the model
+**left out** is deliberately not a problem — it draws as a blank row under a label the person can read. The
+brief is a **guide, not a gate**: its `requires` drives the `Needed` badges and the board-fit readout in
+later steps, and it never disables Continue.
 
-`design_request` (`src/build/application_spec.rs:728`) is the whole prompt, assembled from sources:
+### 3b. `createProject/ParseComposition` — the design, read from a file
 
-| Block | Source | Where |
-|---|---|---|
-| **The board** | the caller's `BoardChoice` — chip, BSP, HAL — echoed exactly, with a note that onboard devices (display, camera, IMU) belong to the board, not the units | `:761`, `:765` |
-| **The library** | `library_facts` (`src/build/idf_projects.rs:1449`): the components that already exist, each with its kind, plus the library's `SPIRE.md` — which is why `"source": "existing"` is a fact rather than a guess | `:771` |
-| **What it has to do** | the form's `description`, then the **six questions** it must answer — (1) what it does, (2) what it **senses** and how fast, (3) what it **acts on**, (4) what it **reacts to over time**, (5) **timing** / what is parallel, (6) what happens **when something is missing**. "If this leaves one of these unanswered, **say so and leave the field empty** — do not invent a device, an address, a pin or a protocol." | `:775`, `:777` |
-| **The framework rule** | either the user *chose* it ("not yours to reconsider"), or the model must choose and justify it: human-timescale/interactive → `actors`; machine-timescale/high-rate stages → `ramen`; and "a *stream* is a component's job either way" | `:736` |
-| **The spec schema** | the JSON shape: `framework`, `justification`, `board`, `board_facts`, `units`, `wiring` | `:793` |
-| **The three unit kinds** | `component` (driver or library — knows no pins, address, task, mailbox or framework), `actor` (a `Message`, `state`, `uses`, `sends_to`), `stage` (`pulls`/`pushes`, a DAG) | `:814` |
-| **The six rules the tool checks** | one framework & one unit per id; every actor states a `message` and every stage a `pulls`/`pushes`; every reference resolves and a dataflow has no cycle; every component has a `role` and `driver`/`library`/`published` discipline; every board fact names a driver in this spec; nothing invented and unused | `:837` |
-| **Where code comes from** | `"existing"` (the library has it), `"stub"` (it will be written — "name it rather than avoiding it"), `"published"` (it is on the ESP Component Registry — "**look it up** with the `registry/*` tools rather than designing a second copy") | `:854` |
+The design is a **file**. `handle_create_project_parse_composition` (`src/actors/coordinator.rs`) takes the
+contents of a `composition.spire` and answers with the validated spec plus the exact line the application
+will state its framework with, so what a person reviews is what gets scaffolded. A `composition.spire` is
+the same file the scaffold writes and a project is edited through, so opening one and reviewing it is the
+same review, by the same rules a file on a tree is read by.
 
-The last line of the prompt is `Respond with **only the JSON object**, and nothing else.` (`:866`).
+Nothing is written, and no board, library or description is needed: **a composition states its board**, so
+this door cannot be asked for a board it would have to guess. Two refusals are **by name**, before any tree
+exists:
 
-### 3c. The loop: design, validate, repair
+- **It does not parse → refuse.** `parse_composition` (`src/build/application_spec.rs`) is the same parser
+  `idf_projects::read_application` reads a project's own file with;
+- **It parses and does not hold together → refuse**, with every broken rule at once
+  (`idf_projects::design_that_holds_together` — the rules below).
 
-`design_application` (`src/build/application_spec.rs:923`) is the whole loop, with the LLM leg injected
-as a closure so it is testable without a model. It runs at most `MAX_DESIGN_ATTEMPTS = 3` (`:897`):
+### 3c. What a composition states
 
-1. send `design_request` through the injected caller — in production the coordinator's
-   `design_application` (`src/actors/coordinator.rs:6149`), which routes it through the LLM actor with
-   `LlmModelRole::Planning` (`:6171`);
-2. `parse_spec` (`:278`) the reply;
-3. `validate` (`:300`) it against the six rules;
-4. on failure, make a **repair turn**: re-send the request, the previous answer and the *exact*
-   problems — no chat history, no state, because the model needs the facts and not the conversation.
+A composition is a typed **`ApplicationSpec`** (`src/build/application_spec.rs`): `framework` (`actors` or
+`ramen`, with a one-line `justification`), `board` (chip, BSP, HAL), the `resources` it composes against,
+`units` and `wiring` — and, when it has them, a `description` in prose for the application and for each
+unit, which is carried into the generated headers as documentation rather than read by `validate`.
 
-After the loop, the **board in the answer is overwritten with the caller's** — the model may not
-substitute a BSP. `with_the_callers_board` (`src/build/application_spec.rs:899`) exists because one did:
-`espressif/m5stack_core_s3` came back as `m5stack/cores3`, which the scaffold wrote into
-`main/idf_component.yml` and the build could not resolve. The reasoning is stated there — the six rules
-are about the *composition*, which is what the model is actually being asked to decide; the board is
-the part it is not (`:905`). The result is a validated `ApplicationSpec` (`:244`) for a person to
-approve.
+`validate` checks the six rules, each one a failure that would otherwise reach the compiler or a board:
 
-Because the rules live in `validate` rather than in the prompt, they are provable with a scripted
-closure and no model at all — which is why `application_spec`'s own tests can prove the six rules and
-the repair turn, while `tests/design_application_llm_tests.rs` proves the *plumbing*: the HTTP request,
-the response parse, the coordinator's route, the planning role, the validation and the repair as a
-second round trip, with only the model's text scripted. As that file says, what neither can tell you is
-whether a real model gives *good* decompositions — that is a quality question for a live endpoint.
+1. one framework, and one unit per id;
+2. every actor states a `message`, and every ramen stage a `pulls`/`pushes`;
+3. every reference resolves, and a dataflow has no cycle;
+4. every component is framework-agnostic — it knows no pins, address, task, mailbox or framework;
+5. every board fact names a driver in this spec;
+6. nothing invented and unused — plus a **declared resource** behind every device a unit reaches, with
+   **exactly one owner** for each such device.
+
+Because the rules live in `validate` and not in a prompt, they are provable with no model at all.
+
+The field-by-field reference for the file is `docs/composition-format.md`, and
+`docs/example-composition.spire` is a fully annotated composition that exercises nearly every field.
 
 ### 3d. `createProject/Scaffold` — the skeleton, deterministic
 
@@ -351,8 +364,8 @@ to neither stage's component. The names come from the design in both cases; the 
 The **framework** a unit is written in decides the harness, and nothing else about the layout: an actor's
 host test links the framework's sources and the fake FreeRTOS underneath them, while a stage's links no
 framework source at all — ramen is a header, and a chain is a chain of calls. `unit_component_files`
-returns nothing when the design has no units, and `fill_roots` still names both trees — a composition with
-no design phase is written by the fill, and its units land in `components/` the same way.
+returns nothing when the design has no units, and `fill_roots` still names both trees — a composition that
+states no units is written by the fill, and its units land in `components/` the same way.
 
 Rendered above the file lists, both prompt blocks state the layout so the model does not have to infer
 it: each framework block carries its own per-unit-component rule — an actor's message, a stage's
@@ -694,14 +707,11 @@ is read from disk (or the caller) at prompt-assembly time, never from conversati
 
 | Source | Read from | Reaches which prompt | Where it is assembled |
 |---|---|---|---|
-| The board (chip, BSP, HAL) | the caller's `BoardChoice` | design | `src/build/application_spec.rs:761` |
-| The board's onboard devices | the board prompt's own note | design | `src/build/application_spec.rs:765` |
-| Existing components + library `SPIRE.md` | `<library>/components/*`, `<library>/SPIRE.md` | design | `src/build/idf_projects.rs:1449` |
-| The form's answers | the caller's `description` | design | `src/build/application_spec.rs:775` |
-| The six questions | the prompt itself, as constraints | design | `src/build/application_spec.rs:777` |
-| The six spec rules | `validate` — *not* only prose in the prompt | design + repair turn | `src/build/application_spec.rs:300`, `:837` |
-| The spec JSON schema | the prompt, hand-written beside the parser | design | `src/build/application_spec.rs:793` |
-| Framework choice/justification | the caller's `framework`, else the model decides and justifies | design, then fill | `:736`, `src/build/idf_projects.rs:824` |
+| The design | the `composition.spire` the caller hands in, or the one the tree already carries | review, scaffold, fill | `src/build/application_spec.rs` (`parse_composition`), `src/build/idf_projects.rs` (`read_application`) |
+| The board (chip, BSP, HAL) | the composition's own `board` | scaffold, build | the spec, read back where it is used |
+| The six spec rules | `validate` — never prose in a prompt | the parse door, the scaffold gate | `src/build/application_spec.rs` (`validate`) |
+| Framework choice/justification | the composition's `framework` and `justification` | scaffold, fill | `src/build/idf_projects.rs` (`framework_block`, `framework_prompt_block`) |
+| The design brief | the caller's `description`, read by the Planning model | brief step (`BoardResourceFlowView`) | `src/build/application_spec.rs` (`brief_request`, `brief_application`) |
 | The reviewed decomposition | `ApplicationSpec` | application fill | `src/build/idf_projects.rs:973` |
 | The components' real headers | `<library>/components/<id>/include/<id>.hpp` | application fill | `src/build/idf_projects.rs:923` |
 | The library's `SPIRE.md` | the library root (application) or own root (library) | fill (both), component edit | `src/subsystems/project/project_creation.rs:766`, `src/build/idf_projects.rs:1952` |
@@ -720,17 +730,17 @@ prompts. A design or a rewrite is recomputed from facts each time, which is what
 
 *Illustrative but mechanically accurate — each step is the code path named, in the order it runs.*
 
-1. **A person fills the form.** Goal: "log PM2.5 and temperature every minute and show the reading."
-   Board: `m5stack-core-s3` (chip `esp32s3`, BSP `m5stack_core_s3`), against a library root that
-   `declares_library` recognises. No framework is pinned.
-2. **Design.** `idf_design_application` refuses nothing (board ✓, description ✓, library ✓) and asks the
-   **Planning** model. The prompt is `design_request`: board echoed, the library's existing components,
-   the six questions, the schema, the six rules. The model answers with a spec naming a `pm_sensor`
-   driver (`source: "stub"`, since the library does not have it), an `actors` framework with a sensor
-   actor and a display actor, the wiring between them, and board facts for the display.
-3. **Validate + review.** `validate` checks the six rules exhaustively. Anything wrong becomes a
-   **repair turn** carrying the exact problems — at most three times. Then the board is overwritten
-   with the caller's and a person approves.
+1. **A person writes the composition.** A `composition.spire` against a library root that
+   `declares_library` recognises: the board (`m5stack_core_s3`, chip `esp32s3`), an `actors` framework
+   with a sensor actor and a display actor, the wiring between them, board facts for the display, and a
+   `pm_sensor` driver marked `source: "stub"` because the library does not have it. If the person only
+   has words, `createProject/BriefApplication` reads them into a **brief** first — capabilities and
+   suggested units, and no board.
+2. **Review.** `createProject/ParseComposition` parses the file and `validate` checks the six rules
+   exhaustively; anything wrong is refused **by name**, before a tree exists. Nothing is asked of a model,
+   and what a person approves is exactly what gets scaffolded.
+3. **Approve.** The composition's own board is what the build will target, and the file is the thing to
+   edit if any of it is wrong — which is why the review step names it.
 4. **Scaffold.** `application_scaffold` writes the four templates plus `composition.spire` — the
    decomposition as the YAML file a person opens — `SPIRE.application.json` beside it, stated from that
    same file, and `main/idf_component.yml` for the design's managed dependencies; all structural except
@@ -778,7 +788,7 @@ behaviour is testable rather than hoped for.
 | Question | File |
 |---|---|
 | Routing, design handler, `plan_rewrites`, RAG seam | `crates/spire-code/src/actors/coordinator.rs` |
-| Spec type, `validate`, `design_request`, `design_application` | `crates/spire-code/src/build/application_spec.rs` |
+| Spec type, `validate`, `parse_composition`, `brief_request` | `crates/spire-code/src/build/application_spec.rs` |
 | Scaffolds, component scope, `component_edit_request`, prompts | `crates/spire-code/src/build/idf_projects.rs` |
 | `idf.py` build/flash plans | `crates/spire-code/src/build/idf.rs` |
 | The modify plan, `Verified`, rollback | `crates/spire-code/src/build/modify_code.rs` |
@@ -786,6 +796,6 @@ behaviour is testable rather than hoped for.
 | Prompt text helpers | `crates/spire-code/src/build/generic_helpers.rs` |
 | Fill-plan prompt assembly | `crates/spire-code/src/subsystems/project/project_creation.rs` |
 | Corpus manifests and facts documents | `crates/spire-code/src/actors/rag_bundle.rs`, `resources/device-facts/` |
-| Design plumbing tests (scripted model text) | `crates/spire-code/tests/design_application_llm_tests.rs` |
+| Brief repeatability, against the live model | `crates/spire-code/tests/brief_repeatability_live_tests.rs` |
 | Component-edit tests, incl. the near-miss | `crates/spire-code/tests/idf_component_edit_tests.rs` |
 

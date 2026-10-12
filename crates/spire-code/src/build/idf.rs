@@ -649,7 +649,7 @@ mod tests {
             "a library states no framework — it is built against nothing and belongs to neither"
         );
 
-        // The decomposition the design phase produced and a person reviewed, as the scaffold is given
+        // The decomposition the composition states and a person reviewed, as the scaffold is given
         // it: the framework is stated in the file, and the spec itself is written beside it.
         let designed = crate::build::application_spec::parse_spec(
             crate::build::application_spec::examples::PM25_METER,
@@ -699,7 +699,7 @@ mod tests {
             "an absolute path is written as it was given — the `if(NOT IS_ABSOLUTE …)` is what\n             keeps it from being resolved against this application:\n{}",
             absolute.build_content
         );
-        // The framework the design phase decided is *stated* in the file, so the fill phase, a
+        // The framework the composition states is *stated* in the file, so the fill phase, a
         // person and another tool all read the same choice back instead of inferring one.
         assert_eq!(
             crate::build::application_spec::declared_framework(&application.build_content),

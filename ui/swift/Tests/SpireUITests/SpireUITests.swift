@@ -500,13 +500,13 @@ func projectTypesAreDistinctAndGrouped() {
     ])
 }
 
-/// The **design phase's** reply, as a reviewer reads it.
+/// A **design**, as a reviewer reads it.
 ///
-/// This is the contract between the two halves of the wizard's review step: the Rust side decides the
-/// decomposition (`createProject/DesignApplication`) and this shows it — the framework with the line it
+/// This is the contract between the two halves of the wizard's review step: the Rust side reads the
+/// composition (`createProject/ParseComposition`) and this shows it — the framework with the line it
 /// becomes, the units with what each one *is*, the wiring and the board facts. A field that quietly
 /// stopped decoding would review an empty application and approve it, which is the one outcome the
-/// design phase exists to prevent, so it is pinned against the exact JSON the core produces.
+/// review step exists to prevent, so it is pinned against the exact JSON the core produces.
 @Test("A design reply decodes into what a person reviews")
 func designReplyDecodes() throws {
     let json = """
@@ -616,52 +616,6 @@ func readBackDesignDecodes() throws {
             == "actor on Tick, holding both sensors, uses sps30, sends to air_quality")
     // The composition as the file holds it travels beside the reading, for the panel's lower half.
     #expect((reply["yaml"] as? String)?.contains("framework: actors") == true)
-}
-
-/// The design form's six answers become the `description` the design request is built from.
-///
-/// The labels are load-bearing: the request asks the model to say which question went unanswered rather
-/// than invent a device, an address or a protocol to fill the gap, and a model handed six labelled
-/// paragraphs can see the gap. An empty answer is left out — a blank line under a heading would make an
-/// unanswered question look answered.
-@Test("The design form labels its answers and leaves the blanks out")
-func designFormDescription() {
-    var form = ApplicationDesignForm()
-    #expect(!form.isUsable, "an empty form is not something to design from")
-    #expect(form.description.isEmpty)
-
-    form.purpose = "  A PM2.5 meter with a small screen.  "
-    form.senses = "SPS30 and SHT20 on i2c, about 1 Hz"
-    // `actsOn`, `reactsTo`, `timing` and `missing` are left unanswered on purpose.
-
-    #expect(form.isUsable)
-    #expect(form.description.hasPrefix("What it does: A PM2.5 meter"))
-    #expect(form.description.contains("\n\nWhat it senses: SPS30 and SHT20"))
-    #expect(!form.description.contains("What it acts on"), "a blank answer is not sent as one")
-    #expect(form.answers.count == 6, "the six questions, in the order the request asks them")
-    #expect(form.answers[4].answer.isEmpty)
-}
-
-/// A board is required rather than defaulted, and the rule is the core's: a guessed chip is a build that
-/// fails on hardware. Checked here so the button is disabled rather than the design refused. A BSP is
-/// **not** required — the catalogue has one on one board in ten — so a chip alone is a board.
-@Test("A board needs a chip, and a BSP only when the board has one")
-func boardChoiceRule() {
-    var board = BoardChoice()
-    #expect(!board.isComplete)
-    #expect(board.json["chip"] as? String == "")
-
-    board.chip = " esp32s3 "
-    #expect(board.isComplete, "the chip is what decides the build; a BSP is the board's to offer")
-    #expect(board.json["chip"] as? String == "esp32s3", "the field is trimmed, not sent as typed")
-    #expect(board.json["bsp"] as? String == "", "no BSP is an answer, not a missing one")
-
-    board.bsp = "espressif/m5stack_core_s3"
-    #expect(board.json["bsp"] as? String == "espressif/m5stack_core_s3")
-    #expect(board.json["hal"] == nil)
-
-    board.hal = "m5unified"
-    #expect(board.json["hal"] as? String == "m5unified")
 }
 
 /// A **repair** reply: the rewrites to run, and the two lists that say what a repair would not touch.
@@ -808,43 +762,36 @@ func applicationDefaultsToTheSharedLibrary() {
 }
 
 /// The primary button's rule — and the half it used to be missing: the **form** needs somewhere to put
-/// the project, not only a board and the six answers.
+/// the project, not only a composition to open.
 ///
-/// It was the pairing that failed. A design ran happily with no location chosen, and the *review*
+/// It was the pairing that failed. A composition opened with no location chosen, and the *review*
 /// screen — which has no location field — then offered a Create button that could never enable. So the
-/// rule is pinned as a whole: form ⇒ root **and** board **and** answers; review ⇒ root; and neither
-/// while a creation is in flight.
-@Test("The form cannot be designed without a place to put the project")
+/// rule is pinned as a whole: form ⇒ root; review ⇒ root; and neither while a creation is in flight.
+@Test("The form cannot be opened without a place to put the project")
 func theFormCannotBeDesignedWithoutARoot() {
     func enabled(
         _ stage: CreateProjectSheet.Stage,
         application: Bool = true,
         creating: Bool = false,
-        board: Bool = true,
-        form: Bool = true,
         root: Bool = true
     ) -> Bool {
         CreateProjectSheet.primaryEnabled(
-            stage: stage, isApplication: application, isCreating: creating,
-            boardComplete: board, formUsable: form, canCreate: root
+            stage: stage, isApplication: application, isCreating: creating, canCreate: root
         )
     }
 
     #expect(enabled(.form))
-    // The bug: a board and the answers, but nowhere to put the result.
+    // The bug: a composition to open, but nowhere to put the result.
     #expect(!enabled(.form, root: false),
-            "a design with no location reaches a review screen whose Create button cannot enable")
-    #expect(!enabled(.form, board: false))
-    #expect(!enabled(.form, form: false))
+            "a composition opened with no location reaches a review screen whose Create cannot enable")
 
     // At review the root is all that is left, and a project is never created twice.
-    #expect(enabled(.review, board: false, form: false))
+    #expect(enabled(.review))
     #expect(!enabled(.review, root: false))
     #expect(!enabled(.review, creating: true))
-    #expect(!enabled(.designing))
 
     // A non-application has no design stage: the button simply follows the root.
-    #expect(enabled(.form, application: false, board: false, form: false))
+    #expect(enabled(.form, application: false))
     #expect(!enabled(.form, application: false, root: false))
 }
 
@@ -999,59 +946,42 @@ func theBuildRecordsOutputIsBounded() {
         .contains("build output"))
 }
 
-/// The build runs for the **design's** chip, not the form's picker — which a loaded composition left
-/// empty.
+/// The build runs for the chip the **composition** names, which is the only board there is.
 ///
-/// Opening a composition fills no form, so `board.chip` is empty while the design's own `board.chip`
-/// carries the file's board. Reading the form first handed the build no platform, and no platform
+/// A composition states its own board, so there is no form picker to fall back to — and no platform
 /// routes a `CMakeLists.txt` tree to the CMake module (`cmake --build build`) instead of the ESP-IDF
-/// one (`idf.py build`) — which is how a real, never-configured ESP-IDF project failed with "`build`
-/// is not a directory" instead of building. The scaffold is told the same chip, so the recorded
-/// targets and the build's module cannot disagree.
-@Test("The build runs for the design's chip, even when the form's picker is empty")
+/// one (`idf.py build`), which is how a real, never-configured ESP-IDF project failed with "`build` is
+/// not a directory" instead of building. The scaffold is told the same chip, so the recorded targets
+/// and the build's module cannot disagree.
+@Test("The build runs for the chip the composition names")
 func theBuildRunsForTheDesignsChip() {
-    // The load path: the form was never filled, so the design is the only board there is.
-    #expect(CreateProjectSheet.buildPlatform(designChip: "esp32s3", formChip: "") == "esp32s3",
-            "a loaded composition builds for the file's own board")
+    #expect(CreateProjectSheet.buildPlatform(designChip: "esp32s3") == "esp32s3",
+            "a composition builds for its own board")
 
-    // The designed path: the form *is* the design, so the two agree and the answer is the same one.
-    #expect(CreateProjectSheet.buildPlatform(designChip: "esp32s3", formChip: "esp32s3") == "esp32s3")
-
-    // With no design at all the form still decides, which is the shape a scaffold without one has.
-    #expect(CreateProjectSheet.buildPlatform(designChip: nil, formChip: "rpi5") == "rpi5")
-
-    // Neither names a chip: a host build, which is what a scaffold without a board means.
-    #expect(CreateProjectSheet.buildPlatform(designChip: nil, formChip: "") == nil)
-    #expect(CreateProjectSheet.buildPlatform(designChip: "", formChip: "") == nil,
-            "an empty design chip is not a chip")
+    // No chip named is no chip at all: a host build, which is what a scaffold without a board means.
+    #expect(CreateProjectSheet.buildPlatform(designChip: nil) == nil)
+    #expect(CreateProjectSheet.buildPlatform(designChip: "") == nil, "an empty chip is not a chip")
 }
 
-/// The platform decision is written down — both inputs and what they resolved to — so a run inside a
+/// The platform decision is written down — the input and what it resolved to — so a run inside a
 /// process launched before a fix was linked is distinguishable from a broken rule.
 ///
 /// The failure this pins is a puzzle that cost a session: the same `cmake --build build` error after
 /// the rule was fixed, because the app doing the create had been launched *before* the fixed binary
-/// was assembled. The line reading `design.chip=nil form.chip=nil` for a composition whose tree names
-/// a chip is the tell — the inputs were empty, so the old rule's answer was reproduced by the old
-/// binary, not by this one.
-@Test("The platform decision is logged with both inputs and the platform it resolved to")
+/// was assembled. The line reading `design.chip=nil -> nil` for a composition whose tree names a chip
+/// is the tell — the input was empty, so the old rule's answer was reproduced by the old binary, not
+/// by this one.
+@Test("The platform decision is logged with its input and the platform it resolved to")
 func thePlatformDecisionIsLogged() {
-    // The load path: the design's chip decides, the form's empty picker does not, and the line says so.
-    #expect(CreateProjectSheet.buildPlatformLogLine(designChip: "esp32s3", formChip: "")
+    #expect(CreateProjectSheet.buildPlatformLogLine(designChip: "esp32s3")
             == "CreateProjectSheet.create() platform: design.chip=esp32s3 "
-                + "form.chip=nil -> esp32s3 platforms=[\"esp32s3\"]",
+                + "-> esp32s3 platforms=[\"esp32s3\"]",
             "the line names the input that decided and the platforms the scaffold will record")
 
-    // The shape a stale binary produces, and the reason the line exists: both inputs empty, no
-    // platform — which is correct for this input and wrong for a tree that names a chip.
-    #expect(CreateProjectSheet.buildPlatformLogLine(designChip: nil, formChip: "")
-            == "CreateProjectSheet.create() platform: design.chip=nil "
-                + "form.chip=nil -> nil platforms=[]")
-
-    // The designed path: the form is the design, so the line's two inputs agree.
-    #expect(CreateProjectSheet.buildPlatformLogLine(designChip: "esp32s3", formChip: "esp32s3")
-            == "CreateProjectSheet.create() platform: design.chip=esp32s3 "
-                + "form.chip=esp32s3 -> esp32s3 platforms=[\"esp32s3\"]")
+    // The shape a stale binary produces, and the reason the line exists: no input, no platform — which
+    // is correct for this input and wrong for a tree that names a chip.
+    #expect(CreateProjectSheet.buildPlatformLogLine(designChip: nil)
+            == "CreateProjectSheet.create() platform: design.chip=nil -> nil platforms=[]")
 }
 
 /// **A component the design says is already here and is not** stops the run before a file is written,
@@ -1373,7 +1303,7 @@ func boardProfileDecodesDevices() throws {
         "the core sends them in name order, and the flow shows them in that order")
 
     let display = try #require(profile.devices.first { $0.name == "display" })
-    #expect(display.role == "media.display")
+    #expect(display.roles == ["media.display"], "the scalar `role` decodes as a one-element list")
     #expect(display.part == "ILI9342C")
     #expect(display.bus == "display")
     #expect(display.address == "", "a part the board gave no address is empty, not \"\" written by the core")
@@ -1388,6 +1318,47 @@ func boardProfileDecodesDevices() throws {
     #expect(profile.realizes.first?.capability == "io.usb")
     #expect(profile.pins.map(\.function).contains("i2c_internal"), "the wiring reads back too")
 }
+
+/// A **multi-role** device — one part, several capabilities (the SHT20 is temperature *and* humidity).
+/// The `roles` list decodes whole, the board *carries* the part by every role (so the catalogue leaves
+/// each of them to the part row), and the resource draft the flow produces names them all — one device,
+/// one resource, several roles.
+@Test("A board device may carry several roles, and the flow reads them all")
+func boardDeviceCarriesSeveralRoles() throws {
+    let json = """
+    { "board": "diy-sht20", "realizes": [], "carries": [], "pins": [],
+      "devices": [
+        { "name": "sht20", "properties": { "bus": "i2c_internal", "part": "SHT20", "address": "0x40" },
+          "roles": ["sensing.temperature", "sensing.humidity"] }
+      ] }
+    """
+    let profile = try JSONDecoder().decode(BoardProfile.self, from: Data(json.utf8))
+    let sht20 = try #require(profile.devices.first)
+    #expect(sht20.roles == ["sensing.temperature", "sensing.humidity"], "the list form decodes whole")
+    #expect(sht20.rolesLabel == "sensing.temperature, sensing.humidity")
+    #expect(sht20.carries(role: "sensing.humidity") && !sht20.carries(role: "media.display"))
+
+    var state = BoardResourceFlowState()
+    state.choose(boardID: "diy-sht20", profile: profile)
+    #expect(
+        state.boardCarriesRole("sensing.temperature") && state.boardCarriesRole("sensing.humidity"),
+        "the board carries the part by *both* roles")
+    // A carried role is the board's, so the catalogue leaves it alone — even the second role of a part
+    // the board declares only once.
+    state.toggleCatalogueResource(role: "sensing.humidity")
+    #expect(state.resources.isEmpty, "the part row is the only control for either role")
+
+    state.toggleBoardPart(name: "sht20")
+    let draft = try #require(state.resources.first)
+    #expect(draft.roles == ["sensing.temperature", "sensing.humidity"], "the part carries both roles")
+    #expect(
+        draft.json["roles"] as? [String] == ["sensing.temperature", "sensing.humidity"],
+        "the spec carries the list, not a scalar")
+    #expect(state.declaresRole("sensing.humidity"), "either role is covered by the one resource")
+    #expect(state.declaredVia(role: "sensing.temperature") == .board)
+    #expect(!state.boardCarriesRole("media.display"), "a role nothing declares is not carried")
+}
+
 
 /// The **capability vocabulary** decodes as categories of paths — the catalogue a resource's role is
 /// picked from, and the same one the core validates against.
@@ -1512,9 +1483,9 @@ func boardResourceFlowTogglesParts() throws {
     state.toggleBoardPart(name: "rtc")
     let rtc = try #require(state.resources.first { $0.name == "rtc" })
     #expect(rtc.json["address"] as? String == "0x51")
-    #expect(rtc.role == "timekeeping.rtc")
+    #expect(rtc.roles.contains("timekeeping.rtc"))
     #expect(
-        state.resources.contains { $0.role == "timekeeping.rtc" },
+        state.resources.contains { $0.roles.contains("timekeeping.rtc") },
         "the selected part covers its capability — what the catalogue reads to disable a twin")
 
     // A catalogue path: named by the role's last segment, reached through the library in v1.
@@ -1574,6 +1545,177 @@ func boardResourceFlowTogglesParts() throws {
         "the new board's palette arrives unselected; the application's addition stays")
 
     #expect(!BoardResourceFlowState().canContinue, "no board, nothing to continue with")
+}
+
+/// The **design brief** the describe step reads: it decodes tolerantly (a missing key is *nothing
+/// said*, not a dead step), and what it names drives the board-fit read and the `Needed` badges —
+/// without ever gating Continue. That last point is the whole design: the brief is a guide.
+@Test("The design brief decodes and steers the resources step")
+func designBriefSteersResources() throws {
+    // What the core sends: a brief with every field, and the description read against all six points.
+    let json = """
+    {
+      "summary": "A PM2.5 meter with a touch screen.",
+      "framework": "actors",
+      "requires": ["sensing.particulate", "media.display"],
+      "suggests": ["sampler", "view"],
+      "points": [
+        { "point": "purpose", "said": "reads particulate and shows it" },
+        { "point": "senses", "said": "particulate, once a second" },
+        { "point": "acts_on", "said": "the display" },
+        { "point": "reacts_to", "said": "a periodic tick" },
+        { "point": "timing", "said": "a reading a second against a human-rate UI" },
+        { "point": "missing", "said": "", "decided": "keeps the last value and shows --" }
+      ]
+    }
+    """
+    let brief = try JSONDecoder().decode(DesignBrief.self, from: Data(json.utf8))
+    #expect(brief.framework == "actors")
+    #expect(brief.requires == ["sensing.particulate", "media.display"])
+    #expect(brief.requiresLabel == "sensing.particulate, media.display")
+    #expect(!brief.isEmpty)
+
+    // **Six rows, always.** The card iterates `BriefPoint.allCases`, so a point the model skipped is a
+    // blank row under a label rather than a shorter list — which is exactly what let the old `gaps` count
+    // move between two reads of one text with nothing on screen saying which question had gone.
+    #expect(BriefPoint.allCases.count == 6)
+    #expect(brief.reading(of: .senses)?.said == "particulate, once a second")
+    #expect(
+        brief.reading(of: .missing)?.decided == "keeps the last value and shows --",
+        "the point the text left open is decided, not asked")
+    #expect(brief.reading(of: .purpose)?.isBlank == false)
+
+    // A thin brief is an answer, not a failure: absent keys fall back rather than throwing, and a point
+    // nobody read is simply not found — which the row draws as `not read`.
+    let thin = try JSONDecoder().decode(
+        DesignBrief.self, from: Data(#"{ "summary": "something" }"#.utf8))
+    #expect(thin.framework == nil)
+    #expect(thin.requires.isEmpty && thin.suggests.isEmpty)
+    #expect(thin.points.isEmpty && thin.forks.isEmpty)
+    #expect(thin.reading(of: .purpose) == nil, "an unread point has no reading to draw")
+    #expect(!thin.isEmpty, "a summary is something")
+    #expect(DesignBrief().isEmpty, "an empty brief says nothing")
+
+    // A board whose palette carries the display but **not** the particulate capability — so the fit
+    // read has something to say.
+    let profileJSON = """
+    {
+      "board": "diy-pm25",
+      "realizes": [], "carries": [], "pins": [],
+      "devices": [
+        { "name": "display", "properties": { "bus": "display", "part": "ILI9342C" }, "roles": ["media.display"] }
+      ]
+    }
+    """
+    let profile = try JSONDecoder().decode(BoardProfile.self, from: Data(profileJSON.utf8))
+
+    var state = BoardResourceFlowState()
+    #expect(!state.canLeaveDescribe, "without a description there is nothing to read")
+    state.description = "a PM2.5 meter"
+    #expect(state.canLeaveDescribe, "a description is enough to move on — the brief is optional")
+    state.brief = brief
+
+    // Board fit: the display is carried as a part, the particulate capability is not.
+    state.choose(boardID: "diy-pm25", profile: profile)
+    #expect(state.requirementsNotOnBoard(brief) == ["sensing.particulate"])
+    #expect(state.isRequired("media.display") && !state.isRequired("sensing.temperature"))
+    #expect(!BoardResourceFlowState().isRequired("media.display"), "no brief, no badges")
+
+    // Nothing is declared yet, so both capabilities are uncovered — a warning, never a gate: the flow's
+    // own rule is still what disables Continue.
+    #expect(state.uncoveredRequirements(brief) == brief.requires)
+    #expect(!state.canContinue, "the brief does not decide Continue; the resource rule does")
+
+    // Selecting the board's part covers that capability...
+    state.toggleBoardPart(name: "display")
+    #expect(state.uncoveredRequirements(brief) == ["sensing.particulate"])
+    // ...and adding the missing one covers the rest, so nothing is left uncovered.
+    state.toggleCatalogueResource(role: "sensing.particulate")
+    #expect(state.uncoveredRequirements(brief).isEmpty)
+    #expect(state.canContinue, "and with a part and a role the flow may go on")
+}
+
+/// **A fork is answered by picking, not by writing.** The brief that comes back with a decision open stays
+/// exactly as the model read it; the person's answer is kept beside it and resolved onto what the later
+/// steps read — so picking changes the capabilities the board fit and the badges see, and changing your
+/// mind swaps the answer rather than piling the paths of both up.
+@Test("A fork's answer merges the capabilities it carries into the brief the flow reads")
+func forkAnswersMergeIntoTheBrief() throws {
+    let json = """
+    {
+      "summary": "A temperature logger.",
+      "framework": "actors",
+      "requires": ["sensing.temperature"],
+      "suggests": ["sampler"],
+      "forks": [
+        { "point": "purpose", "question": "Where do the readings go?",
+          "choices": [
+            { "label": "SD card", "requires": ["storage.sd"], "suggests": ["logger"] },
+            { "label": "WiFi upload", "requires": ["radio.wifi"], "suggests": ["uploader"] }
+          ] }
+      ]
+    }
+    """
+    let brief = try JSONDecoder().decode(DesignBrief.self, from: Data(json.utf8))
+    #expect(brief.forks.first?.briefPoint == .purpose, "the fork sits under the point it belongs to")
+    var state = BoardResourceFlowState()
+    state.description = "a temperature logger"
+    state.brief = brief
+
+    // Nothing picked yet: the draft is the model's own reading, untouched.
+    #expect(state.resolvedBrief?.requires == ["sensing.temperature"])
+    #expect(state.resolvedBrief?.suggests == ["sampler"])
+    #expect(!state.isRequired("storage.sd"), "an unpicked fork decides nothing")
+
+    // Picking the first answer adds exactly what it carries...
+    state.toggleFork(0, 0)
+    #expect(state.resolvedBrief?.requires == ["sensing.temperature", "storage.sd"])
+    #expect(state.resolvedBrief?.suggests == ["sampler", "logger"])
+    #expect(state.isRequired("storage.sd"), "the badges read the answer, not the model's draft")
+
+    // ...changing your mind swaps it rather than piling up...
+    state.toggleFork(0, 1)
+    #expect(state.resolvedBrief?.requires == ["sensing.temperature", "radio.wifi"])
+    #expect(!state.isRequired("storage.sd"))
+
+    // ...answering the same choice twice takes the answer back, and a fresh reading drops the picks so
+    // an answer to the previous brief can never land on the new one.
+    state.toggleFork(0, 1)
+    #expect(state.forkPicks.isEmpty)
+    #expect(state.resolvedBrief?.requires == ["sensing.temperature"])
+    state.toggleFork(0, 0)
+    state.clearForkPicks()
+    #expect(state.forkPicks.isEmpty)
+    #expect(state.resolvedBrief?.suggests == ["sampler"])
+    #expect(
+        state.brief?.requires == ["sensing.temperature"],
+        "the model's own reading is never overwritten — only resolved onto")
+}
+
+/// The brief's **suggested units** seed the actor step: a row per suggestion, added **once** however
+/// many times the step is entered, never colliding with a resource name or an id the person wrote, and
+/// only when the suggestion is already a legal `lower_snake` id — an advisory name the person did not
+/// write is not worth an error next to it.
+@Test("The brief's suggested units seed the actor step")
+func briefSuggestionsSeedActors() throws {
+    var state = ActorAssignmentState(
+        board: nil,
+        resources: [ResourceDraft(name: "particulate", roles: ["sensing.particulate"], via: .library)]
+    )
+
+    state.suggestActors(["sampler", "view", "particulate", "Air Quality", "sampler"])
+    #expect(
+        state.actors.map(\.id) == ["sampler", "view"],
+        "one row each, no duplicate, no resource collision and no illegal id")
+
+    // Syncing on every (re)entry is what makes it idempotent: the person's rows are kept, and the
+    // suggestions already present are not added twice.
+    _ = state.addActor()
+    state.actors[state.actors.count - 1].id = "custom"
+    state.suggestActors(["sampler", "custom"])
+    #expect(
+        state.actors.map(\.id) == ["sampler", "view", "custom"],
+        "re-entering the step adds nothing")
 }
 
 /// A `platforms/list`-shaped fixture — the fields a `Platform` needs, with `kind` present only when
@@ -1638,4 +1780,411 @@ private let profileFixture = """
   ]
 }
 """
+
+
+// --- the actor-assignment step: who owns each resource, and who talks to whom --------------------
+
+/// The board the assignment tests build for: a **board** (not a chip) that names its silicon, its
+/// BSP and its HAL, so the assembled spec's `board` is whole rather than a shape the core would
+/// refuse to build.
+private func assignmentBoard() throws -> Platform {
+    let json = """
+    {
+      "id": "m5stack-core-s3", "name": "M5Stack CoreS3", "os": "esp-idf",
+      "architecture": {
+        "cpu_family": "xtensa", "cpu": "esp32s3", "endian": "little",
+        "target_triple": "riscv32imac-esp-espidf"
+      },
+      "toolchain": {
+        "c": "c", "cpp": "cpp", "ar": "ar", "strip": "strip",
+        "c_args_extra": [], "cpp_args_extra": [], "linker_args_extra": [], "needs_exe_wrapper": false
+      },
+      "sysroot": { "root": "", "lib_dirs": [], "include_dirs": [], "pkg_config_libdir": [] },
+      "kind": "board", "embedded": true,
+      "chip": "esp32s3", "bsp": "m5stack_core_s3",
+      "hal": { "crate": "m5unified", "version": "0.2", "features": [] }
+    }
+    """
+    return try JSONDecoder().decode(Platform.self, from: Data(json.utf8))
+}
+
+/// The assignment mirrors the core's rules. Ownership is **structural** — one device, one owner — so
+/// re-assigning a resource *moves* it rather than sharing it (rule 8), and every other rule the core
+/// would refuse is reported while the person can still fix it: an id that is not lower_snake (rule 1),
+/// an actor with no message (rule 2), a `library` resource that needs a driver bus (rule 4), and an
+/// actor no edge names (rule 6).
+@Test("Assigning a resource moves it, and the step names every rule it cannot satisfy")
+func actorAssignmentMovesOwnershipAndGatesContinue() throws {
+    let board = try assignmentBoard()
+    let resources = [
+        ResourceDraft(name: "display", roles: ["media.display"], via: .board, bus: "display"),
+        ResourceDraft(name: "particulate", roles: ["sensing.particulate"], via: .library, bus: "i2c"),
+    ]
+    var state = ActorAssignmentState(board: board, resources: resources)
+
+    // Nothing owns anything: rule 8's reachable half, plus there being no actor to own with.
+    #expect(state.unownedResources.map(\.name) == ["display", "particulate"])
+    #expect(!state.canContinue)
+    #expect(state.problems.contains { $0.contains("no owner") })
+    #expect(state.problems.contains { $0.contains("no actors") })
+
+    // An id is lower_snake — the shape the unit's directory and class will have.
+    #expect(ActorAssignmentState.isIdentifier("air_quality"))
+    #expect(ActorAssignmentState.isIdentifier("sps30"))
+    #expect(!ActorAssignmentState.isIdentifier("AirQuality"))
+    #expect(!ActorAssignmentState.isIdentifier("_leading"))
+    #expect(!ActorAssignmentState.isIdentifier("trailing_"))
+    #expect(!ActorAssignmentState.isIdentifier("double__underscore"))
+    #expect(!ActorAssignmentState.isIdentifier("a-b"))
+    #expect(!ActorAssignmentState.isIdentifier(""))
+
+    let sampler = state.addActor()
+    let view = state.addActor()
+    state.actors[0].id = "sampler"
+    state.actors[0].message = "Tick"
+    state.actors[1].id = "view"
+    state.actors[1].message = "Report"
+
+    // A `library` resource is driven by a driver this project writes, and a driver states its bus.
+    state.resources[1].bus = ""
+    #expect(state.problems.contains { $0.contains("needs a driver bus") })
+    state.resources[1].bus = "i2c"
+
+    // The board's part goes to the view, the added sensor to the sampler: what each `uses` will be.
+    state.assign("display", to: view)
+    state.assign("particulate", to: sampler)
+    #expect(state.ownerID(of: "display") == "view")
+    #expect(state.ownerUID(of: "particulate") == sampler)
+    #expect(state.resourcesOwned(by: sampler) == ["particulate"])
+
+    // Re-assigning **moves** it — one device, one owner, never shared.
+    state.assign("particulate", to: view)
+    #expect(state.resourcesOwned(by: sampler).isEmpty)
+    #expect(state.resourcesOwned(by: view) == ["display", "particulate"])
+    #expect(state.owners.count == 2, "two resources, two owners — a resource is never shared")
+
+    // Both actors are wired to nobody: an actor no edge names is the invented unit rule 6 refuses.
+    #expect(!state.isReferenced(sampler))
+    #expect(state.problems.filter { $0.contains("wired to nobody") }.count == 2)
+
+    // "sends to" is the source of truth; the `wiring` is its rendering, deduplicated and sorted, and
+    // the per-unit `sends_to` reads off the same list.
+    state.toggleSend(from: view, to: sampler)
+    state.toggleSend(from: sampler, to: view)
+    state.toggleSend(from: sampler, to: sampler)  // an actor cannot send to itself
+    #expect(state.wiring == ["sampler -> view", "view -> sampler"])
+    #expect(state.sendsToIDs(of: view) == ["sampler"])
+    #expect(state.isReferenced(sampler) && state.isReferenced(view))
+    #expect(state.canContinue, "a complete assignment: \(state.problems)")
+
+    // An actor *is* a message type (rule 2).
+    state.actors[1].message = ""
+    #expect(state.problems.contains { $0.contains("no message") })
+    state.actors[1].message = "Report"
+
+    // An id is unique (rule 1), and a unit id may not be a resource's name — that would shadow the
+    // board's part (rule 7) or collide with its driver (rule 1).
+    state.actors[1].id = "sampler"
+    #expect(state.problems.contains { $0.contains("used by two actors") })
+    state.actors[1].id = "particulate"
+    #expect(state.problems.contains { $0.contains("both an actor and a resource") })
+    state.actors[1].id = "view"
+    #expect(state.canContinue, "\(state.problems)")
+
+    // Removing an actor leaves its resources **unowned** and drops every edge that named it, rather
+    // than quietly handing them on or leaving a `sends_to` that resolves to nothing. By now the view
+    // owns both resources (particulate was moved to it), so it is the one to remove.
+    #expect(state.resourcesOwned(by: view) == ["display", "particulate"])
+    state.removeActor(view)
+    #expect(state.owners.isEmpty)
+    #expect(state.ownerUID(of: "particulate") == nil)
+    #expect(state.problems.contains { $0.contains("no owner") })
+    #expect(state.actors.count == 1)
+    #expect(state.wiring.isEmpty, "the only edges into or out of the removed actor are gone")
+}
+
+/// The actor list reads as **what each actor is** rather than a form: the derived summary is the same
+/// reading the review gives a unit — the message, the state it holds, the devices it owns and the peers
+/// it posts to — collapsed to one line, so the decomposition can be checked at a glance (nothing owning
+/// the display or the touch is exactly the gap a person is looking for). It is **derived** from the very
+/// fields the spec is assembled from, so it cannot drift from what would be built.
+@Test("An actor's summary says what it does, derived from the fields the spec is built from")
+func actorSummarySaysWhatItDoes() throws {
+    let board = try assignmentBoard()
+    let resources = [
+        ResourceDraft(name: "particulate", roles: ["sensing.particulate"], via: .library, bus: "i2c"),
+        ResourceDraft(name: "display", roles: ["media.display"], via: .board, bus: "display"),
+    ]
+    var state = ActorAssignmentState(board: board, resources: resources)
+
+    let sampler = state.addActor()
+    let view = state.addActor()
+    state.actors[0].id = "sampler"
+    state.actors[1].id = "view"
+
+    // Nothing filled in yet: the summary is honest about the gap rather than inventing a message.
+    #expect(state.summary(of: sampler) == "on an unnamed message")
+
+    // Fill the sampler in — a message, the state it holds, the device it owns, the peer it posts to.
+    state.actors[0].message = "Tick"
+    state.actors[0].state = "the last reading"
+    state.actors[1].message = "Report"
+    state.assign("particulate", to: sampler)
+    state.toggleSend(from: sampler, to: view)
+    #expect(
+        state.summary(of: sampler)
+            == "on Tick · holds the last reading · uses particulate · sends to view"
+    )
+
+    // The other side reads from *its* fields: a message and nothing else.
+    #expect(state.summary(of: view) == "on Report")
+
+    // The same reading the assembled spec carries — the summary is a view of the spec, not a second
+    // description of it.
+    let unit = try #require(state.design?.composition.first { $0.id == "sampler" })
+    #expect(unit.summary == "actor on Tick, holding the last reading, uses particulate, sends to view")
+}
+
+
+/// A `library` resource arrives from the board step with no driver bus, and the step fills the common
+/// one in rather than leaving the person facing a blank "needs a driver bus". It is a **starting
+/// point** on the resource's own row, not a hidden decision: the field shows it and the person can
+/// change it, which is why the spec still states the bus explicitly.
+@Test("A library resource is given a starting driver bus when the step is entered")
+func actorAssignmentDefaultsTheDriverBus() throws {
+    let board = try assignmentBoard()
+    var state = ActorAssignmentState()
+    // The board's own part carries its **wiring function**; the addition has no bus yet, and the
+    // published one can never be finished here (its registry component is not named).
+    state.sync(
+        board: board,
+        resources: [
+            ResourceDraft(name: "display", roles: ["media.display"], via: .board, bus: "display"),
+            ResourceDraft(name: "particulate", roles: ["sensing.particulate"], via: .library),
+            ResourceDraft(name: "sps30", roles: ["sensing.particulate"], via: .published),
+        ])
+
+    let bus = { (name: String) in state.resources.first { $0.name == name }?.bus }
+    // The library resource is filled in with the default, so rule 4's warning never appears.
+    #expect(bus("particulate") == ActorAssignmentState.defaultDriverBus)
+    #expect(!state.problems.contains { $0.contains("driver bus") })
+    // A board part's `bus` is the board's wiring function: the step must not overwrite it.
+    #expect(bus("display") == "display")
+    // A `published` resource's bus belongs to its registry component, which this step cannot name —
+    // it is refused on its own terms rather than silently given a bus.
+    #expect(bus("sps30") == "")
+    #expect(state.problems.contains { $0.contains("published resource") })
+}
+
+
+/// The assembled **spec**: what the step writes when nothing stands in its way. The board's own part
+/// has no component (the BSP reaches it), the added sensor's driver carries its **id as the resource
+/// name** — the rule the core enforces — and `uses` is what makes that driver *referenced* rather
+/// than the invented unit rule 6 refuses. The review reader opens the same JSON, so what a person
+/// approves is the spec that would validate.
+@Test("The actor assignment assembles an actors spec the review reader opens")
+func actorAssignmentAssemblesASpec() throws {
+    let board = try assignmentBoard()
+    var state = ActorAssignmentState(
+        board: board,
+        resources: [
+            ResourceDraft(name: "display", roles: ["media.display"], via: .board, bus: "display"),
+            ResourceDraft(
+                name: "sps30", roles: ["sensing.particulate"], via: .library,
+                bus: "i2c", address: "0x69"),
+        ])
+    let sampler = state.addActor()
+    let view = state.addActor()
+    state.actors[0].id = "sampler"
+    state.actors[0].message = "Tick"
+    state.actors[0].state = "reads the sensor"
+    state.actors[1].id = "view"
+    state.actors[1].message = "Report"
+    state.assign("sps30", to: sampler)
+    state.assign("display", to: view)
+    state.toggleSend(from: sampler, to: view)
+    #expect(state.canContinue, "\(state.problems)")
+
+    let json = state.specJSON
+    #expect(json["framework"] as? String == "actors")
+    #expect(state.wiring == ["sampler -> view"])
+
+    let boardJSON = try #require(json["board"] as? [String: Any])
+    #expect(boardJSON["chip"] as? String == "esp32s3")
+    #expect(boardJSON["bsp"] as? String == "m5stack_core_s3")
+    #expect(boardJSON["hal"] as? String == "m5unified")
+
+    // The board's own part has no component; the added sensor's driver has the resource name as its
+    // id, which is the rule the core checks.
+    let units = try #require(json["units"] as? [[String: Any]])
+    let driver = try #require(units.first { $0["id"] as? String == "sps30" })
+    #expect(driver["kind"] as? String == "component")
+    #expect(driver["role"] as? String == "driver")
+    #expect(driver["source"] as? String == "stub")
+    #expect(driver["bus"] as? String == "i2c")
+    #expect(driver["provides"] as? String == "sensing.particulate")
+    #expect(
+        units.contains { $0["id"] as? String == "display" } == false,
+        "a board part is reached through the BSP and has no driver")
+
+    let actor = try #require(units.first { $0["id"] as? String == "sampler" })
+    #expect(actor["kind"] as? String == "actor")
+    #expect(actor["message"] as? String == "Tick")
+    #expect(actor["state"] as? String == "reads the sensor")
+    #expect(actor["uses"] as? [String] == ["sps30"])
+    #expect(actor["sends_to"] as? [String] == ["view"])
+
+    let resources = try #require(json["resources"] as? [[String: Any]])
+    #expect(resources.count == 2)
+    #expect(resources.first { $0["name"] as? String == "sps30" }?["via"] as? String == "library")
+    #expect(resources.first { $0["name"] as? String == "display" }?["via"] as? String == "board")
+
+    // A board fact carries the address the *product* knows, and only a driver this project writes
+    // has one.
+    let facts = try #require(json["board_facts"] as? [[String: Any]])
+    #expect(facts.count == 1)
+    #expect(facts[0]["bus"] as? String == "i2c")
+    #expect(facts[0]["device"] as? String == "sps30")
+    #expect(facts[0]["address"] as? String == "0x69")
+
+    // The review reader opens it: one reader for a spec, so what is reviewed is what validates.
+    let design = try #require(state.design)
+    #expect(design.framework == "actors")
+    #expect(design.board.chip == "esp32s3")
+    #expect(design.components.map(\.id) == ["sps30"])
+    #expect(design.composition.map(\.id) == ["sampler", "view"])
+    #expect(design.componentsToWrite.map(\.id) == ["sps30"])
+    #expect(design.componentsFromRegistry.isEmpty)
+    #expect(design.edges == ["sampler -> view"])
+    #expect(design.facts.map(\.device) == ["sps30"])
+
+    // Re-syncing with the same resources keeps the actors already written — going back to add a
+    // device must not throw the composition away.
+    state.sync(board: board, resources: state.resources)
+    #expect(state.actors.count == 2)
+    #expect(state.owners.count == 2)
+    #expect(state.specJSON["wiring"] as? [String] == ["sampler -> view"])
+}
+
+/// The **prose** the person wrote travels into the assembled spec: the whole application's description
+/// and each actor's own sentence, so the code the scaffold generates is headed with the same words the
+/// design was reviewed against. The review reader opens the same JSON, so the sentence a person approves
+/// is the sentence the code carries.
+@Test("The person's prose rides into the assembled spec and back out of the review reader")
+func actorAssignmentCarriesTheProse() throws {
+    let board = try assignmentBoard()
+    var state = ActorAssignmentState(
+        board: board,
+        resources: [
+            ResourceDraft(
+                name: "sps30", roles: ["sensing.particulate"], via: .library, bus: "i2c",
+                address: "0x69")
+        ])
+    state.sync(
+        board: board, resources: state.resources,
+        description: "A particulate monitor: sample, average, show.")
+    let sampler = state.addActor()
+    let view = state.addActor()
+    state.actors[0].id = "sampler"
+    state.actors[0].message = "Tick"
+    state.actors[0].description = "wakes on the timer and reads the sensor."
+    state.actors[1].id = "view"
+    state.actors[1].message = "Report"
+    state.assign("sps30", to: sampler)
+    state.toggleSend(from: sampler, to: view)
+    #expect(state.canContinue, "\(state.problems)")
+
+    let json = state.specJSON
+    #expect(json["description"] as? String == "A particulate monitor: sample, average, show.")
+    let units = try #require(json["units"] as? [[String: Any]])
+    let unit = try #require(units.first { $0["id"] as? String == "sampler" })
+    #expect(unit["description"] as? String == "wakes on the timer and reads the sensor.")
+
+    // The review reader opens it — one reader for a spec, so what is reviewed is what validates.
+    let design = try #require(state.design)
+    #expect(design.description == "A particulate monitor: sample, average, show.")
+    #expect(
+        design.composition.first { $0.id == "sampler" }?.description
+            == "wakes on the timer and reads the sensor.")
+}
+
+/// Absent prose is **omitted**, not written empty: a spec with none is exactly the spec it always was,
+/// at both levels. This is what keeps the field additive — an application built without prose produces
+/// the same JSON record it produced before prose existed.
+@Test("A spec with no prose writes no description key at either level")
+func actorAssignmentOmitsAbsentProse() throws {
+    let board = try assignmentBoard()
+    var state = ActorAssignmentState(
+        board: board,
+        resources: [
+            ResourceDraft(
+                name: "sps30", roles: ["sensing.particulate"], via: .library, bus: "i2c",
+                address: "0x69")
+        ])
+    state.sync(board: board, resources: state.resources)
+    let sampler = state.addActor()
+    let view = state.addActor()
+    state.actors[0].id = "sampler"
+    state.actors[0].message = "Tick"
+    state.actors[1].id = "view"
+    state.actors[1].message = "Report"
+    state.assign("sps30", to: sampler)
+    state.toggleSend(from: sampler, to: view)
+    #expect(state.canContinue, "\(state.problems)")
+
+    let json = state.specJSON
+    #expect(json["description"] == nil, "no whole-application prose writes no key")
+    let units = try #require(json["units"] as? [[String: Any]])
+    let unit = try #require(units.first { $0["id"] as? String == "sampler" })
+    #expect(unit["description"] == nil, "and no actor prose writes none either")
+
+    let design = try #require(state.design)
+    #expect(design.description == nil)
+}
+
+/// The **assembled spec** for a multi-role device: the resource carries every role and the driver the
+/// step writes says it provides all of them. This is the seam the Rust `validate` reads — one device,
+/// several capabilities, one driver found by name — so the shape the UI emits is the one the core accepts.
+@Test("A multi-role resource assembles a spec that names every role")
+func actorAssignmentAssemblesMultiRoleSpec() throws {
+    let board = try assignmentBoard()
+    var state = ActorAssignmentState(
+        board: board,
+        resources: [
+            ResourceDraft(
+                name: "sht20",
+                roles: ["sensing.temperature", "sensing.humidity"],
+                via: .library, bus: "i2c", address: "0x40"),
+        ])
+    let sampler = state.addActor()
+    let view = state.addActor()
+    state.actors[0].id = "sampler"
+    state.actors[0].message = "Tick"
+    state.actors[1].id = "view"
+    state.actors[1].message = "Report"
+    state.assign("sht20", to: sampler)
+    state.toggleSend(from: sampler, to: view)
+    #expect(state.canContinue, "\(state.problems)")
+
+    let json = state.specJSON
+    let resources = try #require(json["resources"] as? [[String: Any]])
+    #expect(
+        resources.first { $0["name"] as? String == "sht20" }?["roles"] as? [String]
+            == ["sensing.temperature", "sensing.humidity"],
+        "the resource names both capabilities")
+
+    let units = try #require(json["units"] as? [[String: Any]])
+    let driver = try #require(units.first { $0["id"] as? String == "sht20" })
+    #expect(driver["role"] as? String == "driver")
+    #expect(
+        driver["provides"] as? String == "sensing.temperature, sensing.humidity",
+        "the driver's own line names every capability it provides")
+
+    // The review reader opens it — one reader for a spec, so what is reviewed is what validates.
+    let design = try #require(state.design)
+    #expect(design.components.map(\.id) == ["sht20"])
+    #expect(design.components.first?.provides == "sensing.temperature, sensing.humidity")
+}
+
+
 

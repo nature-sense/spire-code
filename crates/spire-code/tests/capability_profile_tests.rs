@@ -71,7 +71,7 @@ async fn the_resolved_profile_reads_the_seeded_capability_graph() {
          { interface: mipi-dsi, via: esp32p4 }\n  power:\n    battery: { charger: true }\n\
          pins:\n  led: { pin: GPIO8, addressable: true }\n  grove:\n    a: { i2c: [GPIO2, GPIO1] }\n\
          companions:\n  - chip: esp32c5\n    role: radio\n\
-         devices:\n  touch: { role: media.touch, part: FT6336, bus: i2c_internal, address: \"0x38\" }\n",
+         devices:\n  touch: { role: media.touch, part: FT6336, bus: i2c_internal, address: \"0x38\" }\n  sht20: { roles: [sensing.temperature, sensing.humidity], part: SHT20, bus: i2c_internal, address: \"0x40\" }\n",
     )
     .unwrap();
 
@@ -148,21 +148,38 @@ async fn the_resolved_profile_reads_the_seeded_capability_graph() {
     );
 
     // The parts the board declares: the `Device` node's name, the `devices` edge's values (`part`,
-    // `bus`, `address`), and the `role` edge to the capability the part *is* — resolved through the
+    // `bus`, `address`), and the `roles` edges to the capabilities the part *is* — resolved through the
     // graph, so an application's `resources:` can name a part the board actually carries.
     let devices = profile["devices"].as_array().expect("devices");
     let touch = devices
         .iter()
         .find(|d| d["name"] == "touch")
         .expect("the board declares a touch controller");
-    assert_eq!(touch["role"], "media.touch");
+    assert_eq!(touch["roles"], serde_json::json!(["media.touch"]));
     assert_eq!(touch["properties"]["part"], "FT6336");
     assert_eq!(touch["properties"]["bus"], "i2c_internal");
     assert_eq!(touch["properties"]["address"], "0x38");
     assert!(
-        touch["properties"].get("role").is_none(),
-        "`role` is the edge's endpoint, not also a property: {touch}"
+        touch["properties"].get("role").is_none() && touch["properties"].get("roles").is_none(),
+        "the role is the edge's endpoint, not also a property: {touch}"
     );
+
+    // A **multi-role** part: the SHT20 is temperature *and* humidity, so it comes back with both roles
+    // off its two `role` edges — the whole path (`seeder_input` → `memory_graph` → `resolved_profile`)
+    // carrying the list that one device per several requirements needs.
+    let sht20 = devices
+        .iter()
+        .find(|d| d["name"] == "sht20")
+        .expect("the board declares the SHT20");
+    let mut roles: Vec<String> = sht20["roles"]
+        .as_array()
+        .expect("roles is a list")
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    roles.sort();
+    assert_eq!(roles, vec!["sensing.humidity", "sensing.temperature"]);
+    assert_eq!(sht20["properties"]["part"], "SHT20");
 
     match previous {
         Some(p) => std::env::set_var("SPIRE_PLATFORM_DIR", p),

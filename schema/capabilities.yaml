@@ -112,6 +112,11 @@ categories:
   sensing:
     imu:         {}
     temperature: {}
+    # The SHT20's other half: temperature and humidity are two capabilities of *one* part, so an
+    # application that composes against the SHT20 names both — one device, several roles. Its own name
+    # rather than a property of `temperature`, because a requirement is stated per capability and a
+    # device's `roles:` is what an application's `resources[].roles` resolves against.
+    humidity:    {}
     # The BMM150 beside the BMI270: its own I2C address, a separate part, so its own name. Presence
     # is the claim; there is no shape to state yet.
     magnetometer: {}

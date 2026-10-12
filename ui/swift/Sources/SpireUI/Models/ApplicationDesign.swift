@@ -42,13 +42,17 @@ struct ApplicationDesign: Codable, Equatable {
 
     let framework: String
     var justification: String?
+    /// The application **in English** — the person's own words, from the composition. It is not read by
+    /// the core's rules; it is the sentence the generated code is headed with, shown at review so the
+    /// person confirms the *words* as well as the graph.
+    var description: String?
     let board: Board
     var boardFacts: [BoardFact]?
     let units: [Unit]
     var wiring: [String]?
 
     enum CodingKeys: String, CodingKey {
-        case framework, justification, board, units, wiring
+        case framework, justification, description, board, units, wiring
         case boardFacts = "board_facts"
     }
 
@@ -100,6 +104,10 @@ struct ApplicationDesign: Codable, Equatable {
         /// resolves. A reviewer reads it to see *which* upstream component, not just that there is one.
         var registry: String?
         var provides: String?
+        /// The unit **in English** — what this actor (or driver, or stage) does, in the person's own
+        /// words. It heads the unit's generated class doc-comment; optional, since a driver's `provides`
+        /// line is usually all it needs.
+        var description: String?
         var bus: String?
         var message: String?
         var state: String?
@@ -109,7 +117,8 @@ struct ApplicationDesign: Codable, Equatable {
         var sendsTo: [String]?
 
         enum CodingKeys: String, CodingKey {
-            case id, kind, role, source, registry, provides, bus, message, state, pulls, pushes, uses
+            case id, kind, role, source, registry, provides, description, bus, message, state, pulls,
+                pushes, uses
             case sendsTo = "sends_to"
         }
 

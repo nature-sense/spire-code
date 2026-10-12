@@ -2,16 +2,61 @@ import Foundation
 
 /// One **part** a board declares it carries — a `Device` node, read back by `capabilities/profile`.
 ///
-/// The name (`display`, `rtc`) is what an application's `resources:` refers to; `role` is the
-/// capability the part *is* (`media.display`); `properties` is everything the board wrote beside it
-/// (`part`, `bus`, `address`). A part with no role cannot exist: the core refuses a device whose role
-/// the vocabulary does not name, so a `role` here is either a known path or the part was dropped.
+/// The name (`display`, `rtc`) is what an application's `resources:` refers to; `roles` are the
+/// capabilities the part *is* (`media.display`, or both `sensing.temperature` and `sensing.humidity`);
+/// `properties` is everything the board wrote beside it (`part`, `bus`, `address`). A part with no role
+/// cannot exist: the core refuses a device whose roles the vocabulary does not name, so each role here
+/// is either a known path or the part was dropped.
 struct BoardDevice: Codable, Hashable, Identifiable {
     let name: String
-    let role: String?
+    /// The capabilities the part **is** — one or several (the SHT20 is `sensing.temperature` *and*
+    /// `sensing.humidity`). The core sends `roles: [...]`; a bare `role: "…"` from an older core is
+    /// read as a one-element list, so a payload either side of the multi-role change decodes.
+    let roles: [String]
     let properties: [String: JSONValue]
 
     var id: String { name }
+
+    enum CodingKeys: String, CodingKey {
+        case name, roles, role, properties
+    }
+
+    init(name: String, roles: [String], properties: [String: JSONValue]) {
+        self.name = name
+        self.roles = roles
+        self.properties = properties
+    }
+
+    /// Tolerant on purpose: the canonical `roles: [...]` list and the older scalar `role: "…"` are one
+    /// field to the rest of the UI, and the scalar is read as `[role]`. A part that names neither has no
+    /// role (the core would have dropped it, so this only guards an older payload).
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        properties = try container.decode([String: JSONValue].self, forKey: .properties)
+        if let list = try container.decodeIfPresent([String].self, forKey: .roles) {
+            roles = list
+        } else if let one = try container.decodeIfPresent(String.self, forKey: .role) {
+            roles = [one]
+        } else {
+            roles = []
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(roles, forKey: .roles)
+        try container.encode(properties, forKey: .properties)
+    }
+
+    /// The part's roles as one line — `sensing.temperature, sensing.humidity`. What a part row shows
+    /// where a single role used to be.
+    var rolesLabel: String { roles.joined(separator: ", ") }
+
+    /// Whether the part *is* this capability — the read every role-keyed gate uses, now that one part
+    /// may carry several.
+    func carries(role: String) -> Bool { roles.contains(role) }
 
     /// The wiring function the part is reached on (`bus:` in the board's `devices:` block), when the
     /// board named one. A function of the board's `pins:`, not a protocol.
@@ -36,8 +81,8 @@ struct BoardProfile: Codable, Hashable {
 }
 
 /// One **category** of the capability vocabulary, with the paths under it — the `capabilities/
-/// vocabulary` reply. The catalogue, not a board's facts: every path here is one a device's `role:`
-/// (or an application's `resources[].role`) may take, because the same embedded vocabulary validates
+/// vocabulary` reply. The catalogue, not a board's facts: every path here is one a device's `roles:`
+/// (or an application's `resources[].roles`) may take, because the same embedded vocabulary validates
 /// both.
 struct VocabularyCategory: Codable, Hashable, Identifiable {
     let category: String
@@ -79,7 +124,8 @@ enum ResourceVia: String, Codable, CaseIterable, Hashable {
 /// anything is generated.
 struct ResourceDraft: Identifiable, Hashable {
     var name: String
-    var role: String
+    /// The capabilities the device **is** — one or several. The spec carries them as `roles: [...]`.
+    var roles: [String]
     var via: ResourceVia
     /// The board wiring function it is reached on, when it has one.
     var bus: String = ""
@@ -88,10 +134,13 @@ struct ResourceDraft: Identifiable, Hashable {
 
     var id: String { name }
 
-    /// The `resources:` entry as the spec would carry it: `name`/`role`/`via` always, the rest only
+    /// The roles as one line, for a row that shows what the device is.
+    var rolesLabel: String { roles.joined(separator: ", ") }
+
+    /// The `resources:` entry as the spec would carry it: `name`/`roles`/`via` always, the rest only
     /// when stated — an empty string is not an answer, so it is omitted rather than written blank.
     var json: [String: Any] {
-        var out: [String: Any] = ["name": name, "role": role, "via": via.rawValue]
+        var out: [String: Any] = ["name": name, "roles": roles, "via": via.rawValue]
         if !bus.isEmpty { out["bus"] = bus }
         if !address.isEmpty { out["address"] = address }
         return out
@@ -118,6 +167,65 @@ struct BoardResourceFlowState: Equatable {
     /// The resources declared so far: the board's parts that were *selected*, and anything added —
     /// the union the spec carries, in the order they were chosen.
     var resources: [ResourceDraft] = []
+    /// The **description** the person wrote on the first step, in their own words — the input the brief
+    /// is read from, and the thing the later steps are guided by.
+    var description = ""
+    /// The **brief** the describe step produced, when it did. `nil` until something is summarized: the
+    /// brief is a guide, so the board and resource steps work without one — they simply lose the steer.
+    var brief: DesignBrief?
+
+    /// Which **fork** the person answered, and with which choice — by the fork's index in `brief.forks`.
+    ///
+    /// The brief itself is never overwritten: it is the model's reading, and keeping it means a pick can
+    /// be changed — or taken back — exactly, with no accumulation of the paths a previous answer added.
+    /// The *resolved* brief below is what the card shows and what the later steps read.
+    var forkPicks: [Int: Int] = [:]
+
+    /// The brief **with the person's fork answers applied** — the draft the describe step edits, and what
+    /// the board and actor steps steer by.
+    ///
+    /// A fork is the one question a brief asks, and answering it has to mean something: picking a choice
+    /// merges the `requires` and `suggests` that choice carries, so the `Needed` badges, the board-fit
+    /// readout and the units the actor step starts from all follow the answer. That is the whole reason a
+    /// fork is a pick rather than a question in prose the model would have to read again.
+    var resolvedBrief: DesignBrief? {
+        guard var brief else { return nil }
+        for (index, pick) in forkPicks {
+            guard brief.forks.indices.contains(index),
+                brief.forks[index].choices.indices.contains(pick)
+            else { continue }
+            let choice = brief.forks[index].choices[pick]
+            brief.requires = merging(brief.requires, choice.requires)
+            brief.suggests = merging(brief.suggests, choice.suggests)
+        }
+        return brief
+    }
+
+    /// Answer a fork with one of its choices — or take the answer back by answering the same choice
+    /// twice. The picks are kept and `resolvedBrief` is recomputed from the model's own brief, so the
+    /// paths never accumulate across a change of mind.
+    mutating func toggleFork(_ fork: Int, _ choice: Int) {
+        forkPicks[fork] = forkPicks[fork] == choice ? nil : choice
+    }
+
+    /// Forget the fork answers — what the describe step does when a fresh brief is read, so an answer to
+    /// the previous brief never lands on the new one.
+    mutating func clearForkPicks() {
+        forkPicks = [:]
+    }
+
+    /// `values` with `added` after them, in order and without repeats — the merge a fork's answer does.
+    private func merging(_ values: [String], _ added: [String]) -> [String] {
+        added.reduce(into: values) { result, value in
+            if !result.contains(value) { result.append(value) }
+        }
+    }
+
+    /// Whether there is a description to move on with. The brief itself is **not** required: a person
+    /// may go on without summarizing, and the later steps simply lose the guidance — a guide, not a gate.
+    var canLeaveDescribe: Bool {
+        !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var selectedBoard: Platform? { boards.first { $0.id == selectedBoardID } }
 
@@ -136,7 +244,7 @@ struct BoardResourceFlowState: Equatable {
     static func boardPart(_ device: BoardDevice) -> ResourceDraft {
         ResourceDraft(
             name: device.name,
-            role: device.role ?? "",
+            roles: device.roles,
             via: .board,
             bus: device.bus,
             address: device.address
@@ -185,7 +293,7 @@ struct BoardResourceFlowState: Equatable {
     /// reached through the board's part row and never added as a library resource, so the two surfaces
     /// cannot disagree about it (`power.pmu` is the board's `pmu` device, not a `power` addition).
     func boardCarriesRole(_ role: String) -> Bool {
-        profile?.devices.contains { $0.role == role } ?? false
+        profile?.devices.contains { $0.carries(role: role) } ?? false
     }
 
     /// Turn a catalogue path on or off — the mirror of `toggleBoardPart` for a resource the board
@@ -202,20 +310,20 @@ struct BoardResourceFlowState: Equatable {
     /// the same capability in twice.
     mutating func toggleCatalogueResource(role: String) {
         guard !boardCarriesRole(role) else { return }
-        if let existing = resources.first(where: { $0.role == role }) {
+        if let existing = resources.first(where: { $0.roles.contains(role) }) {
             guard existing.via != .board else { return }
-            resources.removeAll { $0.via != .board && $0.role == role }
+            resources.removeAll { $0.via != .board && $0.roles.contains(role) }
         } else {
             let name = Self.defaultName(for: role)
             guard !name.isEmpty, !resources.contains(where: { $0.name == name }) else { return }
-            resources.append(ResourceDraft(name: name, role: role, via: .library))
+            resources.append(ResourceDraft(name: name, roles: [role], via: .library))
         }
     }
 
     /// Whether any declared resource already covers this capability — the read the catalogue's
     /// "one capability once" gate is built on. A board part and an added resource are both "covered".
     func declaresRole(_ role: String) -> Bool {
-        resources.contains { $0.role == role }
+        resources.contains { $0.roles.contains(role) }
     }
 
     /// How the declared resource covering `role` is reached, when one is — `nil` when nothing covers
@@ -223,7 +331,25 @@ struct BoardResourceFlowState: Equatable {
     /// else is an addition the application can still unchoose. This is what tells the catalogue's
     /// "on board" from its "added".
     func declaredVia(role: String) -> ResourceVia? {
-        resources.first { $0.role == role }?.via
+        resources.first { $0.roles.contains(role) }?.via
+    }
+
+    /// Whether the brief asks for this capability — the read the `Needed` badges are drawn from. Empty
+    /// when no brief has been read, so a step without one simply shows no badges.
+    func isRequired(_ role: String) -> Bool {
+        resolvedBrief?.requires.contains(role) ?? false
+    }
+
+    /// The brief's `requires` the board does **not** carry as a part — the capabilities the application
+    /// will have to add as `library`/`published` resources.
+    func requirementsNotOnBoard(_ brief: DesignBrief) -> [String] {
+        brief.requires.filter { !boardCarriesRole($0) }
+    }
+
+    /// The brief's `requires` nothing in the draft covers yet — a **soft warning**, never a gate: the
+    /// person is mid-design, and the rule the core enforces is the spec's, not the brief's.
+    func uncoveredRequirements(_ brief: DesignBrief) -> [String] {
+        brief.requires.filter { !declaresRole($0) }
     }
 
     /// A role's word as a resource name: its last dotted segment (`sensing.particulate` →
@@ -238,7 +364,10 @@ struct BoardResourceFlowState: Equatable {
         !selectedBoardID.isEmpty && !resources.isEmpty
             && resources.allSatisfy {
                 !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    && !$0.role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !$0.roles.isEmpty
+                    && $0.roles.allSatisfy {
+                        !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }
             }
     }
 }

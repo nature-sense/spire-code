@@ -552,7 +552,7 @@ pub enum ProjectCreationMessage {
         embedded_root: Option<PathBuf>,
         /// True for embedded projects (cross-compiled targets only — no host).
         embedded: bool,
-        /// The **framework** the application was designed in, when the design phase ran: it is
+        /// The **framework** the application was designed in, when the composition states one: it is
         /// written into the application's `CMakeLists.txt`, so the fill phase, a person and another
         /// tool all read the same choice back instead of inferring one.
         application: Option<crate::build::application_spec::ApplicationSpec>,
@@ -790,7 +790,7 @@ impl ProjectCreationActor {
                 )
             })
             .unwrap_or_default();
-        // The **decomposition** the design phase produced, which is what stops the model choosing a
+        // The **decomposition** the composition states, which is what stops the model choosing a
         // framework again *and* inventing a composition. It matters only for an application: a library
         // builds against nothing and states neither, which is exactly what the library scaffold
         // asserts.
@@ -825,7 +825,7 @@ impl ProjectCreationActor {
             _ => None,
         };
         // The framework: from the decomposition when there is one, and otherwise from the line the
-        // application states — so an application made before the design phase runs is still told what
+        // application states — so an application made before a design is stated is still told what
         // it says about itself.
         let framework = match designed.as_ref().map(|application| application.framework) {
             Some(framework) => Some(framework),
@@ -1254,7 +1254,7 @@ and NEVER repeat any line or block."
         embedded_root: Option<&Path>,
         embedded: bool,
         // The **design** this spec is resolved from, already decided by the caller — the framework the
-        // design phase chose and the composition that goes with it, which is what the application's own
+        // composition states and the units that go with it, which is what the application's own
         // `CMakeLists.txt` states and the fill phase reads back.
         //
         // Resolved by the caller rather than here, and through the one resolver,
@@ -3246,8 +3246,8 @@ mod tests {
         );
     }
 
-    /// The library's `SPIRE.md` reaches the model — and so do the **decomposition** the design phase
-    /// produced and the framework inside it.
+    /// The library's `SPIRE.md` reaches the model — and so do the **decomposition** the composition
+    /// states and the framework inside it.
     ///
     /// The first is the whole reason the file is written down, and both of its failure modes are
     /// silent: hints that never arrive are an architecture nobody follows, and hints taken from the
@@ -3362,7 +3362,7 @@ mod tests {
             "no library named, so no hints:\n{unnamed}"
         );
 
-        // The decomposition the design phase produced, which is what stops the model choosing a
+        // The decomposition the composition states, which is what stops the model choosing a
         // framework again *and* inventing a composition.
         let app_one = crate::build::application_spec::parse_spec(examples::PM25_METER)
             .expect("the worked example parses");
@@ -3562,7 +3562,7 @@ mod tests {
              {native_with_nothing}"
         );
 
-        // An application made before the design phase exists states no decomposition — only the
+        // An application made before a design is stated states no decomposition — only the
         // framework line — and that alone is still followed.
         let stated = tempfile::tempdir().unwrap();
         std::fs::write(

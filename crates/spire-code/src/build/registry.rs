@@ -3,7 +3,7 @@
 
 //! The **ESP Component Registry** as a tool: `registry/search` and `registry/component`.
 //!
-//! The design phase can only say that a component *exists* if something can tell it so. A library on
+//! A design can only say that a component *exists* if something can tell it so. A library on
 //! this machine is read off disk (`idf_projects::library_facts`), but the display driver and the touch
 //! controller the next applications need are **published** components —
 //! `espressif/esp_lcd_st7701`, `espressif/esp_lcd_touch_gt911` — and the honest way to name one is to
@@ -452,7 +452,7 @@ mod tests {
     ///
     /// Ignored by default because it needs the network, and a suite that fails on a plane teaches people
     /// to ignore failures. Everything it checks is also checked offline — what only this can catch is the
-    /// registry moving, which is exactly the fact the design phase depends on and the one a fixture
+    /// registry moving, which is exactly the fact a design depends on and the one a fixture
     /// freezes in the past.
     #[test]
     #[ignore = "reaches components.espressif.com"]

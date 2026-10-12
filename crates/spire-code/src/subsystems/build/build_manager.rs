@@ -3591,8 +3591,8 @@ executable('{project_name}-{platform}',
 
             // Applying a **design** to a library: the components it names, written as stubs.
             //
-            // The decomposition is checked here rather than trusted — the same rules the design phase
-            // ran — because the wizard may hand back an edited one, and a stub written from a design
+            // The decomposition is checked here rather than trusted — the same rules a composition is held
+            // to — because the wizard may hand back an edited one, and a stub written from a design
             // that does not hold together is a component nobody asked for. What the library already has
             // is read once, so the plan is a snapshot of one moment rather than a view that shifts as
             // the plan is applied.
@@ -4151,29 +4151,13 @@ executable('{project_name}-{platform}',
                 }),
             },
             spire_core::actors::ToolInfo {
-                name: "idf_design_application".to_string(),
-                description: "Design the composition of an ESP-IDF application before any of it is written: what it senses and acts on, which components exist (a `driver` on a bus, a pure `library`), what each unit's mailbox or dataflow ports are, how they are wired, and — as the application's own facts — the bus and address of every device it drives. The framework (classical `actors` for a human-timescale interactive application, `ramen` dataflow for machine-rate streamed data) is chosen from the description and justified, or pinned by the caller. Returns a spec that has passed the checks, for a person to review, plus the line the application will state its framework with. Nothing is written to disk.".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "chip": { "type": "string", "description": "The chip, e.g. esp32s3" },
-                        "bsp": { "type": "string", "description": "The board support package, as the registry names it (e.g. m5stack_core_s3)" },
-                        "hal": { "type": "string", "description": "The board abstraction the application is written against (m5unified, bsp), when there is one" },
-                        "description": { "type": "string", "description": "What the application has to do: what it senses and how fast, what it acts on, what it reacts to over time, what is parallel and at what rate, and what happens when something is missing" },
-                        "framework": { "type": "string", "enum": ["actors", "ramen"], "description": "Optional. Pin the framework instead of letting the design choose: `actors` for a human-timescale interactive application, `ramen` for machine-rate data flowing through stages" },
-                        "library": { "type": "string", "description": "Optional but important: the component library directory the application is built against. Its components are what makes the design's `\"source\": \"existing\"` a fact — without it the design cannot know which parts already exist. Naming a directory that is not a component library is refused rather than read as an empty one." }
-                    },
-                    "required": ["chip", "bsp", "description"]
-                }),
-            },
-            spire_core::actors::ToolInfo {
                 name: "idf_apply_design".to_string(),
                 description: "Apply a reviewed decomposition to an ESP-IDF component library: write the components the design names that the library does not have, as typed stubs whose code the model fills in — a `driver` gets a bus seam, a fake bus and a host-test harness, a `library` gets a plain unit test — and report what was written, what was already there, and where the design and the library *disagree* (a component the design says the library has and it does not, which is a person's call to resolve). Nothing of the design's composition is written here: the units, the wiring and the board facts belong to the application's `main/`.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "root": { "type": "string", "description": "The component library directory (the project whose CMakeLists.txt says `set(SPIRE_PROJECT_STRUCTURE idf_library)`)" },
-                        "application": { "type": "object", "description": "The reviewed application spec — the same object `idf_design_application` returned, checked again here rather than trusted" }
+                        "application": { "type": "object", "description": "The reviewed application spec — the composition `createProject/ParseComposition` read, checked again here rather than trusted" }
                     },
                     "required": ["root", "application"]
                 }),
@@ -5270,46 +5254,33 @@ mod tests {
         }
     }
 
-    /// The **design phase** and **applying it** are advertised, because a tool a model cannot discover
-    /// is a tool that does not exist: `build_default_registry` registers exactly what `ListTools`
-    /// returns, and the coordinator intercepts `idf_design_application` before this manager ever sees
-    /// it. This pins the half that can be checked here — the advertisement and the arguments each needs.
+    /// **Applying a design** is advertised, because a tool a model cannot discover is a tool that does
+    /// not exist: `build_default_registry` registers exactly what `ListTools` returns. This pins the
+    /// half that can be checked here — the advertisement and the arguments it needs.
     #[test]
-    fn the_idf_design_tools_are_advertised_with_their_required_arguments() {
+    fn the_apply_design_tool_is_advertised_with_its_required_arguments() {
         let tools = BuildManagerActor::list_tools();
-        for (name, required_args) in [
-            ("idf_design_application", vec!["chip", "bsp", "description"]),
-            ("idf_apply_design", vec!["root", "application"]),
-        ] {
-            let tool = tools.iter().find(|t| t.name == name).unwrap_or_else(|| {
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "idf_apply_design")
+            .unwrap_or_else(|| {
                 panic!(
-                    "`{name}` must be advertised or the model cannot reach it. Registered: {:?}",
+                    "`idf_apply_design` must be advertised or the model cannot reach it. Registered: {:?}",
                     tools.iter().map(|t| &t.name).collect::<Vec<_>>()
                 )
             });
-            let required: Vec<&str> = tool.input_schema["required"]
-                .as_array()
-                .expect("required is an array")
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect();
-            for arg in required_args {
-                assert!(
-                    required.contains(&arg),
-                    "'{arg}' is required by {name}, so the tool must say so: {required:?}"
-                );
-            }
-        }
-
-        // A framework is pinned by name, so the schema offers the names.
-        let design = tools
+        let required: Vec<&str> = tool.input_schema["required"]
+            .as_array()
+            .expect("required is an array")
             .iter()
-            .find(|t| t.name == "idf_design_application")
-            .expect("advertised");
-        assert!(
-            design.input_schema["properties"]["framework"]["enum"].is_array(),
-            "the framework is pinned by name, so the schema offers the names"
-        );
+            .filter_map(|v| v.as_str())
+            .collect();
+        for arg in ["root", "application"] {
+            assert!(
+                required.contains(&arg),
+                "'{arg}' is required by idf_apply_design, so the tool must say so: {required:?}"
+            );
+        }
     }
 
     /// **Applying a design** to a library, through the tool: the components it names are written, what

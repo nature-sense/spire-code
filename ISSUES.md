@@ -4866,3 +4866,244 @@ Several actors may also form one **functional unit** (a display = panel + touch 
 optional `group` on `Unit`, validated as wiring-connected. Build order: the ownership `validate` rule
 first, then the template proposer and the manual step, then the seeded LLM.
 
+
+## The manual actor-assignment step is built; the other two doors are not (2026-10-04)
+
+The **manual** door of the spectrum above is now implemented as the third step of
+`BoardResourceFlowView`: `ActorAssignmentState` / `ActorDraft` (`Models/ActorAssignment.swift`) hold the
+actors and the **exclusive** ownership, the view edits them (resource pane + actor pane + inline
+warnings), and Continue assembles a `specJSON` and shows it through the existing `DesignReviewView`.
+
+What the step pins down, and why:
+
+- **Ownership is structural.** `owners: [String: UUID]` maps a resource name to the *one* actor that
+  owns it, so a resource is never shared — rule 8's "≥2" cannot be expressed, only its "0" (unowned),
+  which is reported. Re-assigning a resource **moves** it.
+- **Drivers are synthesized, not hand-edited.** Each `library` resource becomes a `component`/`driver`
+  unit whose `id` *is* the resource name (`source: stub`); a `board` resource gets none (the BSP
+  reaches it). Because a driver must state its bus (rule 4) and the board step only knows a *wiring
+  function* for board parts, the step collects a **driver bus** (a protocol, e.g. `i2c`) per `library`
+  resource — the one driver fact a person still enters, pre-filled with `i2c` when the step is entered
+  and editable on the resource's row, and it lives on the resource in the actor step for now.
+- **`wiring` and `sends_to` are one list, written twice.** The "sends to" picker is the source of
+  truth; the step emits both the per-unit `sends_to` and the union as `wiring`, sorted.
+- **The core's rules are mirrored live** so Continue is *disabled* rather than the spec refused: an
+  unowned resource, a non-`lower_snake`/duplicate/shadowing id, an actor with no message, an actor no
+  edge names, and a `library` resource that needs a driver bus (pre-filled with `i2c`, so this fires
+  only when the field is cleared).
+
+Deferred, recorded so the next slice is a plan rather than a rediscovery:
+
+- **Door 2, the seeded LLM proposal** — `design_application` seeded with the fixed resource list, the
+  same parse/repair loop. The door lives beside the manual editor; the manual editor is the shape the
+  proposal has to produce.
+- **The template grouper** — a deterministic `propose_units(resources)` that groups the chosen resources
+  into candidate actors for the person to edit.
+- **`Unit.group` functional units** — several actors as one functional unit (a display = panel + touch +
+  backlight), validated as wiring-connected. Needs the `Unit` field and its validate rule first.
+- **Editing a driver's `source`/`registry`** — the step always writes `stub`; naming an *existing*
+  library component or a **published** one (which needs its registry name, rule 4) is not offered, and a
+  `published` resource is refused with a message saying so.
+- **The scaffold handoff** — the step stops at producing and reviewing a validated spec; handing it to
+  `createProject/Scaffold` (and the apply/fill that follow) is the next step.
+
+`BoardResourceFlowView` no longer writes a bare `resources:` draft — the old stubbed "Draft" pane is
+gone, replaced by the actors step and its review.
+
+
+## Multi-role devices: one part, several capabilities (2026-10-04)
+
+A device may now *be* more than one capability at once — the SHT20 is `sensing.temperature` **and**
+`sensing.humidity` — and a board's `devices:` (and an application's `resources:`) name **all** of them.
+This is **Phase 0** of the description-first slice. The graph already modelled it: a `Device` node can
+carry N outgoing `role` edges, and more are simply never written. Only the device/resource model refused
+it — at six layers, whose single root was `.filter(|(_, e)| e.get("role").and_then(Value::as_str).is_some())`
+in `capability_vocabulary::devices()`, a one-line filter that silently **dropped** a `role: [a, b]` list.
+The change admits the list everywhere and emits it on every wire.
+
+What changed, layer by layer:
+
+- **`schema/capabilities.yaml`** — `sensing.humidity` appended under `sensing:` (the SHT20's other half),
+  free under the file's own "open on vocabulary" rule. Without it the first multi-role example is refused,
+  which is exactly the intended discipline: a new name is a *line*, and its absence makes a typo.
+- **`capability_vocabulary.rs`** — `devices()` normalizes `role: a` (sugar) and `roles: [a, b]` to one
+  `roles: [...]` shape; `unknown_device_roles()` checks **per role**; `seeder_input()` emits `roles` and
+  names **each** capability, keeping the known roles of a partly-bad device and refusing only the bad name
+  (per-name, like a board's `realized:`), so a multi-role part loses one typo rather than the whole part.
+- **`memory_graph.rs`** — the seeder writes **one `role` edge per role**, so a multi-role part is one
+  `Device` node with an edge to each capability. The legacy scalar `role:` still seeds (belt and braces).
+- **`capabilities.rs`** — `resolved_profile` collects **every** `role` edge into `roles: [...]`.
+- **`application_spec.rs`** — `Resource.role: String` → `roles: Vec<String>`; `parse_spec`/`parse_composition`
+  accept a bare `role` string as **sugar** for `[role]` (a `de_roles` `serde(alias = "role")`), so every spec
+  and fixture written before multi-role parts still parses; `validate` checks **each** role against the
+  vocabulary and refuses an empty list. The design request and the canonical `docs/example-composition.spire`
+  now teach `roles` (with the SHT20 as the worked two-role example).
+- **`composition_graph.rs`** — the `RESOURCE` node's `role` property is the list, read back with `prop_list`.
+- **`idf_projects.rs`** — the design/review text joins the roles.
+- **Swift** — `BoardDevice.roles: [String]` (tolerant decode of `roles` *or* a bare `role`), `ResourceDraft.roles`
+  (+ `rolesLabel`), and `boardPart`/`boardCarriesRole`/`declaresRole`/`declaredVia`/`json`/`canContinue` read the
+  list; the actor step's synthesized driver `provides` joins all roles. Board-part selection stays **name-keyed**
+  (one part = one driver = N capabilities); driver-by-name (rule 8) and the catalogue's "one capability once"
+  gate are unchanged — they simply see every role a part has.
+
+### Deferred: combining two catalogue additions into one multi-role part
+
+A board-declared multi-role part works end-to-end, but two **separate catalogue additions**
+(`sensing.temperature` and `sensing.humidity`, ticked independently) cannot yet be merged into *one*
+`library` resource carrying both roles. That needs a **parts library** (a known part → its roles) or a
+**merge gesture** in the resource step. Consequence flagged: a board-declared `sht20` makes **both** roles
+read as board-carried, so neither shows as a catalogue addition — which is correct for a board-declared part;
+the external add-on case is exactly this deferred merge, not Phase 0.
+
+
+
+## Description-first: the brief comes before the board (2026-10-04)
+
+**The gap it closes.** The board-and-resources flow opened on a **board**, so the first thing a person
+decided was hardware — before saying what the application was for. The description was nowhere, and the
+framework (which shapes everything downstream) was therefore never derived from anything: the flow simply
+composed `actors`.
+
+The flow now opens on a **description**, read by the model into a **design brief**. Four steps instead of
+three, with the brief prepended:
+
+1. **Describe** — free text, in the person's own words, and a **Summarize** button that reads it into a brief.
+2. **Board** — unchanged, but the chosen board is now read against the brief's `requires`.
+3. **Resources** — unchanged, plus `Needed` badges and a board-fit readout from the brief.
+4. **Actors** — unchanged, plus the brief's suggested units as starting rows and its summary as a header.
+
+**The brief is a guide, not a gate.** `requires` produces badges, a fit readout and a soft
+"Not yet covered" warning; it never disables Continue, and the framework is a *derived suggestion* the
+person confirms by choosing a board. That is deliberate: the person is mid-design, and the rule the core
+enforces is the *spec's*, not the brief's.
+
+What it refuses to do is the point of its shape. A brief **never names a board, a resource, a driver or a
+wiring edge** — those are steps 2–4's to decide, and a brief that guessed them would be a decomposition
+nobody asked for. So there is no board in the request at all: `createProject/BriefApplication` takes one
+parameter, `description`.
+
+**The seam.** A new coordinator method and a sibling of the design phase, not a mode of it:
+
+| caller | shape | why it exists |
+|---|---|---|
+| Rust `DesignBrief` | `summary`, `framework?`, `requires`, `suggests`, `gaps` | the answer a brief is |
+| `createProject/BriefApplication` | `{ description }` → `{ brief }` | the flow's first step |
+| `SpireBridge.briefApplication` | `description` → `(DesignBrief?, error?)` | the seam's Swift half |
+| `brief_application` / `brief_request` | the phase itself, in `application_spec.rs` | where it is tested without an LLM |
+
+`requires` is the **one** thing checked — each path against `capability_vocabulary::is_known_path`, because
+an unknown path is a misspelling rather than a new capability, exactly as a device's `roles` are checked. A
+bad one earns a **repair round**, the same bounded ask/parse/check/repair loop the design phase uses; an
+unreachable model and a model that cannot answer are reported differently, as there.
+
+**One implementation of the model leg.** The design phase's LLM plumbing was extracted into
+`plan_completion`, so the brief and the design phase share one place that reaches the model through the LLM
+actor's mailbox — a second copy of "send a planning-role `Complete` and await the reply" is how the two
+would silently drift.
+
+**Deferred.** Collapsing the board and resources steps into one (the brief makes them adjacent questions, and
+a person may not need two screens); and *using* the brief's `framework` rather than only showing it — this
+flow composes `actors`, so a `ramen` brief is reported rather than built, and the framework wizard remains
+the door for a pipeline.
+
+## The brief stopped counting: six points the model drafts and the person edits (2026-10-11)
+
+**The bug was a number that moved.** The design brief read a description against six questions and then
+*reported* the ones it judged the text had left open, as a free-form `gaps: [String]`. That list is a
+judgement about how thin a description is, and a judgement reported as a **count** is not reproducible —
+which a harness built for exactly this question then measured rather than argued
+(`crates/spire-code/tests/brief_repeatability_live_tests.rs`, `#[ignore]`d, live key):
+
+* eight reads of one **unchanged ~11 KB description**, with a **byte-identical request hash every run**
+  (`brief_request` is a pure function of the description, so the variance could only be the model's),
+  returned `gaps` = **0, 1, 1, 0, 3, 1** entries — one run finding the text complete where another found
+  three things missing;
+* a greedy (`temperature: 0.0`), penalty-free sampling of that very same request gave **0, 6, 2, 2, 1, 1,
+  0, 1** — every point open in one run, everything settled in another. That variant was **reverted**: it
+  did not help, so it had no reason to ship, and the harness keeps the result so nobody tries it again;
+* what was **stable** every run: `requires`, `suggests` and `summary`. The content was reproducible, and
+  only the *cardinality* the model chose for one list was not.
+
+So the fix is structural, not a prompt's. A prompt can say "at most six" — it did — and the ceiling was
+checked in code and repaired, and the model still answered at 0, 1, 3, 6 and 10. There is nothing left to
+tune: the count *was* the model's judgement, and the screen was showing a person a coin flip.
+
+**What replaced it: the same six points, always.** `DesignBrief` now carries
+
+| field | what it is |
+|---|---|
+| `points: [BriefPointRead]` | the description read against each of the six points (`BRIEF_POINTS`) — `{ point, said, decided }`: what the text **said**, and what was **decided** where it said nothing |
+| `forks: [BriefFork]` | at most `BRIEF_FORK_CEILING` (two) decisions whose answer would change **which capabilities** the application is given — each `{ point, question, choices: [{ label, requires, suggests }] }` |
+
+and `gaps` is **gone**. The judgement is not bounded now, it is removed: every description is read against
+all six points, so "what is open" is no longer a length the model chooses — it is **which `decided` cells
+are filled**, attached to the point they answer. The request was rewritten to say what to do with a thin
+text instead of asking it to complain about one: *read all six; decide the point and say what you decided;
+you draft, they edit; the one exception is a fork, which is a **pick between named alternatives**, never an
+open question, and never for a point the text already answers.*
+
+**The person edits structure, not prose.** The one question that survives is answered by clicking: a
+`BriefChoice` carries the capabilities its answer implies (`storage.sd` against `radio.wifi`), and picking
+one merges them into the brief the rest of the flow reads. `BoardResourceFlowState.forkPicks` keeps the
+answer and `resolvedBrief` recomputes from the model's own reading, so changing your mind **swaps** the
+paths rather than accumulating them, and the model's reading is never overwritten. The `Needed` badges,
+the board-fit readout and the units the actor step starts from all follow the pick, with no wording sent
+back to the model — which is the difference between editing the draft and **coding in English**.
+
+**The checks moved to what a person cannot see.** `validate_brief` no longer counts anything. It now holds:
+
+* every `requires` path — the brief's own **and** the ones inside its forks' choices — against
+  `capability_vocabulary::is_known_path`, because an unknown path is a misspelling rather than a new
+  capability (the same check as before, extended to choices, since a path is just as invisible on a button);
+* each `points` entry naming one of the six ids, **once**. An invented id (`purpose2`) is a seventh point no
+  row can show, and a repeated id is two answers to one point with nothing to say which the design used.
+  Both are invisible on screen, so both are the code's to catch — and the refusal names the six ids rather
+  than only refusing;
+* each fork keeping to the ceiling, with at least two choices, each labelled, and **no two choices bringing
+  the same capabilities** — a "choice" whose answers are identical decides nothing.
+
+A point the model **left out is deliberately not a problem**. Under `gaps` a missing question was invisible
+— the count moved and nothing said which reading was short — which is why the count itself had to be
+checked. A missing point is now a **blank row under a label**: the person sees which question went unread,
+and a check a person can perform by looking is not the code's to perform. Failing a brief over a visible gap
+would turn a reading into a dead step.
+
+**On the screen.** The describe step's card lost its "N gaps" heading entirely — a count derived from the
+unstable part is a coin flip shown to a person — and draws instead **six labelled rows**
+(`BriefPoint.allCases`: What it does / What it senses / What it acts on / What it reacts to / Timing / When
+something is missing), each with the model's `said` and, where the text was silent, its `decided` marked as
+*its* call rather than the person's words. The list **cannot get shorter between two reads of one text**,
+which is the structural half of the fix: what is open is a fact about the text, read row by row. Below the
+six, "Your call" holds any forks as capsule buttons that fill in when chosen, with what the pick adds
+written under them — and nothing is drawn at all when there are no forks, because "nothing to decide" would
+be a claim about the reading rather than something the person can act on.
+
+**The seam.**
+
+| caller | shape | why it exists |
+|---|---|---|
+| Rust `DesignBrief` | `summary`, `framework?`, `requires`, `suggests`, `points`, `forks` | the answer a brief is |
+| `BRIEF_POINTS` / `brief_points_for_prompt` | the six ids and their questions, rendered into the request | the prompt, the check and the screen are one list |
+| `validate_brief` | known paths, the six ids once each, the fork's shape | the things a person cannot see on screen |
+| Swift `DesignBrief` / `BriefPoint` | the mirror, plus the six ids the card iterates | six rows, always |
+| `BoardResourceFlowState.resolvedBrief` / `toggleFork` | the model's brief + the person's picks | what the later steps read |
+
+**Tests.** `application_spec`'s brief suite was retargeted rather than extended: the ceiling test became the
+**fork ceiling**, and the "interviews the person" repair test now feeds a three-fork answer and checks that
+the repair turn says what a fork is for rather than only how many came back. New unit tests cover an
+invented id, a repeated id, a point listed with nothing read and nothing decided, a fork with a single
+choice, two choices that bring the same thing, a misspelled capability *inside* a choice, and — in the other
+direction — that an **unread point is not a problem**. `LOGGER_BRIEF` joined `PM25_BRIEF` in `examples` as
+the canonical *fork* case (the logger that never said where its readings go); `PM25_BRIEF` is now the
+complete reading, five points `said` and the sixth `decided`, with no forks at all. On the Swift side the
+mirror's test decodes all six points, checks that a missing one is simply not found, and a new test drives
+`toggleFork` through picking, swapping, taking back and clearing — asserting the model's own `requires` is
+never overwritten. The **live harness** flipped its assertion from "the same gap count every time" to "the
+same six points, the same cells decided, **no forks** for a description that settles everything", which is
+the property the old one could only approximate.
+
+**Deferred.** The design leg (`design_request`, the six questions, and the wizard's own form) is unchanged,
+and deliberately: there the six questions are **filled fields**, not a list the model reports, so the "leave
+it empty" rule has no free-form count that can drift — the same restructuring there would be a solution
+without a measured problem.
+
