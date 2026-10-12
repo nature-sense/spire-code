@@ -3532,6 +3532,25 @@ mod tests {
         );
         // A unit that states none is honestly absent, not an empty string.
         assert!(by_id("sps30").description.is_none());
+
+        // And the **messages** layer is in the file for the same reason the resources layer is: the example
+        // is what teaches the format, so a layer missing from it is a layer nobody writes. The view's inbox
+        // is a declared set, and the actor speaks the set's id rather than a bare struct.
+        assert_eq!(
+            spec.messages.len(),
+            1,
+            "the example declares one message-set"
+        );
+        assert_eq!(spec.messages[0].id, "screen_update");
+        assert_eq!(
+            spec.messages[0].kinds,
+            vec!["Report".to_string(), "Gesture".to_string()]
+        );
+        assert_eq!(
+            by_id("view").message.as_deref(),
+            Some("screen_update"),
+            "the view's inbox is the declared set, not a bare message"
+        );
     }
 
     #[test]

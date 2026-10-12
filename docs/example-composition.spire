@@ -94,6 +94,19 @@ board_facts:
     device: sht20
     address: "0x40"
 
+# The **message-sets**: an actor that reacts to *several kinds* of thing names them once, and the kinds
+# are shared types rather than one actor's private enum. Each kind becomes a plain `struct` in
+# `components/messages/`, and the set becomes the `std::variant` over them — so the `view` below is still
+# one actor, one mailbox, one `on_message`, and it dispatches on which kind arrived. A set's id is the word
+# an actor's `message` speaks, and it needs **two or more** kinds: one kind is written `message: <kind>`
+# directly, which is the shorter way to say it. A kind may also be a bare message elsewhere — `Gesture` is
+# a kind here *and* `touch`'s own `message`, one thing crossing two edges — and that sharing is exactly
+# what a set is for.
+messages:
+  - id: screen_update
+    kinds: [Report, Gesture]
+    description: what the view answers — a reading to paint, or a gesture to turn the page.
+
 units:
   # A **unit**'s `description` is the slice of the application's English that belongs to it — what this
   # actor (or driver, or stage) does, in the same voice as the whole-application prose above. It becomes
@@ -146,7 +159,10 @@ units:
 
   - id: view
     kind: actor
-    message: Report
+    # The view reacts to *two* kinds of thing — the reading `air_quality` posts across the edge and the
+    # gesture `touch` sends — so its `message` names the **set** declared above rather than one struct.
+    # One actor, one mailbox, one `on_message`; the kinds are the shared types the set lists.
+    message: screen_update
     description: paints the reading and pages between the three screens on a gesture.
     state: the LVGL screen
     # The board's screen is the view's: it holds the display in its state. A `board` part is reached by

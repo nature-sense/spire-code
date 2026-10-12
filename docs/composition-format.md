@@ -489,9 +489,10 @@ A message type may be any number of actors' message, because it is a *shape*, no
   sends_to: [view, sampler]
 ```
 
-Each target is resolved on its own terms, and the receivers need not take the same type: `touch` posts a
-`Report` to `view` and a `Tick` to `sampler`, so it holds `ActorRef<Report>` **and** `ActorRef<Tick>` — one
-ref per edge, typed by that edge's *receiver*, never by the sender. Those refs are the sender's
+Each target is resolved on its own terms, and the receivers need not take the same type: `touch` posts one
+of the `screen_update` kinds into `view`'s mailbox and a `Tick` to `sampler`, so it holds
+`ActorRef<ScreenUpdate>` **and** `ActorRef<Tick>` — one ref per edge, typed by that edge's *receiver*,
+never by the sender. Those refs are the sender's
 **constructor arguments**; `main/` spawns every receiver **before** the actor that sends to it, and the one
 peer a sender cannot be constructed with — the far side of a cycle — is resolved by name in `init()`
 through the `Registry` it was handed.
