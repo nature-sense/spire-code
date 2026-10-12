@@ -38,6 +38,12 @@ struct DesignReviewView: View {
             )
 
             section(
+                "Message sets (\\(design.messageSets.count))",
+                lines: design.messageSets.map { ($0.id, $0.summary) },
+                empty: "none — every actor receives a single kind"
+            )
+
+            section(
                 "Board facts",
                 lines: design.facts.map { ($0.summary, "") },
                 empty: "none — no device is reached at an address"

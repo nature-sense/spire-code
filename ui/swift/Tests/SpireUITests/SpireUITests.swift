@@ -572,6 +572,60 @@ func designReplyDecodes() throws {
     #expect(stage.summary == "stage: pulls frames, pushes tensors")
 }
 
+/// A **message-set** decodes, and is read for its kinds rather than its id.
+///
+/// An actor's `message` names a set by id — `actor on supervision` — which says nothing until the kinds
+/// arrive beside it, and that is the whole reason the review shows the set. Pinned because the id alone
+/// decodes either way: a `messages` that quietly stopped decoding would review an actor whose inbox is a
+/// word, and a set with no kinds is a `std::variant` with no alternatives.
+@Test("A message-set decodes into the kinds a reviewer reads")
+func messageSetDecodes() throws {
+    let json = """
+    {
+      "framework": "actors",
+      "board": { "chip": "esp32s3", "bsp": "waveshare/esp32_s3" },
+      "messages": [
+        { "id": "supervision", "kinds": ["Reading", "Command", "Heartbeat"],
+          "description": "everything the supervisor reacts to" },
+        { "id": "telemetry", "kinds": ["Sample", "Stats"] }
+      ],
+      "units": [
+        { "id": "sps30", "kind": "component", "role": "driver", "source": "stub",
+          "provides": "PM1/2.5/4/10 readings", "bus": "i2c" },
+        { "id": "supervisor", "kind": "actor", "message": "supervision", "state": "the last reading",
+          "uses": ["sps30"] }
+      ],
+      "wiring": ["supervisor -> view"]
+    }
+    """
+
+    let design: ApplicationDesign = try MessageSerializer.decode(Data(json.utf8))
+
+    #expect(design.messageSets.map(\.id) == ["supervision", "telemetry"])
+    #expect(design.messageSets[0].kinds == ["Reading", "Command", "Heartbeat"])
+    #expect(design.messageSets[0].description == "everything the supervisor reacts to")
+    #expect(design.messageSets[1].description == nil)
+    #expect(design.messageSets[0].summary
+            == "Reading, Command, Heartbeat — one actor receives any one of them")
+
+    // The actor's own line still names the set it receives: the set is read *beside* the actor, so the
+    // kinds are not folded into a summary that would then read as one message.
+    #expect(design.composition.map(\.summary)
+            == ["actor on supervision, holding the last reading, uses sps30"])
+
+    // A design with no set at all states none: `messages` is absent, not an empty list.
+    let plain: ApplicationDesign = try MessageSerializer.decode(try JSONSerialization.data(
+        withJSONObject: [
+            "framework": "actors",
+            "board": ["chip": "esp32s3", "bsp": "waveshare/esp32_s3"],
+            "units": [],
+        ]
+    ))
+    #expect(plain.messageSets.isEmpty)
+}
+
+
+
 /// The **composition panel's** reply, as the viewer reads it — a design read back *off a tree* rather
 /// than one a model has just chosen.
 ///

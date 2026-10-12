@@ -913,27 +913,54 @@ pub(crate) fn message_type_name(raw: &str) -> String {
     type_name(&ident_of(raw))
 }
 
+/// The **kinds an actor's `message` names**, resolved: a message-set's kinds when it names one, and the
+/// name itself otherwise.
+///
+/// A design states an actor's inbox one of two ways — `message: Tick` for the single-kind case, and
+/// `message: supervision` for a set — and the scaffold turns both into the same thing: the list of
+/// concrete types the actor receives. Resolving here keeps the two forms one path downstream, so a bare
+/// `Tick` and a `Reading` that is a kind of a set become the same kind of entry.
+fn message_kinds_of(application: &ApplicationSpec, message: &str) -> Vec<String> {
+    match application.message_set(message) {
+        Some(set) => set
+            .kinds
+            .iter()
+            .map(|kind| message_type_name(kind))
+            .filter(|name| !name.is_empty())
+            .collect(),
+        None => {
+            let name = message_type_name(message);
+            if name.is_empty() {
+                Vec::new()
+            } else {
+                vec![name]
+            }
+        }
+    }
+}
+
 /// The **types the design names**, in the order it first names them, each with the units that name it.
 ///
-/// One list from two sources: an actor names the message it receives, and a stage names the value on
-/// each of its edges — what it pulls and what it pushes. The same name on both sides of an edge is
-/// **one** type, which is what an edge is; and a name two actors receive (`Tick`, in the worked example)
-/// is one type too, which is exactly why it cannot live in either actor's component.
+/// One list from two sources: an actor names the message (or the set of kinds) it receives, and a stage
+/// names the value on each of its edges — what it pulls and what it pushes. The same name on both sides
+/// of an edge is **one** type, which is what an edge is; and a name two actors receive (`Tick`, in the
+/// worked example) is one type too, which is exactly why it cannot live in either actor's component.
 fn messages_of(application: &ApplicationSpec) -> Vec<(String, Vec<String>)> {
     let mut found: Vec<(String, Vec<String>)> = Vec::new();
     for unit in &application.units {
-        let named: Vec<&str> = match unit.kind {
-            UnitKind::Actor => vec![unit.message.as_deref().unwrap_or_default()],
+        let named: Vec<String> = match unit.kind {
+            UnitKind::Actor => {
+                message_kinds_of(application, unit.message.as_deref().unwrap_or_default())
+            }
             UnitKind::Stage => vec![
-                unit.pulls.as_deref().unwrap_or_default(),
-                unit.pushes.as_deref().unwrap_or_default(),
+                message_type_name(unit.pulls.as_deref().unwrap_or_default()),
+                message_type_name(unit.pushes.as_deref().unwrap_or_default()),
             ],
             // A component names no message and no edge: it is framework-agnostic, which is the rule
             // `validate` states by refusing it any of those fields.
             UnitKind::Component => Vec::new(),
         };
-        for raw in named {
-            let name = message_type_name(raw);
+        for name in named {
             if name.is_empty() {
                 continue;
             }
@@ -948,6 +975,52 @@ fn messages_of(application: &ApplicationSpec) -> Vec<(String, Vec<String>)> {
         }
     }
     found
+}
+
+/// The **message-sets a design declares**, normalised: the derived alias name, its kinds, the actors that
+/// receive the set, and the person's own sentence about it when the design gave one.
+///
+/// Empty for the ordinary single-kind case, and when it is empty nothing about the emitted header changes
+/// — the composite type exists only where a design stated one. A set that no actor names still appears,
+/// with no receiver, because the header states what the design declared; `validate` is what refuses an
+/// unused set.
+fn message_sets_of(
+    application: &ApplicationSpec,
+) -> Vec<(String, Vec<String>, Vec<String>, Option<String>)> {
+    application
+        .messages
+        .iter()
+        .filter_map(|set| {
+            let name = message_type_name(&set.id);
+            if name.is_empty() {
+                return None;
+            }
+            let kinds: Vec<String> = set
+                .kinds
+                .iter()
+                .map(|kind| message_type_name(kind))
+                .filter(|kind| !kind.is_empty())
+                .collect();
+            let users: Vec<String> = application
+                .units
+                .iter()
+                .filter(|unit| {
+                    unit.kind == UnitKind::Actor
+                        && message_type_name(unit.message.as_deref().unwrap_or_default()) == name
+                })
+                .map(|unit| unit.id.clone())
+                .collect();
+            // The person's sentence about this inbox, when the composition gave one — the same
+            // `description` a unit carries, read the same way.
+            let description = set
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+            Some((name, kinds, users, description))
+        })
+        .collect()
 }
 
 /// The composition's **units as components of their own**: one directory per actor and per ramen
@@ -1084,7 +1157,7 @@ fn unit_component_files(application: Option<&ApplicationSpec>, library: &str) ->
         // components use, so a unit is reached exactly the way a driver or a library is.
         files.push(unit_file(
             &format!("include/{ident}.hpp"),
-            unit_header(unit, kind),
+            unit_header(application, unit, kind),
             false,
         ));
         files.push(unit_file(
@@ -1110,15 +1183,18 @@ fn unit_component_files(application: Option<&ApplicationSpec>, library: &str) ->
 
 /// The **shared types** the design names, as the file the fill starts from.
 ///
-/// One empty struct per type, in the order the design first names them. Empty on purpose: what a message
-/// *contains* is a fact about whatever is at the other end of the edge — a device's reading, a frame, a
-/// screen's report — and neither the design nor the scaffold knows it. What the scaffold can state is
-/// which types exist and where they live, and that is what makes every unit (generated from the same
-/// names) compile before anything has been filled in.
+/// One empty struct per type, in the order the design first names them — and, for a **message-set**, the
+/// `std::variant` of its kinds, so an actor that receives several kinds is one actor on one type. Empty
+/// on purpose: what a message *contains* is a fact about whatever is at the other end of the edge — a
+/// device's reading, a frame, a screen's report — and neither the design nor the scaffold knows it. What
+/// the scaffold can state is which types exist and where they live, and that is what makes every unit
+/// (generated from the same names) compile before anything has been filled in.
 ///
 /// The line above each type names the units that name it, which is a fact no reader of this file can
-/// recover: `Tick` is two actors' message, so the type belongs to neither of them.
+/// recover: `Tick` is two actors' message, so the type belongs to neither of them — and a set's kinds are
+/// theirs to share with any actor that names one on its own.
 fn messages_component_header(application: &ApplicationSpec) -> String {
+    let sets = message_sets_of(application);
     let mut text = r#"// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 NatureSense
 
@@ -1136,11 +1212,18 @@ fn messages_component_header(application: &ApplicationSpec) -> String {
 // what crosses an edge is a fact about the device, the protocol or the screen at the other end. Keep
 // them plain, copyable values: an actor's message is copied into a mailbox, so no heap, no ownership and
 // no virtual anything.
-
-namespace messages {
-
 "#
     .to_string();
+    // A message-set is a `std::variant` of its kinds, so the header that declares one needs `<variant>`
+    // — and only then, because a header that includes what it does not use is a header that lies about
+    // its dependencies.
+    if !sets.is_empty() {
+        text.push_str(
+            "\n// A message-set below is a `std::variant` of its kinds, so this header needs `<variant>`.\n\
+             #include <variant>\n",
+        );
+    }
+    text.push_str("\nnamespace messages {\n\n");
     for (name, users) in messages_of(application) {
         text.push_str(&format!(
             "/// TODO: what a `{name}` is — the fields that cross the edge, as plain values.\n\
@@ -1148,6 +1231,28 @@ namespace messages {
              /// Named by {}.\n\
              struct {name} {{}};\n\n",
             users.join(", ")
+        ));
+    }
+    for (name, kinds, users, description) in &sets {
+        let alternatives = kinds.join(", ");
+        let receivers = if users.is_empty() {
+            "no actor".to_string()
+        } else {
+            users.join(", ")
+        };
+        // The person's own sentence about this inbox, when the composition gave one: it leads the doc
+        // **verbatim**, exactly as a unit's `description` leads its class — so a set read back off the tree
+        // is the set the person stated, not the scaffold's paraphrase of it.
+        let intent = match description {
+            Some(description) => format!("{}\n///\n", doc_lines(description)),
+            None => String::new(),
+        };
+        text.push_str(&format!(
+            "{intent}/// The **`{name}` message-set**: a `{name}` is any one of `{alternatives}` — the several\n\
+             /// kinds of message one actor receives, written as a single type so the actor is still one\n\
+             /// `on_message`. Received by {receivers}. Each kind above is a shared type of its own: another\n\
+             /// actor may name one alone, and a sender posts that one kind.\n\
+             using {name} = std::variant<{alternatives}>;\n\n"
         ));
     }
     text.push_str("}  // namespace messages\n");
@@ -1226,6 +1331,21 @@ int main() {
             "    // `{name}` — named by {}. A message nothing can hold is a message nothing can send.\n\
              \x20   expect(sizeof(messages::{name}) > 0, \"{name} is a complete type\");\n",
             users.join(", ")
+        ));
+    }
+    for (name, kinds, users, _) in message_sets_of(application) {
+        let receivers = if users.is_empty() {
+            "no actor".to_string()
+        } else {
+            users.join(", ")
+        };
+        text.push_str(&format!(
+            "    // `{name}` — the set of {count} kind(s) ({kinds}), received by {receivers}: the variant's\n\
+             \x20   // alternatives are the whole of what a set is.\n\
+             \x20   expect(std::variant_size_v<messages::{name}> == {count},\n\
+             \x20          \"{name} is a variant of its {count} kind(s)\");\n",
+            count = kinds.len(),
+            kinds = kinds.join(", "),
         ));
     }
     text.push_str(
@@ -1522,13 +1642,14 @@ fn unit_ports(unit: &Unit) -> Vec<UnitPort> {
 /// `TODO` where its work goes.
 ///
 /// It compiles as it stands, which is the property `add_component`'s stubs have and the reason this one
-/// exists: an actor is declared `spire::Actor<messages::Tick>` for the message the design named, and a
+/// exists: an actor is declared `spire::Actor<messages::Tick>` for the message the design named — a kind
+/// or, when the design named a **message-set**, the `std::variant` of that set's kinds — and a
 /// stage declares one port per edge, typed by the value on it. Neither computes anything — everything a
 /// unit *does* is the fill's — and what the scaffold can state is where the class goes, what it is
 /// called, and which types it is written against.
-fn unit_header(unit: &Unit, kind: ComponentKind) -> String {
+fn unit_header(application: &ApplicationSpec, unit: &Unit, kind: ComponentKind) -> String {
     match kind {
-        ComponentKind::Actor => actor_unit_header(unit),
+        ComponentKind::Actor => actor_unit_header(application, unit),
         ComponentKind::Stage => stage_unit_header(unit),
         // A driver or a library is the **library's**: `unit_component_kind` maps neither to a unit, and
         // `component_files` is what writes those headers. Empty rather than a shape for a directory this
@@ -1562,12 +1683,26 @@ pub fn doc_lines(text: &str) -> String {
 /// The lines that are not a stub are the framework's own: the message type is fixed by the design, and
 /// `on_message` runs on the actor's **own task** — which is the whole difference from a dataflow stage,
 /// where the producer runs the consumer.
-fn actor_unit_header(unit: &Unit) -> String {
+fn actor_unit_header(application: &ApplicationSpec, unit: &Unit) -> String {
     let ident = component_ident(&unit.id);
     let id = unit.id.as_str();
     let type_name = type_name(&ident);
     let message = message_type_name(unit.message.as_deref().unwrap_or_default());
     let state = unit.state.as_deref().unwrap_or("(the design states none)");
+    // A `message` may name a **set** rather than a kind — an actor that receives several kinds of thing.
+    // The class is `spire::Actor<messages::Supervision>` either way, but what a *sender* posts differs,
+    // and the fill has to know which of the two it is holding.
+    let kinds: Vec<String> = unit
+        .message
+        .as_deref()
+        .and_then(|named| application.message_set(named))
+        .map(|set| {
+            set.kinds
+                .iter()
+                .map(|kind| message_type_name(kind))
+                .collect()
+        })
+        .unwrap_or_default();
     // The person's own sentence, when the composition gave one: it leads the class doc, verbatim, so the
     // code is written against the design's words rather than this scaffold's paraphrase. Absent, the
     // scaffold's TODO stands in — the same stub a design that said nothing about this actor gets.
@@ -1577,6 +1712,27 @@ fn actor_unit_header(unit: &Unit) -> String {
             "/// TODO: what the actor `{id}` is for, in the terms a person reading `main/` thinks in — and\n\
              /// what it is not."
         ),
+    };
+    // What the class doc says the actor receives. A set is a different promise from a kind: the actor is
+    // still one task on one type, but its **senders** post one of the several, so the boundary reads
+    // differently and the fill writes `on_message` differently.
+    let receives = if kinds.is_empty() {
+        format!(
+            "///  * it is a `spire::Actor<messages::{message}>` — the message the design named, which is what\n\
+             ///    it receives, never a type it invents. A sender elsewhere holds `ActorRef<messages::{message}>`\n\
+             ///    and posts **that** type, so this declaration is the boundary, written down where both sides\n\
+             ///    can see it;"
+        )
+    } else {
+        format!(
+            "///  * it is a `spire::Actor<messages::{message}>` — the **message-set** the design named, which is a\n\
+             ///    `std::variant` of the kinds `{kinds}`: one task with one mailbox, receiving whichever kind\n\
+             ///    arrived, so `on_message` dispatches on it. **A sender posts one kind, never the set**\n\
+             ///    (`messages::{first}`), so this declaration is the boundary, written down where both sides\n\
+             ///    can see it;",
+            kinds = kinds.join("`, `"),
+            first = kinds.first().cloned().unwrap_or_default()
+        )
     };
     format!(
         r#"// SPDX-License-Identifier: GPL-3.0-or-later
@@ -1603,9 +1759,7 @@ namespace {ident} {{
 ///
 /// What is fixed is the shape, and the shape is the framework's:
 ///
-///  * it is a `spire::Actor<messages::{message}>` — the message the design named, which is what it
-///    receives, never a type it invents. A sender elsewhere holds `ActorRef<messages::{message}>` and
-///    posts **that** type, so this declaration is the boundary, written down where both sides can see it;
+{receives}
 ///  * `on_message` runs on the **actor's own task**: it may take as long as this actor needs and holds
 ///    nobody else up. That is why a mailbox and a task are worth their cost here, and why a slow actor is
 ///    not a slow system;
@@ -2789,6 +2943,33 @@ pub fn composition_block(application: &ApplicationSpec) -> String {
             }
         };
         text.push_str(&format!("- `{}` — {shape}{uses}{target}\n", unit.id));
+    }
+
+    // The **message-sets** — an inbox that takes more than one kind of message. Stated for the same
+    // reason the devices are: the set is a shape the scaffold *derived* (a `std::variant` of its kinds),
+    // and a fill that does not know that will read `on_message` as if one kind arrived.
+    if !application.messages.is_empty() {
+        text.push_str(
+            "\nMessage sets (an actor receiving **more than one kind** of message — each set is a \
+             `std::variant` of its kinds, declared in `messages.hpp`):\n",
+        );
+        for (name, kinds, users, _) in message_sets_of(application) {
+            let receivers = if users.is_empty() {
+                "no actor".to_string()
+            } else {
+                users.join(", ")
+            };
+            text.push_str(&format!(
+                "- `{name}` — a `std::variant` of {} — received by {receivers}. Its actor has one \
+                 `on_message(const messages::{name}&)` and dispatches on which kind arrived; a sender \
+                 posts **one of the kinds**, never the set.\n",
+                kinds
+                    .iter()
+                    .map(|kind| format!("`{kind}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
 
     // Where each unit is written — the layout that this block would otherwise leave to a model that has only
@@ -4201,7 +4382,25 @@ fn unit_design_block(design: &ApplicationSpec, unit: &Unit, kind: ComponentKind)
     match kind {
         ComponentKind::Actor => {
             let message = message_type_name(unit.message.as_deref().unwrap_or_default());
-            lines.push(format!("- **receives**: `messages::{message}`"));
+            // A `message` may name a **set** rather than a kind. The class is the same either way, but an
+            // actor on a set receives one of several and a sender posts one of them, which is the fact the
+            // fill cannot recover from the name alone.
+            match design.message_set(unit.message.as_deref().unwrap_or_default()) {
+                Some(set) => {
+                    let kinds = set
+                        .kinds
+                        .iter()
+                        .map(|kind| format!("`messages::{}`", message_type_name(kind)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(format!(
+                        "- **receives**: `messages::{message}` — a **message-set**, a `std::variant` of \
+                         {kinds}. One mailbox and one `on_message`: it has to dispatch on which kind \
+                         arrived, and a sender posts **one** of those kinds, never the set"
+                    ));
+                }
+                None => lines.push(format!("- **receives**: `messages::{message}`")),
+            }
             if let Some(state) = unit
                 .state
                 .as_deref()
@@ -4211,18 +4410,34 @@ fn unit_design_block(design: &ApplicationSpec, unit: &Unit, kind: ComponentKind)
                 lines.push(format!("- **state it holds between messages**: {state}"));
             }
             for peer in &unit.sends_to {
-                let peer_message = design
+                let peer_named = design
                     .units
                     .iter()
                     .find(|candidate| candidate.id.as_str() == peer.as_str())
                     .and_then(|candidate| candidate.message.as_deref())
-                    .map(message_type_name)
                     .unwrap_or_default();
-                lines.push(format!(
-                    "- **sends to** `{peer}`, which takes `messages::{peer_message}` — so this actor \
-                     holds `spire::ActorRef<messages::{peer_message}>` and posts a \
-                     `messages::{peer_message}`"
-                ));
+                let peer_message = message_type_name(peer_named);
+                match design.message_set(peer_named) {
+                    Some(set) => {
+                        let kinds = set
+                            .kinds
+                            .iter()
+                            .map(|kind| format!("`messages::{}`", message_type_name(kind)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(format!(
+                            "- **sends to** `{peer}`, which receives the set `messages::{peer_message}` \
+                             (a `std::variant` of {kinds}) — so this actor holds \
+                             `spire::ActorRef<messages::{peer_message}>` and posts **one of those kinds**, \
+                             never the set"
+                        ));
+                    }
+                    None => lines.push(format!(
+                        "- **sends to** `{peer}`, which takes `messages::{peer_message}` — so this actor \
+                         holds `spire::ActorRef<messages::{peer_message}>` and posts a \
+                         `messages::{peer_message}`"
+                    )),
+                }
             }
         }
         ComponentKind::Stage => {
@@ -6765,6 +6980,90 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
                 file.path
             );
         }
+    }
+
+    /// An actor that receives **more than one kind** of message: the design's set becomes a `std::variant`
+    /// in the shared header and the actor is declared on the variant — one task, one mailbox, and a
+    /// `on_message` that dispatches. The kinds are `struct`s of their own, shared with any actor that names
+    /// one alone, and the header grows `#include <variant>` only because a set is there.
+    #[test]
+    fn a_message_set_becomes_a_variant_in_the_shared_types() {
+        use crate::build::application_spec::parse_spec;
+
+        let spec = parse_spec(
+            r#"{
+              "framework": "actors",
+              "justification": "a supervisor that reacts to a reading, a command and a heartbeat",
+              "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+              "messages": [
+                { "id": "supervision", "kinds": ["Reading", "Command", "Heartbeat"],
+                  "description": "everything the supervisor reacts to" }
+              ],
+              "units": [
+                { "id": "sensor", "kind": "component", "role": "driver", "source": "stub",
+                  "bus": "i2c", "provides": "a reading" },
+                { "id": "supervisor", "kind": "actor", "message": "supervision",
+                  "uses": ["sensor"], "state": "the last reading" },
+                { "id": "view", "kind": "actor", "message": "Command" }
+              ],
+              "wiring": [ "supervisor -> view" ]
+            }"#,
+        )
+        .expect("the message-set design parses");
+
+        let out =
+            application_scaffold("triage", &[], "../sensors", Some(&spec)).expect("scaffolds");
+        let file = |path: &str| {
+            out.files
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} is emitted"))
+                .content
+                .clone()
+        };
+
+        let messages = file("components/messages/include/messages.hpp");
+        for kind in ["Reading", "Command", "Heartbeat"] {
+            assert!(
+                messages.contains(&format!("struct {kind} {{}};")),
+                "{kind} is a shared type of its own:\n{messages}"
+            );
+        }
+        assert!(
+            messages.contains("using Supervision = std::variant<Reading, Command, Heartbeat>;"),
+            "the set is the variant over its kinds:\n{messages}"
+        );
+        // The person's own sentence about the inbox leads the doc, verbatim, as a unit's does.
+        assert!(
+            messages.contains("/// everything the supervisor reacts to\n"),
+            "the set's description heads its doc:\n{messages}"
+        );
+        assert!(
+            messages.contains("#include <variant>"),
+            "the header that declares a variant includes it:\n{messages}"
+        );
+        // `view` receives the bare kind `Command`, which is *shared* — not a second type of that name.
+        assert_eq!(
+            messages.matches("struct Command {};").count(),
+            1,
+            "{messages}"
+        );
+
+        // The actor is one task on the variant, and its doc says what a sender posts.
+        let supervisor = file("components/supervisor/include/supervisor.hpp");
+        assert!(
+            supervisor
+                .contains("class Supervisor final : public spire::Actor<messages::Supervision>"),
+            "{supervisor}"
+        );
+        assert!(supervisor.contains("message-set"), "{supervisor}");
+
+        // The case the scaffold writes is about the set itself: a variant is its kinds, no more.
+        let test = file("components/messages/test/messages_test.cpp");
+        assert!(
+            test.contains("std::variant_size_v<messages::Supervision> == 3"),
+            "{test}"
+        );
     }
 
     /// A **ramen** application lays its stages out the same way: one component per stage, and the values that

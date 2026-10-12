@@ -40,6 +40,23 @@ struct ApplicationDesign: Codable, Equatable {
         }
     }
 
+    /// A **message-set**: the several kinds of message one actor receives, written as a single type.
+    ///
+    /// An actor's `message` names a set by its id, so a reviewer reading `actor on supervision` cannot
+    /// tell what actually arrives until the kinds are shown beside it — which is the whole reason this
+    /// decodes the set rather than the id alone. The Rust side derives a `std::variant` of the kinds, so
+    /// a kind here is also a type another actor may name on its own.
+    struct MessageSet: Codable, Equatable {
+        let id: String
+        let kinds: [String]
+        var description: String?
+
+        /// One line of the review: `Reading, Command, Heartbeat — one actor receives any one of them`.
+        var summary: String {
+            "\(kinds.joined(separator: ", ")) — one actor receives any one of them"
+        }
+    }
+
     let framework: String
     var justification: String?
     /// The application **in English** — the person's own words, from the composition. It is not read by
@@ -48,11 +65,15 @@ struct ApplicationDesign: Codable, Equatable {
     var description: String?
     let board: Board
     var boardFacts: [BoardFact]?
+    /// The **message-sets** the design declares: the inboxes that take more than one kind of message. An
+    /// actor's `message` names one of these by id, which is why the review shows the set and its kinds
+    /// beside the actor rather than the id alone.
+    var messages: [MessageSet]?
     let units: [Unit]
     var wiring: [String]?
 
     enum CodingKeys: String, CodingKey {
-        case framework, justification, description, board, units, wiring
+        case framework, justification, description, board, units, wiring, messages
         case boardFacts = "board_facts"
     }
 
@@ -62,6 +83,7 @@ struct ApplicationDesign: Codable, Equatable {
 
     var facts: [BoardFact] { boardFacts ?? [] }
     var edges: [String] { wiring ?? [] }
+    var messageSets: [MessageSet] { messages ?? [] }
 
     /// The components, and the units that use them. The split is the one a reader needs: the first list
     /// is what the *library* is made of (and what has to exist before a build), the second is what this

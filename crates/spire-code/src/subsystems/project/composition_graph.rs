@@ -6,7 +6,8 @@
 //! The graph is Spire's single source of truth, so a project's **composition** lives there as typed
 //! nodes and edges (one node per entity) rather than as a JSON/file blob: the anchor (framework and
 //! justification), the **board**, its **board facts**, the **facets** (power/storage/network/security),
-//! every **unit** (a component, an actor or a ramen stage), and every **message** type. Files
+//! every **unit** (a component, an actor or a ramen stage), every **message** type, and every
+//! **message-set** an actor may receive. Files
 //! (`composition.spire`, `SPIRE.application.json`) are rendered copies of this graph, never its source.
 //!
 //! This module is pure: [`decompose`] turns an [`ApplicationSpec`] into a [`CompositionGraph`] of
@@ -21,10 +22,12 @@
 //!   [`node::BOARD_FACT`] (a bus/device/address triple), [`node::RESOURCE`] (a device the application
 //!   declares, with the capability it *is* and how it is reached), [`node::FACET`] (a
 //!   power/storage/network/security lens), [`node::COMPONENT`]/[`node::ACTOR`]/[`node::STAGE`] (a unit,
-//!   discriminated by its kind), [`node::MESSAGE`] (a message type, deduplicated by name), and
-//!   [`node::DESIGN_RECORD`] (the decision that produced the composition);
+//!   discriminated by its kind), [`node::MESSAGE`] (a message type, deduplicated by name),
+//!   [`node::MESSAGE_SET`] (a named set of kinds an actor may receive), and [`node::DESIGN_RECORD`] (the
+//!   decision that produced the composition);
 //! * **edges** — containment ([`edge::HAS_BOARD`], [`edge::HAS_BOARD_FACT`], [`edge::HAS_RESOURCE`],
-//!   [`edge::HAS_FACET`], [`edge::HAS_UNIT`], [`edge::HAS_MESSAGE`], [`edge::HAS_DESIGN_RECORD`]) and
+//!   [`edge::HAS_FACET`], [`edge::HAS_UNIT`], [`edge::HAS_MESSAGE`], [`edge::HAS_MESSAGE_SET`],
+//!   [`edge::HAS_DESIGN_RECORD`]) and
 //!   the composition's own wiring ([`edge::USES`], [`edge::SENDS_TO`], [`edge::WIRED_TO`]). The board's
 //!   facts hang off the **board**, not the anchor, because a fact is about a board; the **resources**
 //!   hang off the anchor, because a device the application added is no part of the board.
@@ -60,8 +63,8 @@ use serde_json::{json, Value};
 
 use crate::build::application_spec::{
     framework_from_name, ApplicationFramework, ApplicationSpec, BoardChoice, BoardFact,
-    ComponentRole, NetworkFacet, PowerFacet, Resource, ResourceVia, SecurityFacet, StorageFacet,
-    Unit, UnitKind, UnitSource,
+    ComponentRole, MessageSet, NetworkFacet, PowerFacet, Resource, ResourceVia, SecurityFacet,
+    StorageFacet, Unit, UnitKind, UnitSource,
 };
 
 /// Node-type discriminators for the decomposed composition graph (stored as the `subtype` of an
@@ -77,6 +80,10 @@ pub mod node {
     pub const ACTOR: &str = "actor";
     pub const STAGE: &str = "stage";
     pub const MESSAGE: &str = "message";
+    /// A **message-set** (`messages:` in `composition.spire`): the several kinds one actor receives,
+    /// derived as a `std::variant`. A top-level block rather than an actor's field, because a set is
+    /// shared — two actors may receive one.
+    pub const MESSAGE_SET: &str = "message_set";
     /// The decision that produced the composition (one per project; see [`super::DesignRecord`]).
     pub const DESIGN_RECORD: &str = "design_record";
 }
@@ -91,6 +98,9 @@ pub mod edge {
     pub const HAS_FACET: &str = "HAS_FACET";
     pub const HAS_UNIT: &str = "HAS_UNIT";
     pub const HAS_MESSAGE: &str = "HAS_MESSAGE";
+    /// Anchor → a [`node::MESSAGE_SET`] the application declares. Off the **anchor**, like a resource: a
+    /// set is the application's own naming of its inboxes, not any unit's.
+    pub const HAS_MESSAGE_SET: &str = "HAS_MESSAGE_SET";
     /// Anchor → the [`node::DESIGN_RECORD`] that ratifies the composition.
     pub const HAS_DESIGN_RECORD: &str = "HAS_DESIGN_RECORD";
     pub const USES: &str = "USES";
@@ -117,6 +127,18 @@ const RESOURCE_PREFIX: &str = "resource.";
 /// The graph key of the resource node declared as `name`.
 fn resource_node(name: &str) -> String {
     format!("{RESOURCE_PREFIX}{name}")
+}
+
+/// The prefix a **message-set** node's key carries: the set's own id, namespaced.
+///
+/// A node's `name` is the graph's identity, and a set's id shares one C++ namespace with the bare message
+/// a `message` may name (both are `messages::X`), so a set node's key cannot *be* the id — it is recovered
+/// from the key instead, the way a resource's name is.
+const MESSAGE_SET_PREFIX: &str = "message_set.";
+
+/// The graph key of the message-set declared as `id`.
+fn message_set_node(id: &str) -> String {
+    format!("{MESSAGE_SET_PREFIX}{id}")
 }
 
 /// Logical name of the single design-record node. The store scopes it `{project}::{this}`, so a
@@ -152,6 +174,8 @@ const P_WAKE: &str = "wake";
 const P_STORAGE_ROLE: &str = "storage_role";
 const P_NETWORK_ROLE: &str = "network_role";
 const P_REQUIRES: &str = "requires";
+/// The kinds a [`node::MESSAGE_SET`] is made of (a JSON array of names).
+const P_KINDS: &str = "kinds";
 // Design-record properties (`node::DESIGN_RECORD`): the provenance of the composition, kept on the
 // record itself so it reads as one self-contained decision rather than needing the anchor joined in.
 const P_SOURCE_KIND: &str = "source_kind";
@@ -371,6 +395,22 @@ pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
     }
     for m in &messages {
         g.nodes.push(CompositionNode::new(node::MESSAGE, m));
+    }
+
+    // Message-sets: the named inboxes an application states, each a variant of its kinds. Off the anchor,
+    // like a resource, because a set is the application's own naming rather than any unit's — and
+    // key-prefixed, because a set's id shares one C++ namespace with the bare message a `message` may
+    // name, and a node's name is the graph's identity.
+    for (i, set) in spec.messages.iter().enumerate() {
+        let key = message_set_node(&set.id);
+        let mut n = CompositionNode::new(node::MESSAGE_SET, &key)
+            .with(P_KINDS, json!(set.kinds))
+            .with(PROP_ORDER, json!(i));
+        if let Some(description) = &set.description {
+            n = n.with(P_DESCRIPTION, json!(description));
+        }
+        g.nodes.push(n);
+        g.edges.push(edge(edge::HAS_MESSAGE_SET, ROOT, &key));
     }
 
     // What a `uses` can reach: a unit, or a declared resource with no unit of its own (a part of the
@@ -608,6 +648,21 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
         });
     }
 
+    let messages = children(g, &anchor.name, edge::HAS_MESSAGE_SET)
+        .into_iter()
+        .map(|n| MessageSet {
+            // The key is namespaced because a set's id shares the `messages::` namespace with the bare
+            // message a `message` may name; the set's own id is the rest of it.
+            id: n
+                .name
+                .strip_prefix(MESSAGE_SET_PREFIX)
+                .unwrap_or(n.name.as_str())
+                .to_string(),
+            kinds: prop_list(n, P_KINDS),
+            description: prop_str(n, P_DESCRIPTION),
+        })
+        .collect();
+
     Ok(ApplicationSpec {
         description,
         framework,
@@ -615,6 +670,7 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
         board,
         board_facts,
         resources,
+        messages,
         units,
         wiring,
         power,
@@ -923,6 +979,62 @@ mod tests {
         assert!(g.edges.iter().any(|e| e.predicate == edge::WIRED_TO
             && e.from_name == "sampler"
             && e.to_name == "air_quality"));
+    }
+
+    /// A design whose actor receives a **message-set**, for the graph tests.
+    const SUPERVISED_TRIAGE: &str = r#"{
+      "framework": "actors",
+      "justification": "a supervisor that reacts to a reading, a command and a heartbeat",
+      "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+      "messages": [
+        { "id": "supervision", "kinds": ["Reading", "Command", "Heartbeat"],
+          "description": "everything the supervisor reacts to" }
+      ],
+      "units": [
+        { "id": "sensor", "kind": "component", "role": "driver", "source": "stub", "bus": "i2c",
+          "provides": "a reading" },
+        { "id": "supervisor", "kind": "actor", "message": "supervision", "uses": ["sensor"],
+          "state": "the last reading" },
+        { "id": "view", "kind": "actor", "message": "Command", "sends_to": ["supervisor"] }
+      ],
+      "wiring": [ "supervisor -> view" ]
+    }"#;
+
+    /// A message-set is a node of its own — an inbox that takes several kinds — and it survives the graph.
+    ///
+    /// Its key is namespaced (`message_set.supervision`) rather than the bare id, because a set's id shares
+    /// one C++ namespace with the bare message a `message` may name. A node's `name` is the graph's
+    /// identity, so the two cannot be one word.
+    #[test]
+    fn a_message_set_is_a_node_of_its_own_and_roundtrips() {
+        let spec = parse_spec(SUPERVISED_TRIAGE).expect("the message-set design parses");
+
+        let g = decompose(&spec);
+        assert_eq!(count(&g, node::MESSAGE_SET), 1);
+        assert_eq!(edge_count(&g, edge::HAS_MESSAGE_SET), 1);
+        // Off the anchor, like a resource: a set is the application's own naming, not any unit's.
+        assert!(g.edges.iter().any(|e| {
+            e.predicate == edge::HAS_MESSAGE_SET
+                && e.from_name == ROOT
+                && e.to_name == "message_set.supervision"
+        }));
+
+        let set_node = g
+            .nodes
+            .iter()
+            .find(|n| n.node_type == node::MESSAGE_SET)
+            .expect("the set node");
+        assert_eq!(set_node.name, "message_set.supervision");
+        assert_eq!(
+            set_node
+                .properties
+                .iter()
+                .find(|(key, _)| key == P_KINDS)
+                .map(|(_, value)| value.as_array().expect("kinds is an array").len()),
+            Some(3)
+        );
+
+        assert_eq!(reconstruct(&g).expect("reconstruct"), spec);
     }
 
     #[test]

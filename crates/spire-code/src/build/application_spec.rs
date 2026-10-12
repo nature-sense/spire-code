@@ -66,6 +66,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::build::idf_projects::message_type_name;
+
 /// The `CMakeLists.txt` marker that records an application's framework.
 ///
 /// Stated rather than inferred, for the same reason a component states its kind: a later reader — a
@@ -411,6 +413,36 @@ pub struct SecurityFacet {
     pub requires: Vec<String>,
 }
 
+/// A **message-set**: the several kinds an actor receives, named once and shared.
+///
+/// An actor is *a message type* — one `struct`, one mailbox, one `on_message`. But an actor often reacts
+/// to more than one *kind* of thing (a supervisor's `Reading`, `Command`, `Heartbeat`), and giving each
+/// kind its own actor would name the same task three times. A message-set is that actor's whole inbox
+/// stated as a list: each kind is a **shared type** the scaffold declares (one `struct` each, in
+/// `components/messages/`), and the set itself becomes the `std::variant` of them — so the actor is still
+/// `spire::Actor<messages::Supervision>`, one mailbox, and it dispatches on which kind arrived.
+///
+/// It is a **top-level block** rather than a field on the actor because a set is shared: two actors that
+/// receive the same kinds name one set, and the composite type lives with the kinds rather than inside
+/// either actor — the same reason a message type cannot live in one actor's component.
+///
+/// A single-kind message is **not** a set: `message: Tick` states it directly, and the scaffold writes one
+/// `struct` named `Tick`. A set is for the multi-kind case, and [`validate`] refuses one with fewer than
+/// two kinds — `message: <kind>` is the shorter way to say one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSet {
+    /// The set's **id** — the name an actor's `message` refers to it by, and the name of the derived
+    /// `std::variant` alias (`supervision` becomes `messages::Supervision`).
+    pub id: String,
+    /// The kinds that make up the set, in the order they are declared — the order of the variant's
+    /// alternatives, which is also the order the scaffold writes the structs in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    /// One line a reviewer reads: what this set of messages is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// The application, decided.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationSpec {
@@ -437,6 +469,12 @@ pub struct ApplicationSpec {
     /// which is the rule that makes "nothing invented" checkable rather than a hope. See [`Resource`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<Resource>,
+    /// The **message-sets** this application declares: the actors that receive more than one kind of
+    /// message, each kind a shared type. Empty for the ordinary case, where every actor's `message` names
+    /// a single kind on its own. An actor's `message` **refers** to a set by its id, and the scaffold
+    /// derives the composite `std::variant` from it. See [`MessageSet`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<MessageSet>,
     pub units: Vec<Unit>,
     /// `from -> to`, by unit id. Stated rather than derived from `sends_to`, because the edges *are*
     /// what a reviewer checks — and because a stage has no `sends_to` to derive them from.
@@ -470,6 +508,21 @@ impl ApplicationSpec {
     /// The resource with this name, if the spec declares one — what a `uses` is checked against.
     fn resource(&self, name: &str) -> Option<&Resource> {
         self.resources.iter().find(|r| r.name == name)
+    }
+
+    /// The message-set an actor's `message` names, if it names one.
+    ///
+    /// Matched on the **normalised** C++ name, because that is the name the scaffold writes and the name
+    /// the membership test is really about: `supervision` and `Supervision` are one set. A `message` that
+    /// matches no set is a bare kind, which is the ordinary single-kind form rather than an error.
+    pub(crate) fn message_set(&self, message: &str) -> Option<&MessageSet> {
+        let name = message_type_name(message);
+        if name.is_empty() {
+            return None;
+        }
+        self.messages
+            .iter()
+            .find(|set| message_type_name(&set.id) == name)
     }
 }
 
@@ -582,7 +635,8 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
         }
     }
 
-    // 2. Every actor states its message; every stage states a port.
+    // 2. Every actor states its message; every stage states a port; and the message-sets hold
+    //    together.
     for unit in &spec.units {
         match unit.kind {
             UnitKind::Actor => {
@@ -609,6 +663,101 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
                 }
             }
             UnitKind::Component => {}
+        }
+    }
+
+    // The message-sets a design declares, held together: one id, **more than one** kind, and nothing
+    // that makes one C++ name mean two things. A set's id is the name an actor's `message` refers to it
+    // by and the name of the derived `std::variant`; its kinds are the shared `struct`s the variant is
+    // made of.
+    let mut set_ids: BTreeSet<String> = BTreeSet::new();
+    for set in &spec.messages {
+        let id = message_type_name(&set.id);
+        if id.is_empty() {
+            problems.push(
+                "a message-set has no `id` — the id is the name an actor's `message` refers to it by, \
+                 and the name of the derived variant (`supervision` becomes `Supervision`)"
+                    .into(),
+            );
+            continue;
+        }
+        // An id is what a `message` resolves by, so two sets sharing one would make every `message` that
+        // names it ambiguous — and `message_set` answers with the first, so the second would read as
+        // though it were not declared.
+        if !set_ids.insert(id.clone()) {
+            problems.push(format!(
+                "the message-set '{}' is declared twice — an id is what an actor's `message` refers \
+                 to, so two sets cannot share one",
+                set.id
+            ));
+        }
+        // A set is for the actor that receives *more than one* kind of message. One kind is not a set,
+        // and writing it as one asks the scaffold for a `std::variant` of a single alternative that
+        // `message: <kind>` already says without it.
+        if set.kinds.len() < 2 {
+            problems.push(format!(
+                "the message-set '{}' names {} kind(s) — a set is the *several* kinds one actor \
+                 receives (`kinds: [Reading, Command, Heartbeat]`), and a single kind is written \
+                 `message: <kind>` directly",
+                set.id,
+                set.kinds.len()
+            ));
+        }
+        let mut kinds: BTreeSet<String> = BTreeSet::new();
+        for kind in &set.kinds {
+            let name = message_type_name(kind);
+            if name.is_empty() {
+                problems.push(format!(
+                    "the message-set '{}' names a kind '{}' that is not a name — a kind is the word \
+                     for one thing the actor receives (`Reading`), and it becomes a `struct`",
+                    set.id, kind
+                ));
+                continue;
+            }
+            if !kinds.insert(name) {
+                problems.push(format!(
+                    "the message-set '{}' names the kind '{}' twice — `kinds` is a list of distinct \
+                     kinds, and two entries that mean one name are one kind written twice",
+                    set.id, kind
+                ));
+            }
+        }
+    }
+    // **One namespace.** A set becomes a `std::variant` under its id, and every other name here becomes a
+    // `struct` — the kinds, each bare actor `message`, each stage's port value. So a set whose id
+    // normalises to one of those would declare the same name twice, once a struct and once an alias, and
+    // the actor that named the other would be built against a type of the wrong shape. A kind reused as a
+    // bare message is *not* a collision: that is the sharing a set exists for.
+    let struct_names: BTreeSet<String> = spec
+        .messages
+        .iter()
+        .flat_map(|set| set.kinds.iter().map(|kind| message_type_name(kind)))
+        .chain(spec.units.iter().flat_map(|unit| {
+            let named: Vec<String> = match unit.kind {
+                UnitKind::Actor => vec![message_type_name(
+                    unit.message.as_deref().unwrap_or_default(),
+                )],
+                UnitKind::Stage => vec![
+                    message_type_name(unit.pulls.as_deref().unwrap_or_default()),
+                    message_type_name(unit.pushes.as_deref().unwrap_or_default()),
+                ],
+                UnitKind::Component => Vec::new(),
+            };
+            named
+                .into_iter()
+                .filter(|name| !name.is_empty() && !set_ids.contains(name))
+                .collect::<Vec<String>>()
+        }))
+        .collect();
+    for set in &spec.messages {
+        let id = message_type_name(&set.id);
+        if !id.is_empty() && struct_names.contains(&id) {
+            problems.push(format!(
+                "the message-set '{}' is named for a type the design already declares — a set becomes \
+                 `messages::{}`, a `std::variant`, and a kind, a bare message or a port value of that \
+                 name is a `struct`; one name cannot be both. Rename the set",
+                set.id, id
+            ));
         }
     }
 
@@ -802,6 +951,22 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
                 "'{}' is referenced by no wiring edge, no `sends_to`, no `uses` and no board fact — \
                  an invented unit nobody uses is either a mistake or work that belongs to another spec",
                 unit.id
+            ));
+        }
+    }
+    // A message-set is referenced the way a unit is: an actor's `message` names it. One no actor names
+    // says what an inbox takes and is never received — invented, like a unit nobody wires.
+    for set in &spec.messages {
+        let id = message_type_name(&set.id);
+        let received = spec.units.iter().any(|unit| {
+            unit.kind == UnitKind::Actor
+                && message_type_name(unit.message.as_deref().unwrap_or_default()) == id
+        });
+        if !received {
+            problems.push(format!(
+                "the message-set '{}' is named by no actor's `message` — a set is what an actor \
+                 receives, so one nobody receives is either a mistake or belongs to another spec",
+                set.id
             ));
         }
     }
@@ -2141,6 +2306,94 @@ mod tests {
         // The one unit is the published runtime, which the detector wraps.
         assert_eq!(spec.units.len(), 6);
         assert_eq!(by_id("detector").uses, vec!["esp_dl".to_string()]);
+    }
+    /// A design whose actor receives a **message-set**: a supervisor that reacts to three kinds of
+    /// message. Everything else about it is ordinary, so each fault below is the one line it breaks.
+    const SUPERVISED_TRIAGE: &str = r#"{
+      "framework": "actors",
+      "justification": "a supervisor that reacts to a reading, a command and a heartbeat",
+      "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+      "messages": [
+        { "id": "supervision", "kinds": ["Reading", "Command", "Heartbeat"] }
+      ],
+      "units": [
+        { "id": "sensor", "kind": "component", "role": "driver", "source": "stub", "bus": "i2c",
+          "provides": "a reading" },
+        { "id": "supervisor", "kind": "actor", "message": "supervision", "uses": ["sensor"],
+          "state": "the last reading" },
+        { "id": "view", "kind": "actor", "message": "Command" }
+      ],
+      "wiring": [ "supervisor -> view" ]
+    }"#;
+
+    #[test]
+    fn a_message_set_is_the_several_kinds_one_actor_receives() {
+        let spec = spec(SUPERVISED_TRIAGE);
+        validate(&spec).expect("a set received by an actor validates");
+
+        // The set is the id an actor's `message` speaks; its kinds are types of their own, so a kind a
+        // second actor names on its own (`view` and `Command`) is one type, not two.
+        assert_eq!(spec.messages.len(), 1);
+        let set = spec.message_set("supervision").expect("the declared set");
+        assert_eq!(
+            set.kinds.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["Reading", "Command", "Heartbeat"]
+        );
+        assert!(spec.message_set("Command").is_none(), "a kind is not a set");
+    }
+
+    #[test]
+    fn a_message_set_is_held_to_its_own_shape() {
+        // One kind is not a set: `message: <kind>` says the same thing without a `std::variant`.
+        refused(
+            &refusal(
+                SUPERVISED_TRIAGE,
+                r#""kinds": ["Reading", "Command", "Heartbeat"]"#,
+                r#""kinds": ["Reading"]"#,
+            ),
+            "names 1 kind(s)",
+        );
+        // Two entries that normalise to one name are one kind written twice.
+        refused(
+            &refusal(
+                SUPERVISED_TRIAGE,
+                r#""Reading", "Command""#,
+                r#""Reading", "reading""#,
+            ),
+            "twice",
+        );
+        // A set no actor names states an inbox nothing receives — invented, like an unwired unit.
+        refused(
+            &refusal(
+                SUPERVISED_TRIAGE,
+                r#""message": "supervision""#,
+                r#""message": "Reading""#,
+            ),
+            "named by no actor's `message`",
+        );
+    }
+
+    #[test]
+    fn a_message_set_cannot_be_named_for_a_type_the_design_declares() {
+        // A set becomes `messages::Command`, a `std::variant` — and `Command` is also a `struct`, the
+        // kind. One name cannot be both, so the set is the thing to rename.
+        refused(
+            &refusal(
+                SUPERVISED_TRIAGE,
+                r#""id": "supervision""#,
+                r#""id": "Command""#,
+            ),
+            "one name cannot be both",
+        );
+        // Two sets sharing an id would make every `message` that names it ambiguous.
+        refused(
+            &refusal(
+                SUPERVISED_TRIAGE,
+                r#""messages": ["#,
+                r#""messages": [ { "id": "supervision", "kinds": ["Halt", "Resume"] },"#,
+            ),
+            "declared twice",
+        );
     }
 
     #[test]
