@@ -1,8 +1,11 @@
 # The stages of a composition
 
 <!--
-  A design note, and deliberately a **proposal**: nothing below is implemented, and where it and
-  `docs/composition-format.md` disagree, that file is the reference.
+  A design note, and deliberately a **proposal**: of what is below, the contracts block itself has since
+  been implemented — a `messages:` entry may declare a message **type** and its `fields`, and the parser,
+  `validate` and the scaffold are real — while the promotion of the brief's `decided` shape into that
+  block is still to come. Where this note and `docs/composition-format.md` disagree, that file is the
+  reference.
 
   It lays out the stages a composition already passes through — the brief
   (`application_spec::brief_request`), the decomposition (`docs/composition-format.md`) and the fill —
@@ -20,7 +23,7 @@ A composition already moves through three stages, each one narrowing the last:
 | stage | artifact | what it holds | held to |
 | --- | --- | --- | --- |
 | 0 · the **brief** | `DesignBrief` (JSON) | the `description` read against six fixed points — `purpose`, `senses`, `acts_on`, `reacts_to`, `timing`, `missing` — each with a `said` (what the description says) and a `decided` (the reading where it is open) | structure only; the prose is not checked |
-| 1 · the **decomposition** | `composition.spire` (YAML) | names: units, mailboxes, edges, the kinds of a set, resources, facets — plus prose `description`s carried verbatim | fully, by `validate` |
+| 1 · the **decomposition** | `composition.spire` (YAML) | names: units, mailboxes, edges, the kinds of a set, the fields of a declared type, resources, facets — plus prose `description`s carried verbatim | fully, by `validate` |
 | 2 · the **fill** | generated `struct`s and `on_message` | the actual shape and behaviour, written by hand over stubs | by the C++ compile |
 
 The rule that has kept the two structural stages clean is worth stating once, because the proposal below
@@ -68,8 +71,8 @@ rule over every declared name, and it would simply extend to the new field names
 
 ## The contracts stage
 
-`messages:` is a set-only block today. The proposal promotes it to *every message, bare or set* — the
-same move `units` already makes by holding `component`, `actor` and `stage` in one list:
+`messages:` used to be a set-only block. It now holds *every message, bare or set* — the same move `units`
+makes by holding `component`, `actor` and `stage` in one list:
 
 ```yaml
 messages:
@@ -131,5 +134,10 @@ Three decisions, now all taken:
    is also some actor's bare message is declared once and referenced twice — the sharing a set exists for.
    A kind named but not declared stays a stub, exactly as an undeclared bare message does.
 
-All three decisions are taken. The note stands as the proposal until the parser, the check and the
-scaffold make the contracts stage real.
+Two halves of this note stand differently now. The contracts block **has landed**: a `messages:` entry may
+declare a type and its `fields`, `validate` holds the `id` and each field's `name`, and the scaffold
+writes the members and their `///` comments into the stub — so the shape a design decided survives into
+the code instead of being re-decided in the fill. What is still a proposal is the other half: `DesignBrief`
+remains prose (`said`/`decided`), and nothing yet promotes a `decided` shape into the block, so a brief's
+contract is still retyped by hand into `messages:`. The gap this note opened with is closing from the code
+side rather than from the brief's.

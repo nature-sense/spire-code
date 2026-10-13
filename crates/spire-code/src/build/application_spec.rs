@@ -413,32 +413,72 @@ pub struct SecurityFacet {
     pub requires: Vec<String>,
 }
 
-/// A **message-set**: the several kinds an actor receives, named once and shared.
+/// One **declaration** in the `messages:` block: the shape of a message, stated once.
 ///
-/// An actor is *a message type* — one `struct`, one mailbox, one `on_message`. But an actor often reacts
-/// to more than one *kind* of thing (a supervisor's `Reading`, `Command`, `Heartbeat`), and giving each
-/// kind its own actor would name the same task three times. A message-set is that actor's whole inbox
-/// stated as a list: each kind is a **shared type** the scaffold declares (one `struct` each, in
-/// `components/messages/`), and the set itself becomes the `std::variant` of them — so the actor is still
-/// `spire::Actor<messages::Supervision>`, one mailbox, and it dispatches on which kind arrived.
+/// An actor is *a message type* — one `struct`, one mailbox, one `on_message`. But the shape of that type
+/// is a fact about whatever is at the other end of the edge (a device's reading, a frame, a screen's
+/// report), so left alone it is written by hand in the fill, inside the stub the scaffold emits. This
+/// block is where the design can **state it instead**, so the shape it decided is carried into the stub
+/// rather than being re-decided there.
 ///
-/// It is a **top-level block** rather than a field on the actor because a set is shared: two actors that
-/// receive the same kinds name one set, and the composite type lives with the kinds rather than inside
-/// either actor — the same reason a message type cannot live in one actor's component.
+/// A declaration is one of two things, and one list holds both — the way [`Unit`] holds components, actors
+/// and stages:
 ///
-/// A single-kind message is **not** a set: `message: Tick` states it directly, and the scaffold writes one
-/// `struct` named `Tick`. A set is for the multi-kind case, and [`validate`] refuses one with fewer than
-/// two kinds — `message: <kind>` is the shorter way to say one.
+/// * a **type** — an `id` and its [`fields`](Self::fields): the members the generated `struct` declares,
+///   each a `name` and a `type` **carried verbatim**. The `type` is a *hint, not a checked type*: only
+///   the field's `name` — a bare identifier, unique within its type — and the declaration's own `id` are
+///   validated, because a schema that policed C++ types would either invent a type system or refuse the
+///   design's own words for the thing it is describing.
+/// * a **set** — an `id` and its [`kinds`](Self::kinds): the several kinds an actor receives, stated as a
+///   list. Each kind is a **shared type** the scaffold declares (one `struct` each, in
+///   `components/messages/`), and the set itself becomes the `std::variant` of them — so a multi-kind
+///   inbox is still `spire::Actor<messages::Supervision>`, one mailbox, dispatching on which kind arrived.
+///
+/// Both are **shared**, which is why this is a **top-level block** rather than a field on the actor: a
+/// type is named by an actor's `message`, by a stage's port, or by a set's `kinds` — the type belongs to
+/// the edge rather than to either end of it — and two actors that receive the same kind name one type.
+///
+/// A declaration may state **neither**: an `id` alone is a **declared stub**, a name the design states
+/// outright and the fill writes, exactly as an undeclared bare message is.
+///
+/// A single-kind message needs no set: `message: Tick` states it directly, and the scaffold writes one
+/// `struct`. [`validate`] refuses a set of fewer than two kinds — `message: <kind>` is the shorter way to
+/// say one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MessageSet {
-    /// The set's **id** — the name an actor's `message` refers to it by, and the name of the derived
-    /// `std::variant` alias (`supervision` becomes `messages::Supervision`).
+pub struct MessageDecl {
+    /// The declaration's **id** — the name an actor's `message` refers to it by, and the name of the C++
+    /// type the scaffold derives (`Reading` becomes `messages::Reading`, `supervision` becomes
+    /// `messages::Supervision`).
     pub id: String,
-    /// The kinds that make up the set, in the order they are declared — the order of the variant's
-    /// alternatives, which is also the order the scaffold writes the structs in.
+    /// The kinds that make up a **set**, in the order they are declared — the order of the variant's
+    /// alternatives, which is also the order the scaffold writes the structs in. Empty for a **type**.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
-    /// One line a reviewer reads: what this set of messages is for.
+    /// The **fields** of a **type**, in the order they are declared — the members of the generated
+    /// `struct`, each written with the `///` a person gave it. Empty for a set, and for a declared stub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<MessageField>,
+    /// One line a reviewer reads: what this message carries, and what an actor does with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One **field** of a message **type**, as the design declares it.
+///
+/// A design states a field in one line — `{ name: pm_2_5, type: uint16, description: … }` — and the
+/// scaffold writes it into the struct: the `name` a member, the `description` a `///` above it, and the
+/// `type` **verbatim**. See [`MessageDecl`] for why the type is a hint rather than a checked type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageField {
+    /// The field's **name** — the member of the generated `struct`, and the one thing about a field a
+    /// schema can check: a bare identifier, unique within its type.
+    pub name: String,
+    /// The field's **type**, carried **verbatim** into the stub — `uint16`, `float`,
+    /// `enum(tap, long_press)`. Deliberately unchecked: it names the fact about the device, the protocol
+    /// or the screen at the other end, which the fill owns and the design only states.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    /// One line a reviewer reads: what this field carries, as the comment above it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -469,12 +509,14 @@ pub struct ApplicationSpec {
     /// which is the rule that makes "nothing invented" checkable rather than a hope. See [`Resource`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<Resource>,
-    /// The **message-sets** this application declares: the actors that receive more than one kind of
-    /// message, each kind a shared type. Empty for the ordinary case, where every actor's `message` names
-    /// a single kind on its own. An actor's `message` **refers** to a set by its id, and the scaffold
-    /// derives the composite `std::variant` from it. See [`MessageSet`].
+    /// The **messages** this application declares: the shape of each message it states, and the inboxes
+    /// that take more than one kind of message. Empty for the ordinary case, where every type is written
+    /// by hand in the fill. An actor's `message`, a stage's port and a set's `kinds` all **refer** to a
+    /// declaration by its id: a **set** becomes the composite `std::variant` of its kinds, a **type** the
+    /// `struct` of its fields, and a name the design does not declare stays a **stub** the fill writes.
+    /// See [`MessageDecl`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub messages: Vec<MessageSet>,
+    pub messages: Vec<MessageDecl>,
     pub units: Vec<Unit>,
     /// `from -> to`, by unit id. Stated rather than derived from `sends_to`, because the edges *are*
     /// what a reviewer checks — and because a stage has no `sends_to` to derive them from.
@@ -510,19 +552,35 @@ impl ApplicationSpec {
         self.resources.iter().find(|r| r.name == name)
     }
 
-    /// The message-set an actor's `message` names, if it names one.
+    /// The message-**set** an actor's `message` names, if it names one.
     ///
     /// Matched on the **normalised** C++ name, because that is the name the scaffold writes and the name
-    /// the membership test is really about: `supervision` and `Supervision` are one set. A `message` that
-    /// matches no set is a bare kind, which is the ordinary single-kind form rather than an error.
-    pub(crate) fn message_set(&self, message: &str) -> Option<&MessageSet> {
+    /// the membership test is really about: `supervision` and `Supervision` are one set. **Only a
+    /// declaration with `kinds` is a set**: a *type* of the same name is not one, because `message:
+    /// Reading` means the bare type rather than a `std::variant` of one alternative — and a `message`
+    /// that matches no set is a kind, which is the ordinary single-kind form rather than an error.
+    pub(crate) fn message_set(&self, message: &str) -> Option<&MessageDecl> {
         let name = message_type_name(message);
         if name.is_empty() {
             return None;
         }
         self.messages
             .iter()
-            .find(|set| message_type_name(&set.id) == name)
+            .find(|decl| !decl.kinds.is_empty() && message_type_name(&decl.id) == name)
+    }
+
+    /// The declaration with this **normalised** name, if the design states one — a type, a set or a
+    /// declared stub.
+    ///
+    /// What the scaffold reads to write a type's real members instead of an empty stub: the fields, in
+    /// the order the design gave them, and the sentence that leads that type's doc comment.
+    pub(crate) fn message_decl(&self, name: &str) -> Option<&MessageDecl> {
+        if name.is_empty() {
+            return None;
+        }
+        self.messages
+            .iter()
+            .find(|decl| message_type_name(&decl.id) == name)
     }
 }
 
@@ -666,59 +724,101 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
         }
     }
 
-    // The message-sets a design declares, held together: one id, **more than one** kind, and nothing
-    // that makes one C++ name mean two things. A set's id is the name an actor's `message` refers to it
-    // by and the name of the derived `std::variant`; its kinds are the shared `struct`s the variant is
-    // made of.
+    // The messages a design declares, held together: one id, a shape that is **one** of the two — a set
+    // of kinds or a type of fields — and nothing that makes one C++ name mean two things. A
+    // declaration's id is the name an actor's `message` refers to it by, and the name of the C++ type
+    // the scaffold derives from it: the `std::variant` of a set's kinds, the `struct` of a type's fields.
+    let mut decl_ids: BTreeSet<String> = BTreeSet::new();
+    // The **sets** among them, by normalised id, for the one-namespace rule below: a set becomes a
+    // `std::variant` alias where every other name here becomes a `struct`, and only that pair can
+    // collide.
     let mut set_ids: BTreeSet<String> = BTreeSet::new();
-    for set in &spec.messages {
-        let id = message_type_name(&set.id);
+    for decl in &spec.messages {
+        let id = message_type_name(&decl.id);
         if id.is_empty() {
             problems.push(
-                "a message-set has no `id` — the id is the name an actor's `message` refers to it by, \
-                 and the name of the derived variant (`supervision` becomes `Supervision`)"
+                "a message has no `id` — the id is the name an actor's `message` refers to it by, and \
+                 the name of the C++ type the scaffold derives from it (`supervision` becomes \
+                 `Supervision`)"
                     .into(),
             );
             continue;
         }
-        // An id is what a `message` resolves by, so two sets sharing one would make every `message` that
-        // names it ambiguous — and `message_set` answers with the first, so the second would read as
-        // though it were not declared.
-        if !set_ids.insert(id.clone()) {
+        // An id is what a `message` resolves by, so two declarations sharing one would make every
+        // `message` that names it ambiguous — and `message_set` and `message_decl` answer with the
+        // first, so the second would read as though it were not declared.
+        if !decl_ids.insert(id.clone()) {
             problems.push(format!(
-                "the message-set '{}' is declared twice — an id is what an actor's `message` refers \
-                 to, so two sets cannot share one",
-                set.id
+                "the message '{}' is declared twice — an id is what an actor's `message` refers to, \
+                 so two declarations cannot share one",
+                decl.id
             ));
         }
-        // A set is for the actor that receives *more than one* kind of message. One kind is not a set,
-        // and writing it as one asks the scaffold for a `std::variant` of a single alternative that
-        // `message: <kind>` already says without it.
-        if set.kinds.len() < 2 {
+        // A declaration is a **set** or a **type**, never both: a set becomes a `std::variant` and a type
+        // a `struct`, and one id cannot be both shapes. Stating both asks the scaffold to pick one.
+        if !decl.kinds.is_empty() && !decl.fields.is_empty() {
             problems.push(format!(
-                "the message-set '{}' names {} kind(s) — a set is the *several* kinds one actor \
-                 receives (`kinds: [Reading, Command, Heartbeat]`), and a single kind is written \
-                 `message: <kind>` directly",
-                set.id,
-                set.kinds.len()
+                "the message '{}' declares both `kinds` and `fields` — a declaration is one or the \
+                 other: a **set** (`kinds: [Reading, Command]`) becomes a `std::variant`, and a \
+                 **type** (`fields: [...]`) a `struct`",
+                decl.id
             ));
         }
-        let mut kinds: BTreeSet<String> = BTreeSet::new();
-        for kind in &set.kinds {
-            let name = message_type_name(kind);
-            if name.is_empty() {
+        // A **set** is a `std::variant` of the kinds it names, and the only kind of declaration that
+        // becomes an *alias* — which is why it alone is recorded for the one-namespace rule below.
+        if !decl.kinds.is_empty() {
+            set_ids.insert(id.clone());
+            // A set is for the actor that receives *more than one* kind of message. One kind is not a
+            // set, and writing it as one asks the scaffold for a `std::variant` of a single alternative
+            // that `message: <kind>` already says without it.
+            if decl.kinds.len() < 2 {
                 problems.push(format!(
-                    "the message-set '{}' names a kind '{}' that is not a name — a kind is the word \
-                     for one thing the actor receives (`Reading`), and it becomes a `struct`",
-                    set.id, kind
+                    "the message-set '{}' names {} kind(s) — a set is the *several* kinds one actor \
+                     receives (`kinds: [Reading, Command, Heartbeat]`), and a single kind is written \
+                     `message: <kind>` directly",
+                    decl.id,
+                    decl.kinds.len()
+                ));
+            }
+            let mut kinds: BTreeSet<String> = BTreeSet::new();
+            for kind in &decl.kinds {
+                let name = message_type_name(kind);
+                if name.is_empty() {
+                    problems.push(format!(
+                        "the message-set '{}' names a kind '{}' that is not a name — a kind is the \
+                         word for one thing the actor receives (`Reading`), and it becomes a `struct`",
+                        decl.id, kind
+                    ));
+                    continue;
+                }
+                if !kinds.insert(name) {
+                    problems.push(format!(
+                        "the message-set '{}' names the kind '{}' twice — `kinds` is a list of \
+                         distinct kinds, and two entries that mean one name are one kind written twice",
+                        decl.id, kind
+                    ));
+                }
+            }
+        }
+        // A **type** is a `struct` of members, and the members are the one part of it a schema can hold:
+        // each `name` is the member the compiler will see, and no two of them are one member written
+        // twice. The `type` itself is deliberately **not** read — see [`MessageDecl`].
+        let mut members: BTreeSet<String> = BTreeSet::new();
+        for field in &decl.fields {
+            let name = field.name.trim();
+            if !is_field_name(name) {
+                problems.push(format!(
+                    "the message '{}' declares a field '{}' that is not a name — a field is a member \
+                     of the generated `struct`, so it is a bare identifier (`pm_2_5`)",
+                    decl.id, field.name
                 ));
                 continue;
             }
-            if !kinds.insert(name) {
+            if !members.insert(name.to_string()) {
                 problems.push(format!(
-                    "the message-set '{}' names the kind '{}' twice — `kinds` is a list of distinct \
-                     kinds, and two entries that mean one name are one kind written twice",
-                    set.id, kind
+                    "the message '{}' declares the field '{}' twice — `fields` is a list of distinct \
+                     members, and two that mean one name are one field written twice",
+                    decl.id, field.name
                 ));
             }
         }
@@ -731,7 +831,7 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
     let struct_names: BTreeSet<String> = spec
         .messages
         .iter()
-        .flat_map(|set| set.kinds.iter().map(|kind| message_type_name(kind)))
+        .flat_map(|decl| decl.kinds.iter().map(|kind| message_type_name(kind)))
         .chain(spec.units.iter().flat_map(|unit| {
             let named: Vec<String> = match unit.kind {
                 UnitKind::Actor => vec![message_type_name(
@@ -749,14 +849,18 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
                 .collect::<Vec<String>>()
         }))
         .collect();
-    for set in &spec.messages {
-        let id = message_type_name(&set.id);
-        if !id.is_empty() && struct_names.contains(&id) {
+    for decl in &spec.messages {
+        let id = message_type_name(&decl.id);
+        // Only a **set** can collide. It is the one declaration that becomes an *alias* (`set_ids` holds
+        // them), and `struct_names` is the round of `struct`s it must not be confused with. A declared
+        // **type** is a `struct` under its own id by definition — an actor that says `message: Reading`
+        // names the very `struct` the declaration states, which is the sharing the block exists for.
+        if !decl.kinds.is_empty() && !id.is_empty() && struct_names.contains(&id) {
             problems.push(format!(
                 "the message-set '{}' is named for a type the design already declares — a set becomes \
                  `messages::{}`, a `std::variant`, and a kind, a bare message or a port value of that \
                  name is a `struct`; one name cannot be both. Rename the set",
-                set.id, id
+                decl.id, id
             ));
         }
     }
@@ -954,19 +1058,48 @@ pub fn validate(spec: &ApplicationSpec) -> Result<(), Vec<String>> {
             ));
         }
     }
-    // A message-set is referenced the way a unit is: an actor's `message` names it. One no actor names
-    // says what an inbox takes and is never received — invented, like a unit nobody wires.
-    for set in &spec.messages {
-        let id = message_type_name(&set.id);
+    // A message declaration is referenced the way a unit is: a **set** by an actor's `message`, and a
+    // **type** — or a declared stub — wherever a message name is used at all: an actor's mailbox, a
+    // stage's port, or one kind of a set. One that nothing uses states a type nothing can be sent, which
+    // is invented, like a unit nobody wires.
+    for decl in &spec.messages {
+        let id = message_type_name(&decl.id);
+        if id.is_empty() {
+            continue; // Refused above, for having no id for anything to name.
+        }
         let received = spec.units.iter().any(|unit| {
             unit.kind == UnitKind::Actor
                 && message_type_name(unit.message.as_deref().unwrap_or_default()) == id
         });
-        if !received {
+        if !decl.kinds.is_empty() {
+            if !received {
+                problems.push(format!(
+                    "the message-set '{}' is named by no actor's `message` — a set is what an actor \
+                     receives, so one nobody receives is either a mistake or belongs to another spec",
+                    decl.id
+                ));
+            }
+            continue;
+        }
+        // A **type** is shared, which is what the block is for: the three ways a design uses one are the
+        // actor that receives it (or the set that carries it as one of its kinds), and the stage that
+        // moves it along an edge.
+        let carried = spec
+            .messages
+            .iter()
+            .any(|other| other.kinds.iter().any(|kind| message_type_name(kind) == id));
+        let ported = spec.units.iter().any(|unit| {
+            let ports = [unit.pulls.as_deref(), unit.pushes.as_deref()];
+            unit.kind == UnitKind::Stage
+                && ports
+                    .iter()
+                    .any(|port| message_type_name(port.unwrap_or_default()) == id)
+        });
+        if !received && !carried && !ported {
             problems.push(format!(
-                "the message-set '{}' is named by no actor's `message` — a set is what an actor \
-                 receives, so one nobody receives is either a mistake or belongs to another spec",
-                set.id
+                "the message '{}' is declared and used by nothing — a type no actor receives, no stage \
+                 carries and no set names is either a mistake or belongs to another spec",
+                decl.id
             ));
         }
     }
@@ -1924,6 +2057,22 @@ fn is_identifier(text: &str) -> bool {
         })
 }
 
+/// Whether `text` is a **message field's name**: a bare C++ identifier — a letter or `_`, then letters,
+/// digits or `_`.
+///
+/// Stricter than [`is_identifier`], and deliberately: a field's name is the member of a generated
+/// `struct`, so a `.` or a `-` in it is not a naming style this check dislikes but a compile error the
+/// design would otherwise hand to the fill.
+fn is_field_name(text: &str) -> bool {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {
+            characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        }
+        _ => false,
+    }
+}
+
 /// Whether `name` is a registry **component name**: an optional `namespace/`, then a name.
 ///
 /// Deliberately not "must be namespaced": the board catalogue stores the BSP as its SDK writes it
@@ -2393,6 +2542,109 @@ mod tests {
                 r#""messages": [ { "id": "supervision", "kinds": ["Halt", "Resume"] },"#,
             ),
             "declared twice",
+        );
+    }
+
+    /// A design that **states a message's shape**: the reading an actor receives, declared with the fields
+    /// that cross the edge. Everything else is the smallest thing that validates, so each fault below is
+    /// the one line it breaks.
+    const DECLARED_READING: &str = r#"{
+      "framework": "actors",
+      "justification": "a reading whose shape the design states rather than leaving to the fill",
+      "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+      "messages": [
+        { "id": "Reading",
+          "description": "One SPS30 sample, as the driver reported it.",
+          "fields": [
+            { "name": "pm_2_5", "type": "uint16", "description": "PM2.5 as a raw count" },
+            { "name": "pm_10", "type": "uint16" },
+            { "name": "temperature", "type": "float" }
+          ] }
+      ],
+      "units": [
+        { "id": "sensor", "kind": "component", "role": "driver", "source": "stub", "bus": "i2c",
+          "provides": "a reading" },
+        { "id": "air_quality", "kind": "actor", "message": "Reading", "uses": ["sensor"],
+          "state": "the last reading" },
+        { "id": "view", "kind": "actor", "message": "Reading" }
+      ],
+      "wiring": [ "air_quality -> view" ]
+    }"#;
+
+    #[test]
+    fn a_declared_message_states_the_fields_that_cross_the_edge() {
+        let spec = spec(DECLARED_READING);
+        validate(&spec).expect("a declared type two actors receive validates");
+
+        // The declaration is read off the spec as the design wrote it: the fields in order, each `type`
+        // the design's own words, each sentence the person's.
+        let declared = spec.message_decl("Reading").expect("the declared type");
+        assert_eq!(
+            declared.description.as_deref(),
+            Some("One SPS30 sample, as the driver reported it.")
+        );
+        assert_eq!(
+            declared
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pm_2_5", "pm_10", "temperature"]
+        );
+        assert_eq!(declared.fields[0].r#type.as_deref(), Some("uint16"));
+        assert_eq!(
+            declared.fields[0].description.as_deref(),
+            Some("PM2.5 as a raw count")
+        );
+
+        // A **type** is not a set: `message: Reading` means the bare type, so no `std::variant` of one
+        // alternative is derived from it — and the sharing is what the block is for, one declaration named
+        // by both actors.
+        assert!(spec.message_set("Reading").is_none(), "a type is not a set");
+        assert_eq!(
+            spec.units
+                .iter()
+                .filter_map(|unit| unit.message.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["Reading", "Reading"]
+        );
+    }
+
+    #[test]
+    fn a_declared_message_is_held_to_its_own_shape() {
+        // A field's name becomes a member of the generated `struct`, so it has to be one name C++ takes —
+        // and a bare identifier is the one thing about a field the schema can check.
+        refused(
+            &refusal(DECLARED_READING, r#""name": "pm_10""#, r#""name": "pm 10""#),
+            "is not a name",
+        );
+        // Two fields that mean one member are one member written twice.
+        refused(
+            &refusal(
+                DECLARED_READING,
+                r#""name": "pm_10""#,
+                r#""name": "pm_2_5""#,
+            ),
+            "twice",
+        );
+        // A declaration is a set or a type, never both: one id cannot be a `std::variant` and a `struct`.
+        refused(
+            &refusal(
+                DECLARED_READING,
+                r#""description": "One SPS30"#,
+                r#""kinds": ["Tick", "Tock"], "description": "One SPS30"#,
+            ),
+            "both `kinds` and `fields`",
+        );
+        // A type nothing may be sent is invented, like a unit nobody wires: here the declared type is
+        // renamed out from under both actors, whose `message` then names nothing the design states.
+        refused(
+            &refusal(
+                DECLARED_READING,
+                r#""id": "Reading","#,
+                r#""id": "Sample","#,
+            ),
+            "declared and used by nothing",
         );
     }
 

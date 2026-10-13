@@ -977,6 +977,41 @@ fn messages_of(application: &ApplicationSpec) -> Vec<(String, Vec<String>)> {
     found
 }
 
+/// The **declared message types a design states**, as the lines a build plan lists them on: the normalised
+/// name, then each field's member as `type name` — the design's own words — or the field's name alone when
+/// the design stated the member without saying what it carries.
+///
+/// Empty when the design declared no type, which is the ordinary case: an edge's value is then the fill's to
+/// shape entirely, and nothing about the emitted plan changes.
+fn declared_message_types(application: &ApplicationSpec) -> Vec<String> {
+    application
+        .messages
+        .iter()
+        .filter(|decl| !decl.fields.is_empty())
+        .map(|decl| {
+            let members = decl
+                .fields
+                .iter()
+                .map(|field| {
+                    match field
+                        .r#type
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|ty| !ty.is_empty())
+                    {
+                        Some(ty) => format!("`{ty} {}`", field.name.trim()),
+                        // The member exists in the design and has no type, so it has no member in the stub
+                        // either — the plan says which half is the fill's rather than inventing a type.
+                        None => format!("`{}` (its `type` is yours to choose)", field.name.trim()),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("- `{}` — {members}\n", message_type_name(&decl.id))
+        })
+        .collect()
+}
+
 /// The **message-sets a design declares**, normalised: the derived alias name, its kinds, the actors that
 /// receive the set, and the person's own sentence about it when the design gave one.
 ///
@@ -984,6 +1019,10 @@ fn messages_of(application: &ApplicationSpec) -> Vec<(String, Vec<String>)> {
 /// — the composite type exists only where a design stated one. A set that no actor names still appears,
 /// with no receiver, because the header states what the design declared; `validate` is what refuses an
 /// unused set.
+///
+/// Only a declaration with **`kinds`** is a set. A declaration with fields is a **type** — a `struct` of
+/// the members the design stated — and reaches the header through the ordinary per-name loop, not here:
+/// writing a `std::variant` for it would give the designer's own type two definitions, and an empty one.
 fn message_sets_of(
     application: &ApplicationSpec,
 ) -> Vec<(String, Vec<String>, Vec<String>, Option<String>)> {
@@ -1001,6 +1040,11 @@ fn message_sets_of(
                 .map(|kind| message_type_name(kind))
                 .filter(|kind| !kind.is_empty())
                 .collect();
+            // A declaration with no kinds at all is a **type** (or a stub), never a set: `std::variant<>`
+            // is not a type, so there is nothing here to emit.
+            if kinds.is_empty() {
+                return None;
+            }
             let users: Vec<String> = application
                 .units
                 .iter()
@@ -1183,12 +1227,17 @@ fn unit_component_files(application: Option<&ApplicationSpec>, library: &str) ->
 
 /// The **shared types** the design names, as the file the fill starts from.
 ///
-/// One empty struct per type, in the order the design first names them — and, for a **message-set**, the
-/// `std::variant` of its kinds, so an actor that receives several kinds is one actor on one type. Empty
-/// on purpose: what a message *contains* is a fact about whatever is at the other end of the edge — a
-/// device's reading, a frame, a screen's report — and neither the design nor the scaffold knows it. What
-/// the scaffold can state is which types exist and where they live, and that is what makes every unit
-/// (generated from the same names) compile before anything has been filled in.
+/// One type per message the design names, in the order it first names them — and, for a **message-set**,
+/// the `std::variant` of its kinds, so an actor that receives several kinds is one actor on one type.
+///
+/// A type the design **declared** (`messages:` in `composition.spire`) is written with the fields it
+/// stated: each member the name the design gave it, the `type` it gave it carried **verbatim**, and the
+/// person's own sentence as the `///` above it. What the design did not state stays a `TODO` — the type
+/// of a field it named without one, and the whole of a type it did not declare — because what crosses an
+/// edge is a fact about the device, the protocol or the screen at the other end, and neither the design
+/// nor the scaffold knows it. What the scaffold *can* state is which types exist, where they live and
+/// what the design said their shape is, and that is what makes every unit (generated from the same names)
+/// compile before anything has been filled in.
 ///
 /// The line above each type names the units that name it, which is a fact no reader of this file can
 /// recover: `Tick` is two actors' message, so the type belongs to neither of them — and a set's kinds are
@@ -1208,10 +1257,11 @@ fn messages_component_header(application: &ApplicationSpec) -> String {
 // neither stage alone. Nothing here is a framework's: a message is plain data, and this component
 // REQUIRES no framework, exactly as it should.
 //
-// **These are stubs.** The names are the design's; the fields are not, and no scaffold can supply them —
-// what crosses an edge is a fact about the device, the protocol or the screen at the other end. Keep
-// them plain, copyable values: an actor's message is copied into a mailbox, so no heap, no ownership and
-// no virtual anything.
+// **Some of these are stubs.** Where the design declared a type's fields, they are here: the names and
+// the `type`s it gave, carried verbatim, with a `TODO` for whatever it left unsaid. Where it did not, the
+// fields are the fill's — no scaffold can supply them, because what crosses an edge is a fact about the
+// device, the protocol or the screen at the other end. Keep them plain, copyable values: an actor's
+// message is copied into a mailbox, so no heap, no ownership and no virtual anything.
 "#
     .to_string();
     // A message-set is a `std::variant` of its kinds, so the header that declares one needs `<variant>`
@@ -1225,13 +1275,52 @@ fn messages_component_header(application: &ApplicationSpec) -> String {
     }
     text.push_str("\nnamespace messages {\n\n");
     for (name, users) in messages_of(application) {
+        // What the design said about this type, if it said anything. A declared type carries its fields
+        // into the stub; a type nobody declared is the stub it always was. The two differ only in how much
+        // is left for a `TODO` to ask for.
+        let declaration = application.message_decl(&name);
+        let intent = declaration
+            .and_then(|decl| decl.description.as_deref())
+            .map(|description| format!("{}\n///\n", doc_lines(description)))
+            .unwrap_or_default();
+        let fields = declaration
+            .map(|decl| decl.fields.as_slice())
+            .unwrap_or_default();
+        if fields.is_empty() {
+            text.push_str(&format!(
+                "{intent}/// TODO: what a `{name}` is — the fields that cross the edge, as plain values.\n\
+                 ///\n\
+                 /// Named by {}.\n\
+                 struct {name} {{}};\n\n",
+                users.join(", ")
+            ));
+            continue;
+        }
         text.push_str(&format!(
-            "/// TODO: what a `{name}` is — the fields that cross the edge, as plain values.\n\
-             ///\n\
-             /// Named by {}.\n\
-             struct {name} {{}};\n\n",
+            "{intent}/// The **`{name}` message**: the fields the design declared, carried into the stub\n\
+             /// as plain members. Named by {}.\n\
+             struct {name} {{\n",
             users.join(", ")
         ));
+        for field in fields {
+            if let Some(description) = &field.description {
+                for line in doc_lines(description).lines() {
+                    text.push_str(&format!("    {line}\n"));
+                }
+            }
+            match &field.r#type {
+                Some(ty) => text.push_str(&format!("    {} {};\n", ty.trim(), field.name.trim())),
+                // The design named the field but not what it carries, so there is no member to write: a
+                // `//` rather than a `///` because this is the scaffold's note and not the person's
+                // sentence, and no guessed type because a guess is what compiles and what lies.
+                None => text.push_str(&format!(
+                    "    // TODO: `{}`'s type — the design named the field, not what it carries \
+                     (`type: uint16`).\n",
+                    field.name.trim()
+                )),
+            }
+        }
+        text.push_str("};\n\n");
     }
     for (name, kinds, users, description) in &sets {
         let alternatives = kinds.join(", ");
@@ -2945,15 +3034,36 @@ pub fn composition_block(application: &ApplicationSpec) -> String {
         text.push_str(&format!("- `{}` — {shape}{uses}{target}\n", unit.id));
     }
 
+    // The **declared message types** — the shapes the design stated rather than left to the fill. Their
+    // members are already in `messages.hpp`, which a fill reading only its own unit's stub would never
+    // know: it would treat a stated field as its own to invent, and rename or reshape what the rest of the
+    // composition is compiled against. The sentence about the fields in the layout below then reads as one
+    // rule with one exception rather than as two.
+    let declared = declared_message_types(application);
+    if !declared.is_empty() {
+        text.push_str(
+            "\nMessage types the design **declared** (the members are already written in \
+             `messages.hpp` — keep each name and `type` as the design wrote it, and add only what it left \
+             unsaid):\n",
+        );
+        for line in declared {
+            text.push_str(&line);
+        }
+    }
+
     // The **message-sets** — an inbox that takes more than one kind of message. Stated for the same
     // reason the devices are: the set is a shape the scaffold *derived* (a `std::variant` of its kinds),
     // and a fill that does not know that will read `on_message` as if one kind arrived.
-    if !application.messages.is_empty() {
+    //
+    // Guarded on the **sets**, not on the block: a design may declare only types, and a heading with
+    // nothing under it states a fact of its own that is not true.
+    let sets = message_sets_of(application);
+    if !sets.is_empty() {
         text.push_str(
             "\nMessage sets (an actor receiving **more than one kind** of message — each set is a \
              `std::variant` of its kinds, declared in `messages.hpp`):\n",
         );
-        for (name, kinds, users, _) in message_sets_of(application) {
+        for (name, kinds, users, _) in &sets {
             let receivers = if users.is_empty() {
                 "no actor".to_string()
             } else {
@@ -3003,7 +3113,9 @@ pub fn composition_block(application: &ApplicationSpec) -> String {
              are **structural**: do not edit them.\n\
              The **shared types are the composition's**: every type the design names on an edge goes in \
              `components/messages/include/messages.hpp`, included as `#include <messages.hpp>` \
-             — the names are declared for you there and the fields are not. `main/main.cpp` **{wiring}** only: \
+             — the names are declared for you there, and the fields are yours to fill in wherever the \
+             design did not state them. Where it declared a type's fields, they are already its members: \
+             keep them as the design wrote them. `main/main.cpp` **{wiring}** only: \
              it declares no {unit_word} class and no shared type of its own.\n"
         ));
     }
@@ -7063,6 +7175,107 @@ gmake[2]: *** [CMakeFiles/sps30_test.dir/all] Error 2
         assert!(
             test.contains("std::variant_size_v<messages::Supervision> == 3"),
             "{test}"
+        );
+    }
+
+    /// A design that **states a message's shape**: the fields that cross the edge are the design's, so they
+    /// arrive in the stub as members rather than as a `TODO`. The `type` is carried **verbatim** — the
+    /// scaffold never parses it — and the part the design left unsaid stays a `TODO` rather than a guess
+    /// that would compile and lie.
+    #[test]
+    fn a_declared_message_carries_its_fields_into_the_stub() {
+        use crate::build::application_spec::parse_spec;
+
+        let spec = parse_spec(
+            r#"{
+              "framework": "actors",
+              "justification": "a reading whose shape the design states rather than leaving to the fill",
+              "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+              "messages": [
+                { "id": "Reading",
+                  "description": "One SPS30 sample, as the driver reported it.",
+                  "fields": [
+                    { "name": "pm_2_5", "type": "uint16", "description": "PM2.5 as a raw count" },
+                    { "name": "temperature", "type": "float" },
+                    { "name": "flags" }
+                  ] }
+              ],
+              "units": [
+                { "id": "sensor", "kind": "component", "role": "driver", "source": "stub",
+                  "bus": "i2c", "provides": "a reading" },
+                { "id": "air_quality", "kind": "actor", "message": "Reading",
+                  "uses": ["sensor"], "state": "the last reading" },
+                { "id": "view", "kind": "actor", "message": "Reading" }
+              ],
+              "wiring": [ "air_quality -> view" ]
+            }"#,
+        )
+        .expect("the declared-message design parses");
+
+        let out = application_scaffold("meter", &[], "../sensors", Some(&spec)).expect("scaffolds");
+        let messages = out
+            .files
+            .iter()
+            .find(|file| file.path == "components/messages/include/messages.hpp")
+            .expect("the shared types are emitted")
+            .content
+            .clone();
+
+        // The person's sentence about the type leads its doc, and the fields are the members the design
+        // named: the `description` the `///` above the member, the `type` as the design wrote it.
+        assert!(
+            messages.contains("/// One SPS30 sample, as the driver reported it.\n"),
+            "{messages}"
+        );
+        assert!(
+            messages.contains("struct Reading {\n"),
+            "a declared type is a `struct` with members, not an empty stub:\n{messages}"
+        );
+        assert!(
+            messages.contains("    /// PM2.5 as a raw count\n    uint16 pm_2_5;\n"),
+            "{messages}"
+        );
+        assert!(messages.contains("    float temperature;\n"), "{messages}");
+        // One declaration is both actors' mailbox, so the type is written once, with both names on it.
+        assert_eq!(
+            messages.matches("struct Reading {").count(),
+            1,
+            "{messages}"
+        );
+        assert!(
+            messages.contains("/// as plain members. Named by air_quality, view.\n"),
+            "{messages}"
+        );
+        // A field the design named without a `type` cannot become a member. The scaffold leaves the `TODO`
+        // that says so, and writes no member at all — a guessed type is what compiles and what lies.
+        assert!(
+            messages.contains(
+                "// TODO: `flags`'s type — the design named the field, not what it carries"
+            ),
+            "{messages}"
+        );
+        assert!(
+            !messages.contains("flags;"),
+            "no member is invented for a field with no type:\n{messages}"
+        );
+        // A **type** is not a set: no variant, so no `<variant>` either — a header that includes what it
+        // does not use lies about its dependencies.
+        assert!(!messages.contains("std::variant"), "{messages}");
+        assert!(!messages.contains("#include <variant>"), "{messages}");
+
+        // The **fill's view of the design** names the stated members too. A model that read only the unit's
+        // own stub would treat a member the design fixed as its to invent, and rewrite what the rest of the
+        // composition is compiled against. It says nothing about sets, because this design states none.
+        let block = composition_block(&spec);
+        assert!(
+            block.contains(
+                "- `Reading` — `uint16 pm_2_5`, `float temperature`, `flags` (its `type` is yours to choose)"
+            ),
+            "{block}"
+        );
+        assert!(
+            !block.contains("Message sets (an actor receiving"),
+            "a design with no set gets no sets section:\n{block}"
         );
     }
 

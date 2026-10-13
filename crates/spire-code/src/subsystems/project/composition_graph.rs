@@ -63,8 +63,8 @@ use serde_json::{json, Value};
 
 use crate::build::application_spec::{
     framework_from_name, ApplicationFramework, ApplicationSpec, BoardChoice, BoardFact,
-    ComponentRole, MessageSet, NetworkFacet, PowerFacet, Resource, ResourceVia, SecurityFacet,
-    StorageFacet, Unit, UnitKind, UnitSource,
+    ComponentRole, MessageDecl, MessageField, NetworkFacet, PowerFacet, Resource, ResourceVia,
+    SecurityFacet, StorageFacet, Unit, UnitKind, UnitSource,
 };
 
 /// Node-type discriminators for the decomposed composition graph (stored as the `subtype` of an
@@ -176,6 +176,12 @@ const P_NETWORK_ROLE: &str = "network_role";
 const P_REQUIRES: &str = "requires";
 /// The kinds a [`node::MESSAGE_SET`] is made of (a JSON array of names).
 const P_KINDS: &str = "kinds";
+/// The **fields** a declared message **type** is made of (a JSON array of `{name, type?, description?}`).
+///
+/// The one message property that is not a scalar or a list of names: a field is a name, a type carried
+/// verbatim and a sentence, so the property is the declaration's own array, written only when the design
+/// states one — a set carries none, and its node is the node it always was.
+const P_FIELDS: &str = "fields";
 // Design-record properties (`node::DESIGN_RECORD`): the provenance of the composition, kept on the
 // record itself so it reads as one self-contained decision rather than needing the anchor joined in.
 const P_SOURCE_KIND: &str = "source_kind";
@@ -265,6 +271,15 @@ fn prop_list(n: &CompositionNode, key: &str) -> Vec<String> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// A message declaration's **fields**, in order — a JSON array of `{name, type?, description?}`, read
+/// back as the declaration writes it. Absent is the ordinary case (a set, or a declared stub) and is an
+/// empty list rather than an error.
+fn prop_fields(n: &CompositionNode) -> Vec<MessageField> {
+    prop(n, P_FIELDS)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
         .unwrap_or_default()
 }
 
@@ -397,16 +412,20 @@ pub fn decompose(spec: &ApplicationSpec) -> CompositionGraph {
         g.nodes.push(CompositionNode::new(node::MESSAGE, m));
     }
 
-    // Message-sets: the named inboxes an application states, each a variant of its kinds. Off the anchor,
-    // like a resource, because a set is the application's own naming rather than any unit's — and
-    // key-prefixed, because a set's id shares one C++ namespace with the bare message a `message` may
-    // name, and a node's name is the graph's identity.
-    for (i, set) in spec.messages.iter().enumerate() {
-        let key = message_set_node(&set.id);
+    // Message declarations: the named inboxes an application states, each a variant of its kinds, and
+    // the types it states, each a `struct` of its fields. Off the anchor, like a resource, because a
+    // declaration is the application's own naming rather than any unit's — and key-prefixed, because a
+    // declaration's id shares one C++ namespace with the bare message a `message` may name, and a node's
+    // name is the graph's identity.
+    for (i, decl) in spec.messages.iter().enumerate() {
+        let key = message_set_node(&decl.id);
         let mut n = CompositionNode::new(node::MESSAGE_SET, &key)
-            .with(P_KINDS, json!(set.kinds))
+            .with(P_KINDS, json!(decl.kinds))
             .with(PROP_ORDER, json!(i));
-        if let Some(description) = &set.description {
+        if !decl.fields.is_empty() {
+            n = n.with(P_FIELDS, json!(decl.fields));
+        }
+        if let Some(description) = &decl.description {
             n = n.with(P_DESCRIPTION, json!(description));
         }
         g.nodes.push(n);
@@ -650,15 +669,16 @@ pub fn reconstruct(g: &CompositionGraph) -> Result<ApplicationSpec, String> {
 
     let messages = children(g, &anchor.name, edge::HAS_MESSAGE_SET)
         .into_iter()
-        .map(|n| MessageSet {
-            // The key is namespaced because a set's id shares the `messages::` namespace with the bare
-            // message a `message` may name; the set's own id is the rest of it.
+        .map(|n| MessageDecl {
+            // The key is namespaced because a declaration's id shares the `messages::` namespace with
+            // the bare message a `message` may name; the declaration's own id is the rest of it.
             id: n
                 .name
                 .strip_prefix(MESSAGE_SET_PREFIX)
                 .unwrap_or(n.name.as_str())
                 .to_string(),
             kinds: prop_list(n, P_KINDS),
+            fields: prop_fields(n),
             description: prop_str(n, P_DESCRIPTION),
         })
         .collect();
@@ -1033,6 +1053,64 @@ mod tests {
                 .map(|(_, value)| value.as_array().expect("kinds is an array").len()),
             Some(3)
         );
+
+        assert_eq!(reconstruct(&g).expect("reconstruct"), spec);
+    }
+
+    /// A design whose actor receives a **declared message type** — the shape stated, not left to the fill.
+    const DECLARED_READING: &str = r#"{
+      "framework": "actors",
+      "justification": "a reading whose shape the design states rather than leaving to the fill",
+      "board": { "chip": "esp32s3", "bsp": "m5stack_core_s3" },
+      "messages": [
+        { "id": "Reading",
+          "description": "One SPS30 sample, as the driver reported it.",
+          "fields": [
+            { "name": "pm_2_5", "type": "uint16", "description": "PM2.5 as a raw count" },
+            { "name": "temperature", "type": "float" }
+          ] }
+      ],
+      "units": [
+        { "id": "sensor", "kind": "component", "role": "driver", "source": "stub", "bus": "i2c",
+          "provides": "a reading" },
+        { "id": "air_quality", "kind": "actor", "message": "Reading", "uses": ["sensor"],
+          "state": "the last reading" },
+        { "id": "view", "kind": "actor", "message": "Reading" }
+      ],
+      "wiring": [ "air_quality -> view" ]
+    }"#;
+
+    /// A **declared message type** travels as a node of its own with its fields, and comes back whole.
+    ///
+    /// The fields are the part of a declaration the graph could quietly lose: everything else about a
+    /// declaration is a scalar or a list of names, and a round trip that dropped the members would give a
+    /// project whose own record disagrees with the stub it generated.
+    #[test]
+    fn a_declared_message_travels_with_its_fields() {
+        let spec = parse_spec(DECLARED_READING).expect("the declared-message design parses");
+
+        let g = decompose(&spec);
+        assert_eq!(count(&g, node::MESSAGE_SET), 1);
+        assert!(g.edges.iter().any(|e| {
+            e.predicate == edge::HAS_MESSAGE_SET
+                && e.from_name == ROOT
+                && e.to_name == "message_set.Reading"
+        }));
+
+        let node = g
+            .nodes
+            .iter()
+            .find(|n| n.node_type == node::MESSAGE_SET)
+            .expect("the declaration's node");
+        let fields = prop(node, P_FIELDS)
+            .and_then(|value| value.as_array())
+            .expect("the fields are written as an array");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["name"], "pm_2_5");
+        assert_eq!(fields[0]["type"], "uint16");
+        assert_eq!(fields[0]["description"], "PM2.5 as a raw count");
+        // A type carries no kinds, and a set carries no fields: the two shapes never share a node.
+        assert_eq!(prop_list(node, P_KINDS), Vec::<String>::new());
 
         assert_eq!(reconstruct(&g).expect("reconstruct"), spec);
     }

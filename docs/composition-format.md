@@ -74,7 +74,7 @@ board_facts:              # bus + address per driver component (optional)
     device: sps30
     address: "0x69"
 
-messages:                 # the inboxes that take several kinds (optional)
+messages:                 # the shapes stated once: the types and the sets (optional)
   - id: screen_update
     kinds: [Reading, Gesture]
 
@@ -122,7 +122,7 @@ Every key of `ApplicationSpec`, in the order `render_composition` writes them:
 | `board` | **yes** | mapping | chip, BSP, HAL — see [`board`](#board) |
 | `board_facts` | no | list | how each driver is reached — see [`board_facts`](#board_facts) |
 | `resources` | no | list | the devices declared — see [`resources`](#resources) |
-| `messages` | no | list | the inboxes that take **several** kinds — see [`messages`](#messages) |
+| `messages` | no | list | the shapes stated once — types and sets — see [`messages`](#messages) |
 | `units` | **yes** | list | the units of work — see [`units`](#units) |
 | `wiring` | no | list of `a -> b` | the edges, by unit id — see [`wiring`](#wiring) |
 | `power` | no | mapping | `budget_mah`, `target_days` — see [Facets](#the-facets) |
@@ -259,22 +259,61 @@ rather than a number.
 
 ## `messages`
 
-The **inboxes that take several kinds**. Most actors receive one kind of thing and say so on the unit
-itself (`message: Tick`). An actor that reacts to a reading, a command *and* a heartbeat needs one type
-that carries all three — and that type is a decision about a **conversation**: a sender posts one of the
-kinds, the receiver dispatches on which arrived. So it is stated here, once, by name:
+The **shapes of the messages**, stated once. Most designs state none: a message is a `struct` whose
+contents are a fact about whatever is at the other end of an edge — a device's reading, a frame, a
+screen's report — so the fill writes it inside the empty stub the scaffold emits. This block is where a
+design **states the shape instead**, so the fields it decided are carried into the stub rather than
+re-decided there:
 
 ```yaml
 messages:
-  - id: screen_update
+  - id: Reading                    # a type: the fields that cross the edge
+    description: One SPS30 sample, as the driver reported it.
+    fields:
+      - name: pm_2_5
+        type: uint16
+        description: PM2.5 as a raw count, µg/m³
+      - name: pm_10
+        type: uint16
+  - id: screen_update              # a set: the kinds one actor receives
     kinds: [Reading, Gesture]
 ```
 
+Both live in **one list**, the way `units` holds components, actors and stages: a declaration is either a
+**type** (an `id` and its `fields`) or a **set** (an `id` and its `kinds`), never both.
+
 | key | required | notes |
 | --- | --- | --- |
-| `id` | **yes** | the set's name — what an actor's `message` refers to it by |
-| `kinds` | **yes** | two or more message kinds, the alternatives of the variant |
-| `description` | no | the inbox **in English** — see [Prose](#prose-the-description-fields) |
+| `id` | **yes** | the declaration's name — what an actor's `message`, a stage's port or a set's `kinds` refers to it by |
+| `fields` | no | a **type**'s members — see [A type's `fields`](#a-types-fields) |
+| `kinds` | no | a **set**'s two or more message kinds, the alternatives of the variant |
+| `description` | no | the declaration **in English** — see [Prose](#prose-the-description-fields) |
+
+An `id` and nothing else is a **declared stub** — a name the design states and the fill writes, exactly
+as an undeclared bare message is. A declaration is also **shared**: it is named by an actor's `message`,
+by a stage's port, or as one of a set's `kinds`, and two actors that receive the same type name one
+declaration — which is why it is a top-level block rather than a field on the actor. The type belongs to
+the edge, not to either end of it.
+
+### A type's `fields`
+
+A field is `{ name, type, description? }`, and in the scaffold it becomes a member of the generated
+`struct`: the `name` a member, the `description` the `///` above it, carried **verbatim** (a person's
+sentence, not a scaffold's paraphrase), and the `type` written as it stands.
+
+That `type` is a **hint, not a checked type**. `uint16`, `float`, `enum(tap, long_press)`, a type the
+fill has yet to declare — the design's own words are emitted and never parsed, because the alternative is
+a schema that either invents a type system or refuses the person's way of naming what the other end
+sends. What *is* checked is the part a C++ compiler would reject anyway: the declaration's `id`, and each
+field's `name` — a bare identifier, unique within its type. A field with no `type` is a name the design
+states and nothing more: the member cannot be written without one, so the scaffold leaves the `TODO` that
+says so rather than guessing one.
+
+Declaring a type is what makes an actor's mailbox concrete before the fill exists. Where the design states
+the fields, the header carries them; where it does not, the type is the empty stub it always was, and
+nothing else about the generated project changes.
+
+### A set's `kinds`
 
 An actor that holds a set is written like any other actor: `message: screen_update` names the **mailbox**,
 and the mailbox still holds one type. What changes is the type — the scaffold writes
@@ -283,23 +322,30 @@ and the mailbox still holds one type. What changes is the type — the scaffold 
 index), never the set itself. The set's `description` leads that type's doc comment in the header, exactly
 as a unit's description leads its class — read back off the tree, a set is the set the person stated.
 
-Three rules hold a set to its own shape, and each is stated in the language of the thing it refuses:
+Rules hold a declaration to its own shape, each stated in the language of the thing it refuses:
 
-- **At least two kinds, all distinct.** One kind is not a set — the unit already says that with
+- **A set has at least two kinds, all distinct.** One kind is not a set — the unit already says that with
   `message: <kind>` — so it is refused rather than emitted as a variant of one alternative. A kind named
   twice is refused too: `kinds` is a list of *distinct* kinds.
-- **Named by some actor's `message`.** A set nobody receives is a type nothing can be sent, refused like
-  any other declaration nothing references.
+- **A set is named by some actor's `message`.** A set nobody receives is a type nothing can be sent,
+  refused like any other declaration nothing references.
+- **A type is used by something.** A type — or a declared stub — that no actor receives, no stage carries
+  and no set names is a type nothing can be sent, refused for the same reason.
+- **One shape, one id.** A declaration with both `kinds` and `fields` is asking for an alias and a
+  `struct` under one name, and is refused. So is an id that another declaration already has: an id is
+  what a `message` resolves *by*, so two declarations sharing one would make every `message` that names it
+  ambiguous.
 - **A name of its own.** The kinds become `struct`s, the set becomes a `std::variant` alias, and all of
   them live in the one `messages::` namespace — so a set id that normalises onto another declared name
   (`screen_update` beside a kind, bare message or port value named `ScreenUpdate`) would be one name for
   two shapes, and is refused.
 
-What is **not** a collision is a **kind reused elsewhere**: the kinds are shared types in their own right
-(one `struct` each), so another actor may name one kind alone (`message: Gesture`) and receive the same
-type the set carries, and one kind may belong to two sets. A set exists only where a design states one:
-with no `messages` key the section is empty, and every generated header is byte-for-byte what it was
-before — the ordinary one-kind case costs nothing and reads the same.
+What is **not** a collision is a **declaration reused elsewhere**, which is what the block is for: a
+**type** named by two actors (or by a stage's port) is one `struct` both ends share, a **kind** is a
+shared type in its own right, so another actor may name one kind alone (`message: Gesture`) and receive
+the same type the set carries, and one kind may belong to two sets. A declaration exists only where a
+design states one: with no `messages` key the section is empty, and every generated header is
+byte-for-byte what it was before — the ordinary one-kind case costs nothing and reads the same.
 
 ## `units`
 
@@ -353,7 +399,7 @@ A classical actor: a `Message` type, the state behind it, and the refs it sends 
 
 | key | required | notes |
 | --- | --- | --- |
-| `message` | **yes** | the **mailbox type** it receives — *an actor **is** a message type*, and the compile cannot infer one (`spire::Actor` is templated on it). One name, so one type however many kinds of message it carries — a kind (`Tick`), or the id of a declared [message-set](#messages) — see below |
+| `message` | **yes** | the **mailbox type** it receives — *an actor **is** a message type*, and the compile cannot infer one (`spire::Actor` is templated on it). One name, so one type however many kinds of message it carries — a bare kind (`Tick`), or the id of a declared [`messages`](#messages) **type** or **set** — see below |
 | `state` | no | the state it holds between messages |
 | `uses` | no | the **components** (and declared resources) this actor wraps |
 | `sends_to` | no | the unit ids it posts to — a **list**, so one sender may post to several, each receiver typed by its own `message` (see [Messages across units](#messages-across-units-one-type-many-actors)) |
@@ -370,9 +416,18 @@ carries all of them, and the *shape* of that type is where the several kinds liv
 written out as what the actor actually receives. The worked example fills one in, ten kinds deep — see
 [One mailbox type, many kinds](#one-mailbox-type-many-kinds--filled-in).
 
-The one shape the composition **does** state is the sum type itself: when the several kinds are known
+The shape itself may be **stated** too: where a design declares a message **type** in
+[`messages`](#messages), the fields it named are written into that stub as the members of the `struct`,
+with the `type`s it gave carried verbatim. The mailbox is then concrete before the fill exists, and the
+fill's job narrows to what the actor *does* with each value — which is the difference between a stub that
+says what to write and one that says only that something must be written. The build plan the fill is
+handed lists those declared types too, with the members already in `messages.hpp`, so a fill that reads
+only its own unit's stub keeps each name and `type` as the design wrote it instead of reshaping what the
+rest of the composition is compiled against.
+
+The other shape a composition may state is the **sum type** itself: when the several kinds are known
 *when the design is written* — the caller and the callee of one conversation — they are declared once in
-[`messages`](#messages) under a name, and every actor that receives them says `message: <set id>`. Then
+[`messages`](#messages) as a **set**, and every actor that receives them says `message: <set id>`. Then
 the mailbox is a `std::variant` over the kinds from the start, and the fill is about what the actor does
 with each one rather than about the type at all.
 
@@ -448,8 +503,10 @@ Messaging has two facts that are easy to run together, and they are different me
 **type** may be **shared** — two actors can take the same message — and a message may be **fanned out** —
 one unit may post to several. Both are ordinary here; neither is a broadcast. A third fact belongs to the
 *receiver* rather than to the edges: one mailbox may carry **several kinds**, and when the design knows
-which, they are declared once as a [`messages`](#messages) **message-set** and every actor that receives
-them names that one id.
+which, they are declared once as a [`messages`](#messages) **set** and every actor that receives them
+names that one id. A fourth is the *shape* of a shared type: when the design knows the fields, it states
+them once as a [`messages`](#messages) **type**, and every actor that receives it — or every stage port
+that carries it — shares the one `struct` the scaffold writes from them.
 
 ### One type, several actors
 
@@ -466,7 +523,8 @@ struct Tick {};
 
 That `Named by …` line is the point: the type belongs to the **edge**, so whoever fills it writes for two
 readers at once. If the two need different fields, that is the moment to give them **two** types rather
-than one that half-serves each.
+than one that half-serves each. And a type the design *did* describe arrives with its members instead of
+that `TODO` — same shared `struct`, same `Named by …` line, only the work left over is smaller.
 
 Sharing a type shares no mailbox. Each actor has its own queue and therefore its own ref, and two actors
 that take `Tick` are two `spire::ActorRef<messages::Tick>` values told apart by the mailbox they address.
@@ -533,8 +591,8 @@ lens — and a composition may have both, as `docs/example-composition.spire` do
 
 A composition states the design **twice**: as structure (everything above) and as **English**. The whole
 application has a `description`, each unit may have its own, and so may each declared
-[`messages`](#messages) entry — the inbox in English. They exist so the structure and the sentence that
-explains it cannot drift apart in two files.
+[`messages`](#messages) entry — the type or the inbox, in English. They exist so the structure and the
+sentence that explains it cannot drift apart in two files.
 
 ```yaml
 description: |
@@ -557,8 +615,9 @@ Three properties matter:
 - **It is carried verbatim into the generated tree.** The whole-application `description` becomes the
   comment block at the top of `main/main.cpp` (the one file a person opens first, substituted by name
   through `DESCRIPTION_BLOCK_TOKEN`), each unit's `description` becomes that unit's generated class
-  doc-comment, and a message-set's leads the doc-comment of the variant the scaffold writes for it. So a
-  person codes against the same words the design was reviewed against, rather than a paraphrase.
+  doc-comment, a declared message type's leads the doc-comment of the `struct` the scaffold writes for it,
+  and a set's leads the `variant`'s. So a person codes against the same words the design was reviewed
+  against, rather than a paraphrase.
 - **It is optional.** A driver's `provides` line is usually enough; an actor almost always has one,
   because *"what does this actor do on receiving X"* is a question its message type and state hint
   cannot answer.
@@ -620,8 +679,9 @@ The precondition and the seven rules:
 6. **Nothing invented and unused.** A unit referenced by no wiring edge, no `sends_to`, no `uses` and no
    board fact is refused: *"an invented unit nobody uses is either a mistake or work that belongs to
    another spec."*
-   A message-set is referenced the same way — an actor's `message` names it — so a set no actor receives
-   is refused for the same reason: a set nobody receives is a type nothing can be sent.
+   A message declaration is referenced the same way — an actor's `message`, a stage's port, or a set's
+   `kinds` names it — so a **set** no actor receives is refused for the same reason, and so is a **type**
+   no actor receives, no stage carries and no set names: a type nothing can be sent.
 7. **The declared resources hold together.** A resource `name` must be a bare identifier and unique; it
    must name at least one capability and every `role` must be a path the vocabulary knows; it must state
    a `via`; a `via: board` resource may not share its name with a unit; a `library`/`published` resource
@@ -789,8 +849,11 @@ sub-message is where the actor's RAM goes.
       `validate` does not enforce today.
 - [ ] Every actor's `message` names one **mailbox type** — even when the actor reacts to several kinds of
       message (`std::variant<…>`) — and every `stage` states at least one port.
-- [ ] Every declared message-set has two or more distinct kinds, and some actor's `message` names it — and
-      its id is not also the name of a kind, a bare message or a port value.
+- [ ] Every declared message-**set** has two or more distinct kinds, and some actor's `message` names it —
+      and its id is not also the name of a kind, a bare message or a port value. Every declared message
+      **type** has field names that are bare identifiers, unique within the type, and is used by some
+      actor's `message`, some stage's port or some set's `kinds` — and no declaration carries both `kinds`
+      and `fields`, or an id another declaration already has.
 - [ ] Every `component` is framework-agnostic — no `message`, `state`, `uses`, `sends_to` or ports — and
       its `role`, `bus` and `source` agree.
 - [ ] No unit is left referenced by nothing.
